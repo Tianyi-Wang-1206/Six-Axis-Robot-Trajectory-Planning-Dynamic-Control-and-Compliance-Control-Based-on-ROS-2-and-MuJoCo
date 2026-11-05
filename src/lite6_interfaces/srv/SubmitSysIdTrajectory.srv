@@ -1,0 +1,10 @@
+# The GUI retains the Fourier excitation generator, but it must not
+# publish directly to JTC. Supervisor checks session, state and limits,
+# then exclusively submits the trajectory to JTC.
+uint64 session_id
+trajectory_msgs/JointTrajectory trajectory
+---
+# accepted means validated/accepted for dispatch, NOT motion completion.
+bool accepted
+uint64 revision
+string message

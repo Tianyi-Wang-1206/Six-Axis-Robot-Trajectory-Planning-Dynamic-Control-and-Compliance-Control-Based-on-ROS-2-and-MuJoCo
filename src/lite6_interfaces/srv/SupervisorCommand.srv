@@ -1,0 +1,22 @@
+# A request is an EVENT, never a request to force an arbitrary state.
+# Supervisor owns all transition guards and command side effects.
+uint8 CMD_ESTOP=1
+uint8 CMD_BEGIN_RECOVERY=2
+uint8 CMD_ACK_SOFT_FAULT=3
+uint8 CMD_BEGIN_SYSID=4
+uint8 CMD_SYSID_CALCULATION_DONE=5
+uint8 CMD_ABORT_SYSID=6
+
+uint8 command
+
+# For session-scoped operations use the ID returned by BEGIN_*.
+# For ESTOP, BEGIN_RECOVERY, ACK_SOFT_FAULT and BEGIN_SYSID send 0.
+uint64 session_id
+string reason
+---
+# accepted only acknowledges that the event passed its guard;
+# it does NOT mean a controller mode switch has completed.
+bool accepted
+uint64 session_id
+uint64 revision
+string message

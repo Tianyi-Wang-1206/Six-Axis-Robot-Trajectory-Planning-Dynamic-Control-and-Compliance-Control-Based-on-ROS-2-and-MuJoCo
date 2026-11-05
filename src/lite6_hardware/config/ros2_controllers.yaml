@@ -1,0 +1,80 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 1000  # 1000Hz Hard Real-Time Control Loop
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    # 1. Declare the CTC controller, which is a custom controller that implements Computed Torque Control (CTC) for the Lite6 robot arm
+    ctc_controller:
+      type: lite6_controllers/Lite6CTCController
+
+    # 2. Declare the native JTC
+    lite6_arm_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+joint_state_broadcaster:  # Broadcaster for the joint states of the robot arm
+  ros__parameters:
+    publish_rate: 200
+
+# --- Computed Torque Control (CTC) Controller Configuration ---
+ctc_controller:
+  ros__parameters:
+    kp: [800.0, 800.0, 800.0, 800.0, 800.0, 800.0]
+    kv: [56.6, 56.6, 56.6, 56.6, 56.6, 56.6]
+
+    # Acceleration-level integral gains [1/s^3], joint1 ... joint6.
+    # Initial tuning values; set an axis to 0.0 to disable its integration.
+    ki: [1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0]
+    # Absolute integral torque limits [N m], including inertia coupling.
+    integral_torque_limit: [30.0, 30.0, 25.0, 25.0, 25.0, 20.0]
+    # Accumulate only near target and at low measured AND target velocity.
+    # Freeze outside these windows; retain compensation at zero error.
+    integral_position_window: 0.1  # rad
+    integral_velocity_window: 0.5   # rad/s
+    
+    # Results of system identification
+    # --- Identified Dynamic Parameters ---
+    armature:           [0.1011, 0.1019, 0.1012, 0.1013, 0.1005, 0.1000]
+    friction_v_nominal: [1.0046, 1.0060, 0.5062, 0.2124, 0.1039, 0.0487]
+    friction_c_nominal: [1.4983, 1.5030, 0.9962, 0.4760, 0.1975, 0.1004]
+
+    # Parameter of the friction compensation (if you change this parameter, you need to change it in the sysid_engine.py code as well) 
+    tanh_slope: 1000.0 
+
+    # Maximum torque of each joint (same as the xml file)
+    max_effort : [50.0, 50.0, 32.0, 32.0, 32.0, 20.0]
+
+    # Deceleration (rad/s^2) of each joint when the emergency stop is triggered. This is used to compute the deceleration trajectory for each joint.
+    estop_decel: [17.5, 12.5, 20.0, 40.0, 40.0, 50.0]  # 5x of the joint acceleration limits.
+
+# --- Joint Trajectory Control (JTC) Configuration ---
+lite6_arm_controller:
+  ros__parameters:
+
+    open_loop_control: true
+    allow_integration_in_goal_trajectories: true
+
+    joints:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+    
+    command_joints:
+      - ctc_controller/joint1
+      - ctc_controller/joint2
+      - ctc_controller/joint3
+      - ctc_controller/joint4
+      - ctc_controller/joint5
+      - ctc_controller/joint6
+      
+    command_interfaces:
+      - position
+      - velocity
+      - acceleration
+      
+    state_interfaces:
+      - position

@@ -1,0 +1,55 @@
+# Goal: request a motion through the single Supervisor-owned action server.
+# The original motion command layout and numeric values are retained.
+uint8 MOVEJ=0
+uint8 MOVEP=1
+uint8 MOVEL=2
+uint8 MOVEC=3
+
+uint8 command_type
+float64[6] joint_target
+geometry_msgs/Pose pose_target
+geometry_msgs/Pose pose_aux
+float64 velocity_scale
+float64 acceleration_scale
+
+# NORMAL is the default for ordinary GUI/client motions.
+# SYSID and RECOVERY are supervisor-gated internal motions, not privileges.
+uint8 CONTEXT_NORMAL=0
+uint8 CONTEXT_SYSID=1
+uint8 CONTEXT_RECOVERY=2
+uint8 context
+
+# Zero for normal motions. For internal motions this must match the active
+# nonzero session_id issued by SupervisorCommand and SupervisorState.
+uint64 session_id
+---
+# Result: original codes and fields are unchanged.
+int32 SUCCESS=1
+int32 ERR_INVALID_INPUT=-1
+int32 ERR_NO_IK_SOLUTION=-2
+int32 ERR_LIMIT_VIOLATION=-3
+int32 ERR_SINGULARITY=-4
+int32 ERR_QUADRANT_JUMP=-5
+int32 ERR_RUCKIG_FAILED=-6
+int32 ERR_EXECUTION_ABORTED=-7
+
+# Additional supervisory / lifecycle failures (for accepted goals only).
+int32 ERR_CANCELLED=-8
+int32 ERR_BUSY=-9
+int32 ERR_NOT_READY=-10
+int32 ERR_TIMEOUT=-11
+int32 ERR_SUPERVISOR_DENIED=-12
+int32 ERR_INTERNAL=-13
+
+int32 error_code
+string error_string
+float64 execution_time
+---
+# Feedback: preserve the previous meanings of 0 and 1.
+uint8 STATE_PLANNING=0
+uint8 STATE_EXECUTING=1
+uint8 STATE_WAITING_JTC=2
+uint8 STATE_CANCELING=3
+
+uint8 current_state
+float64 percent_complete

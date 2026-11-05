@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>lite6_planner</name>
+  <version>0.0.0</version>
+  <description>Analytical Lite6 motion planning with event-supervised execution.</description>
+  <maintainer email="2159593747@qq.com">tianyi</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
+  <depend>lite6_interfaces</depend>
+  <depend>action_msgs</depend>
+  <depend>control_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>ruckig</depend>
+  <depend>pinocchio</depend>
+  <depend>coal</depend>
+  <depend>yaml-cpp</depend>
+  <depend>ament_index_cpp</depend>
+  <depend>eigen</depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>lite6_description</test_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>
