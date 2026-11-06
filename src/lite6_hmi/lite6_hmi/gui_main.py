@@ -147,6 +147,12 @@ class PyQtHMI(QMainWindow):
         self.worker.recovery_complete_signal.connect(self.on_recovery_completed)
         self._supervisor_offline_displayed = False
 
+        # Render the cached snapshot as well as future transitions. A Worker
+        # supplied by another caller may already have received its first state.
+        with self.worker.state_lock:
+            state, detail = self.worker.state, self.worker.error_msg
+        self.on_state_updated(state, detail)
+
         # Connection timeout watchdog timer
         self.watchdog_timer = QTimer()
         self.watchdog_timer.timeout.connect(self.check_connection_watchdog)
@@ -980,10 +986,6 @@ def main(args=None):
     os.environ["QT_SCALE_FACTOR"] = "1.0"    # This factor changes the total size of the GUI window. The fonts inside it will be changed automatically.
     rclpy.init(args=args)
 
-    # 1. Instantiate the ROS 2 executor inside QThread Worker
-    worker = ROS2Worker()
-    worker.start()
-
     # Enable High-DPI Scaling for 2K/4K screens
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
@@ -998,8 +1000,11 @@ def main(args=None):
     # Establish dynamic color palette settings matching modern OS environments
     app.setStyle('Fusion')
     
+    # Connect every GUI receiver before the executor can emit its first state.
+    worker = ROS2Worker()
     gui = PyQtHMI(worker)
     gui.show()
+    worker.start()
 
     exit_code = app.exec_()
     

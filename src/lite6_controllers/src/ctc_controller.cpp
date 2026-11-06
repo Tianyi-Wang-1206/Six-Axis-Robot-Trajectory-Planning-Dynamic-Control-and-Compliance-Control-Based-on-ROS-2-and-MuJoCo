@@ -16,11 +16,6 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
   
   auto_declare<std::vector<double>>("kp", {800.0, 800.0, 800.0, 800.0, 800.0, 800.0});
   auto_declare<std::vector<double>>("kv", {56.6, 56.6, 56.6, 56.6, 56.6, 56.6});
-  auto_declare<std::vector<double>>("ki", {0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
-  auto_declare<std::vector<double>>("integral_torque_limit", {2.0, 2.0, 1.5, 0.7, 0.3, 0.15});
-  auto_declare<double>("integral_position_window", 0.017453292519943295);
-  auto_declare<double>("integral_velocity_window", 0.02);
-  
   auto_declare<std::vector<double>>("friction_v_nominal", {1.0, 1.0, 0.5, 0.2, 0.1, 0.05});
   auto_declare<std::vector<double>>("friction_c_nominal", {1.5, 1.5, 1.0, 0.5, 0.2, 0.1});
   auto_declare<std::vector<double>>("armature", {0.1, 0.1, 0.1, 0.1, 0.1, 0.1});
@@ -79,29 +74,6 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
 
   auto kp_v = get_node()->get_parameter("kp").as_double_array();
   auto kv_v = get_node()->get_parameter("kv").as_double_array();
-  auto ki_v = get_node()->get_parameter("ki").as_double_array();
-  auto integral_limit_v = get_node()->get_parameter("integral_torque_limit").as_double_array();
-  integral_position_window_ = get_node()->get_parameter("integral_position_window").as_double();
-  integral_velocity_window_ = get_node()->get_parameter("integral_velocity_window").as_double();
-  const auto finite_nonnegative = [](double value) {
-    return std::isfinite(value) && value >= 0.0;
-  };
-  if (ki_v.size() != n || integral_limit_v.size() != n ||
-      !std::all_of(ki_v.begin(), ki_v.end(), finite_nonnegative) ||
-      !std::all_of(integral_limit_v.begin(), integral_limit_v.end(), finite_nonnegative) ||
-      !std::isfinite(integral_position_window_) || integral_position_window_ <= 0.0 ||
-      !std::isfinite(integral_velocity_window_) || integral_velocity_window_ <= 0.0) {
-    RCLCPP_ERROR(get_node()->get_logger(),
-      "Integral gains/torque limits must contain six finite nonnegative values; "
-      "integral position/velocity windows must be finite and positive");
-    return controller_interface::CallbackReturn::ERROR;
-  }
-  integral_gain_ = Eigen::Map<const Eigen::VectorXd>(ki_v.data(), n);
-  integral_torque_limit_ = Eigen::Map<const Eigen::VectorXd>(integral_limit_v.data(), n);
-  integral_acceleration_.setZero(n);
-  integral_torque_.setZero(n);
-  integral_mass_.setZero(n, n);
-  integral_enabled_ = (integral_gain_.array() > 0.0).any();
   auto fv_v = get_node()->get_parameter("friction_v_nominal").as_double_array();
   auto fc_v = get_node()->get_parameter("friction_c_nominal").as_double_array();
   auto arm_v = get_node()->get_parameter("armature").as_double_array();
@@ -173,7 +145,6 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   }
   
   system_state_ = SystemState::NORMAL;
-  integral_acceleration_.setZero();
   cmd_buffer_.writeFromNonRT(0);
   // Force a fresh NORMAL observation on the first successful update.
   // Never infer a mode from the last received system_cmd value.
@@ -184,67 +155,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
 
 controller_interface::CallbackReturn Lite6CTCController::on_deactivate(const rclcpp_lifecycle::State &)
 {
-  integral_acceleration_.setZero();
   return controller_interface::CallbackReturn::SUCCESS;
-}
-
-void Lite6CTCController::apply_integral(double dt)
-{
-  // Preserve the original PD + feedforward command if integration is disabled.
-  if (!integral_enabled_ || !std::isfinite(dt) || !q_.allFinite() ||
-      !dq_.allFinite() || !e_.allFinite() || !dq_target_.allFinite() ||
-      !tau_cmd_.allFinite()) return;
-
-  pinocchio::crba(pin_model_, pin_data_, q_);
-  integral_mass_ = pin_data_.M.selfadjointView<Eigen::Upper>();
-  integral_mass_.diagonal() += armature_;
-  if (!integral_mass_.allFinite()) return;
-
-  // Limit actual integral torque, including coupling and changing inertia.
-  // Uniform scaling preserves zero integral acceleration on axes with Ki == 0.
-  integral_torque_.noalias() = integral_mass_ * integral_acceleration_;
-  double retained_scale = 1.0;
-  for (Eigen::Index j = 0; j < integral_torque_.size(); ++j) {
-    const double magnitude = std::abs(integral_torque_[j]);
-    if (magnitude > integral_torque_limit_[j]) {
-      retained_scale = std::min(retained_scale, integral_torque_limit_[j] / magnitude);
-    }
-  }
-  integral_acceleration_ *= retained_scale;
-  integral_torque_ *= retained_scale;
-
-  for (Eigen::Index i = 0; i < e_.size(); ++i) {
-    // Freeze (do not clear) outside the integration window, including motion.
-    // There is deliberately no small-error deadband or reset on reaching goal.
-    if (integral_gain_[i] == 0.0 || std::abs(e_[i]) > integral_position_window_ ||
-        std::abs(dq_[i]) > integral_velocity_window_ ||
-        std::abs(dq_target_[i]) > integral_velocity_window_) continue;
-
-    const double increment = integral_gain_[i] * e_[i] * dt;
-    if (!std::isfinite(increment)) continue;
-    double scale = 1.0;
-    for (Eigen::Index j = 0; j < e_.size(); ++j) {
-      const double delta_torque = integral_mass_(j, i) * increment;
-      if (delta_torque == 0.0) continue;
-      const double direction = delta_torque > 0.0 ? 1.0 : -1.0;
-      const double integral_room = integral_torque_limit_[j] - direction * integral_torque_[j];
-      const double actuator_room = max_effort_[j] - direction * (tau_cmd_[j] + integral_torque_[j]);
-      // Conditional integration: block increments driving ANY coupled actuator
-      // further into saturation, but allow increments that unwind saturation.
-      const double room = std::max(0.0, std::min(integral_room, actuator_room));
-      scale = std::min(scale, room / std::abs(delta_torque));
-    }
-    const double accepted = scale * increment;
-    integral_acceleration_[i] += accepted;
-    for (Eigen::Index j = 0; j < e_.size(); ++j) {
-      integral_torque_[j] += integral_mass_(j, i) * accepted;
-    }
-  }
-
-  // Equivalent to adding Ki * integral(e dt) to a_d before RNEA and armature.
-  // Keeping the original command as the baseline enables torque anti-windup.
-  a_d_ += integral_acceleration_;
-  tau_cmd_ += integral_torque_;
 }
 
 controller_interface::return_type Lite6CTCController::update_and_write_commands(
@@ -263,7 +174,6 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   // 2. State Machine & Kinematic Deceleration Trajectory Generation
   int32_t* cmd_ptr = cmd_buffer_.readFromRT();
   int32_t current_cmd = cmd_ptr ? *cmd_ptr : 0;
-  const SystemState previous_state = system_state_;
 
   if (current_cmd == 1 && system_state_ != SystemState::ESTOP) {
       system_state_ = SystemState::ESTOP;
@@ -281,10 +191,6 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
               reference_interfaces_[2*n+i] = 0.0;
           }
       }
-  }
-
-  if (system_state_ != previous_state || system_state_ != SystemState::NORMAL) {
-      integral_acceleration_.setZero();
   }
 
   Eigen::Map<Eigen::VectorXd> map_q_d(reference_interfaces_.data(), n);
@@ -325,9 +231,12 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
 
   // 4. Branching Control Law
   if (system_state_ == SystemState::SYS_ID) {
+      // Rotor inertia is known in every mode; only friction is unidentified.
       a_d_.noalias() = ddq_target_ + (Kp_ * e_) + (Kv_ * de_);
       pinocchio::rnea(pin_model_, pin_data_, q_, dq_, a_d_);
-      for(size_t i = 0; i < n; ++i) tau_cmd_[i] = pin_data_.tau[i]; 
+      for(size_t i = 0; i < n; ++i) {
+          tau_cmd_[i] = pin_data_.tau[i] + (armature_[i] * a_d_[i]);
+      }
   } 
   else {
       a_d_.noalias() = ddq_target_ + (Kp_ * e_) + (Kv_ * de_);
@@ -337,8 +246,6 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
           tau_cmd_[i] = pin_data_.tau[i] + (armature_[i] * a_d_[i]) + tau_fric_[i];
       }
   }
-
-  if (system_state_ == SystemState::NORMAL) apply_integral(dt);
 
   // 5. Hardware Limits
   for (size_t i = 0; i < n; ++i) {

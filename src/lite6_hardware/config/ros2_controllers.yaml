@@ -23,24 +23,15 @@ ctc_controller:
     kp: [800.0, 800.0, 800.0, 800.0, 800.0, 800.0]
     kv: [56.6, 56.6, 56.6, 56.6, 56.6, 56.6]
 
-    # Acceleration-level integral gains [1/s^3], joint1 ... joint6.
-    # Initial tuning values; set an axis to 0.0 to disable its integration.
-    ki: [1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0]
-    # Absolute integral torque limits [N m], including inertia coupling.
-    integral_torque_limit: [30.0, 30.0, 25.0, 25.0, 25.0, 20.0]
-    # Accumulate only near target and at low measured AND target velocity.
-    # Freeze outside these windows; retain compensation at zero error.
-    integral_position_window: 0.1  # rad
-    integral_velocity_window: 0.5   # rad/s
-    
-    # Results of system identification
-    # --- Identified Dynamic Parameters ---
-    armature:           [0.1011, 0.1019, 0.1012, 0.1013, 0.1005, 0.1000]
-    friction_v_nominal: [1.0046, 1.0060, 0.5062, 0.2124, 0.1039, 0.0487]
-    friction_c_nominal: [1.4983, 1.5030, 0.9962, 0.4760, 0.1975, 0.1004]
+    # Known  rotor inertia, provided by the official MuJoCo model
+    armature: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+
+    # Identified viscous and Coulomb friction.
+    friction_v_nominal: [1.0001, 1.0093, 0.5054, 0.2006, 0.1004, 0.0510]
+    friction_c_nominal: [1.4999, 1.4990, 0.9994, 0.4996, 0.1998, 0.0986]
 
     # Parameter of the friction compensation (if you change this parameter, you need to change it in the sysid_engine.py code as well) 
-    tanh_slope: 1000.0 
+    tanh_slope: 300.0
 
     # Maximum torque of each joint (same as the xml file)
     max_effort : [50.0, 50.0, 32.0, 32.0, 32.0, 20.0]

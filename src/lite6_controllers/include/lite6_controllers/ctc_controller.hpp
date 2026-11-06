@@ -14,7 +14,6 @@
 #include "pinocchio/multibody/model.hpp"
 #include "pinocchio/multibody/data.hpp"
 #include "pinocchio/parsers/urdf.hpp"
-#include "pinocchio/algorithm/crba.hpp"
 #include "pinocchio/algorithm/rnea.hpp"
 
 namespace lite6_controllers
@@ -52,15 +51,6 @@ private:
   // PD Control Matrices
   Eigen::MatrixXd Kp_, Kv_;
 
-  // Integral acceleration (Ki * integral(e dt)); converted through M + armature.
-  void apply_integral(double dt);
-  Eigen::VectorXd integral_gain_, integral_acceleration_, integral_torque_;
-  Eigen::VectorXd integral_torque_limit_;
-  Eigen::MatrixXd integral_mass_;
-  double integral_position_window_ = 0.017453292519943295;  // rad (1 degree)
-  double integral_velocity_window_ = 0.02;  // rad/s, both reference and feedback
-  bool integral_enabled_ = false;
-  
   Eigen::VectorXd friction_v_, friction_c_, armature_;
   Eigen::VectorXd max_effort_;
   double tanh_slope_;

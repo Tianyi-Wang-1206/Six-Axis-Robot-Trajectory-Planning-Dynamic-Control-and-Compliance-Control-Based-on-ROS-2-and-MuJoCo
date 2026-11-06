@@ -592,10 +592,9 @@ class ROS2Worker(QThread):
             self.sysid_start_ros_time = None
             self._last_sysid_sample_time = None
             self.sysid_q0_locked = list(prep_pose)
-        # Exactly the original coefficient construction: the SysIdEngine's
-        # Fourier mathematics is unchanged, as are the UI amplitude inputs.
+        # Prepare and preflight before changing controller mode.
         try:
-            self.inject_sysid_parameters(max_limits)
+            self.inject_sysid_parameters(prep_pose, max_limits)
         except Exception as exc:
             with self.state_lock:
                 self._begin_pending = False
@@ -619,29 +618,9 @@ class ROS2Worker(QThread):
         if snap is not None:
             self._drive_supervisor_phase(snap)
 
-    def inject_sysid_parameters(self, max_limits):
-        """Unmodified original Fourier excitation coefficient preparation."""
-        self.sysid_calc.record_data.clear()
-        np.random.seed(42)
-        N = self.sysid_calc.N_f
-        for i in range(6):
-            self.sysid_calc.a[i, 0:N-1] = np.random.uniform(-1.0, 1.0, N-1)
-            self.sysid_calc.b[i, 0:N-2] = np.random.uniform(-1.0, 1.0, N-2)
-            self.sysid_calc.a[i, N-1] = -np.sum(self.sysid_calc.a[i, 0:N-1])
-            C1 = -np.sum([(l+1) * self.sysid_calc.b[i, l] for l in range(N-2)])
-            C2 = -np.sum([self.sysid_calc.b[i, l] / (l+1) for l in range(N-2)])
-            D = (1.0 - 2.0*N) / (N * (N - 1.0))
-            self.sysid_calc.b[i, N-2] = (C1 / N - N * C2) / D
-            self.sysid_calc.b[i, N-1] = (-C1 / (N - 1.0) + (N - 1.0) * C2) / D
-            t_samples = np.linspace(0, self.sysid_calc.T_total, 200)
-            max_offset = 0.0
-            for t in t_samples:
-                q_offset, _, _ = self.sysid_calc.get_fourier_point(i, t, np.zeros(6))
-                max_offset = max(max_offset, abs(q_offset))
-            if max_offset > 0:
-                scale_factor = max_limits[i] / max_offset
-                self.sysid_calc.a[i, :] *= scale_factor
-                self.sysid_calc.b[i, :] *= scale_factor
+    def inject_sysid_parameters(self, prep_pose, max_limits):
+        self.sysid_calc.generate_fourier_coefficients(prep_pose, max_limits)
+        self.node.get_logger().info(self.sysid_calc.trajectory_summary)
 
     def _submit_sysid_trajectory(self, session, prep):
         if not self.sysid_client.service_is_ready():
@@ -650,10 +629,7 @@ class ROS2Worker(QThread):
             return
         trajectory = JointTrajectory()
         trajectory.joint_names = self.joint_names
-        dt = 0.02
-        steps = int(self.sysid_calc.T_total / dt) + 1
-        for step in range(steps):
-            t = step * dt
+        for t in self.sysid_calc.trajectory_times():
             point = JointTrajectoryPoint()
             point.positions = [0.0] * 6
             point.velocities = [0.0] * 6
