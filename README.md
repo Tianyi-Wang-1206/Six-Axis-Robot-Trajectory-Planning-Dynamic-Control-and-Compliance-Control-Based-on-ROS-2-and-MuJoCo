@@ -219,7 +219,43 @@ flowchart TD
 </p>
 
 ### 2. Automated System Identification
-*   The automated system identification executes bounded Fourier excitation trajectories, records $q, \dot{q}, \tau$, and utilizes **Least Squares Optimization** to extract exact **Armature, Viscous Friction, and Coulomb Friction** matrices.
+The identification engine records actual joint position, velocity and actuator
+effort during one trajectory containing two experiments:
+
+1. The existing bounded Fourier excitation identifies viscous `Fv` and Coulomb
+   `Fc` friction with nonnegative linear least squares and the existing
+   `|velocity| >= 0.05 rad/s` cutoff.
+2. Six low speeds (0.004–0.048 rad/s), each in both directions, identify the
+   Stribeck peak `Fs` and characteristic speed `vs`, keeping `Fv` and `Fc` fixed.
+   Each plateau is preceded by a short same-direction sliding preparation at
+   0.08 rad/s, then a smooth deceleration to measurement speed. This overcomes
+   reversal stiction while friction compensation is disabled. Only settled, measured
+   velocities near each requested speed enter the second fit; each plateau has
+   equal weight. Missing data, poor speed coverage and excessive fit residuals
+   produce an explicit failure instead of nominal parameter output.
+
+Both stages respect the entered excursion bounds, joint motion limits and
+collision checks. The default low-speed experiment adds 51.4 seconds and needs
+0.1952 rad of excursion per joint within the existing 10% margin. Each speed pair
+returns to the workspace center. The Supervisor session and controller mode
+sequence remain the same. Rigid-body torque and the known rotor inertia are
+subtracted before fitting; rotor inertia and LuGre dynamic parameters are not
+identified.
+
+The steady-sliding curve is
+`Fv*v + [Fc + (Fs-Fc)*exp(-(v/vs)^2)]*sign(v)` (fixed exponent 2).
+CTC uses this envelope evaluated at measured velocity, retaining its existing
+`tanh(tanh_slope*(dq_target + 5*position_error))` direction smoothing. SYS_ID
+mode still disables friction compensation. This is a static Stribeck fit, not
+an identification of LuGre bristle memory or a guarantee of zero static error.
+
+The GUI output includes per-axis fit residuals and four YAML arrays:
+`friction_v_nominal`, `friction_c_nominal`, `friction_s_nominal` (Nm), and
+`friction_vs_nominal` (rad/s); `Fv` has units Nm·s/rad. Copy the arrays into the
+CTC configuration and restart/reconfigure to apply them; identification does not
+automatically change controller parameters. The checked-in `Fs/vs` values are
+initial simulation nominals. Omitting `friction_s_nominal` preserves the previous
+Coulomb-only behavior (`Fs=Fc`).
 
 <p align="center">
   <img src="media/demo_SYSID.gif" width="1080" alt="Automated System Identification"/>

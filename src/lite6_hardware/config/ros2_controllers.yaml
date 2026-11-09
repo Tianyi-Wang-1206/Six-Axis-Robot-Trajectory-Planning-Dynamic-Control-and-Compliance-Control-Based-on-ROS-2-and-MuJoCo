@@ -26,11 +26,16 @@ ctc_controller:
     # Known  rotor inertia, provided by the official MuJoCo model
     armature: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
 
-    # Identified viscous and Coulomb friction.
+    # Identified high-speed viscous [Nm s/rad] and Coulomb [Nm] friction.
     friction_v_nominal: [1.0001, 1.0093, 0.5054, 0.2006, 0.1004, 0.0510]
     friction_c_nominal: [1.4999, 1.4990, 0.9994, 0.4996, 0.1998, 0.0986]
 
-    # Parameter of the friction compensation (if you change this parameter, you need to change it in the sysid_engine.py code as well) 
+    # Identified Stribeck peak [Nm] and characteristic speed [rad/s].
+    friction_s_nominal: [1.7250, 1.7248, 1.1499, 0.5749, 0.2300, 0.1147]
+    friction_vs_nominal: [0.0200, 0.0201, 0.0200, 0.0201, 0.0201, 0.0223]
+
+    # Smooth compensation direction; low-speed identification uses steady sliding,
+    # not this smoothing function. Keep in sync with the high-speed fit if changed.
     tanh_slope: 300.0
 
     # Maximum torque of each joint (same as the xml file)

@@ -386,7 +386,13 @@ class ROS2Worker(QThread):
                 if (self._last_sysid_sample_time is None or
                         msg_stamp > self._last_sysid_sample_time):
                     self._last_sysid_sample_time = msg_stamp
-                    if 1.0 < elapsed < (self.sysid_calc.T_total - 1.0):
+                    # Keep both stages and their transition samples for acceleration
+                    # estimation. The engine applies separate guarded fit windows.
+                    complete_effort = all(index[name] < len(msg.effort) and
+                                          index[name] < len(msg.velocity)
+                                          for name in self.joint_names)
+                    if (0.0 <= elapsed <= self.sysid_calc.T_total and complete_effort and
+                            all(math.isfinite(x) for x in self.tau_curr)):
                         self.sysid_record_data.append({
                             "t": elapsed,
                             "q": np.array(self.q_curr, dtype=float),
@@ -669,7 +675,7 @@ class ROS2Worker(QThread):
             self._drive_supervisor_phase(snap)
 
     def inject_sysid_parameters(self, prep_pose, max_limits):
-        self.sysid_calc.generate_fourier_coefficients(prep_pose, max_limits)
+        self.sysid_calc.generate_identification_trajectory(prep_pose, max_limits)
         self.node.get_logger().info(self.sysid_calc.trajectory_summary)
 
     def _submit_sysid_trajectory(self, session, prep):
@@ -681,14 +687,10 @@ class ROS2Worker(QThread):
         trajectory.joint_names = self.joint_names
         for t in self.sysid_calc.trajectory_times():
             point = JointTrajectoryPoint()
-            point.positions = [0.0] * 6
-            point.velocities = [0.0] * 6
-            point.accelerations = [0.0] * 6
-            for i in range(6):
-                q, dq, ddq = self.sysid_calc.get_fourier_point(i, t, prep)
-                point.positions[i] = float(q)
-                point.velocities[i] = float(dq)
-                point.accelerations[i] = float(ddq)
+            q, dq, ddq = self.sysid_calc.get_trajectory_point(t, prep)
+            point.positions = q.tolist()
+            point.velocities = dq.tolist()
+            point.accelerations = ddq.tolist()
             # Integer nanoseconds: never emit nanosec == 1_000_000_000
             # due to floating-point rounding at whole seconds.
             sec, nanosec = divmod(int(round(t * 1_000_000_000)),

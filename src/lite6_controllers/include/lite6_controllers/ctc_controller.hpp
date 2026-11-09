@@ -51,7 +51,7 @@ private:
   // PD Control Matrices
   Eigen::MatrixXd Kp_, Kv_;
 
-  Eigen::VectorXd friction_v_, friction_c_, armature_;
+  Eigen::VectorXd friction_v_, friction_c_, friction_s_, friction_vs_, armature_;
   Eigen::VectorXd max_effort_;
   double tanh_slope_;
 

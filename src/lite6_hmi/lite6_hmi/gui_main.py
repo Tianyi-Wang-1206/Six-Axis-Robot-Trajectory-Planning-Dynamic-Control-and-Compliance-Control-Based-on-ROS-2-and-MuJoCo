@@ -530,7 +530,7 @@ class PyQtHMI(QMainWindow):
         limits_widget = QWidget()
         limits_layout = QVBoxLayout(limits_widget)
         limits_layout.setContentsMargins(0, 0, 0, 0)
-        limits_layout.addWidget(QLabel("Fourier Excitation Limits (radians from pose center)", font=QFont("Segoe UI", 11, QFont.Bold)))
+        limits_layout.addWidget(QLabel("Excitation Limits: Fourier + Low Speed (radians from center)", font=QFont("Segoe UI", 11, QFont.Bold)))
 
         lim_inputs_container = QWidget()
         lim_inputs_layout = QHBoxLayout(lim_inputs_container)
