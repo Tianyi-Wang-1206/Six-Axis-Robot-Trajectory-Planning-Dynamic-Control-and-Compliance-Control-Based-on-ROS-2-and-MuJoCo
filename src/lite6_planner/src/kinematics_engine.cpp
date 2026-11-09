@@ -16,6 +16,9 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <iomanip>
+#include <map>
+#include <sstream>
 #include <stdexcept>
 
 namespace lite6_planner {
@@ -35,6 +38,19 @@ double rotation_error(const Eigen::Matrix3d& a, const Eigen::Matrix3d& b) {
 } // namespace
 
 KinematicsEngine::KinematicsEngine() = default;
+
+std::string IKDiagnostics::summary() const {
+  if(!input_error.empty()) return input_error;
+  std::ostringstream out;
+  out<<"No IK branch satisfies all required checks";
+  std::map<std::string,size_t> counts;
+  for(const auto& r:rejected) ++counts[r.reason];
+  for(const auto& entry:counts) out<<"; "<<entry.first<<"="<<entry.second;
+  // Each branch records its first failing check, not an exhaustive diagnosis.
+  for(const auto& r:rejected)
+    out<<"\nbranch "<<r.branch<<": "<<r.reason<<": "<<r.detail;
+  return out.str();
+}
 
 bool KinematicsEngine::load_limits(const std::string& file) {
   try {
@@ -132,14 +148,30 @@ Eigen::Matrix4d KinematicsEngine::forward_pose(const std::array<double,6>& q) co
   return T;
 }
 
-bool KinematicsEngine::check_collision(const std::array<double,6>& q) const {
-  if (!all_finite(q)) return true;
+bool KinematicsEngine::check_collision(const std::array<double,6>& q,std::string* detail) const {
+  if(detail) detail->clear();
+  if (!all_finite(q)) {
+    if(detail) *detail="Non-finite joint configuration";
+    return true;
+  }
   pinocchio::Data data(pin_model_);
   pinocchio::GeometryData geometry_data(geom_model_);
   const Eigen::Map<const Eigen::Matrix<double,6,1>> qe(q.data());
   pinocchio::forwardKinematics(pin_model_,data,qe);
   pinocchio::updateGeometryPlacements(pin_model_,data,geom_model_,geometry_data);
-  return pinocchio::computeCollisions(geom_model_,geometry_data,true);
+  const bool collided=pinocchio::computeCollisions(geom_model_,geometry_data,true);
+  if(collided&&detail) {
+    *detail="Collision detected";
+    for(size_t i=0;i<geom_model_.collisionPairs.size();++i) {
+      if(geometry_data.collisionResults[i].isCollision()) {
+        const auto& pair=geom_model_.collisionPairs[i];
+        *detail="Collision between "+geom_model_.geometryObjects[pair.first].name+
+            " and "+geom_model_.geometryObjects[pair.second].name;
+        break;
+      }
+    }
+  }
+  return collided;
 }
 
 double KinematicsEngine::check_singularity(const std::array<double,6>& q) const {
@@ -341,40 +373,79 @@ void KinematicsEngine::raw_inverse_kinematics(const Eigen::Matrix4d& T, double c
 
 IKResult KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
     const std::array<double,6>& q_ref,
-    std::vector<std::array<double,6>>& sorted,bool continuous) const {
+    std::vector<std::array<double,6>>& sorted,bool continuous,IKDiagnostics* diagnostics) const {
   sorted.clear();
-  if(!T.allFinite()||!all_finite(q_ref)) return IKResult::ERR_NO_MATH_SOLUTION;
+  if(diagnostics) *diagnostics=IKDiagnostics{};
+  if(!T.allFinite()||!all_finite(q_ref)) {
+    if(diagnostics) diagnostics->input_error="Non-finite IK target or reference joints";
+    return IKResult::ERR_NO_MATH_SOLUTION;
+  }
   if ((T.topLeftCorner<3,3>().transpose()*T.topLeftCorner<3,3>()-
        Eigen::Matrix3d::Identity()).norm()>1e-5 ||
-       std::abs(T.topLeftCorner<3,3>().determinant()-1.0)>1e-5)
+       std::abs(T.topLeftCorner<3,3>().determinant()-1.0)>1e-5) {
+    if(diagnostics) diagnostics->input_error="IK target rotation is not a valid rotation matrix";
     return IKResult::ERR_NO_MATH_SOLUTION;
+  }
 
   double raw[8][6];
   raw_inverse_kinematics(T,raw);
   struct Candidate {std::array<double,6> q; double cost;};
   std::vector<Candidate> candidates;
-  bool mathematical=false, blocked=false, jumped=false, singular=false;
+  bool blocked=false, jumped=false, singular=false;
+  size_t branch_index=0;
   for(auto& branch:raw) {
+    ++branch_index;
+    auto reject=[&](const std::string& reason,const std::string& detail) {
+      if(diagnostics) diagnostics->rejected.push_back({branch_index,reason,detail});
+    };
+    auto joint_detail=[&](int i,double value) {
+      std::ostringstream out;
+      out<<std::setprecision(10)<<"joint"<<i+1<<" value="<<value
+         <<" rad, range=["<<joint_limits_[i].min_pos<<", "<<joint_limits_[i].max_pos<<"] rad";
+      return out.str();
+    };
+    auto reject_invalid=[&](const std::array<double,6>& values) {
+      for(int i=0;i<6;++i) {
+        if(!std::isfinite(values[i])||values[i]<joint_limits_[i].min_pos-tolerance::kJointPosition||
+            values[i]>joint_limits_[i].max_pos+tolerance::kJointPosition) {
+          reject("joint limit / invalid joint",joint_detail(i,values[i]));break;
+        }
+      }
+    };
     std::array<double,6> q{};
     bool valid=true, branch_jump=false;
     double cost=0;
+    std::string jump_detail;
     for(int i=0;i<6;++i) {
       const double base=branch[i];
-      if(!std::isfinite(base)) {valid=false;break;}
+      if(!std::isfinite(base)) {
+        reject("no finite analytic solution","joint"+std::to_string(i+1)+" is non-finite");
+        valid=false;break;
+      }
       const auto& lim=joint_limits_[i];
       const int k_lo=static_cast<int>(std::ceil((lim.min_pos-base-1e-10)/kTwoPi));
       const int k_hi=static_cast<int>(std::floor((lim.max_pos-base+1e-10)/kTwoPi));
-      if(k_lo>k_hi) {valid=false;blocked=true;break;}
+      if(k_lo>k_hi) {
+        reject("joint limit",joint_detail(i,base)+"; no equivalent angle within limits");
+        valid=false;blocked=true;break;
+      }
       const int k=std::clamp(static_cast<int>(std::round((q_ref[i]-base)/kTwoPi)),k_lo,k_hi);
       q[i]=base+k*kTwoPi;
       const double dq=q[i]-q_ref[i];
       cost+=ik_weights_[i]*dq*dq;
-      if(continuous&&std::abs(dq)>quadrant_jump_threshold_) branch_jump=true;
+      if(continuous&&std::abs(dq)>quadrant_jump_threshold_) {
+        branch_jump=true;
+        if(jump_detail.empty()) {
+          std::ostringstream out;
+          out<<std::setprecision(10)<<"joint"<<i+1<<" delta="<<dq
+             <<" rad, threshold="<<quadrant_jump_threshold_<<" rad";
+          jump_detail=out.str();
+        }
+      }
     }
     if(!valid) continue;
-    mathematical=true;
-    if(branch_jump) {jumped=true;continue;}
-    if(!joint_valid(q)) {blocked=true;continue;}
+    if(branch_jump) {reject("branch jump",jump_detail);jumped=true;continue;}
+    if(!joint_valid(q)) {reject_invalid(q);blocked=true;continue;}
     // Seeded closed-loop pose correction (CLIK): keep the Maple branch,
     // but correct finite symbolic/model mismatch using a normalized SVD-DLS step.
     // Only a small local correction is permitted; this is NOT a new global IK.
@@ -409,15 +480,30 @@ IKResult KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
       for(int j=0;j<6;++j) q[j]+=correction[j];
       if(!joint_valid(q)) break;
     }
-    if(!joint_valid(q)) {blocked=true;continue;}
+    if(!joint_valid(q)) {reject_invalid(q);blocked=true;continue;}
     const Eigen::Matrix4d fk=forward_pose(q);
-    if((fk.topRightCorner<3,1>()-T.topRightCorner<3,1>()).norm()>kFKPositionTol||
-        rotation_error(fk.topLeftCorner<3,3>(),T.topLeftCorner<3,3>())>kFKRotationTol)
+    const double pos_error=(fk.topRightCorner<3,1>()-T.topRightCorner<3,1>()).norm();
+    const double rot_error=rotation_error(fk.topLeftCorner<3,3>(),T.topLeftCorner<3,3>());
+    if(pos_error>kFKPositionTol||rot_error>kFKRotationTol) {
+      std::ostringstream out;
+      out<<std::setprecision(10)<<"position residual="<<pos_error<<" m (tolerance="
+         <<kFKPositionTol<<" m), rotation residual="<<rot_error
+         <<" rad (tolerance="<<kFKRotationTol<<" rad) after local correction";
+      reject("FK verification failed",out.str());
       continue; // Do not publish an unverified inverse-kinematics branch.
-    if(continuous&&check_singularity(q)<std::max(0.003,singularity_threshold_)) {
-      singular=true;continue;
     }
-    if(check_collision(q)) {blocked=true;continue;}
+    if(continuous) {
+      const double sigma=check_singularity(q),threshold=std::max(0.003,singularity_threshold_);
+      if(sigma<threshold) {
+        std::ostringstream out;
+        out<<std::setprecision(10)<<"normalized Jacobian sigma_min="<<sigma<<", threshold="<<threshold;
+        reject("near singularity",out.str());singular=true;continue;
+      }
+    }
+    std::string collision;
+    if(check_collision(q,diagnostics?&collision:nullptr)) {
+      reject("collision",collision);blocked=true;continue;
+    }
     cost=0.0;
     for(int j=0;j<6;++j) cost+=ik_weights_[j]*std::pow(q[j]-q_ref[j],2);
     bool duplicate=false;

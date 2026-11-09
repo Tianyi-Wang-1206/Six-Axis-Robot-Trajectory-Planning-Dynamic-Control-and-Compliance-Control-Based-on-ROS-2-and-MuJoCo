@@ -12,6 +12,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/IndustrialMotion.action"
   "msg/ControllerStatus.msg"
   "msg/SupervisorState.msg"
+  "msg/MotionRejection.msg"
   "srv/SupervisorCommand.srv"
   "srv/SubmitSysIdTrajectory.srv"
   DEPENDENCIES

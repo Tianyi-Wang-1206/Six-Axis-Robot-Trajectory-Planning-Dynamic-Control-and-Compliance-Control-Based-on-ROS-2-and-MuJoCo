@@ -75,6 +75,14 @@ int32_t ik_code(IKResult e) {
 double angle_difference(const Eigen::Matrix3d& a,const Eigen::Matrix3d& b) {
   return std::abs(Eigen::AngleAxisd(a.transpose()*b).angle());
 }
+std::string path_location(double s,const Eigen::Matrix4d& T) {
+  const Eigen::Quaterniond q(T.topLeftCorner<3,3>());
+  std::ostringstream out;
+  out<<std::setprecision(10)<<"s="<<s<<" ("<<100*s<<"%), target xyz=["
+     <<T(0,3)<<", "<<T(1,3)<<", "<<T(2,3)<<"] m, quaternion xyzw=["
+     <<q.x()<<", "<<q.y()<<", "<<q.z()<<", "<<q.w()<<"]";
+  return out.str();
+}
 }
 
 MotionPlanner::MotionPlanner(const KinematicsEngine& engine):engine_(engine){}
@@ -125,8 +133,9 @@ trajectory_msgs::msg::JointTrajectory MotionPlanner::plan(const Goal& goal,
           "Joint"+std::to_string(i+1)+" must settle: velocity points outside joint range");
   }
   // Check the measured pose too, so normalization cannot conceal a collision.
-  if(engine_.check_collision(initial.q)||engine_.check_collision(start.q))
-    fail(Action::Result::ERR_LIMIT_VIOLATION,"Start configuration is in collision");
+  std::string start_collision;
+  if(engine_.check_collision(initial.q,&start_collision)||engine_.check_collision(start.q,&start_collision))
+    fail(Action::Result::ERR_LIMIT_VIOLATION,"Start configuration: "+start_collision);
   check_cancelled(cancel);
   if(goal.command_type==Goal::MOVEJ||goal.command_type==Goal::MOVEP) {
     Goal target=goal;
@@ -144,8 +153,13 @@ trajectory_msgs::msg::JointTrajectory MotionPlanner::plan(const Goal& goal,
           "Alignment joint target [rad]");
     return plan_ptp(target,start,cancel);
   }
-  if(goal.command_type==Goal::MOVEL||goal.command_type==Goal::MOVEC)
-    return plan_cartesian(goal,start,cancel);
+  if(goal.command_type==Goal::MOVEL||goal.command_type==Goal::MOVEC) {
+    try {return plan_cartesian(goal,start,cancel);}
+    catch(const MotionError& e) {
+      if(e.code==Action::Result::ERR_CANCELLED) throw;
+      fail(e.code,std::string(goal.command_type==Goal::MOVEL?"MoveL: ":"MoveC: ")+e.what());
+    }
+  }
   fail(Action::Result::ERR_INVALID_INPUT,"Unsupported motion command");
   return {};
 }
@@ -210,8 +224,10 @@ trajectory_msgs::msg::JointTrajectory MotionPlanner::plan_ptp(const Goal& goal,
       angle_difference(current.topLeftCorner<3,3>(),T.topLeftCorner<3,3>())<1e-4)
     return ruckig_ptp(initial,initial.q,goal.velocity_scale,goal.acceleration_scale,cancel);
   std::vector<std::array<double,6>> solutions;
-  const auto status=engine_.solve_optimal_ik(T,initial.q,solutions,false);
-  if(status!=IKResult::SUCCESS) fail(ik_code(status),"MoveP goal has no valid IK solution");
+  IKDiagnostics diagnostics;
+  const auto status=engine_.solve_optimal_ik(T,initial.q,solutions,false,&diagnostics);
+  if(status!=IKResult::SUCCESS)
+    fail(ik_code(status),"MoveP goal: "+path_location(1.0,T)+"\n"+diagnostics.summary());
   for(const auto& q:solutions) {
     check_cancelled(cancel);
     try {
@@ -287,13 +303,17 @@ struct MotionPlanner::JointSpline {
       segments.push_back(seg);
     }
   }
-  bool within_joint_limits(const std::array<JointLimit,6>& limits) const {
+  bool within_joint_limits(const std::array<JointLimit,6>& limits,std::string& detail) const {
     // A cubic's extrema occur at its endpoints or roots of its derivative.
-    for(const auto& x:segments) for(int j=0;j<6;++j) {
+    for(size_t segment=0;segment<segments.size();++segment) for(int j=0;j<6;++j) {
+      const auto& x=segments[segment];
       auto within=[&](double u) {
         const double q=x.a[j]+u*(x.b[j]+u*(x.c[j]+u*x.d[j]));
-        return std::isfinite(q)&&q>=limits[j].min_pos-tolerance::kJointPosition&&
+        const bool valid=std::isfinite(q)&&q>=limits[j].min_pos-tolerance::kJointPosition&&
             q<=limits[j].max_pos+tolerance::kJointPosition;
+        if(!valid) detail=range_error("Spline joint limit at s="+std::to_string(segment*h+u),
+            j,q,limits[j].min_pos,limits[j].max_pos,tolerance::kJointPosition)+" rad";
+        return valid;
       };
       if(!within(0)||!within(h)) return false;
       const double a=3*x.d[j],b=2*x.c[j],c=x.b[j];
@@ -340,19 +360,25 @@ trajectory_msgs::msg::JointTrajectory MotionPlanner::plan_cartesian(const Goal& 
     const Eigen::Vector3d p2=Ta.topRightCorner<3,1>();
     const Eigen::Vector3d u=p2-path.p0,v=path.p1-path.p0;
     const double L=std::max({u.norm(),v.norm(),(path.p1-p2).norm()});
-    if(L<1e-5) fail(Action::Result::ERR_INVALID_INPUT,"Circular points coincide");
+    auto circle_failure=[&](const std::string& reason) {
+      std::ostringstream out;
+      out<<std::setprecision(10)<<reason<<"; start xyz=["<<path.p0.transpose()
+         <<"], auxiliary xyz=["<<p2.transpose()<<"], end xyz=["<<path.p1.transpose()<<"] m";
+      fail(Action::Result::ERR_INVALID_INPUT,out.str());
+    };
+    if(L<1e-5) circle_failure("Circular points coincide (maximum separation < 1e-5 m)");
     Eigen::Vector3d normal=u.cross(v);
-    if(normal.norm()<1e-5*L*L) fail(Action::Result::ERR_INVALID_INPUT,"Collinear circular points");
+    if(normal.norm()<1e-5*L*L) circle_failure("Collinear circular points (normalized cross product < 1e-5)");
     normal.normalize();
     Eigen::Vector3d e1=u.normalized(),e2=normal.cross(e1);
     const double x=v.dot(e1),y=v.dot(e2);
-    if(std::abs(y)<1e-8*L) fail(Action::Result::ERR_INVALID_INPUT,"Degenerate circle");
+    if(std::abs(y)<1e-8*L) circle_failure("Degenerate circle (transverse separation < 1e-8 * maximum separation)");
     const double cx=u.norm()/2.0;
     const double cy=(x*x+y*y-2*x*cx)/(2*y);
     path.center=path.p0+cx*e1+cy*e2;
     path.radius=(path.p0-path.center).norm();
     if(!(std::isfinite(path.radius)&&path.radius>1e-5))
-      fail(Action::Result::ERR_INVALID_INPUT,"Invalid circle radius");
+      circle_failure("Invalid circle radius="+std::to_string(path.radius)+" m; must be finite and > 1e-5 m");
     path.xaxis=(path.p0-path.center)/path.radius;
     path.yaxis=normal.cross(path.xaxis);
     auto theta=[&](const Eigen::Vector3d& p){
@@ -363,12 +389,13 @@ trajectory_msgs::msg::JointTrajectory MotionPlanner::plan_cartesian(const Goal& 
     double th_end=theta(path.p1);
     if(th_end+1e-9<th_aux) th_end+=2*kPi;
     if(th_aux<1e-6||th_end-th_aux<1e-6||th_end>2*kPi+1e-6)
-      fail(Action::Result::ERR_INVALID_INPUT,"Auxiliary point not strictly on chosen arc");
+      circle_failure("Auxiliary point not strictly on chosen arc; auxiliary angle="+
+          std::to_string(th_aux)+", end angle="+std::to_string(th_end)+" rad");
     path.angle=th_end;
     path.trans_length=path.radius*path.angle;
     const Eigen::Vector3d check=path.at(th_aux/path.angle).topRightCorner<3,1>();
     if((check-p2).norm()>1e-6*L)
-      fail(Action::Result::ERR_INVALID_INPUT,"Circle misses auxiliary point");
+      circle_failure("Circle misses auxiliary point; residual="+std::to_string((check-p2).norm())+" m");
   } else path.trans_length=(path.p1-path.p0).norm();
   if(path.trans_length<1e-7&&path.rot_length<1e-7)
     return ruckig_ptp(initial,initial.q,goal.velocity_scale,goal.acceleration_scale,cancel);
@@ -386,23 +413,39 @@ trajectory_msgs::msg::JointTrajectory MotionPlanner::plan_cartesian(const Goal& 
     for(size_t k=1;k<=samples;++k) {
       if(k%8==0) check_cancelled(cancel);
       std::vector<std::array<double,6>> solutions;
-      const auto status=engine_.solve_optimal_ik(path.at(static_cast<double>(k)/samples),
-          knots[k-1],solutions,true);
-      if(status!=IKResult::SUCCESS) fail(ik_code(status),"Cartesian IK branch lost at path sample");
+      const double s=static_cast<double>(k)/samples;
+      const auto target=path.at(s);
+      IKDiagnostics diagnostics;
+      const auto status=engine_.solve_optimal_ik(target,knots[k-1],solutions,true,&diagnostics);
+      if(status!=IKResult::SUCCESS) fail(ik_code(status),
+          "IK failed at sample "+std::to_string(k)+"/"+std::to_string(samples)+
+          ", "+path_location(s,target)+"\n"+diagnostics.summary());
       knots[k]=solutions.front();
     }
     spline=std::make_unique<JointSpline>(knots);
-    bool accurate=spline->within_joint_limits(engine_.get_joint_limits());
-    for(size_t k=0;k<samples;++k) {
+    std::string failure_detail;
+    bool accurate=spline->within_joint_limits(engine_.get_joint_limits(),failure_detail);
+    int32_t failure_code=Action::Result::ERR_LIMIT_VIOLATION;
+    for(size_t k=0;accurate&&k<samples;++k) {
       if(k%16==0) check_cancelled(cancel);
       for(const double off:{0.25,0.5,0.75}) {
         const double s=(static_cast<double>(k)+off)/samples;
         Vec6 q,qs,qss; spline->eval(s,q,qs,qss);
         const auto qarr=from_eigen(q);
-        if(!engine_.joint_valid(qarr)) {accurate=false;break;}
+        if(!engine_.joint_valid(qarr)) {
+          accurate=false;
+          failure_detail="Invalid spline joint configuration at "+path_location(s,path.at(s));
+          break;
+        }
         const Eigen::Matrix4d fk=engine_.forward_pose(qarr), ref=path.at(s);
-        if((fk.topRightCorner<3,1>()-ref.topRightCorner<3,1>()).norm()>kPathPosTolerance||
-            angle_difference(fk.topLeftCorner<3,3>(),ref.topLeftCorner<3,3>())>kPathRotTolerance) {
+        const double position_error=(fk.topRightCorner<3,1>()-ref.topRightCorner<3,1>()).norm();
+        const double rotation_error=angle_difference(fk.topLeftCorner<3,3>(),ref.topLeftCorner<3,3>());
+        if(position_error>kPathPosTolerance||rotation_error>kPathRotTolerance) {
+          std::ostringstream out;
+          out<<std::setprecision(10)<<"Spline approximation failed at "<<path_location(s,ref)
+             <<"; position residual="<<position_error<<" m (tolerance="<<kPathPosTolerance
+             <<" m), rotation residual="<<rotation_error<<" rad (tolerance="<<kPathRotTolerance<<" rad)";
+          failure_detail=out.str();failure_code=Action::Result::ERR_NO_IK_SOLUTION;
           accurate=false;break;
         }
       }
@@ -410,7 +453,8 @@ trajectory_msgs::msg::JointTrajectory MotionPlanner::plan_cartesian(const Goal& 
     }
     if(accurate) break;
     if(refinement==3||samples*2>kMaxIKSamples)
-      fail(Action::Result::ERR_NO_IK_SOLUTION,"Spline cannot approximate Cartesian path within tolerance");
+      fail(failure_code,failure_detail+"; refinement pass="+std::to_string(refinement+1)+
+          "/4, IK segments="+std::to_string(samples)+", maximum segments="+std::to_string(kMaxIKSamples));
     samples*=2;
   }
 
@@ -526,11 +570,16 @@ void MotionPlanner::verify_trajectory(const trajectory_msgs::msg::JointTrajector
       // jerk is bounded analytically by Ruckig/PTP or spline derivatives/time law.
       if(jerk&&k>0&&std::abs((p.accelerations[i]-prev_acc[i])/(time-prev_time))>
                         lim.max_jerk*1.001+1e-3)
-        fail(Action::Result::ERR_LIMIT_VIOLATION,"Joint jerk check failed");
+        fail(Action::Result::ERR_LIMIT_VIOLATION,range_error(
+            "Trajectory jerk [rad/s^3] at sample "+std::to_string(k)+", t="+std::to_string(time),
+            i,(p.accelerations[i]-prev_acc[i])/(time-prev_time),
+            -lim.max_jerk,lim.max_jerk,lim.max_jerk*0.001+1e-3));
       prev_acc[i]=p.accelerations[i];
     }
     if(k==0) {
-      if(engine_.check_collision(q)) fail(Action::Result::ERR_LIMIT_VIOLATION,"Collision at start");
+      std::string collision;
+      if(engine_.check_collision(q,&collision))
+        fail(Action::Result::ERR_LIMIT_VIOLATION,"Trajectory sample 0, t="+std::to_string(time)+" s: "+collision);
     } else {
       double biggest=0;
       for(int j=0;j<6;++j) biggest=std::max(biggest,std::abs(q[j]-prev_q[j]));
@@ -539,8 +588,11 @@ void MotionPlanner::verify_trajectory(const trajectory_msgs::msg::JointTrajector
         std::array<double,6> mid{};
         const double s=static_cast<double>(z)/pieces;
         for(int j=0;j<6;++j) mid[j]=(1-s)*prev_q[j]+s*q[j];
-        if(engine_.check_collision(mid)) fail(Action::Result::ERR_LIMIT_VIOLATION,
-          "Trajectory collision (joint-space subdivision)");
+        std::string collision;
+        if(engine_.check_collision(mid,&collision)) fail(Action::Result::ERR_LIMIT_VIOLATION,
+          "Trajectory segment "+std::to_string(k-1)+" -> "+std::to_string(k)+
+          ", subdivision "+std::to_string(z)+"/"+std::to_string(pieces)+
+          ", approximate t="+std::to_string(prev_time+s*(time-prev_time))+" s: "+collision);
       }
     }
     prev_q=q;

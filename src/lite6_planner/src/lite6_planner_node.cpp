@@ -12,6 +12,7 @@
 #include <lite6_interfaces/action/industrial_motion.hpp>
 #include <lite6_interfaces/msg/controller_status.hpp>
 #include <lite6_interfaces/msg/supervisor_state.hpp>
+#include <lite6_interfaces/msg/motion_rejection.hpp>
 #include <lite6_interfaces/srv/supervisor_command.hpp>
 #include <lite6_interfaces/srv/submit_sys_id_trajectory.hpp>
 
@@ -59,6 +60,8 @@ public:
     io_group_=create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     const auto state_qos=rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     state_pub_=create_publisher<S>("/supervisor/state",state_qos);
+    rejection_pub_=create_publisher<lite6_interfaces::msg::MotionRejection>(
+      "/supervisor/motion_rejections",rclcpp::QoS(32).reliable());
     cmd_pub_=create_publisher<std_msgs::msg::Int32>("/ctc_controller/system_cmd",10);
     rclcpp::SubscriptionOptions sensor_options;
     sensor_options.callback_group=io_group_;
@@ -121,6 +124,7 @@ private:
   rclcpp::CallbackGroup::SharedPtr io_group_;
   std::atomic<bool> shutdown_{false};
   rclcpp::Publisher<S>::SharedPtr state_pub_;
+  rclcpp::Publisher<lite6_interfaces::msg::MotionRejection>::SharedPtr rejection_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr cmd_pub_;
   rclcpp::Subscription<lite6_interfaces::msg::ControllerStatus>::SharedPtr controller_sub_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joints_sub_;
@@ -178,21 +182,32 @@ private:
   }
   rclcpp_action::GoalResponse on_goal(const rclcpp_action::GoalUUID& id,
       std::shared_ptr<const Motion::Goal> goal) {
-    if(goal->command_type>Motion::Goal::MOVEC||!std::isfinite(goal->velocity_scale)||
+    const auto key=hex_uuid(id);
+    auto reject=[&](int32_t code,const std::string& reason) {
+      lite6_interfaces::msg::MotionRejection message;
+      message.goal_id=key;message.error_code=code;message.error_string=reason;
+      rejection_pub_->publish(message);
+      RCLCPP_WARN(get_logger(),"Goal %s rejected: %s",key.c_str(),reason.c_str());
+      return rclcpp_action::GoalResponse::REJECT;
+    };
+    if(goal->command_type>Motion::Goal::MOVEC)
+      return reject(Motion::Result::ERR_INVALID_INPUT,"Unsupported motion command_type="+
+          std::to_string(goal->command_type));
+    if(!std::isfinite(goal->velocity_scale)||
        !std::isfinite(goal->acceleration_scale)||goal->velocity_scale<0.01||
        goal->velocity_scale>1.0||goal->acceleration_scale<0.01||
-       goal->acceleration_scale>1.0) return rclcpp_action::GoalResponse::REJECT;
+       goal->acceleration_scale>1.0)
+      return reject(Motion::Result::ERR_INVALID_INPUT,"Scaling factors must be finite and in [0.01, 1]; velocity_scale="+
+          std::to_string(goal->velocity_scale)+", acceleration_scale="+std::to_string(goal->acceleration_scale));
     if(goal->context!=Motion::Goal::CONTEXT_NORMAL&&
        goal->context!=Motion::Goal::CONTEXT_SYSID&&
        goal->context!=Motion::Goal::CONTEXT_RECOVERY)
-      return rclcpp_action::GoalResponse::REJECT;
+      return reject(Motion::Result::ERR_INVALID_INPUT,"Unknown motion context="+std::to_string(goal->context));
     if(goal->context!=Motion::Goal::CONTEXT_NORMAL&&goal->command_type!=Motion::Goal::MOVEJ)
-      return rclcpp_action::GoalResponse::REJECT;
-    const auto key=hex_uuid(id);
+      return reject(Motion::Result::ERR_SUPERVISOR_DENIED,"SYSID / RECOVERY context only permits MoveJ reference alignment");
     std::string reason;
     if(!supervisor_.reserve_motion(key,goal->context,goal->session_id,reason)) {
-      RCLCPP_WARN(get_logger(),"Goal rejected by Supervisor: %s",reason.c_str());
-      return rclcpp_action::GoalResponse::REJECT;
+      return reject(Motion::Result::ERR_SUPERVISOR_DENIED,reason);
     }
     publish_state();
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
@@ -302,12 +317,15 @@ private:
       }
     };
     options.result_callback=[this,key](const FJTHandle::WrappedResult& wrapped) {
+      const std::string detail="JTC action status="+std::to_string(static_cast<int>(wrapped.code))+
+          (wrapped.result?", error_code="+std::to_string(wrapped.result->error_code)+
+              ": "+wrapped.result->error_string:", result payload unavailable");
       if(wrapped.code==rclcpp_action::ResultCode::SUCCEEDED&&wrapped.result&&
          wrapped.result->error_code==FJT::Result::SUCCESSFUL)
         finish_jtc(key,Motion::Result::SUCCESS,"JTC trajectory completed");
       else if(wrapped.code==rclcpp_action::ResultCode::CANCELED)
-        finish_jtc(key,Motion::Result::ERR_CANCELLED,"JTC trajectory canceled");
-      else finish_jtc(key,Motion::Result::ERR_EXECUTION_ABORTED,"JTC execution failed");
+        finish_jtc(key,Motion::Result::ERR_CANCELLED,"JTC trajectory canceled\n"+detail);
+      else finish_jtc(key,Motion::Result::ERR_EXECUTION_ABORTED,"JTC execution failed\n"+detail);
     };
     try {jtc_->async_send_goal(g,options);}
     catch(const std::exception& e) {

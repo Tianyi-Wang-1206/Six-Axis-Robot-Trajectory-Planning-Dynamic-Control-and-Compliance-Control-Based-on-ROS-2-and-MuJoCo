@@ -10,6 +10,7 @@ GUI widgets, their layouts and the SysIdEngine numerical methods live elsewhere.
 import math
 import threading
 import time
+import uuid
 
 import numpy as np
 import pinocchio as pin
@@ -24,8 +25,9 @@ from geometry_msgs.msg import Pose
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Int32
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from unique_identifier_msgs.msg import UUID
 from lite6_interfaces.action import IndustrialMotion
-from lite6_interfaces.msg import SupervisorState
+from lite6_interfaces.msg import SupervisorState, MotionRejection
 from lite6_interfaces.srv import SupervisorCommand, SubmitSysIdTrajectory
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -134,6 +136,13 @@ class ROS2Worker(QThread):
         self.current_goal_handle = None
         self._motion_pending = False
         self._goal_epoch = 0
+        self._result_reported_epoch = -1
+        # Correlate admission diagnostics with the actual Action response.
+        # The topic and response can arrive in either order.
+        self._motion_requests = {}
+        self.rejection_sub = self.node.create_subscription(
+            MotionRejection, "/supervisor/motion_rejections", self._motion_rejection_cb, 32)
+        self.rejection_timer = self.node.create_timer(0.1, self._flush_motion_rejections)
         self._begin_pending = False
         self._sysid_requested = False
         self._sysid_session = 0
@@ -181,6 +190,33 @@ class ROS2Worker(QThread):
         self.node.get_logger().warn(message)
         if not self._stopping:
             self.command_error_signal.emit(message)
+
+    def _motion_rejection_cb(self, msg):
+        with self.state_lock:
+            request = self._motion_requests.get(msg.goal_id)
+            if request is None:
+                return  # Another client, old request, or an already reported rejection.
+            request['detail'] = (
+                f"Motion rejected: {self.get_planner_error_str(msg.error_code)} "
+                f"({msg.error_code})\n{msg.error_string}")
+        self._flush_motion_rejections()
+
+    def _flush_motion_rejections(self):
+        messages = []
+        now = time.monotonic()
+        with self.state_lock:
+            for key, request in list(self._motion_requests.items()):
+                if request['rejected_at'] is not None:
+                    if request['detail'] is not None or now - request['rejected_at'] >= 1.0:
+                        messages.append(request['detail'] or
+                                        "IndustrialMotion goal rejected by Supervisor\n"
+                                        "Detailed admission diagnostic was not received.")
+                        del self._motion_requests[key]
+                elif now - request['created'] > 30.0:
+                    # Bounds diagnostic storage only; never changes motion authorization.
+                    del self._motion_requests[key]
+        for message in messages:
+            self._report_error(message)
 
     def _send_command(self, event, session=0, reason="", done=None):
         if not self.command_client.service_is_ready():
@@ -408,13 +444,18 @@ class ROS2Worker(QThread):
             self._motion_pending = True
             self._goal_epoch += 1
             epoch = self._goal_epoch
+            goal_id = uuid.uuid4()
+            key = goal_id.hex
+            self._motion_requests[key] = {
+                'created': time.monotonic(), 'rejected_at': None, 'detail': None}
         try:
-            fut = self.move_client.send_goal_async(goal)
+            fut = self.move_client.send_goal_async(goal, goal_uuid=UUID(uuid=list(goal_id.bytes)))
             fut.add_done_callback(lambda f: self._goal_response(
-                f, epoch, int(goal.context), int(goal.session_id)))
+                f, epoch, int(goal.context), int(goal.session_id), key))
             return True
         except Exception as exc:
             with self.state_lock:
+                self._motion_requests.pop(key, None)
                 if epoch == self._goal_epoch:
                     self._motion_pending = False
             self._report_error(f"Motion submission failed: {exc}")
@@ -461,25 +502,31 @@ class ROS2Worker(QThread):
         elif context == IndustrialMotion.Goal.CONTEXT_RECOVERY:
             self.trigger_estop("Recovery synchronization failed: " + reason)
 
-    def _goal_response(self, future, epoch, context, session):
+    def _goal_response(self, future, epoch, context, session, key):
         try:
             handle = future.result()
             with self.state_lock:
                 if epoch != self._goal_epoch:
+                    self._motion_requests.pop(key, None)
                     if handle is not None and handle.accepted:
                         handle.cancel_goal_async()
                     return
                 self._motion_pending = False
                 if not handle.accepted:
-                    self._report_error("IndustrialMotion goal rejected by Supervisor")
+                    request = self._motion_requests.setdefault(key, {
+                        'created': time.monotonic(), 'detail': None})
+                    request['rejected_at'] = time.monotonic()
+                    self._flush_motion_rejections()
                     self._scoped_dispatch_failed(
                         context, session, "Supervisor rejected internal motion")
                     return
+                self._motion_requests.pop(key, None)
                 self.current_goal_handle = handle
             handle.get_result_async().add_done_callback(
                 lambda f: self._goal_result(f, epoch, context, session))
         except Exception as exc:
             with self.state_lock:
+                self._motion_requests.pop(key, None)
                 if epoch == self._goal_epoch:
                     self._motion_pending = False
             self._report_error(f"Action goal response failed: {exc}")
@@ -489,17 +536,20 @@ class ROS2Worker(QThread):
         try:
             wrapped = future.result()
             with self.state_lock:
-                if epoch != self._goal_epoch:
+                if epoch != self._goal_epoch or epoch == self._result_reported_epoch:
                     return
+                self._result_reported_epoch = epoch
                 self.current_goal_handle = None
             result = wrapped.result
             if result.error_code != IndustrialMotion.Result.SUCCESS:
-                if result.error_code not in (
-                        IndustrialMotion.Result.ERR_CANCELLED,
-                        IndustrialMotion.Result.ERR_EXECUTION_ABORTED):
-                    # Supervisor owns the fault state; this is informational.
-                    self.node.get_logger().warn(
-                        f"Motion result: {result.error_code}: {result.error_string}")
+                if result.error_code != IndustrialMotion.Result.ERR_CANCELLED:
+                    # Only the Action result opens a notice. SupervisorState
+                    # updates the banner, so heartbeat messages never repeat it.
+                    self._report_error(
+                        f"Motion failed: {self.get_planner_error_str(result.error_code)} "
+                        f"({result.error_code})\n{result.error_string}")
+                else:
+                    self.node.get_logger().info(result.error_string)
                 self._scoped_dispatch_failed(
                     context, session, f"Internal motion failed: {result.error_string}")
         except Exception as exc:
@@ -718,9 +768,9 @@ class ROS2Worker(QThread):
         messages = {
             IndustrialMotion.Result.SUCCESS: "Success",
             IndustrialMotion.Result.ERR_INVALID_INPUT: "Invalid Input Parameters",
-            IndustrialMotion.Result.ERR_NO_IK_SOLUTION: "No IK Solution",
+            IndustrialMotion.Result.ERR_NO_IK_SOLUTION: "No Valid IK / Cartesian Approximation",
             IndustrialMotion.Result.ERR_LIMIT_VIOLATION: "Physical Limit / Collision Violation",
-            IndustrialMotion.Result.ERR_SINGULARITY: "Kinematic Singularity Detected",
+            IndustrialMotion.Result.ERR_SINGULARITY: "No Valid IK Branch (Singularity Encountered)",
             IndustrialMotion.Result.ERR_QUADRANT_JUMP: "Quadrant Jump Prevented",
             IndustrialMotion.Result.ERR_RUCKIG_FAILED: "Trajectory Generation Failed",
             IndustrialMotion.Result.ERR_EXECUTION_ABORTED: "Execution Aborted",

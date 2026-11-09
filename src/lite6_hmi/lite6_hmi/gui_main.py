@@ -700,7 +700,13 @@ class PyQtHMI(QMainWindow):
 
     def on_command_error(self, message):
         # A rejected request is a notification, not a state transition.
-        QMessageBox.warning(self, "Supervisor / Action Notice", message)
+        summary, _, detail = message.partition("\n")
+        notice = QMessageBox(QMessageBox.Warning, "Supervisor / Action Notice",
+                             summary, QMessageBox.Ok, self)
+        notice.setTextFormat(Qt.PlainText)
+        if detail:
+            notice.setDetailedText(detail)
+        notice.exec_()
 
     def on_recovery_completed(self):
         # Reproduce the original recovery UI synchronization, but only once
@@ -725,15 +731,20 @@ class PyQtHMI(QMainWindow):
 
     def on_state_updated(self, state, error_msg):
         """Processes state transition events safely."""
+        # Keep long per-branch diagnostics readable without expanding the banner.
+        self.state_banner.setToolTip(error_msg)
+        error_summary = error_msg.splitlines()[0] if error_msg else ""
+        if len(error_summary) > 140:
+            error_summary = error_summary[:137] + "..."
         if state == Lite6StateMachine.IDLE:
             self.set_banner_color("#27ae60") # Emerald
             self.state_banner.setText("SYSTEM READY")
         elif state == Lite6StateMachine.ERROR:
             self.set_banner_color("#c0392b") # Alizarin red
-            self.state_banner.setText(f"SYSTEM FAULT: {error_msg}")
+            self.state_banner.setText(f"SYSTEM FAULT: {error_summary}")
         elif state == Lite6StateMachine.SOFT_ERROR:
             self.set_banner_color("#d35400") # Pumpkin Orange
-            self.state_banner.setText(f"WARNING: {error_msg}")
+            self.state_banner.setText(f"WARNING: {error_summary}")
         elif state.startswith("SYSID"):
             self.set_banner_color("#8e44ad") # Amethyst purple
             self.state_banner.setText(state)

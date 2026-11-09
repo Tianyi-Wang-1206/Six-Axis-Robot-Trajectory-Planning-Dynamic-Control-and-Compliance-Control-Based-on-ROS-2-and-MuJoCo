@@ -28,6 +28,14 @@ enum class IKResult {
   ERR_QUADRANT_JUMP = -5
 };
 
+// Local planning diagnostics; the Action wire format and legacy codes stay stable.
+struct IKDiagnostics {
+  struct Rejection { size_t branch; std::string reason; std::string detail; };
+  std::vector<Rejection> rejected;
+  std::string input_error;
+  std::string summary() const;
+};
+
 class KinematicsEngine {
 public:
   KinematicsEngine();
@@ -37,14 +45,14 @@ public:
   IKResult solve_optimal_ik(const Eigen::Matrix4d& T,
       const std::array<double, 6>& q_ref,
       std::vector<std::array<double, 6>>& sorted,
-      bool continuous) const;
+      bool continuous, IKDiagnostics* diagnostics=nullptr) const;
 
   // Dimensionless, length-normalized minimum singular value of the 6x6 Jacobian.
   // Pinocchio orders spatial motions [linear; angular].
   double check_singularity(const std::array<double, 6>& q) const;
   // Geometry only (non-finite inputs are rejected). Callers validate joint limits
   // with the allowance appropriate to observations, targets or sampled trajectories.
-  bool check_collision(const std::array<double, 6>& q) const;
+  bool check_collision(const std::array<double, 6>& q, std::string* detail=nullptr) const;
   bool joint_valid(const std::array<double,6>& q,
       double epsilon=tolerance::kJointPosition) const;
   Eigen::Matrix4d forward_pose(const std::array<double,6>& q) const;
