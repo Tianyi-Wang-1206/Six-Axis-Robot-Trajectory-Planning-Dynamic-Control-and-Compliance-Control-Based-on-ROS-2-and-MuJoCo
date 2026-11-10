@@ -19,8 +19,8 @@ uint8 mode
 
 uint8 MOTION_IDLE=0
 uint8 MOTION_PLANNING=1
-# Legacy constant name retained for compatibility; now waits for direct CTC acceptance.
-uint8 MOTION_WAITING_JTC=2
+# Waiting for direct CTC acceptance.
+uint8 MOTION_WAITING_CTC=2
 uint8 MOTION_EXECUTING=3
 uint8 MOTION_CANCELING=4
 uint8 motion_phase
@@ -35,12 +35,19 @@ uint8 SYSID_CALCULATING=5
 uint8 SYSID_POST_ALIGN=6
 uint8 SYSID_WAIT_NORMAL_MODE=7
 uint8 SYSID_RETURN_ALIGN=8
+uint8 SYSID_COMPLETING=9
 uint8 sysid_phase
+
+# No phase entry action is permitted until continuous physical settling is confirmed.
+bool waiting_for_settle
+# CTC-authored trajectory origin, correlated to this session's excitation Action.
+builtin_interfaces/Time excitation_start
 
 # Only meaningful when mode == MODE_RECOVERING.
 uint8 RECOVERY_NONE=0
 uint8 RECOVERY_SYNC_REFERENCE=1
 uint8 RECOVERY_WAIT_NORMAL_MODE=2
+uint8 RECOVERY_SETTLING=3
 uint8 recovery_phase
 
 # ControllerStatus.mode; UNKNOWN when unobserved or stale.
@@ -51,5 +58,6 @@ bool motion_allowed
 bool estop_latched
 
 # Informational diagnostics, not authoritative transition triggers.
+int32 ERROR_SYSID_ESTIMATION=-14
 int32 last_error_code
 string detail

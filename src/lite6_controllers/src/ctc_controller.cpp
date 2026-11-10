@@ -219,7 +219,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_deactivate(const rcl
 controller_interface::return_type Lite6CTCController::update(
   const rclcpp::Time & time, const rclcpp::Duration & period)
 {
-  if (period.seconds() > 0.0) update_trajectory_reference(period);
+  if (period.seconds() > 0.0) update_trajectory_reference(time, period);
   return update_and_write_commands(time, period);
 }
 
@@ -244,11 +244,12 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       system_state_ = SystemState::ESTOP;
       estop_q_ = q_; 
       estop_dq_ = dq_;
-  } else if (current_cmd == 2 && system_state_ != SystemState::SYS_ID) {
+  } else if (current_cmd == 2 && system_state_ == SystemState::NORMAL) {
       system_state_ = SystemState::SYS_ID;
   } else if (current_cmd == 0 && system_state_ != SystemState::NORMAL) {
       Eigen::Map<Eigen::VectorXd> map_q_d(reference_interfaces_.data(), n);
-      if ((map_q_d - q_).cwiseAbs().maxCoeff() < 0.05) {
+      if ((map_q_d - q_).cwiseAbs().maxCoeff() < 0.05 &&
+          dq_.cwiseAbs().maxCoeff() < 0.01) {
           system_state_ = SystemState::NORMAL;
           for(size_t i=0; i<n; ++i) {
               reference_interfaces_[i] = q_[i];
@@ -347,7 +348,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       [[maybe_unused]] bool set_ok = command_interfaces_[i].set_value(tau_cmd_[i]);
   }
 
-  // 6. Publish at 200Hz (1000Hz / 5) to match the Joint State Broadcaster
+  // 6. Publish shadow visualization at 200Hz (1000Hz / 5).
   publish_counter_++;
   if (publish_counter_ >= publish_rate_divider_) {
       publish_counter_ = 0;
@@ -375,6 +376,13 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
     if (rt_status_pub_->trylock()) {
       auto & status = rt_status_pub_->msg_;
       status.stamp = get_node()->now();
+      const auto & execution = *trajectory_buffer_.readFromRT();
+      status.trajectory_start = builtin_interfaces::msg::Time{};
+      status.trajectory_id.fill(0);
+      if (execution && execution->started) {
+        status.trajectory_start = rclcpp::Time(execution->start_time_ns);
+        status.trajectory_id = execution->goal->get_goal_id();
+      }
       switch (system_state_) {
         case SystemState::NORMAL:
           status.mode = lite6_interfaces::msg::ControllerStatus::MODE_NORMAL;

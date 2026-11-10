@@ -37,7 +37,7 @@ public:
   controller_interface::return_type update(const rclcpp::Time & time, const rclcpp::Duration & period) override;
 
 protected:
-  void update_trajectory_reference(const rclcpp::Duration & period);
+  void update_trajectory_reference(const rclcpp::Time & time, const rclcpp::Duration & period);
   controller_interface::return_type update_and_write_commands(const rclcpp::Time & time, const rclcpp::Duration & period);
 
 private:
@@ -52,6 +52,7 @@ private:
     std::atomic<size_t> sample{0};
     // Only the control thread accesses these playback fields.
     double elapsed = 0.0;
+    int64_t start_time_ns = 0;
     bool started = false;
     bool endpoint_applied = false;
   };
@@ -110,7 +111,7 @@ private:
   SystemState last_reported_state_ = SystemState::NORMAL;
   bool status_publish_pending_ = true;
 
-  // Downsampler to match the 200Hz JSB rate without flooding the network
+  // Downsample shadow visualization to 200Hz without flooding the network.
   int publish_rate_divider_ = 5; 
   int publish_counter_ = 0;
 };

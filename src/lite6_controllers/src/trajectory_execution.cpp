@@ -79,7 +79,8 @@ void Lite6CTCController::configure_trajectory_action()
     std::chrono::milliseconds(20), [this] {monitor_trajectory();});
 }
 
-void Lite6CTCController::update_trajectory_reference(const rclcpp::Duration & period)
+void Lite6CTCController::update_trajectory_reference(
+  const rclcpp::Time & time, const rclcpp::Duration & period)
 {
   // The non-RT buffer retains ownership; no allocations, action calls or blocking locks here.
   const auto & execution = *trajectory_buffer_.readFromRT();
@@ -100,7 +101,10 @@ void Lite6CTCController::update_trajectory_reference(const rclcpp::Duration & pe
     return;
   }
   if (execution->started) execution->elapsed += period.seconds();
-  else execution->started = true;
+  else {
+    execution->started = true;
+    execution->start_time_ns = time.nanoseconds();
+  }
 
   const auto & points = execution->goal->get_goal()->trajectory.points;
   const auto next = std::upper_bound(points.begin(), points.end(), execution->elapsed,

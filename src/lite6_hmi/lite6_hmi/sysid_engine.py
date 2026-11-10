@@ -14,7 +14,7 @@ class SysIdEngine:
     """Fourier Fv/Fc identification followed by steady-sliding Stribeck fitting."""
 
     ARMATURE = 0.1  # Known factory inertia [kg m^2], identical on all six axes.
-    SAMPLE_PERIOD = 0.02
+    SAMPLE_PERIOD = 0.001  # Same 1 ms grid as the CTC control loop and planner.
     MIN_FIT_SPEED = 0.05
     TANH_SLOPE = 300.0
     LIMIT_MARGIN = 0.90
@@ -74,6 +74,7 @@ class SysIdEngine:
         self.high_speed_duration = None
         self.low_segments = []
         self.low_fit_windows = []
+        self.fit_diagnostics = []
 
     @staticmethod
     def _wave(a, b, w, times):
@@ -169,7 +170,7 @@ class SysIdEngine:
                 stretch = max(self.MIN_DURATION / base_duration,
                               ratios[0].max(), np.sqrt(ratios[1].max()),
                               np.cbrt(ratios[2].max()))
-                duration = np.ceil(base_duration * stretch / self.SAMPLE_PERIOD) * self.SAMPLE_PERIOD
+                duration = np.ceil(base_duration * stretch / self.SAMPLE_PERIOD - 1e-9) * self.SAMPLE_PERIOD
                 if duration > self.MAX_DURATION:
                     continue
                 stretch = duration / base_duration
@@ -197,9 +198,8 @@ class SysIdEngine:
                     candidates.append((score, a / stretch, b / stretch,
                                        w / stretch, duration))
             for _, a, b, frequency, duration in sorted(candidates, key=lambda c: c[0], reverse=True):
-                # Use exactly the same grid as trajectory_times(), including
-                # floating-point durations just above an integer step count.
-                sample_times = np.linspace(0, duration, int(np.ceil(duration / self.SAMPLE_PERIOD)) + 1)
+                # Integer control ticks avoid linspace silently shortening the period.
+                sample_times = self._sample_times(duration)
                 offsets, _, _, _ = self._wave(a, b, frequency, sample_times)
                 if not self._path_is_clear(q0 + offsets):
                     continue
@@ -268,7 +268,7 @@ class SysIdEngine:
         patterns.extend(rng.choice([-1., 1.], size=(14, 6)))
         low_times = self.trajectory_times()
         low_times = low_times[low_times >= self.high_speed_duration]
-        scalar = np.array([self._low_point(t)[0] for t in low_times])
+        scalar = self._low_points(low_times)[0]
         # Positions are monotone within each ramp/cruise: extrema occur at stops.
         for pattern in patterns:
             if self._path_is_clear(q0 + scalar[:, None] * pattern):
@@ -300,17 +300,41 @@ class SysIdEngine:
         return (np.asarray(q0) + q * self.low_directions,
                 v * self.low_directions, a * self.low_directions)
 
+    @classmethod
+    def _sample_times(cls, duration):
+        ticks = int(round(duration / cls.SAMPLE_PERIOD))
+        if abs(ticks * cls.SAMPLE_PERIOD - duration) > 1e-8:
+            raise ValueError('SysID duration must be an integer number of control ticks')
+        return np.arange(ticks + 1, dtype=np.int64) * cls.SAMPLE_PERIOD
+
     def trajectory_times(self):
-        # Include the exact endpoint even after non-integer time stretching.
-        if self.high_speed_duration is not None:
-            high = np.linspace(0, self.high_speed_duration,
-                               int(np.ceil(self.high_speed_duration / self.SAMPLE_PERIOD)) + 1)
-            low = np.linspace(self.high_speed_duration, self.T_total,
-                              int(np.ceil((self.T_total - self.high_speed_duration) /
-                                          self.SAMPLE_PERIOD)) + 1)
-            return np.concatenate((high, low[1:]))
-        steps = int(np.ceil(self.T_total / self.SAMPLE_PERIOD))
-        return np.linspace(0, self.T_total, steps + 1)
+        return self._sample_times(self.T_total)
+
+    def _low_points(self, times):
+        """Vectorized low-speed references, including the inter-stage dwell."""
+        indices = np.searchsorted(self._low_starts, times, side='right') - 1
+        segments = np.asarray(self.low_segments)[np.clip(indices, 0, len(self.low_segments) - 1)]
+        start, duration, q0, v0, v1 = segments.T
+        u = np.clip((times - start) / duration, 0., 1.)
+        blend = u**3 * (10. - 15. * u + 6. * u**2)
+        integral = u**4 * (2.5 - 3. * u + u**2)
+        derivative = 30. * u**2 * (1. - u)**2
+        return tuple(np.where(indices < 0, 0., value) for value in (
+            q0 + duration * (v0 * u + (v1 - v0) * integral),
+            v0 + (v1 - v0) * blend, (v1 - v0) * derivative / duration))
+
+    def trajectory_samples(self, q0):
+        """Generate all 1 ms references without a Python loop over Fourier harmonics."""
+        times = self.trajectory_times()
+        high = times < self.high_speed_duration
+        q, v, a = (np.empty((len(times), 6)) for _ in range(3))
+        offsets, v[high], a[high], _ = self._wave(self.a, self.b, self.w, times[high])
+        q[high] = np.asarray(q0) + offsets
+        low_q, low_v, low_a = self._low_points(times[~high])
+        q[~high] = np.asarray(q0) + low_q[:, None] * self.low_directions
+        v[~high] = low_v[:, None] * self.low_directions
+        a[~high] = low_a[:, None] * self.low_directions
+        return times, q, v, a
 
     def get_fourier_point(self, i, t, q0):
         wl = self.w * np.arange(1, self.N_f + 1)
@@ -338,7 +362,11 @@ class SysIdEngine:
                 any(x.shape != (len(t_seq), 6) or not np.isfinite(x).all()
                     for x in (q_seq, dq_seq, tau_seq))):
             raise ValueError('Invalid SysID samples or non-increasing timestamps')
-        dt = np.mean(np.diff(t_seq))
+        self.fit_diagnostics = []
+        if t_seq[0] > 0.25 or t_seq[-1] < self.T_total - 0.25:
+            raise ValueError(f'Incomplete excitation recording: {t_seq[0]:.4f}..{t_seq[-1]:.4f} s; '
+                             f'expected 0..{self.T_total:.4f} s on the CTC clock')
+        dt = float(np.median(np.diff(t_seq)))
         if np.max(np.diff(t_seq)) > max(0.05, 5.0 * dt):
             raise ValueError('SysID recording has telemetry gaps; refusing to interpolate missing experiments')
         t_uniform = np.arange(t_seq[0], t_seq[-1], dt)
@@ -354,28 +382,35 @@ class SysIdEngine:
         friction = np.zeros((6, 2))
         stribeck = np.zeros((6, 2))
         report = []
+        failures = []
         for i in range(6):
-            # Retain the original Fourier-stage speed cutoff and linear solver.
-            valid = ((t_uniform > 1.0) & (t_uniform < self.high_speed_duration - 1.0) &
-                     (np.abs(dq[:, i]) >= self.MIN_FIT_SPEED))
-            if np.count_nonzero(valid) < 200:
-                raise ValueError(f'Joint {i+1}: fewer than 200 useful high-speed friction samples')
-            velocity = dq[valid, i]
-            design = np.column_stack((velocity, np.tanh(self.TANH_SLOPE * velocity)))
-            scaled = design / np.linalg.norm(design, axis=0)
-            if np.linalg.cond(scaled) > 1000:
-                raise ValueError(f'Joint {i+1}: insufficient velocity variation for Fv/Fc fit')
-            result = lsq_linear(design, residual[valid, i], bounds=(0.0, np.inf))
-            if not result.success or not np.isfinite(result.x).all():
-                raise ValueError(f'Joint {i+1}: friction fit failed')
-            friction[i] = result.x
-            high_rmse = np.sqrt(np.mean((design @ result.x - residual[valid, i])**2))
-            fs, vs, low_rmse, count = self._fit_stribeck(
-                i, t_uniform, dq[:, i], ddq[:, i], residual[:, i], dt, *result.x)
-            stribeck[i] = (fs, vs)
-            report.append(f'# joint{i+1}: high-speed RMSE={high_rmse:.6g} Nm '
-                          f'({valid.sum()} samples); low-speed RMSE={low_rmse:.6g} Nm '
-                          f'({count} stable samples, {len(self.low_fit_windows)} plateaus)')
+            try:
+                # Retain the original Fourier-stage speed cutoff and linear solver.
+                valid = ((t_uniform > 1.0) & (t_uniform < self.high_speed_duration - 1.0) &
+                         (np.abs(dq[:, i]) >= self.MIN_FIT_SPEED))
+                if np.count_nonzero(valid) < 200:
+                    raise ValueError(f'Joint {i+1}: fewer than 200 useful high-speed friction samples')
+                velocity = dq[valid, i]
+                design = np.column_stack((velocity, np.tanh(self.TANH_SLOPE * velocity)))
+                scaled = design / np.linalg.norm(design, axis=0)
+                if np.linalg.cond(scaled) > 1000:
+                    raise ValueError(f'Joint {i+1}: insufficient velocity variation for Fv/Fc fit')
+                result = lsq_linear(design, residual[valid, i], bounds=(0.0, np.inf))
+                if not result.success or not np.isfinite(result.x).all():
+                    raise ValueError(f'Joint {i+1}: friction fit failed')
+                friction[i] = result.x
+                high_rmse = np.sqrt(np.mean((design @ result.x - residual[valid, i])**2))
+                fs, vs, low_rmse, count = self._fit_stribeck(
+                    i, t_uniform, dq[:, i], ddq[:, i], residual[:, i], dt, *result.x)
+                stribeck[i] = (fs, vs)
+                report.append(f'# joint{i+1}: high-speed RMSE={high_rmse:.6g} Nm '
+                              f'({valid.sum()} samples); low-speed RMSE={low_rmse:.6g} Nm '
+                              f'({count} stable samples, {len(self.low_fit_windows)} plateaus)')
+            except ValueError as exc:
+                failures.append(str(exc))
+        if failures:
+            raise ValueError('Identification quality checks failed:\n' + '\n'.join(failures) +
+                             '\nPlateau diagnostics:\n' + '\n'.join(self.fit_diagnostics))
 
         def format_list(values):
             return '[' + ', '.join(f'{value:.8g}' for value in values) + ']'
@@ -383,6 +418,7 @@ class SysIdEngine:
         return ('# --- Two-stage identified friction parameters (not automatically applied) ---\n'
                 '# Stage 1: Fourier Fv/Fc. Stage 2: fixed Fv/Fc, fit Fs/vs; exponent=2.\n'
                 + '\n'.join(report) + '\n'
+                + '\n'.join('# ' + line for line in self.fit_diagnostics) + '\n'
                 f'friction_v_nominal: {format_list(friction[:, 0])}\n'
                 f'friction_c_nominal: {format_list(friction[:, 1])}\n'
                 f'friction_s_nominal: {format_list(stribeck[:, 0])}\n'
@@ -391,21 +427,33 @@ class SysIdEngine:
     def _fit_stribeck(self, joint, times, velocity, acceleration, torque, dt, fv, fc):
         speeds, excesses = [], []
         count = 0
+        failures = []
         for start, end, scalar_velocity in self.low_fit_windows:
             reference = scalar_velocity * self.low_directions[joint]
-            mask = ((times >= start) & (times <= end) &
-                    (np.abs(velocity - reference) <= max(0.0005, 0.15 * abs(reference))) &
-                    (np.abs(acceleration) <= max(0.002, 0.1 * abs(reference))))
+            in_window = (times >= start) & (times <= end)
+            speed_ok = np.abs(velocity - reference) <= max(0.0005, 0.15 * abs(reference))
+            acceleration_ok = np.abs(acceleration) <= max(0.002, 0.1 * abs(reference))
+            mask = in_window & speed_ok & acceleration_ok
             samples = np.count_nonzero(mask)
-            if samples < 20 or samples * dt < 0.3:
-                raise ValueError(f'Joint {joint+1}: insufficient steady low-speed data at '
-                                 f'{reference:+.4f} rad/s ({samples} samples); '
-                                 'check recording, tracking and settling')
+            available = np.count_nonzero(in_window)
+            duration = samples * dt
+            speed_rejected = np.count_nonzero(in_window & ~speed_ok) / max(available, 1)
+            acceleration_rejected = np.count_nonzero(in_window & ~acceleration_ok) / max(available, 1)
+            diagnostic = (f'Joint {joint+1}, {reference:+.4f} rad/s, [{start:.3f}, {end:.3f}] s: '
+                          f'{samples}/{available} samples, {duration:.4f} s stable (need 0.3000 s); '
+                          f'velocity rejected {speed_rejected:.1%}, '
+                          f'acceleration rejected {acceleration_rejected:.1%}')
+            self.fit_diagnostics.append(diagnostic)
+            if samples < 20 or duration < 0.3:
+                failures.append(diagnostic)
+                continue
             v = velocity[mask]
             # One robust observation per speed/direction gives equal plateau weight.
             speeds.append(float(np.median(np.abs(v))))
             excesses.append(float(np.median(np.sign(v) * torque[mask] - fv * np.abs(v) - fc)))
             count += samples
+        if failures:
+            raise ValueError('Insufficient steady low-speed data: ' + '; '.join(failures))
         speeds, excesses = np.asarray(speeds), np.asarray(excesses)
         scale = max(fc, 0.01)
         vs_bounds = (min(self.LOW_SPEEDS) / 4., max(self.LOW_SPEEDS) * 2.)

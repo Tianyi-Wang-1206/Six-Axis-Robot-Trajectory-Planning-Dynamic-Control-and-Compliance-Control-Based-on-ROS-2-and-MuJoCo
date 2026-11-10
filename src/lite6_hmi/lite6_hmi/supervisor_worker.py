@@ -63,6 +63,8 @@ def _view_state(msg):
     if msg.mode == S.MODE_RECOVERING:
         return Lite6StateMachine.RECOVERING
     if msg.mode == S.MODE_SYSID:
+        if msg.waiting_for_settle:
+            return "SYSID: WAITING FOR PHYSICAL SETTLING..."
         p = msg.sysid_phase
         labels = {
             S.SYSID_PRE_ALIGN: Lite6StateMachine.SYSID_PRE_ALIGN,
@@ -73,11 +75,12 @@ def _view_state(msg):
             S.SYSID_POST_ALIGN: Lite6StateMachine.SYSID_POST_ALIGN,
             S.SYSID_WAIT_NORMAL_MODE: Lite6StateMachine.SYSID_RESTORE,
             S.SYSID_RETURN_ALIGN: "SYSID: RETURNING TO ALIGNMENT POSE...",
+            S.SYSID_COMPLETING: "SYSID: CONFIRMING COMPLETION...",
         }
         return labels.get(p, "SYSID: WAITING...")
     if msg.motion_phase == S.MOTION_PLANNING:
         return Lite6StateMachine.PLANNING
-    if msg.motion_phase == S.MOTION_WAITING_JTC:
+    if msg.motion_phase == S.MOTION_WAITING_CTC:
         return "WAITING FOR CTC..."
     if msg.motion_phase == S.MOTION_EXECUTING:
         return Lite6StateMachine.EXECUTING
@@ -144,7 +147,8 @@ class ROS2Worker(QThread):
             MotionRejection, "/supervisor/motion_rejections", self._motion_rejection_cb, 32)
         self.rejection_timer = self.node.create_timer(0.1, self._flush_motion_rejections)
         self._begin_pending = False
-        self._sysid_requested = False
+        self._prepare_epoch = 0
+        self._prepared_trajectory = None
         self._sysid_session = 0
         self._recovery_session = 0
         self._phase_actions = set()
@@ -260,6 +264,10 @@ class ROS2Worker(QThread):
                 pass
             self._revision = msg.revision
             self.supervisor_state = msg
+            if msg.mode == SupervisorState.MODE_SYSID and msg.session_id == self._sysid_session:
+                if msg.excitation_start.sec or msg.excitation_start.nanosec:
+                    self.sysid_start_ros_time = (msg.excitation_start.sec +
+                                                 msg.excitation_start.nanosec * 1e-9)
             self.state = _view_state(msg)
             self.error_msg = msg.detail if msg.mode in (
                 SupervisorState.MODE_ESTOP, SupervisorState.MODE_FAULT,
@@ -275,7 +283,9 @@ class ROS2Worker(QThread):
                 self._direct_estop_sent = False
             if msg.mode in (SupervisorState.MODE_ESTOP,
                             SupervisorState.MODE_FAULT):
-                self._sysid_requested = False
+                if self._begin_pending:
+                    self._prepare_epoch += 1
+                    self._begin_pending = False
                 self._sysid_session = 0
                 self._recovery_session = 0
                 self._phase_actions.clear()
@@ -289,9 +299,8 @@ class ROS2Worker(QThread):
                     and previous.mode == SupervisorState.MODE_SYSID
                     and msg.mode == SupervisorState.MODE_NORMAL):
                 self._sysid_session = 0
-                self._sysid_requested = False
                 self._phase_actions.clear()
-                self.node.get_logger().info("Supervisor confirmed SysID complete")
+                self.node.get_logger().info(msg.detail)
         if changed:
             self.state_signal.emit(display[0], display[1])
         self._drive_supervisor_phase(msg)
@@ -302,7 +311,7 @@ class ROS2Worker(QThread):
         with self.state_lock:
             sid = self._sysid_session
             if (not sid or msg.session_id != sid or
-                    msg.mode != SupervisorState.MODE_SYSID):
+                    msg.mode != SupervisorState.MODE_SYSID or msg.waiting_for_settle):
                 return
             phase = msg.sysid_phase
             eligible = {
@@ -324,7 +333,7 @@ class ROS2Worker(QThread):
                     context=IndustrialMotion.Goal.CONTEXT_SYSID, session_id=sid):
                 self._abort_sysid(sid, "Could not dispatch pre-alignment")
         elif phase == SupervisorState.SYSID_READY_FOR_EXCITATION:
-            self._submit_sysid_trajectory(sid, prep)
+            threading.Thread(target=self._submit_sysid_trajectory, args=(sid,), daemon=True).start()
         elif phase == SupervisorState.SYSID_CALCULATING:
             self.run_sysid_calculation(sid)
         elif phase == SupervisorState.SYSID_POST_ALIGN:
@@ -343,7 +352,8 @@ class ROS2Worker(QThread):
             sid = self._recovery_session
             if (sid == 0 or msg.session_id != sid or
                     msg.mode != SupervisorState.MODE_RECOVERING or
-                    msg.recovery_phase != SupervisorState.RECOVERY_SYNC_REFERENCE):
+                    msg.recovery_phase != SupervisorState.RECOVERY_SYNC_REFERENCE or
+                    msg.waiting_for_settle):
                 return
             key = (sid, "recovery-sync")
             if key in self._phase_actions:
@@ -378,11 +388,7 @@ class ROS2Worker(QThread):
             if (self.sysid_calc is not None and s is not None and
                     s.mode == SupervisorState.MODE_SYSID and
                     s.sysid_phase == SupervisorState.SYSID_EXCITING and
-                    s.motion_phase == SupervisorState.MOTION_EXECUTING and
                     s.session_id == self._sysid_session):
-                if self.sysid_start_ros_time is None:
-                    self.sysid_start_ros_time = msg_stamp
-                elapsed = msg_stamp - self.sysid_start_ros_time
                 if (self._last_sysid_sample_time is None or
                         msg_stamp > self._last_sysid_sample_time):
                     self._last_sysid_sample_time = msg_stamp
@@ -391,10 +397,10 @@ class ROS2Worker(QThread):
                     complete_effort = all(index[name] < len(msg.effort) and
                                           index[name] < len(msg.velocity)
                                           for name in self.joint_names)
-                    if (0.0 <= elapsed <= self.sysid_calc.T_total and complete_effort and
+                    if (complete_effort and
                             all(math.isfinite(x) for x in self.tau_curr)):
                         self.sysid_record_data.append({
-                            "t": elapsed,
+                            "t": msg_stamp,  # Converted using the CTC origin, never receipt time.
                             "q": np.array(self.q_curr, dtype=float),
                             "dq": np.array(self.dq_curr, dtype=float),
                             "tau_cmd": np.array(self.tau_curr, dtype=float),
@@ -637,66 +643,84 @@ class ROS2Worker(QThread):
             return
         with self.state_lock:
             snap = self.supervisor_state
-            if self._begin_pending or snap is None or not snap.motion_allowed:
-                self._report_error("Supervisor is not ready for system identification")
+            if self._begin_pending or self._calculation_active or snap is None or not snap.motion_allowed:
+                self._report_error("Supervisor or identification worker is not ready")
                 return
             self._begin_pending = True
-            self._sysid_requested = True
-            self._sysid_session = 0
-            self._phase_actions.clear()
-            self.sysid_record_data.clear()
-            self.sysid_start_ros_time = None
-            self._last_sysid_sample_time = None
-            self.sysid_q0_locked = list(prep_pose)
-        # Prepare and preflight before changing controller mode.
+            self._prepare_epoch += 1
+            epoch = self._prepare_epoch
+            revision = snap.revision
+        # At 1 ms the full trajectory has tens of thousands of points. Preflight
+        # and ROS message construction must block neither Qt nor ROS callbacks.
+        threading.Thread(target=self._prepare_sysid,
+                         args=(epoch, revision, list(prep_pose), list(max_limits)), daemon=True).start()
+
+    def _prepare_sysid(self, epoch, revision, prep_pose, max_limits):
         try:
-            self.inject_sysid_parameters(prep_pose, max_limits)
+            # Each run owns its numerical model and data, including canceled runs.
+            engine = SysIdEngine()
+            engine.generate_identification_trajectory(prep_pose, max_limits)
+            _, positions, velocities, accelerations = engine.trajectory_samples(prep_pose)
+            trajectory = JointTrajectory()
+            trajectory.joint_names = self.joint_names
+            for tick, (q, dq, ddq) in enumerate(zip(positions, velocities, accelerations)):
+                if tick % 1000 == 0:
+                    with self.state_lock:
+                        if self._stopping or epoch != self._prepare_epoch:
+                            return
+                point = JointTrajectoryPoint()
+                point.positions, point.velocities, point.accelerations = q.tolist(), dq.tolist(), ddq.tolist()
+                sec, nanosec = divmod(tick * 1_000_000, 1_000_000_000)
+                point.time_from_start = Duration(sec=sec, nanosec=nanosec)
+                trajectory.points.append(point)
+            with self.state_lock:
+                snap = self.supervisor_state
+                if self._stopping or epoch != self._prepare_epoch:
+                    return
+                if snap is None or snap.revision != revision or not snap.motion_allowed:
+                    self._begin_pending = False
+                    self._report_error("System state changed during SysID preparation; start again when ready")
+                    return
+                self.sysid_calc = engine
+                self._prepared_trajectory = trajectory
+                self._sysid_session = 0
+                self._phase_actions.clear()
+                self.sysid_record_data.clear()
+                self.sysid_start_ros_time = None
+                self._last_sysid_sample_time = None
+                self.sysid_q0_locked = prep_pose
+                self.node.get_logger().info(engine.trajectory_summary + '; reference period 1 ms')
+                if not self._send_command(SupervisorCommand.Request.CMD_BEGIN_SYSID,
+                                          done=lambda resp: self._begin_sysid_reply(resp, epoch)):
+                    self._begin_pending = False
         except Exception as exc:
             with self.state_lock:
+                if self._stopping or epoch != self._prepare_epoch:
+                    return
                 self._begin_pending = False
-                self._sysid_requested = False
             self._report_error(f"System identification setup failed: {exc}")
-            return
-        if not self._send_command(SupervisorCommand.Request.CMD_BEGIN_SYSID,
-                                  done=self._begin_sysid_reply):
-            with self.state_lock:
-                self._begin_pending = False
-                self._sysid_requested = False
 
-    def _begin_sysid_reply(self, resp):
+    def _begin_sysid_reply(self, resp, epoch):
         with self.state_lock:
+            if epoch != self._prepare_epoch or self._stopping:
+                return
             self._begin_pending = False
             if resp is None or not resp.accepted:
-                self._sysid_requested = False
                 return
             self._sysid_session = int(resp.session_id)
             snap = self.supervisor_state
         if snap is not None:
             self._drive_supervisor_phase(snap)
 
-    def inject_sysid_parameters(self, prep_pose, max_limits):
-        self.sysid_calc.generate_identification_trajectory(prep_pose, max_limits)
-        self.node.get_logger().info(self.sysid_calc.trajectory_summary)
-
-    def _submit_sysid_trajectory(self, session, prep):
-        if not self.sysid_client.service_is_ready():
-            self._report_error("Supervisor SysID trajectory service unavailable")
-            self._abort_sysid(session, "Excitation service unavailable")
+    def _submit_sysid_trajectory(self, session):
+        with self.state_lock:
+            if not self._sysid_phase_is(session, SupervisorState.SYSID_READY_FOR_EXCITATION):
+                return
+            trajectory = self._prepared_trajectory
+        if trajectory is None or not self.sysid_client.service_is_ready():
+            self._report_error("Supervisor SysID trajectory service or prepared trajectory unavailable")
+            self._abort_sysid(session, "Excitation submission unavailable")
             return
-        trajectory = JointTrajectory()
-        trajectory.joint_names = self.joint_names
-        for t in self.sysid_calc.trajectory_times():
-            point = JointTrajectoryPoint()
-            q, dq, ddq = self.sysid_calc.get_trajectory_point(t, prep)
-            point.positions = q.tolist()
-            point.velocities = dq.tolist()
-            point.accelerations = ddq.tolist()
-            # Integer nanoseconds: never emit nanosec == 1_000_000_000
-            # due to floating-point rounding at whole seconds.
-            sec, nanosec = divmod(int(round(t * 1_000_000_000)),
-                                  1_000_000_000)
-            point.time_from_start = Duration(sec=sec, nanosec=nanosec)
-            trajectory.points.append(point)
         req = SubmitSysIdTrajectory.Request()
         req.session_id = int(session)
         req.trajectory = trajectory
@@ -707,7 +731,16 @@ class ROS2Worker(QThread):
             self._report_error(f"Cannot send excitation trajectory: {exc}")
             self._abort_sysid(session, "Trajectory submission failed")
 
+    def _sysid_phase_is(self, session, phase=None):
+        with self.state_lock:
+            state = self.supervisor_state
+            return (not self._stopping and session == self._sysid_session and state is not None and
+                    state.session_id == session and state.mode == SupervisorState.MODE_SYSID and
+                    (phase is None or state.sysid_phase == phase))
+
     def _excitation_reply(self, future, session):
+        if not self._sysid_phase_is(session):
+            return
         try:
             resp = future.result()
             if not resp.accepted:
@@ -722,34 +755,41 @@ class ROS2Worker(QThread):
             if self._calculation_active or session != self._sysid_session:
                 return
             self._calculation_active = True
-            recorded = list(self.sysid_record_data)
+            origin = self.sysid_start_ros_time
+            engine = self.sysid_calc
+            recorded = ([dict(sample, t=sample['t'] - origin) for sample in self.sysid_record_data
+                         if 0.0 <= sample['t'] - origin <= engine.T_total]
+                        if origin is not None else [])
         # Numerical estimation can be CPU-heavy; never block ROS heartbeat
         # subscriptions while waiting for the LS solve.
         threading.Thread(target=self._calculate_sysid,
-                         args=(session, recorded), daemon=True).start()
+                         args=(session, engine, recorded, origin), daemon=True).start()
 
-    def _calculate_sysid(self, session, recorded):
+    def _calculate_sysid(self, session, engine, recorded, origin):
         try:
+            if origin is None:
+                raise ValueError("No CTC excitation start timestamp received")
             if not recorded:
                 raise ValueError("No joint samples were recorded during excitation")
-            self.sysid_calc.record_data = recorded
-            result_text = self.sysid_calc.calculate_least_squares()
-            if result_text.lstrip().startswith("# Error") or result_text.lstrip().startswith("# Calculation Failed"):
-                raise RuntimeError(result_text)
-            with self.state_lock:
-                valid = (session == self._sysid_session and
-                         self.supervisor_state is not None and
-                         self.supervisor_state.mode == SupervisorState.MODE_SYSID and
-                         self.supervisor_state.sysid_phase == SupervisorState.SYSID_CALCULATING)
-            if valid:
+            engine.record_data = recorded
+            result_text = engine.calculate_least_squares()
+            if self._sysid_phase_is(session, SupervisorState.SYSID_CALCULATING):
                 self.sysid_yaml_signal.emit(result_text)
-                self._send_command(
-                    SupervisorCommand.Request.CMD_SYSID_CALCULATION_DONE,
-                    session=session, done=lambda resp: self._calculation_done_reply(resp, session))
+                if not self._send_command(
+                        SupervisorCommand.Request.CMD_SYSID_CALCULATION_DONE,
+                        session=session, done=lambda resp: self._calculation_done_reply(resp, session)):
+                    self._abort_sysid(session, "Cannot acknowledge calculation completion")
         except Exception as exc:
-            self.sysid_yaml_signal.emit(f"# Calculation Failed: {exc}")
-            self._report_error(f"SysID least-squares calculation failed: {exc}")
-            self._abort_sysid(session, "Parameter estimation failed")
+            if self._sysid_phase_is(session, SupervisorState.SYSID_CALCULATING):
+                # Data quality failure is not a motion failure. The Supervisor
+                # performs the same guarded return sequence and retains the cause.
+                self.sysid_yaml_signal.emit('# Calculation Failed: ' + str(exc).replace('\n', '\n# '))
+                self._report_error(f"SysID estimation failed; restoring NORMAL: {exc}")
+                if not self._send_command(
+                        SupervisorCommand.Request.CMD_SYSID_CALCULATION_FAILED,
+                        session=session, reason='\n'.join(str(exc).splitlines()[:2])[:1500],
+                        done=lambda resp: self._calculation_done_reply(resp, session)):
+                    self._abort_sysid(session, "Cannot request controlled SysID exit")
         finally:
             with self.state_lock:
                 self._calculation_active = False

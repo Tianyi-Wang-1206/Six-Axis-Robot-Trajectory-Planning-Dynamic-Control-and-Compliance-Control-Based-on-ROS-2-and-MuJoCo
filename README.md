@@ -7,7 +7,7 @@
 
 This repository presents a high-fidelity, mathematically rigorous 6-axis robotic arm simulation and control framework. Initiated by an asynchronous and detailed GUI (based on PyQt5), the system orchestrates high-level motion using a **custom-built, deterministic, and thread-safe C++ planning engine**, bypassing standard frameworks like MoveIt2. This planner leverages a **closed-form Analytical Inverse Kinematics** solver (derived via Maple symbolic computation), combined with **Coal (formerly HPP-FCL)** for 3D collision avoidance and symbolic Jacobian determinant analysis for singularity detection. Trajectory generation is handled by **Ruckig** and **Closed-Loop Inverse Kinematics (CLIK)**. CLIK is combined with Jacobian pseudo-inverse (**Damped Least Squares**) and Quaternion **SLERP**. This provides time-optimal profiles for Joint Space (**MoveJ**), Cartesian Space (**MoveP**), Linear (**MoveL**), and Circular (**MoveC**) Cartesian motions.
 
-At the core, **Controller Chaining** (based on **ros2_control**) interpolates these trajectories into a tight 1000Hz reference for a custom **Computed Torque Control (CTC)** downstream controller. To ensure physical realism, the CTC bypasses **MuJoCo**’s default PID joints to run the physics engine in pure **effort mode**. The CTC processes the feedback states via a **1D Kalman Filter** state observation model to reconstruct noise-free joint velocities, and executes **Pinocchio** dynamics calculations to compute rigid-body inertia, gravity, and Coriolis matrices. Combined with **friction/armature compensation** (smoothly neutralizing viscous damping, Coulomb stiction, and motor rotor inertia), this architecture achieves a tracking precision of $<0.01\text{ mm}$.
+At the core, a custom **Computed Torque Control (CTC)** controller based on **ros2_control** directly consumes sampled trajectories through `FollowJointTrajectory`, holding the latest due reference in its 1000Hz control loop without interpolation. To ensure physical realism, the CTC bypasses **MuJoCo**’s default PID joints to run the physics engine in pure **effort mode**. The CTC processes the feedback states via a **1D Kalman Filter** state observation model to reconstruct noise-free joint velocities, and executes **Pinocchio** dynamics calculations to compute rigid-body inertia, gravity, and Coriolis matrices. Combined with **friction/armature compensation** (smoothly neutralizing viscous damping, Coulomb stiction, and motor rotor inertia), this architecture achieves a tracking precision of $<0.01\text{ mm}$.
 
 To bridge the gap between nominal simulation parameters and real-world physical discrepancies, an automated **system identification** (SysID) framework is integrated to extract joint-level viscous/Coulomb friction and motor armature coefficients, which are difficult to measure directly during manufacturing. Utilizing a bounded **Fourier excitation trajectory** coupled with an offline **Least-Squares solver**, the identified parameters align closely with the ground-truth physical properties defined in the URDF and MuJoCo XML files. Furthermore, the architecture incorporates a robust software emergency stop (E-Stop) and active recovery state machine. Upon triggering, it overrides high-level commands to execute precise, kinematic-limit-aware deceleration trajectories that safely halt the manipulator, while providing a seamless recovery sequence back to the active closed-loop tracking state.
 
@@ -118,7 +118,7 @@ graph TB
     style Sub_Display fill:#f2f4f4,stroke:#ccd1d1,stroke-width:2px;
 ```
 
-The planner sends its complete sampled trajectory directly to `/ctc_controller/follow_joint_trajectory`. CTC holds the latest due position, velocity and acceleration sample without interpolation, and reports completion after consuming the final sample. Cancellation holds the measured position; the existing CTC emergency-stop deceleration remains unchanged. No JointTrajectoryController is loaded.
+The planner sends its complete sampled trajectory directly to `/ctc_controller/follow_joint_trajectory`. CTC holds the latest due position, velocity and acceleration sample without interpolation, and reports completion after consuming the final sample. Cancellation holds the measured position; the existing CTC emergency-stop deceleration remains unchanged.
 
 The controller's architecture is shown in the diagram below:
 ```mermaid
@@ -255,6 +255,21 @@ CTC configuration and restart/reconfigure to apply them; identification does not
 automatically change controller parameters. The checked-in `Fs/vs` values are
 initial simulation nominals. Omitting `friction_s_nominal` preserves the previous
 Coulomb-only behavior (`Fs=Fc`).
+
+SysID references use an exact 1 ms grid, matching the 1000 Hz CTC loop and
+joint feedback. Trajectory generation and message construction run in the
+background. Recorded timestamps are aligned to the first CTC execution cycle,
+correlated by the excitation Action UUID, rather than to receipt of a GUI state
+notification. Each low-speed plateau reports usable duration and the fractions
+rejected by velocity and acceleration checks; the fit quality limits remain enforced.
+
+The Supervisor requires all joint speeds to remain at or below 0.01 rad/s for
+300 ms before advancing SysID alignment/mode transitions and emergency-stop
+recovery. Settling has an 8 s timeout, client dispatch has a 15 s timeout, and
+estimation has a 60 s timeout. An estimation/data-quality failure follows a
+guarded return to NORMAL and retains its diagnostic; motion failures, missing
+feedback and transition timeouts still enter ESTOP. A mode acknowledgement alone
+does not authorize the next motion before the physical robot has settled.
 
 <p align="center">
   <img src="media/demo_SYSID.gif" width="1080" alt="Automated System Identification"/>

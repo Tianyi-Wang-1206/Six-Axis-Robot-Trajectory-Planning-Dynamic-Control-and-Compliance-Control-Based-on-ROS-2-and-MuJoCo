@@ -6,6 +6,8 @@ uint8 CMD_ACK_SOFT_FAULT=3
 uint8 CMD_BEGIN_SYSID=4
 uint8 CMD_SYSID_CALCULATION_DONE=5
 uint8 CMD_ABORT_SYSID=6
+# Estimation/data-quality failure after excitation; restore NORMAL under supervision.
+uint8 CMD_SYSID_CALCULATION_FAILED=7
 
 uint8 command
 

@@ -11,7 +11,7 @@ controller_manager:
 
 joint_state_broadcaster:  # Broadcaster for the joint states of the robot arm
   ros__parameters:
-    publish_rate: 200
+    update_rate: 1000  # 1 ms measured feedback, matching CTC and SysID references.
 
 # --- Computed Torque Control (CTC) Controller Configuration ---
 ctc_controller:

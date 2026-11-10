@@ -57,7 +57,8 @@ public:
        !kinematics_.init_robot_model(desc+"/urdf/lite6.urdf",pkg+"/config/lite6.srdf")||
        !kinematics_.load_limits(pkg+"/config/kinematic_limits.yaml"))
       throw std::runtime_error("Lite6 planning model / YAML initialization failed");
-    io_group_=create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    io_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    validation_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     const auto state_qos=rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     state_pub_=create_publisher<S>("/supervisor/state",state_qos);
     rejection_pub_=create_publisher<lite6_interfaces::msg::MotionRejection>(
@@ -68,7 +69,19 @@ public:
     controller_sub_=create_subscription<lite6_interfaces::msg::ControllerStatus>(
       "/ctc_controller/status",rclcpp::QoS(10),
       [this](const lite6_interfaces::msg::ControllerStatus::SharedPtr msg) {
-        do_effects(supervisor_.observe_controller(msg->mode));
+        const auto stamp=rclcpp::Time(msg->stamp).nanoseconds();
+        if(stamp<=last_controller_stamp_) return;
+        last_controller_stamp_=stamp;
+        {
+          std::lock_guard<std::mutex> transition(transition_mutex_);
+          do_effects(supervisor_.observe_controller(msg->mode));
+        }
+        {
+          std::lock_guard<std::mutex> lock(ctc_mutex_);
+          if(operation_&&operation_->downstream&&
+              operation_->downstream->get_goal_id()==msg->trajectory_id)
+            supervisor_.observe_excitation_start(operation_->key,msg->trajectory_start);
+        }
         publish_state();
       },sensor_options);
     joints_sub_=create_subscription<sensor_msgs::msg::JointState>("/joint_states",rclcpp::QoS(10),
@@ -84,6 +97,7 @@ public:
       "/supervisor/command",
       [this](const std::shared_ptr<lite6_interfaces::srv::SupervisorCommand::Request> req,
              std::shared_ptr<lite6_interfaces::srv::SupervisorCommand::Response> resp) {
+        std::lock_guard<std::mutex> transition(transition_mutex_);
         auto reply=supervisor_.command(req->command,req->session_id,req->reason);
         resp->accepted=reply.accepted;resp->session_id=reply.session_id;
         resp->revision=reply.revision;resp->message=reply.message;
@@ -94,7 +108,7 @@ public:
       [this](const std::shared_ptr<lite6_interfaces::srv::SubmitSysIdTrajectory::Request> req,
              std::shared_ptr<lite6_interfaces::srv::SubmitSysIdTrajectory::Response> resp){
         on_sysid_trajectory(*req,*resp);
-      });
+      },rmw_qos_profile_services_default,validation_group_);
     heartbeat_=create_wall_timer(100ms,[this]{on_heartbeat();},io_group_);
     RCLCPP_INFO(get_logger(),"Supervisor-owned Lite6 planner created (awaiting CTC status)");
   }
@@ -116,12 +130,16 @@ private:
   KinematicsEngine kinematics_;
   MotionPlanner planner_;
   Supervisor supervisor_;
-  std::mutex joints_mutex_,ctc_mutex_;
+  std::mutex joints_mutex_,ctc_mutex_,planning_model_mutex_;
+  // Serialize a state transition with its mode-command publication. Otherwise
+  // a pending NORMAL command could be published after a concurrent ESTOP.
+  std::mutex transition_mutex_;
+  int64_t last_joint_stamp_=0,last_controller_stamp_=0;
   MotionPlanner::InitialState actual_{};
-  std::string current_accepted_key_;
   std::unique_ptr<CTCOperation> operation_;
   std::thread planner_thread_;
   rclcpp::CallbackGroup::SharedPtr io_group_;
+  rclcpp::CallbackGroup::SharedPtr validation_group_;
   std::atomic<bool> shutdown_{false};
   rclcpp::Publisher<S>::SharedPtr state_pub_;
   rclcpp::Publisher<lite6_interfaces::msg::MotionRejection>::SharedPtr rejection_pub_;
@@ -140,7 +158,10 @@ private:
     state_pub_->publish(state);
   }
   void on_joints(const sensor_msgs::msg::JointState& msg) {
+    const auto stamp=rclcpp::Time(msg.header.stamp).nanoseconds();
+    if(stamp<=last_joint_stamp_) return;
     MotionPlanner::InitialState candidate;
+    double max_speed=0.0;
     for(int i=0;i<6;++i) {
       const auto name="joint"+std::to_string(i+1);
       auto it=std::find(msg.name.begin(),msg.name.end(),name);
@@ -150,12 +171,14 @@ private:
          static_cast<size_t>(index)>=msg.velocity.size()) return;
       candidate.q[i]=msg.position[index];candidate.dq[i]=msg.velocity[index];
       if(!std::isfinite(candidate.q[i])||!std::isfinite(candidate.dq[i])) return;
+      max_speed=std::max(max_speed,std::abs(candidate.dq[i]));
     }
     {
       std::lock_guard<std::mutex> lock(joints_mutex_);
       actual_=candidate;
     }
-    supervisor_.observe_joint_state();
+    last_joint_stamp_=stamp;
+    supervisor_.observe_joint_state(max_speed);
   }
   void issue_ctc_command(int value) {
     std_msgs::msg::Int32 msg;
@@ -234,13 +257,17 @@ private:
       }
       if(shutdown_.load()||!supervisor_.permitted(key))
         throw MotionError(Motion::Result::ERR_CANCELLED,"Supervisor withdrew authorization");
-      const auto traj=planner_.plan(*gh->get_goal(),start,[this,key]{
-        return shutdown_.load()||!supervisor_.permitted(key);
-      });
+      trajectory_msgs::msg::JointTrajectory traj;
+      {
+        std::lock_guard<std::mutex> lock(planning_model_mutex_);
+        traj=planner_.plan(*gh->get_goal(),start,[this,key]{
+          return shutdown_.load()||!supervisor_.permitted(key);
+        });
+      }
       if(!supervisor_.permitted(key))
         throw MotionError(Motion::Result::ERR_CANCELLED,"Goal cancelled during planning");
       const auto feedback=std::make_shared<Motion::Feedback>();
-      feedback->current_state=Motion::Feedback::STATE_WAITING_JTC;
+      feedback->current_state=Motion::Feedback::STATE_WAITING_CTC;
       feedback->percent_complete=0;
       gh->publish_feedback(feedback);
       dispatch_ctc(key,traj,gh);
@@ -259,7 +286,7 @@ private:
     if(!ctc_->wait_for_action_server(2s)) {
       finish_upper(key,upper,Motion::Result::ERR_EXECUTION_ABORTED,"CTC unavailable",0);return;
     }
-    if(!supervisor_.change_motion_phase(key,S::MOTION_WAITING_JTC)) {
+    if(!supervisor_.change_motion_phase(key,S::MOTION_WAITING_CTC)) {
       finish_upper(key,upper,Motion::Result::ERR_CANCELLED,"Motion canceled before CTC dispatch",0);return;
     }
     const double duration=sec(trajectory.points.back().time_from_start);
@@ -335,13 +362,17 @@ private:
   }
   void finish_upper(const std::string& key,const std::shared_ptr<MotionHandle>& gh,
       int32_t code,const std::string& message,double duration) {
-    const auto effects=supervisor_.finish_motion(key,code==Motion::Result::SUCCESS,code,message);
+    Supervisor::Effects effects;
+    {
+      std::lock_guard<std::mutex> transition(transition_mutex_);
+      effects=supervisor_.finish_motion(key,code==Motion::Result::SUCCESS,code,message);
+      do_effects(effects);
+    }
     auto result=std::make_shared<Motion::Result>();
     result->error_code=effects.terminal_success?Motion::Result::SUCCESS:
       (code==Motion::Result::SUCCESS?Motion::Result::ERR_EXECUTION_ABORTED:code);
     result->error_string=message;
     result->execution_time=duration;
-    do_effects(effects);
     if(gh&&gh->is_active()) {
       if(effects.terminal_success) gh->succeed(result);
       else if(gh->is_canceling()) gh->canceled(result);
@@ -361,6 +392,7 @@ private:
     }
     if(upper) finish_upper(key,upper,code,message,elapsed);
     else {
+      std::lock_guard<std::mutex> transition(transition_mutex_);
       const auto effects=supervisor_.finish_motion(key,code==Motion::Result::SUCCESS,
           code,message);
       do_effects(effects);publish_state();
@@ -370,7 +402,21 @@ private:
       lite6_interfaces::srv::SubmitSysIdTrajectory::Response& resp) {
     // Validate early before occupying the single motion slot.
     try {
-      planner_.verify_trajectory(req.trajectory,true,[this]{return shutdown_.load();});
+      const auto authorized=[this,&req] {
+        const auto state=supervisor_.snapshot();
+        return !shutdown_.load()&&state.mode==S::MODE_SYSID&&
+            state.session_id==req.session_id&&state.sysid_phase==S::SYSID_READY_FOR_EXCITATION&&
+            !state.waiting_for_settle;
+      };
+      if(!authorized()) throw std::runtime_error("SysID session is no longer ready");
+      std::lock_guard<std::mutex> lock(planning_model_mutex_);
+      planner_.verify_trajectory(req.trajectory,true,[&authorized]{return !authorized();});
+      for(size_t tick=0;tick<req.trajectory.points.size();++tick) {
+        const auto& t=req.trajectory.points[tick].time_from_start;
+        if(static_cast<int64_t>(t.sec)*1000000000LL+t.nanosec!=
+            static_cast<int64_t>(tick)*1000000LL)
+          throw std::runtime_error("SysID references must use an exact 1 ms grid starting at zero");
+      }
     } catch(const std::exception& e) {
       resp.accepted=false;resp.message=std::string("SysID trajectory rejected: ")+e.what();
       resp.revision=supervisor_.snapshot().revision;return;
@@ -399,7 +445,10 @@ private:
     dispatch_ctc(key,req.trajectory,nullptr);
   }
   void on_heartbeat() {
-    do_effects(supervisor_.watchdog());
+    {
+      std::lock_guard<std::mutex> transition(transition_mutex_);
+      do_effects(supervisor_.watchdog());
+    }
     std::string timed_out;
     {
       std::lock_guard<std::mutex> lock(ctc_mutex_);

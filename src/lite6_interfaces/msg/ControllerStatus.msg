@@ -9,3 +9,8 @@ uint8 MODE_ESTOP=2
 uint8 MODE_SYSID=3
 
 uint8 mode
+
+# Actual first control-cycle timestamp of the most recent trajectory.
+# A zero timestamp means no trajectory has started. Correlate with the Action UUID.
+uint8[16] trajectory_id
+builtin_interfaces/Time trajectory_start

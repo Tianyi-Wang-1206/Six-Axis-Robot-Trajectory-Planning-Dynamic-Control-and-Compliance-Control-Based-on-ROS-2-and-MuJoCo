@@ -21,7 +21,8 @@ public:
   struct Reply {bool accepted=false; uint64_t session_id=0; uint64_t revision=0;std::string message; Effects effects;};
 
   Supervisor();
-  void observe_joint_state();
+  void observe_joint_state(double max_speed);
+  void observe_excitation_start(const std::string& key, const builtin_interfaces::msg::Time& start);
   Effects observe_controller(uint8_t mode);
   Effects watchdog();
   State snapshot() const;
@@ -45,12 +46,15 @@ private:
   bool can_start_motion_unlocked(uint8_t context,uint64_t session,std::string& reason) const;
   void fault_unlocked(const std::string& reason,bool estop,Effects& effects);
   void clear_motion_unlocked();
+  void settle_unlocked();
+  void complete_sysid_unlocked();
   mutable std::mutex mutex_;
   State state_;
   Clock::time_point controller_time_{},joint_time_{},phase_deadline_{};
+  Clock::time_point stable_since_{};
+  std::string sysid_failure_;
   bool seen_controller_=false,seen_joint_=false;
   std::string active_key_;
-  uint8_t active_context_=0;
   bool cancel_requested_=false;
   uint64_t next_session_=1;
 };
