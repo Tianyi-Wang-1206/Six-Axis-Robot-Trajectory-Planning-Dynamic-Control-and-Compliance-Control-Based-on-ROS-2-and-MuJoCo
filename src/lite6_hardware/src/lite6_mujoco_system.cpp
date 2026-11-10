@@ -20,6 +20,8 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_init(
   }
 #pragma GCC diagnostic pop
 
+  sim_started_ = false;
+
   // 1. Initialize hardware interface state and command vectors
   size_t num_joints = info_.joints.size();
   hw_commands_effort_.resize(num_joints, 0.0);
@@ -133,9 +135,8 @@ hardware_interface::return_type Lite6MujocoSystem::read(
 hardware_interface::return_type Lite6MujocoSystem::write(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
-  // Check if simulation has started (i.e., any non-zero command has been sent)
-  bool sim_started_ = false;
-  // If simulation is not started, we don't step the physics engine
+  // Hold the initial pose until the controller supplies an effective effort.
+  // Once started, keep stepping even when every effort command returns to zero.
   if (!sim_started_) {
     for (size_t i = 0; i < info_.joints.size(); ++i) {
       if (std::abs(hw_commands_effort_[i]) > 0.01) {

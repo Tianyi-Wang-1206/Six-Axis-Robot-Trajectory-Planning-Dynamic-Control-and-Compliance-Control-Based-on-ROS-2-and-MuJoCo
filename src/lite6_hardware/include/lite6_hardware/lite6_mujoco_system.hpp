@@ -32,6 +32,8 @@ public:
 private:
   mjModel * m_model = nullptr;
   mjData * m_data = nullptr;
+  // Latch the first effective effort command; only write() advances this state.
+  bool sim_started_ = false;
 
   std::vector<double> hw_commands_effort_;
   std::vector<double> hw_states_position_;
