@@ -93,6 +93,7 @@ class ROS2Worker(QThread):
     telemetry_signal = pyqtSignal(dict)
     state_signal = pyqtSignal(str, str)
     sysid_yaml_signal = pyqtSignal(str)
+    sysid_preparation_signal = pyqtSignal()
     command_error_signal = pyqtSignal(str)
     recovery_complete_signal = pyqtSignal()
 
@@ -147,6 +148,7 @@ class ROS2Worker(QThread):
             MotionRejection, "/supervisor/motion_rejections", self._motion_rejection_cb, 32)
         self.rejection_timer = self.node.create_timer(0.1, self._flush_motion_rejections)
         self._begin_pending = False
+        self.sysid_preparation_status = ""
         self._prepare_epoch = 0
         self._prepared_trajectory = None
         self._sysid_session = 0
@@ -265,6 +267,8 @@ class ROS2Worker(QThread):
             self._revision = msg.revision
             self.supervisor_state = msg
             if msg.mode == SupervisorState.MODE_SYSID and msg.session_id == self._sysid_session:
+                if self._begin_pending:
+                    self._set_sysid_preparation_status("")
                 if msg.excitation_start.sec or msg.excitation_start.nanosec:
                     self.sysid_start_ros_time = (msg.excitation_start.sec +
                                                  msg.excitation_start.nanosec * 1e-9)
@@ -285,7 +289,7 @@ class ROS2Worker(QThread):
                             SupervisorState.MODE_FAULT):
                 if self._begin_pending:
                     self._prepare_epoch += 1
-                    self._begin_pending = False
+                    self._set_sysid_preparation_status("")
                 self._sysid_session = 0
                 self._recovery_session = 0
                 self._phase_actions.clear()
@@ -444,6 +448,9 @@ class ROS2Worker(QThread):
                 self._report_error("A motion request is already awaiting an Action response")
                 return False
             if goal.context == IndustrialMotion.Goal.CONTEXT_NORMAL:
+                if self._begin_pending:
+                    self._report_error("Wait for SysID preparation before requesting manual motion")
+                    return False
                 if snap is None or not snap.motion_allowed:
                     self._report_error("Supervisor does not currently permit manual motion")
                     return False
@@ -643,10 +650,11 @@ class ROS2Worker(QThread):
             return
         with self.state_lock:
             snap = self.supervisor_state
-            if self._begin_pending or self._calculation_active or snap is None or not snap.motion_allowed:
+            if (self._begin_pending or self._calculation_active or self._motion_pending or
+                    snap is None or not snap.motion_allowed):
                 self._report_error("Supervisor or identification worker is not ready")
                 return
-            self._begin_pending = True
+            self._set_sysid_preparation_status("Loading robot model...")
             self._prepare_epoch += 1
             epoch = self._prepare_epoch
             revision = snap.revision
@@ -655,11 +663,28 @@ class ROS2Worker(QThread):
         threading.Thread(target=self._prepare_sysid,
                          args=(epoch, revision, list(prep_pose), list(max_limits)), daemon=True).start()
 
+    def _set_sysid_preparation_status(self, status):
+        # Caller holds state_lock. This is local work feedback, not a robot mode.
+        self.sysid_preparation_status = status
+        self._begin_pending = bool(status)
+        self.sysid_preparation_signal.emit()
+
+    def _sysid_preparation_progress(self, epoch, status):
+        with self.state_lock:
+            if self._stopping or epoch != self._prepare_epoch:
+                raise InterruptedError("SysID preparation canceled")
+            self._set_sysid_preparation_status(status)
+
     def _prepare_sysid(self, epoch, revision, prep_pose, max_limits):
         try:
+            started = time.monotonic()
             # Each run owns its numerical model and data, including canceled runs.
             engine = SysIdEngine()
-            engine.generate_identification_trajectory(prep_pose, max_limits)
+            engine.generate_identification_trajectory(
+                prep_pose, max_limits,
+                progress=lambda status: self._sysid_preparation_progress(epoch, status))
+            generated = time.monotonic()
+            self._sysid_preparation_progress(epoch, "Building 1 ms trajectory message...")
             _, positions, velocities, accelerations = engine.trajectory_samples(prep_pose)
             trajectory = JointTrajectory()
             trajectory.joint_names = self.joint_names
@@ -678,7 +703,7 @@ class ROS2Worker(QThread):
                 if self._stopping or epoch != self._prepare_epoch:
                     return
                 if snap is None or snap.revision != revision or not snap.motion_allowed:
-                    self._begin_pending = False
+                    self._set_sysid_preparation_status("")
                     self._report_error("System state changed during SysID preparation; start again when ready")
                     return
                 self.sysid_calc = engine
@@ -690,25 +715,35 @@ class ROS2Worker(QThread):
                 self._last_sysid_sample_time = None
                 self.sysid_q0_locked = prep_pose
                 self.node.get_logger().info(engine.trajectory_summary + '; reference period 1 ms')
+                self.node.get_logger().info(
+                    f'SysID preparation: model/validation {generated - started:.3f} s, '
+                    f'samples/message {time.monotonic() - generated:.3f} s, '
+                    f'{len(trajectory.points)} points')
+                self._set_sysid_preparation_status("Waiting for Supervisor acceptance...")
                 if not self._send_command(SupervisorCommand.Request.CMD_BEGIN_SYSID,
                                           done=lambda resp: self._begin_sysid_reply(resp, epoch)):
-                    self._begin_pending = False
+                    self._set_sysid_preparation_status("")
         except Exception as exc:
             with self.state_lock:
                 if self._stopping or epoch != self._prepare_epoch:
                     return
-                self._begin_pending = False
+                self._set_sysid_preparation_status("")
             self._report_error(f"System identification setup failed: {exc}")
 
     def _begin_sysid_reply(self, resp, epoch):
         with self.state_lock:
             if epoch != self._prepare_epoch or self._stopping:
                 return
-            self._begin_pending = False
             if resp is None or not resp.accepted:
+                self._set_sysid_preparation_status("")
                 return
             self._sysid_session = int(resp.session_id)
             snap = self.supervisor_state
+            if (snap is not None and snap.mode == SupervisorState.MODE_SYSID and
+                    snap.session_id == self._sysid_session):
+                self._set_sysid_preparation_status("")
+            else:
+                self._set_sysid_preparation_status("Waiting for Supervisor state...")
         if snap is not None:
             self._drive_supervisor_phase(snap)
 

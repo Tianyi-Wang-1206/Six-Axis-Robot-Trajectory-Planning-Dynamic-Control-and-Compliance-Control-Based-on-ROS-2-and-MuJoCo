@@ -95,11 +95,19 @@ class SysIdEngine:
 
     def _path_is_clear(self, positions):
         # Match the planner's joint-space subdivision; retain its final check.
+        positions = np.asarray(positions)
+        subdivisions = np.maximum(
+            1, np.ceil(np.max(np.abs(np.diff(positions, axis=0)), axis=1) / 0.04)
+        ).astype(int)
+        if np.all(subdivisions == 1):
+            # Dense references need no interpolation. Check every distinct pose,
+            # but only once for exact repeats (dwells and retraced sweeps).
+            # No rounding or temporal decimation: nearby poses remain distinct.
+            return not any(self._in_collision(q) for q in np.unique(positions, axis=0))
         previous = positions[0]
         if self._in_collision(previous):
             return False
-        for q in positions[1:]:
-            pieces = max(1, int(np.ceil(np.max(np.abs(q - previous)) / 0.04)))
+        for q, pieces in zip(positions[1:], subdivisions):
             for part in range(1, pieces + 1):
                 if self._in_collision(previous + (q - previous) * (part / pieces)):
                     return False
@@ -214,14 +222,18 @@ class SysIdEngine:
         raise ValueError('No sufficiently exciting collision-free SysID trajectory within limits; '
                          'choose a different center or larger excitation bounds')
 
-    def generate_identification_trajectory(self, q0, max_pos_limits):
+    def generate_identification_trajectory(self, q0, max_pos_limits, progress=None):
         """Keep Fourier excitation intact; append smooth, paired low-speed sweeps.
 
         One Supervisor-owned trajectory preserves the existing session/mode flow.
         All six axes move together; every speed is visited in both directions and
         each pair returns to the center. No plant friction parameters are read.
         """
+        if progress is not None:
+            progress('Checking Fourier trajectory collisions...')
         self.generate_fourier_coefficients(q0, max_pos_limits)
+        if progress is not None:
+            progress('Checking low-speed trajectory collisions...')
         self.high_speed_duration = self.T_total
         q0 = np.asarray(q0, dtype=float)
         room = np.minimum(q0 - self.limits[:, 0], self.limits[:, 1] - q0)

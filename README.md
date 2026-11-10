@@ -258,7 +258,15 @@ Coulomb-only behavior (`Fs=Fc`).
 
 SysID references use an exact 1 ms grid, matching the 1000 Hz CTC loop and
 joint feedback. Trajectory generation and message construction run in the
-background. Recorded timestamps are aligned to the first CTC execution cycle,
+background. The HMI immediately displays preparation progress (model loading,
+Fourier/low-speed collision checks, message construction and Supervisor acceptance)
+and blocks duplicate starts and local manual motion requests during preparation.
+This feedback does not change the robot mode: the Supervisor still authorizes
+SysID after preflight. Dense-path checks deduplicate only exactly identical poses;
+all distinct samples and required subdivisions remain checked, and the planner
+still validates the complete trajectory before execution. Preparation timings are
+logged separately for model/validation and samples/message construction.
+Recorded timestamps are aligned to the first CTC execution cycle,
 correlated by the excitation Action UUID, rather than to receipt of a GUI state
 notification. Each low-speed plateau reports usable duration and the fractions
 rejected by velocity and acceleration checks; the fit quality limits remain enforced.

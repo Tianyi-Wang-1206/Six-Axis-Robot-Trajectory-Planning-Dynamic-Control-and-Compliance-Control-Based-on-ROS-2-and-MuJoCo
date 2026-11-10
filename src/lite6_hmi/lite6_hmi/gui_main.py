@@ -143,6 +143,7 @@ class PyQtHMI(QMainWindow):
         self.worker.telemetry_signal.connect(self.on_telemetry_updated)
         self.worker.state_signal.connect(self.on_state_updated)
         self.worker.sysid_yaml_signal.connect(self.on_sysid_yaml_updated)
+        self.worker.sysid_preparation_signal.connect(self.on_sysid_preparation_updated)
         self.worker.command_error_signal.connect(self.on_command_error)
         self.worker.recovery_complete_signal.connect(self.on_recovery_completed)
         self._supervisor_offline_displayed = False
@@ -731,14 +732,23 @@ class PyQtHMI(QMainWindow):
 
     def on_state_updated(self, state, error_msg):
         """Processes state transition events safely."""
+        with self.worker.state_lock:
+            preparation = self.worker.sysid_preparation_status
+        self.btn_run_sysid.setEnabled(state == Lite6StateMachine.IDLE and not preparation)
+        self.btn_run_sysid.setText(
+            preparation if preparation else "Start Automated Identification Routine")
         # Keep long per-branch diagnostics readable without expanding the banner.
         self.state_banner.setToolTip(error_msg)
         error_summary = error_msg.splitlines()[0] if error_msg else ""
         if len(error_summary) > 140:
             error_summary = error_summary[:137] + "..."
         if state == Lite6StateMachine.IDLE:
-            self.set_banner_color("#27ae60") # Emerald
-            self.state_banner.setText("SYSTEM READY")
+            if preparation:
+                self.set_banner_color("#8e44ad")
+                self.state_banner.setText(f"SYSID PREPARATION: {preparation}")
+            else:
+                self.set_banner_color("#27ae60") # Emerald
+                self.state_banner.setText("SYSTEM READY")
         elif state == Lite6StateMachine.ERROR:
             self.set_banner_color("#c0392b") # Alizarin red
             self.state_banner.setText(f"SYSTEM FAULT: {error_summary}")
@@ -755,6 +765,15 @@ class PyQtHMI(QMainWindow):
     def on_sysid_yaml_updated(self, yaml_string):
         self.txt_output.clear()
         self.txt_output.insertPlainText(yaml_string)
+
+    def on_sysid_preparation_updated(self):
+        # Read current values so a queued progress notification cannot overwrite
+        # a newer fault/mode or restore an obsolete preparation message.
+        if self._supervisor_offline_displayed:
+            return
+        with self.worker.state_lock:
+            state, detail = self.worker.state, self.worker.error_msg
+        self.on_state_updated(state, detail)
 
     def check_connection_watchdog(self):
         """Monitor *Supervisor* communications without a second state machine.
