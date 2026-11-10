@@ -16,6 +16,9 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
   
   auto_declare<std::vector<double>>("kp", {800.0, 800.0, 800.0, 800.0, 800.0, 800.0});
   auto_declare<std::vector<double>>("kv", {56.6, 56.6, 56.6, 56.6, 56.6, 56.6});
+  auto_declare<std::vector<double>>("ki", {1000.0, 1000.0, 700.0, 350.0, 150.0, 80.0});
+  auto_declare<std::vector<double>>("antiwindup_gain", {10.0, 10.0, 10.0, 10.0, 10.0, 10.0});
+  auto_declare<std::vector<double>>("integral_max_effort", {2.5, 2.5, 1.7, 0.85, 0.35, 0.18});
   auto_declare<std::vector<double>>("friction_v_nominal", {1.0, 1.0, 0.5, 0.2, 0.1, 0.05});
   auto_declare<std::vector<double>>("friction_c_nominal", {1.5, 1.5, 1.0, 0.5, 0.2, 0.1});
   // An omitted Fs array retains the previous Coulomb model (Fs == Fc).
@@ -25,6 +28,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
   
   auto_declare<std::vector<double>>("max_effort", {50.0, 50.0, 32.0, 32.0, 32.0, 20.0}); 
   auto_declare<double>("tanh_slope", 300.0);
+  auto_declare<std::vector<double>>("friction_error_gain", {5.0, 5.0, 5.0, 5.0, 5.0, 5.0});
 
   auto_declare<std::vector<double>>("estop_decel", {17.5, 12.5, 20.0, 40.0, 40.0, 50.0});
   
@@ -58,10 +62,15 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   
   e_.setZero(n); de_.setZero(n); a_d_.setZero(n);
   tau_fric_.setZero(n); tau_cmd_.setZero(n);
+  integral_effort_.setZero(n);
   q_target_.setZero(n); dq_target_.setZero(n); ddq_target_.setZero(n);
 
   auto kp_v = get_node()->get_parameter("kp").as_double_array();
   auto kv_v = get_node()->get_parameter("kv").as_double_array();
+  auto ki_v = get_node()->get_parameter("ki").as_double_array();
+  auto aw_v = get_node()->get_parameter("antiwindup_gain").as_double_array();
+  auto integral_limit_v = get_node()->get_parameter("integral_max_effort").as_double_array();
+  auto error_gain_v = get_node()->get_parameter("friction_error_gain").as_double_array();
   auto fv_v = get_node()->get_parameter("friction_v_nominal").as_double_array();
   auto fc_v = get_node()->get_parameter("friction_c_nominal").as_double_array();
   auto fs_v = get_node()->get_parameter("friction_s_nominal").as_double_array();
@@ -82,11 +91,43 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   auto arm_v = get_node()->get_parameter("armature").as_double_array();
   auto effort_limit_v = get_node()->get_parameter("max_effort").as_double_array();
   auto estop_decel_v = get_node()->get_parameter("estop_decel").as_double_array();
+  tanh_slope_ = get_node()->get_parameter("tanh_slope").as_double();
+  if (kp_v.size() != n || kv_v.size() != n || ki_v.size() != n || aw_v.size() != n ||
+      integral_limit_v.size() != n || error_gain_v.size() != n || arm_v.size() != n ||
+      effort_limit_v.size() != n || estop_decel_v.size() != n) {
+    RCLCPP_ERROR(get_node()->get_logger(), "Control parameter arrays must contain six values");
+    return controller_interface::CallbackReturn::ERROR;
+  }
+  if (!std::isfinite(tanh_slope_) || tanh_slope_ <= 0.0) {
+    RCLCPP_ERROR(get_node()->get_logger(), "tanh_slope must be finite and positive");
+    return controller_interface::CallbackReturn::ERROR;
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if (!std::isfinite(kp_v[i]) || kp_v[i] < 0.0 ||
+        !std::isfinite(kv_v[i]) || kv_v[i] < 0.0 ||
+        !std::isfinite(ki_v[i]) || ki_v[i] < 0.0 ||
+        !std::isfinite(aw_v[i]) || aw_v[i] < 0.0 ||
+        !std::isfinite(integral_limit_v[i]) || integral_limit_v[i] < 0.0 ||
+        !std::isfinite(error_gain_v[i]) || error_gain_v[i] < 0.0 ||
+        !std::isfinite(arm_v[i]) || arm_v[i] < 0.0 ||
+        !std::isfinite(effort_limit_v[i]) || effort_limit_v[i] <= 0.0 ||
+        !std::isfinite(estop_decel_v[i]) || estop_decel_v[i] <= 0.0 ||
+        integral_limit_v[i] > effort_limit_v[i] ||
+        (ki_v[i] > 0.0 && (aw_v[i] <= 0.0 || integral_limit_v[i] <= 0.0))) {
+      RCLCPP_ERROR(get_node()->get_logger(),
+        "Invalid joint%zu control parameters: require finite nonnegative gains/inertia, "
+        "positive effort/deceleration limits, and for ki > 0 a positive antiwindup_gain "
+        "and 0 < integral_max_effort <= max_effort", i + 1);
+      return controller_interface::CallbackReturn::ERROR;
+    }
+  }
 
   Kp_ = Eigen::MatrixXd::Zero(n, n);
   Kv_ = Eigen::MatrixXd::Zero(n, n);
   friction_v_.resize(n); friction_c_.resize(n); friction_s_.resize(n); friction_vs_.resize(n);
   armature_.resize(n); max_effort_.resize(n); estop_decel_.resize(n);
+  ki_.resize(n); antiwindup_gain_.resize(n); integral_max_effort_.resize(n);
+  friction_error_gain_.resize(n);
 
   for(size_t i=0; i<n; ++i) {
       Kp_(i, i) = kp_v[i]; Kv_(i, i) = kv_v[i]; 
@@ -94,8 +135,11 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
       friction_s_[i] = fs_v[i]; friction_vs_[i] = vs_v[i];
       max_effort_[i] = effort_limit_v[i];
       estop_decel_[i] = estop_decel_v[i];
+      ki_[i] = ki_v[i];
+      antiwindup_gain_[i] = aw_v[i];
+      integral_max_effort_[i] = integral_limit_v[i];
+      friction_error_gain_[i] = error_gain_v[i];
   }
-  tanh_slope_ = get_node()->get_parameter("tanh_slope").as_double();
 
   cmd_buffer_.writeFromNonRT(0);
   cmd_sub_ = get_node()->create_subscription<std_msgs::msg::Int32>(
@@ -140,6 +184,8 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
 controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcpp_lifecycle::State &)
 {
   size_t n = joint_names_.size();
+  // Never reuse a bias learned before deactivation or a hardware restart.
+  integral_effort_.setZero();
 
   for (size_t i = 0; i < n; ++i) {
     double initial_pos = state_interfaces_[i].get_value();
@@ -250,6 +296,8 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
 
   // 4. Branching Control Law
   if (system_state_ == SystemState::SYS_ID) {
+      // Identification must contain neither friction nor learned bias compensation.
+      integral_effort_.setZero();
       // Rotor inertia is known in every mode; only friction is unidentified.
       a_d_.noalias() = ddq_target_ + (Kp_ * e_) + (Kv_ * de_);
       pinocchio::rnea(pin_model_, pin_data_, q_, dq_, a_d_);
@@ -267,15 +315,35 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
           const double magnitude = friction_c_[i] +
               (friction_s_[i] - friction_c_[i]) * std::exp(-ratio * ratio);
           tau_fric_[i] = friction_v_[i] * dq_[i] + magnitude *
-              std::tanh(tanh_slope_ * (dq_target_[i] + 5.0 * e_[i]));
-          tau_cmd_[i] = pin_data_.tau[i] + (armature_[i] * a_d_[i]) + tau_fric_[i];
+              std::tanh(tanh_slope_ * (dq_target_[i] + friction_error_gain_[i] * e_[i]));
+          // ki == 0 disables both integration and back-calculation for this joint.
+          if (ki_[i] == 0.0) integral_effort_[i] = 0.0;
+          tau_cmd_[i] = pin_data_.tau[i] + (armature_[i] * a_d_[i]) + tau_fric_[i] +
+              integral_effort_[i];
       }
   }
 
-  // 5. Hardware Limits
+  // 5. Limit the TOTAL effort, then update the bias for the NEXT control cycle.
   for (size_t i = 0; i < n; ++i) {
-      if (std::isnan(tau_cmd_[i])) tau_cmd_[i] = 0.0;
-      tau_cmd_[i] = std::clamp(tau_cmd_[i], -max_effort_[i], max_effort_[i]);
+      const double raw_effort = tau_cmd_[i];
+      if (!std::isfinite(raw_effort) || !std::isfinite(e_[i])) {
+          tau_cmd_[i] = 0.0;
+          integral_effort_[i] = 0.0;
+      } else {
+          tau_cmd_[i] = std::clamp(raw_effort, -max_effort_[i], max_effort_[i]);
+          if (system_state_ != SystemState::SYS_ID && ki_[i] > 0.0) {
+              // During ESTOP retain the holding bias without integrating position
+              // error. Back-calculation still unwinds bias if braking saturates.
+              // NORMAL resumes from this state; trajectory completion never resets it.
+              const double error_rate = system_state_ == SystemState::NORMAL ?
+                  ki_[i] * e_[i] : 0.0;
+              const double rate = error_rate +
+                  antiwindup_gain_[i] * (tau_cmd_[i] - raw_effort);
+              integral_effort_[i] = std::clamp(
+                  integral_effort_[i] + dt * rate,
+                  -integral_max_effort_[i], integral_max_effort_[i]);
+          }
+      }
       [[maybe_unused]] bool set_ok = command_interfaces_[i].set_value(tau_cmd_[i]);
   }
 

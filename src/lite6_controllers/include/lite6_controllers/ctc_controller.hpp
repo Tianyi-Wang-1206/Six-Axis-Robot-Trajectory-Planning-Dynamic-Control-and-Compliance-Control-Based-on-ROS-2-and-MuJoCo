@@ -80,7 +80,11 @@ private:
   // PD Control Matrices
   Eigen::MatrixXd Kp_, Kv_;
 
+  // Torque-domain integral: gains in Nm/(rad s), back-calculation in 1/s,
+  // and both the retained state and its limits in Nm.
+  Eigen::VectorXd ki_, antiwindup_gain_, integral_max_effort_, integral_effort_;
   Eigen::VectorXd friction_v_, friction_c_, friction_s_, friction_vs_, armature_;
+  Eigen::VectorXd friction_error_gain_;
   Eigen::VectorXd max_effort_;
   double tanh_slope_;
 

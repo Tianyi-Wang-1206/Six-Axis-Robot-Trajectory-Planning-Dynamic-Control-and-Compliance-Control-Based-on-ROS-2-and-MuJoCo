@@ -19,6 +19,15 @@ ctc_controller:
     kp: [800.0, 800.0, 800.0, 800.0, 800.0, 800.0]
     kv: [56.6, 56.6, 56.6, 56.6, 56.6, 56.6]
 
+    # Torque-domain integral gains [Nm/(rad s)]; ki=0 disables a joint's integral.
+    # Initial per-joint tuning for slow residual-error correction with LuGre friction.
+    ki: [5000.0, 5000.0, 3500.0, 1750.0, 750.0, 400.0]
+    # Back-calculation from TOTAL effort saturation [1/s], including during ESTOP.
+    antiwindup_gain: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+    # Retained integral torque limits [Nm]. NORMAL integrates without an error deadband;
+    # ESTOP retains the bias without error integration; SYS_ID disables and clears it.
+    integral_max_effort: [12.5, 12.5, 8.5, 4.25, 1.75, 0.9]
+
     # Known  rotor inertia, provided by the official MuJoCo model
     armature: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
 
@@ -33,6 +42,8 @@ ctc_controller:
     # Smooth compensation direction; low-speed identification uses steady sliding,
     # not this smoothing function. Keep in sync with the high-speed fit if changed.
     tanh_slope: 300.0
+    # Position-error injection into reference velocity [1/s], unchanged from 5*e.
+    friction_error_gain: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
 
     # Maximum torque of each joint (same as the xml file)
     max_effort : [50.0, 50.0, 32.0, 32.0, 32.0, 20.0]
