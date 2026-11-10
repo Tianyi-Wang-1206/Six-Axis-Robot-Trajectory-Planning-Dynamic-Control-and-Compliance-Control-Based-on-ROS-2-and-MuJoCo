@@ -73,7 +73,7 @@ public:
       },sensor_options);
     joints_sub_=create_subscription<sensor_msgs::msg::JointState>("/joint_states",rclcpp::QoS(10),
       [this](const sensor_msgs::msg::JointState::SharedPtr msg){on_joints(*msg);},sensor_options);
-    jtc_=rclcpp_action::create_client<FJT>(this,"/lite6_arm_controller/follow_joint_trajectory");
+    ctc_=rclcpp_action::create_client<FJT>(this,"/ctc_controller/follow_joint_trajectory");
     action_server_=rclcpp_action::create_server<Motion>(this,"industrial_motion",
       [this](const rclcpp_action::GoalUUID& id,std::shared_ptr<const Motion::Goal> goal){
         return on_goal(id,std::move(goal));
@@ -104,7 +104,7 @@ public:
   }
 
 private:
-  struct JTCOperation {
+  struct CTCOperation {
     std::string key;
     std::shared_ptr<MotionHandle> upper;
     FJTHandle::SharedPtr downstream;
@@ -116,10 +116,10 @@ private:
   KinematicsEngine kinematics_;
   MotionPlanner planner_;
   Supervisor supervisor_;
-  std::mutex joints_mutex_,jtc_mutex_;
+  std::mutex joints_mutex_,ctc_mutex_;
   MotionPlanner::InitialState actual_{};
   std::string current_accepted_key_;
-  std::unique_ptr<JTCOperation> operation_;
+  std::unique_ptr<CTCOperation> operation_;
   std::thread planner_thread_;
   rclcpp::CallbackGroup::SharedPtr io_group_;
   std::atomic<bool> shutdown_{false};
@@ -128,7 +128,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr cmd_pub_;
   rclcpp::Subscription<lite6_interfaces::msg::ControllerStatus>::SharedPtr controller_sub_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joints_sub_;
-  rclcpp_action::Client<FJT>::SharedPtr jtc_;
+  rclcpp_action::Client<FJT>::SharedPtr ctc_;
   rclcpp_action::Server<Motion>::SharedPtr action_server_;
   rclcpp::Service<lite6_interfaces::srv::SupervisorCommand>::SharedPtr command_service_;
   rclcpp::Service<lite6_interfaces::srv::SubmitSysIdTrajectory>::SharedPtr sysid_service_;
@@ -165,19 +165,19 @@ private:
   void do_effects(const Supervisor::Effects& effects) {
     // CTC ESTOP is requested immediately, before slower cancellation paths.
     if(effects.ctc_command>=0) issue_ctc_command(effects.ctc_command);
-    if(effects.cancel_active) cancel_jtc(effects.cancel_key);
+    if(effects.cancel_active) cancel_ctc(effects.cancel_key);
   }
-  void cancel_jtc(const std::string& key) {
+  void cancel_ctc(const std::string& key) {
     FJTHandle::SharedPtr downstream;
     {
-      std::lock_guard<std::mutex> lock(jtc_mutex_);
+      std::lock_guard<std::mutex> lock(ctc_mutex_);
       if(!operation_||operation_->key!=key) return;
       operation_->cancel_pending=true;
       downstream=operation_->downstream;
     }
     if(downstream) {
-      try {jtc_->async_cancel_goal(downstream);}
-      catch(const std::exception& e) {RCLCPP_WARN(get_logger(),"JTC cancel: %s",e.what());}
+      try {ctc_->async_cancel_goal(downstream);}
+      catch(const std::exception& e) {RCLCPP_WARN(get_logger(),"CTC cancel: %s",e.what());}
     }
   }
   rclcpp_action::GoalResponse on_goal(const rclcpp_action::GoalUUID& id,
@@ -215,7 +215,7 @@ private:
   rclcpp_action::CancelResponse on_cancel(const std::shared_ptr<MotionHandle>& gh) {
     const auto key=hex_uuid(gh->get_goal_id());
     if(!supervisor_.request_cancel(key)) return rclcpp_action::CancelResponse::REJECT;
-    cancel_jtc(key);publish_state();
+    cancel_ctc(key);publish_state();
     return rclcpp_action::CancelResponse::ACCEPT;
   }
   void on_accepted(const std::shared_ptr<MotionHandle>& gh) {
@@ -243,29 +243,29 @@ private:
       feedback->current_state=Motion::Feedback::STATE_WAITING_JTC;
       feedback->percent_complete=0;
       gh->publish_feedback(feedback);
-      dispatch_jtc(key,traj,gh);
+      dispatch_ctc(key,traj,gh);
     } catch(const MotionError& error) {
       finish_upper(key,gh,error.code,error.what(),0);
     } catch(const std::exception& error) {
       finish_upper(key,gh,Motion::Result::ERR_INTERNAL,error.what(),0);
     }
   }
-  void dispatch_jtc(const std::string& key,
+  void dispatch_ctc(const std::string& key,
       const trajectory_msgs::msg::JointTrajectory& trajectory,
       std::shared_ptr<MotionHandle> upper) {
     if(!supervisor_.permitted(key)) {
       finish_upper(key,upper,Motion::Result::ERR_CANCELLED,"Authorization revoked",0);return;
     }
-    if(!jtc_->wait_for_action_server(2s)) {
-      finish_upper(key,upper,Motion::Result::ERR_EXECUTION_ABORTED,"JTC unavailable",0);return;
+    if(!ctc_->wait_for_action_server(2s)) {
+      finish_upper(key,upper,Motion::Result::ERR_EXECUTION_ABORTED,"CTC unavailable",0);return;
     }
     if(!supervisor_.change_motion_phase(key,S::MOTION_WAITING_JTC)) {
-      finish_upper(key,upper,Motion::Result::ERR_CANCELLED,"Motion canceled before JTC dispatch",0);return;
+      finish_upper(key,upper,Motion::Result::ERR_CANCELLED,"Motion canceled before CTC dispatch",0);return;
     }
     const double duration=sec(trajectory.points.back().time_from_start);
     {
-      std::lock_guard<std::mutex> lock(jtc_mutex_);
-      operation_=std::make_unique<JTCOperation>();
+      std::lock_guard<std::mutex> lock(ctc_mutex_);
+      operation_=std::make_unique<CTCOperation>();
       operation_->key=key;operation_->upper=upper;
       operation_->duration=duration;
       operation_->dispatch_time=Clock::now();
@@ -275,18 +275,18 @@ private:
     // Cancellation may have arrived after the initial authorization check,
     // while the downstream goal slot was being prepared.
     if(!supervisor_.permitted(key)) {
-      finish_jtc(key,Motion::Result::ERR_CANCELLED,"Authorization revoked before JTC send");
+      finish_ctc(key,Motion::Result::ERR_CANCELLED,"Authorization revoked before CTC send");
       return;
     }
     FJT::Goal g;g.trajectory=trajectory;
     rclcpp_action::Client<FJT>::SendGoalOptions options;
     options.goal_response_callback=[this,key](const FJTHandle::SharedPtr& downstream) {
       if(!downstream) {
-        finish_jtc(key,Motion::Result::ERR_EXECUTION_ABORTED,"JTC rejected goal");return;
+        finish_ctc(key,Motion::Result::ERR_EXECUTION_ABORTED,"CTC rejected goal");return;
       }
       bool should_cancel=false;
       {
-        std::lock_guard<std::mutex> lock(jtc_mutex_);
+        std::lock_guard<std::mutex> lock(ctc_mutex_);
         if(!operation_||operation_->key!=key) should_cancel=true;
         else {
           operation_->downstream=downstream;
@@ -294,8 +294,8 @@ private:
         }
       }
       if(should_cancel||!supervisor_.permitted(key)) {
-        try {jtc_->async_cancel_goal(downstream);}
-        catch(const std::exception& e) {RCLCPP_WARN(get_logger(),"JTC cancellation: %s",e.what());}
+        try {ctc_->async_cancel_goal(downstream);}
+        catch(const std::exception& e) {RCLCPP_WARN(get_logger(),"CTC cancellation: %s",e.what());}
       }
     };
     options.feedback_callback=[this,key](FJTHandle::SharedPtr,
@@ -303,7 +303,7 @@ private:
       std::shared_ptr<MotionHandle> upper_goal;
       double duration=0;
       {
-        std::lock_guard<std::mutex> lock(jtc_mutex_);
+        std::lock_guard<std::mutex> lock(ctc_mutex_);
         if(!operation_||operation_->key!=key) return;
         upper_goal=operation_->upper;duration=operation_->duration;
       }
@@ -317,19 +317,19 @@ private:
       }
     };
     options.result_callback=[this,key](const FJTHandle::WrappedResult& wrapped) {
-      const std::string detail="JTC action status="+std::to_string(static_cast<int>(wrapped.code))+
+      const std::string detail="CTC action status="+std::to_string(static_cast<int>(wrapped.code))+
           (wrapped.result?", error_code="+std::to_string(wrapped.result->error_code)+
               ": "+wrapped.result->error_string:", result payload unavailable");
       if(wrapped.code==rclcpp_action::ResultCode::SUCCEEDED&&wrapped.result&&
          wrapped.result->error_code==FJT::Result::SUCCESSFUL)
-        finish_jtc(key,Motion::Result::SUCCESS,"JTC trajectory completed");
+        finish_ctc(key,Motion::Result::SUCCESS,"CTC trajectory completed");
       else if(wrapped.code==rclcpp_action::ResultCode::CANCELED)
-        finish_jtc(key,Motion::Result::ERR_CANCELLED,"JTC trajectory canceled\n"+detail);
-      else finish_jtc(key,Motion::Result::ERR_EXECUTION_ABORTED,"JTC execution failed\n"+detail);
+        finish_ctc(key,Motion::Result::ERR_CANCELLED,"CTC trajectory canceled\n"+detail);
+      else finish_ctc(key,Motion::Result::ERR_EXECUTION_ABORTED,"CTC execution failed\n"+detail);
     };
-    try {jtc_->async_send_goal(g,options);}
+    try {ctc_->async_send_goal(g,options);}
     catch(const std::exception& e) {
-      finish_jtc(key,Motion::Result::ERR_EXECUTION_ABORTED,e.what());
+      finish_ctc(key,Motion::Result::ERR_EXECUTION_ABORTED,e.what());
     }
     publish_state();
   }
@@ -349,11 +349,11 @@ private:
     }
     publish_state();
   }
-  void finish_jtc(const std::string& key,int32_t code,const std::string& message) {
+  void finish_ctc(const std::string& key,int32_t code,const std::string& message) {
     std::shared_ptr<MotionHandle> upper;
     double elapsed=0;
     {
-      std::lock_guard<std::mutex> lock(jtc_mutex_);
+      std::lock_guard<std::mutex> lock(ctc_mutex_);
       if(!operation_||operation_->key!=key) return; // stale callback / timed out
       upper=operation_->upper;
       elapsed=std::chrono::duration<double>(Clock::now()-operation_->dispatch_time).count();
@@ -395,19 +395,19 @@ private:
     }
     resp.accepted=true;
     resp.revision=supervisor_.snapshot().revision;
-    resp.message="Trajectory authorized and submitted to JTC; monitor supervisor state for completion";
-    dispatch_jtc(key,req.trajectory,nullptr);
+    resp.message="Trajectory authorized and submitted to CTC; monitor supervisor state for completion";
+    dispatch_ctc(key,req.trajectory,nullptr);
   }
   void on_heartbeat() {
     do_effects(supervisor_.watchdog());
     std::string timed_out;
     {
-      std::lock_guard<std::mutex> lock(jtc_mutex_);
+      std::lock_guard<std::mutex> lock(ctc_mutex_);
       if(operation_&&Clock::now()>operation_->deadline) timed_out=operation_->key;
     }
     if(!timed_out.empty()) {
-      cancel_jtc(timed_out);
-      finish_jtc(timed_out,Motion::Result::ERR_TIMEOUT,"JTC goal/result timeout");
+      cancel_ctc(timed_out);
+      finish_ctc(timed_out,Motion::Result::ERR_TIMEOUT,"CTC goal/result timeout");
     }
     publish_state();
   }

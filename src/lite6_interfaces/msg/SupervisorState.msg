@@ -19,6 +19,7 @@ uint8 mode
 
 uint8 MOTION_IDLE=0
 uint8 MOTION_PLANNING=1
+# Legacy constant name retained for compatibility; now waits for direct CTC acceptance.
 uint8 MOTION_WAITING_JTC=2
 uint8 MOTION_EXECUTING=3
 uint8 MOTION_CANCELING=4

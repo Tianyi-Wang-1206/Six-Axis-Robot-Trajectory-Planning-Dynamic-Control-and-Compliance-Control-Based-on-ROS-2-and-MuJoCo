@@ -7,6 +7,8 @@ endif()
 # 1. Find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(control_msgs REQUIRED)
 find_package(controller_interface REQUIRED)
 find_package(hardware_interface REQUIRED)
 find_package(pluginlib REQUIRED)
@@ -21,13 +23,15 @@ include_directories(${Boost_INCLUDE_DIRS})
 find_package(pinocchio REQUIRED)
 find_package(std_msgs REQUIRED)
 # 2. Compile the controller library
-add_library(${PROJECT_NAME} SHARED src/ctc_controller.cpp)
+add_library(${PROJECT_NAME} SHARED src/ctc_controller.cpp src/trajectory_execution.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 # Link dependencies
 ament_target_dependencies(${PROJECT_NAME}
   rclcpp
+  rclcpp_action
+  control_msgs
   controller_interface
   hardware_interface
   pluginlib
@@ -57,6 +61,6 @@ install(FILES lite6_controllers.xml
 # 5. Ament package
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME})
-ament_export_dependencies(rclcpp controller_interface hardware_interface pluginlib realtime_tools trajectory_msgs ament_index_cpp pinocchio lite6_interfaces)
+ament_export_dependencies(rclcpp rclcpp_action control_msgs controller_interface hardware_interface pluginlib realtime_tools trajectory_msgs ament_index_cpp pinocchio lite6_interfaces)
 
 ament_package()

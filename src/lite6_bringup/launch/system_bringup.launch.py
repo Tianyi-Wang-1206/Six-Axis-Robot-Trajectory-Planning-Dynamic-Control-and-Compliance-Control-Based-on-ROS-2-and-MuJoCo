@@ -80,15 +80,9 @@ def generate_launch_description():
         output='screen'
     )
 
-    # Load controllers: Joint State Broadcaster, CTC Controller, and JTC Controller
+    # Load controllers: Joint State Broadcaster and CTC Controller
     jsb_spawner = Node(package="controller_manager", executable="spawner", arguments=["joint_state_broadcaster"])
     ctc_spawner = Node(package="controller_manager", executable="spawner", arguments=["ctc_controller"])
-    jtc_spawner = Node(package="controller_manager", executable="spawner", arguments=["lite6_arm_controller"])
-
-    delay_jtc_after_ctc = RegisterEventHandler(
-        event_handler=OnProcessExit(target_action=ctc_spawner, on_exit=[jtc_spawner])
-    )
-
     # Planner and HMI nodes
     planner_node = Node(
         package='lite6_planner', 
@@ -103,13 +97,13 @@ def generate_launch_description():
         output='screen'
     )
 
-    delay_upper_layer_after_jtc = RegisterEventHandler(
-        event_handler=OnProcessExit(target_action=jtc_spawner, on_exit=[planner_node, hmi_node])
+    delay_upper_layer_after_ctc = RegisterEventHandler(
+        event_handler=OnProcessExit(target_action=ctc_spawner, on_exit=[planner_node, hmi_node])
     )
 
     return LaunchDescription([
         # 1. Basic nodes: control, state publisher, RViz, shadow robot state publisher, and controller spawners
         control_node, rsp_node, rviz_node, shadow_rsp_node, shadow_tf_node, jsb_spawner, ctc_spawner,
-        # 2. Mount the JTC controller after the CTC controller has been spawned, and then launch the planner and HMI nodes after the JTC controller is ready
-        delay_jtc_after_ctc, delay_upper_layer_after_jtc
+        # 2. Launch the planner and HMI after the direct trajectory CTC controller is ready.
+        delay_upper_layer_after_ctc
     ])

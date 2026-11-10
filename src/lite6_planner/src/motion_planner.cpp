@@ -14,12 +14,12 @@ namespace {
 using Action=lite6_interfaces::action::IndustrialMotion;
 using Vec6=Eigen::Matrix<double,6,1>;
 constexpr double kPi=3.14159265358979323846;
-constexpr double kDt=0.01;
+constexpr double kDt=0.001;
 constexpr double kTiny=1e-10;
 constexpr double kPathPosTolerance=7e-4;
 constexpr double kPathRotTolerance=7e-3;
-constexpr size_t kMaxPoints=30000;
-constexpr size_t kMaxIKSamples=2000;
+constexpr size_t kMaxPoints=300000;
+constexpr size_t kMaxIKSamples=20000;
 
 std::array<double,6> from_eigen(const Vec6& x) {
   std::array<double,6> result{};

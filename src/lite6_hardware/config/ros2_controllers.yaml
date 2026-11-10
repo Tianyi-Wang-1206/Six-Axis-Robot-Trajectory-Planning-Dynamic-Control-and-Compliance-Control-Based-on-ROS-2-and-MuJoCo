@@ -9,10 +9,6 @@ controller_manager:
     ctc_controller:
       type: lite6_controllers/Lite6CTCController
 
-    # 2. Declare the native JTC
-    lite6_arm_controller:
-      type: joint_trajectory_controller/JointTrajectoryController
-
 joint_state_broadcaster:  # Broadcaster for the joint states of the robot arm
   ros__parameters:
     publish_rate: 200
@@ -43,34 +39,3 @@ ctc_controller:
 
     # Deceleration (rad/s^2) of each joint when the emergency stop is triggered. This is used to compute the deceleration trajectory for each joint.
     estop_decel: [17.5, 12.5, 20.0, 40.0, 40.0, 50.0]  # 5x of the joint acceleration limits.
-
-# --- Joint Trajectory Control (JTC) Configuration ---
-lite6_arm_controller:
-  ros__parameters:
-
-    open_loop_control: true
-    allow_integration_in_goal_trajectories: true
-
-    joints:
-      - joint1
-      - joint2
-      - joint3
-      - joint4
-      - joint5
-      - joint6
-    
-    command_joints:
-      - ctc_controller/joint1
-      - ctc_controller/joint2
-      - ctc_controller/joint3
-      - ctc_controller/joint4
-      - ctc_controller/joint5
-      - ctc_controller/joint6
-      
-    command_interfaces:
-      - position
-      - velocity
-      - acceleration
-      
-    state_interfaces:
-      - position

@@ -70,14 +70,11 @@ graph TB
 
     %% Subgraph: Hard Real-Time ROS 2 Control Loop (1000Hz)
     subgraph Sub_R2C [ROS 2 Control Manager — Hard Real-Time 1000Hz Loop]
-        JTC[JointTrajectoryController<br/>Reference Forwarder &<br/>Fine Interpolator]:::R2C
-        CTC[Lite6CTCController<br/>Downstream CTC Controller]:::Custom
+        CTC[Lite6CTCController<br/>Direct Trajectory Playback & CTC]:::Custom
         JSB[JointStateBroadcaster]:::R2C
         KF[1D Kalman Filter<br/>State Observer]:::Custom
         Pinocchio[Pinocchio RBD Engine<br/>RNEA Solver]:::Custom
         
-        %% Chaining Mechanism
-        JTC ==>|Memory Pointer Sharing<br/>q_d, dq_d, ddq_d| CTC
         CTC <-->|computes M, C, G| Pinocchio
         KF -->|Filtered q, dq| CTC
     end
@@ -97,7 +94,7 @@ graph TB
 
     %% System Connections (Data Flow)
     Worker -->|Action Goal:<br/>IndustrialMotion.action| Action
-    Action ==>|Action Goal:<br/>FollowJointTrajectory| JTC
+    Action ==>|Action Goal:<br/>FollowJointTrajectory| CTC
     
     %% CTC Inputs & Outputs
     HW -->|Hardware State Interface<br/>Raw q_measured| KF
@@ -121,22 +118,24 @@ graph TB
     style Sub_Display fill:#f2f4f4,stroke:#ccd1d1,stroke-width:2px;
 ```
 
+The planner sends its complete sampled trajectory directly to `/ctc_controller/follow_joint_trajectory`. CTC holds the latest due position, velocity and acceleration sample without interpolation, and reports completion after consuming the final sample. Cancellation holds the measured position; the existing CTC emergency-stop deceleration remains unchanged. No JointTrajectoryController is loaded.
+
 The controller's architecture is shown in the diagram below:
 ```mermaid
 flowchart TD
     %% Define Styles
     classDef hardware fill:#2c3e50,stroke:#34495e,stroke-width:2px,color:#fff;
-    classDef jtc fill:#2980b9,stroke:#2980b9,stroke-width:2px,color:#fff;
+    classDef trajectory fill:#2980b9,stroke:#2980b9,stroke-width:2px,color:#fff;
     classDef data fill:#f39c12,stroke:#e67e22,stroke-width:2px,color:#fff,shape:pill;
     classDef calc fill:#ecf0f1,stroke:#bdc3c7,stroke-width:2px,color:#2c3e50;
     classDef sum fill:#e74c3c,stroke:#c0392b,stroke-width:2px,color:#fff,shape:circle;
 
     %% 1. Upstream Layer
-    subgraph L1 [Upper Layer: Trajectory Interpolation]
-        JTC[ROS 2<br/>Joint Trajectory Controller]:::jtc
-        JTC -- reference_interfaces --> Q_T([q_target]):::data
-        JTC -- reference_interfaces --> DQ_T([dq_target]):::data
-        JTC -- reference_interfaces --> DDQ_T([ddq_target]):::data
+    subgraph L1 [Upper Layer: Direct Sample Playback]
+        Samples[CTC reads planner samples<br/>by timestamp at 1000 Hz]:::trajectory
+        Samples -- q/dq/ddq --> Q_T([q_target]):::data
+        Samples -- q/dq/ddq --> DQ_T([dq_target]):::data
+        Samples -- q/dq/ddq --> DDQ_T([ddq_target]):::data
     end
 
     %% 2. Hardware Feedback

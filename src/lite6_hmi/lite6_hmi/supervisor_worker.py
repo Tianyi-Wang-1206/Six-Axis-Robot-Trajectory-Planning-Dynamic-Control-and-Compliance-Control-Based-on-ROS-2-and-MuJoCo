@@ -47,7 +47,7 @@ class Lite6StateMachine:
     SYSID_SEND_CMD = "SYSID: CONFIGURING HARDWARE..."
     SYSID_RUNNING = "SYSID: EXCITING TRAJECTORY..."
     SYSID_CALC = "SYSID: LEAST SQUARES SOLVING..."
-    SYSID_POST_ALIGN = "SYSID: ALIGNING JTC TARGETS..."
+    SYSID_POST_ALIGN = "SYSID: ALIGNING CTC TARGETS..."
     SYSID_RESTORE = "SYSID: RESTORING CLOSED-LOOP..."
 
 
@@ -78,7 +78,7 @@ def _view_state(msg):
     if msg.motion_phase == S.MOTION_PLANNING:
         return Lite6StateMachine.PLANNING
     if msg.motion_phase == S.MOTION_WAITING_JTC:
-        return "WAITING FOR JTC..."
+        return "WAITING FOR CTC..."
     if msg.motion_phase == S.MOTION_EXECUTING:
         return Lite6StateMachine.EXECUTING
     if msg.motion_phase == S.MOTION_CANCELING:

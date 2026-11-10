@@ -3,7 +3,11 @@
 
 #include <string>
 #include <vector>
-#include "controller_interface/chainable_controller_interface.hpp"
+#include <atomic>
+#include <mutex>
+#include "controller_interface/controller_interface.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
+#include "control_msgs/action/follow_joint_trajectory.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/int32.hpp"
 #include "realtime_tools/realtime_buffer.hpp"
@@ -19,7 +23,7 @@
 namespace lite6_controllers
 {
 
-class Lite6CTCController : public controller_interface::ChainableControllerInterface
+class Lite6CTCController : public controller_interface::ControllerInterface
 {
 public:
   Lite6CTCController();
@@ -30,14 +34,39 @@ public:
   controller_interface::CallbackReturn on_configure(const rclcpp_lifecycle::State & previous_state) override;
   controller_interface::CallbackReturn on_activate(const rclcpp_lifecycle::State & previous_state) override;
   controller_interface::CallbackReturn on_deactivate(const rclcpp_lifecycle::State & previous_state) override;
+  controller_interface::return_type update(const rclcpp::Time & time, const rclcpp::Duration & period) override;
 
 protected:
-  std::vector<hardware_interface::CommandInterface> on_export_reference_interfaces() override;
-  bool on_set_chained_mode(bool chained_mode) override;
-  controller_interface::return_type update_reference_from_subscribers(const rclcpp::Time & time, const rclcpp::Duration & period) override;
-  controller_interface::return_type update_and_write_commands(const rclcpp::Time & time, const rclcpp::Duration & period) override;
+  void update_trajectory_reference(const rclcpp::Duration & period);
+  controller_interface::return_type update_and_write_commands(const rclcpp::Time & time, const rclcpp::Duration & period);
 
 private:
+  using FollowTrajectory = control_msgs::action::FollowJointTrajectory;
+  using TrajectoryGoal = rclcpp_action::ServerGoalHandle<FollowTrajectory>;
+  enum class TrajectoryResult { RUNNING, SUCCEEDED, CANCELED, DEACTIVATED };
+  struct TrajectoryExecution {
+    explicit TrajectoryExecution(std::shared_ptr<TrajectoryGoal> handle) : goal(std::move(handle)) {}
+    const std::shared_ptr<TrajectoryGoal> goal;
+    std::atomic<bool> cancel{false};
+    std::atomic<TrajectoryResult> result{TrajectoryResult::RUNNING};
+    std::atomic<size_t> sample{0};
+    // Only the control thread accesses these playback fields.
+    double elapsed = 0.0;
+    bool started = false;
+    bool endpoint_applied = false;
+  };
+  void configure_trajectory_action();
+  bool valid_trajectory_goal(const FollowTrajectory::Goal & goal) const;
+  void monitor_trajectory();
+  std::vector<double> reference_interfaces_;
+  std::atomic<bool> trajectory_enabled_{false};
+  std::mutex trajectory_mutex_;  // Non-real-time callbacks only.
+  bool trajectory_reserved_ = false;
+  std::shared_ptr<TrajectoryExecution> active_trajectory_;
+  realtime_tools::RealtimeBuffer<std::shared_ptr<TrajectoryExecution>> trajectory_buffer_;
+  rclcpp_action::Server<FollowTrajectory>::SharedPtr trajectory_server_;
+  rclcpp::TimerBase::SharedPtr trajectory_monitor_;
+
   std::vector<std::string> joint_names_;
 
   pinocchio::Model pin_model_;

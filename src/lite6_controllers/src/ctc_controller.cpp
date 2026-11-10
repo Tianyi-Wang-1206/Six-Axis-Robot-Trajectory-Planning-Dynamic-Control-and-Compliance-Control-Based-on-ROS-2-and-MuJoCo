@@ -49,21 +49,6 @@ controller_interface::InterfaceConfiguration Lite6CTCController::state_interface
   return config;
 }
 
-std::vector<hardware_interface::CommandInterface> Lite6CTCController::on_export_reference_interfaces()
-{
-  std::vector<hardware_interface::CommandInterface> ref_interfaces;
-  size_t n = joint_names_.size();
-  for (size_t i = 0; i < n; ++i) {
-    ref_interfaces.push_back(hardware_interface::CommandInterface(get_node()->get_name(), joint_names_[i] + "/position", &reference_interfaces_[i]));
-    ref_interfaces.push_back(hardware_interface::CommandInterface(get_node()->get_name(), joint_names_[i] + "/velocity", &reference_interfaces_[n + i]));
-    ref_interfaces.push_back(hardware_interface::CommandInterface(get_node()->get_name(), joint_names_[i] + "/acceleration", &reference_interfaces_[2 * n + i]));
-  }
-  return ref_interfaces;
-}
-
-bool Lite6CTCController::on_set_chained_mode(bool) { return true; }
-controller_interface::return_type Lite6CTCController::update_reference_from_subscribers(const rclcpp::Time &, const rclcpp::Duration &) { return controller_interface::return_type::OK; }
-
 controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclcpp_lifecycle::State &)
 {
   size_t n = joint_names_.size();
@@ -148,6 +133,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   status_publish_counter_ = 0;
   status_publish_pending_ = true;
 
+  configure_trajectory_action();
   return controller_interface::CallbackReturn::SUCCESS;
 }
 
@@ -170,12 +156,25 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   // Never infer a mode from the last received system_cmd value.
   status_publish_counter_ = 0;
   status_publish_pending_ = true;
+  trajectory_enabled_.store(true);
   return controller_interface::CallbackReturn::SUCCESS;
 }
 
 controller_interface::CallbackReturn Lite6CTCController::on_deactivate(const rclcpp_lifecycle::State &)
 {
+  trajectory_enabled_.store(false);
+  std::lock_guard<std::mutex> lock(trajectory_mutex_);
+  if (active_trajectory_) {
+    active_trajectory_->result.store(TrajectoryResult::DEACTIVATED);
+  }
   return controller_interface::CallbackReturn::SUCCESS;
+}
+
+controller_interface::return_type Lite6CTCController::update(
+  const rclcpp::Time & time, const rclcpp::Duration & period)
+{
+  if (period.seconds() > 0.0) update_trajectory_reference(period);
+  return update_and_write_commands(time, period);
 }
 
 controller_interface::return_type Lite6CTCController::update_and_write_commands(
@@ -331,4 +330,4 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
 
 }  // namespace lite6_controllers
 
-PLUGINLIB_EXPORT_CLASS(lite6_controllers::Lite6CTCController, controller_interface::ChainableControllerInterface)
+PLUGINLIB_EXPORT_CLASS(lite6_controllers::Lite6CTCController, controller_interface::ControllerInterface)

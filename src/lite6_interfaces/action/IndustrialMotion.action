@@ -48,6 +48,7 @@ float64 execution_time
 # Feedback: preserve the previous meanings of 0 and 1.
 uint8 STATE_PLANNING=0
 uint8 STATE_EXECUTING=1
+# Legacy constant name retained for compatibility; now waits for direct CTC acceptance.
 uint8 STATE_WAITING_JTC=2
 uint8 STATE_CANCELING=3
 

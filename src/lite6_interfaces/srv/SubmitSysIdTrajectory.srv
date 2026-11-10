@@ -1,6 +1,6 @@
 # The GUI retains the Fourier excitation generator, but it must not
-# publish directly to JTC. Supervisor checks session, state and limits,
-# then exclusively submits the trajectory to JTC.
+# publish directly to CTC. Supervisor checks session, state and limits,
+# then exclusively submits the trajectory to CTC.
 uint64 session_id
 trajectory_msgs/JointTrajectory trajectory
 ---
