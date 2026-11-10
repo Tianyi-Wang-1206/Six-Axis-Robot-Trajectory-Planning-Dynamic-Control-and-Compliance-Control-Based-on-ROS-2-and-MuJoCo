@@ -138,13 +138,16 @@ class PyQtHMI(QMainWindow):
 
         # Build HMI Layout
         self.setup_ui()
+        self._command_notice = None
 
         # Connect ROS worker signals to GUI Main Thread slots
         self.worker.telemetry_signal.connect(self.on_telemetry_updated)
         self.worker.state_signal.connect(self.on_state_updated)
         self.worker.sysid_yaml_signal.connect(self.on_sysid_yaml_updated)
         self.worker.sysid_preparation_signal.connect(self.on_sysid_preparation_updated)
-        self.worker.command_error_signal.connect(self.on_command_error)
+        # A GUI command can report rejection while holding the worker's state
+        # lock. Always deliver the notice after that command has unwound.
+        self.worker.command_error_signal.connect(self.on_command_error, Qt.QueuedConnection)
         self.worker.recovery_complete_signal.connect(self.on_recovery_completed)
         self._supervisor_offline_displayed = False
 
@@ -700,14 +703,18 @@ class PyQtHMI(QMainWindow):
         """)
 
     def on_command_error(self, message):
-        # A rejected request is a notification, not a state transition.
+        # Reuse one non-modal notice. exec_() would keep the emitting call's
+        # state lock held during a nested Qt event loop, blocking ROS heartbeats
+        # while the GUI watchdog continues to run and falsely requests ESTOP.
         summary, _, detail = message.partition("\n")
-        notice = QMessageBox(QMessageBox.Warning, "Supervisor / Action Notice",
-                             summary, QMessageBox.Ok, self)
-        notice.setTextFormat(Qt.PlainText)
-        if detail:
-            notice.setDetailedText(detail)
-        notice.exec_()
+        if self._command_notice is None:
+            self._command_notice = QMessageBox(
+                QMessageBox.Warning, "Supervisor / Action Notice", "", QMessageBox.Ok, self)
+            self._command_notice.setTextFormat(Qt.PlainText)
+            self._command_notice.setWindowModality(Qt.NonModal)
+        self._command_notice.setText(summary)
+        self._command_notice.setDetailedText(detail)
+        self._command_notice.show()
 
     def on_recovery_completed(self):
         # Reproduce the original recovery UI synchronization, but only once
