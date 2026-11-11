@@ -192,6 +192,9 @@
   <ros2_control name="Lite6MuJoCo" type="system">
     <hardware>
       <plugin>lite6_hardware/Lite6MujocoSystem</plugin>
+      <!-- Independent 10 kHz physics thread. FIFO is attempted when permitted;
+           set 0 for normal scheduling. Check /simulation/diagnostics for lag. -->
+      <param name="physics_thread_priority">60</param>
     </hardware>
 
     <!-- Joint 1 -->

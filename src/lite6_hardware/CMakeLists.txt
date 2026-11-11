@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.8)
 project(lite6_hardware)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic -O3)
@@ -10,6 +12,8 @@ find_package(rclcpp REQUIRED)
 find_package(hardware_interface REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(ament_index_cpp REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
+find_package(Threads REQUIRED)
 
 set(MUJOCO_DIR $ENV{MUJOCO_DIR})
 include_directories(include ${MUJOCO_DIR}/include)
@@ -25,8 +29,9 @@ ament_target_dependencies(${PROJECT_NAME}
   hardware_interface
   pluginlib
   ament_index_cpp
+  diagnostic_msgs
 )
-target_link_libraries(${PROJECT_NAME} mujoco)
+target_link_libraries(${PROJECT_NAME} mujoco Threads::Threads)
 
 pluginlib_export_plugin_description_file(hardware_interface lite6_hardware.xml)
 
@@ -44,6 +49,6 @@ install(DIRECTORY config
 
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME})
-ament_export_dependencies(rclcpp hardware_interface pluginlib ament_index_cpp)
+ament_export_dependencies(rclcpp hardware_interface pluginlib ament_index_cpp diagnostic_msgs)
 
 ament_package()
