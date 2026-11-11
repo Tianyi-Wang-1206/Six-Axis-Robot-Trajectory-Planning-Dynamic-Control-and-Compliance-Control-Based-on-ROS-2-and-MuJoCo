@@ -16,8 +16,8 @@ joint_state_broadcaster:  # Broadcaster for the joint states of the robot arm
 # --- Computed Torque Control (CTC) Controller Configuration ---
 ctc_controller:
   ros__parameters:
-    kp: [800.0, 800.0, 800.0, 800.0, 800.0, 800.0]
-    kv: [56.6, 56.6, 56.6, 56.6, 56.6, 56.6]
+    kp: [3000.0, 3000.0, 3000.0, 3000.0, 3000.0, 3000.0]
+    kv: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
 
     # Torque-domain integral gains [Nm/(rad s)]; ki=0 disables a joint's integral.
     # Initial per-joint tuning for slow residual-error correction with LuGre friction.
