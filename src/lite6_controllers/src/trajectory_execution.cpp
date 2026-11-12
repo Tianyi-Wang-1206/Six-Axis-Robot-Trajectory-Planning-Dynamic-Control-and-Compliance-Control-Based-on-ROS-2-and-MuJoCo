@@ -214,11 +214,18 @@ void Lite6CTCController::finish_trajectory_cycle(double dt)
   }
   if (!execution->endpoint_applied) return;
 
+  // SYS_ID deliberately removes friction compensation and integral action, so
+  // static friction can leave a steady position error. Use its own bounded
+  // endpoint tolerance for excitation and post-alignment; NORMAL pre/return
+  // alignment keeps the precision tolerance. Mode changes still abort above.
+  const auto & position_tolerance =
+    execution->start_mode == static_cast<int>(SystemState::SYS_ID) ?
+    sysid_goal_position_tolerance_ : goal_position_tolerance_;
   double worst_ratio = 0.0;
   int worst_joint = -1;
   for (size_t i = 0; i < joint_names_.size(); ++i) {
     const double ratio = std::max(
-      std::abs(reference_interfaces_[i] - q_[i]) / goal_position_tolerance_[i],
+      std::abs(reference_interfaces_[i] - q_[i]) / position_tolerance[i],
       std::abs(dq_[i]) / goal_velocity_tolerance_[i]);
     if (ratio > worst_ratio) {worst_ratio = ratio; worst_joint = static_cast<int>(i);}
   }

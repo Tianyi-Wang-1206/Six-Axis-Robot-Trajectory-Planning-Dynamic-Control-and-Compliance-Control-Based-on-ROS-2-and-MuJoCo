@@ -429,12 +429,13 @@ class SysIdEngine:
 
         return ('# --- Two-stage identified friction parameters (not automatically applied) ---\n'
                 '# Stage 1: Fourier Fv/Fc. Stage 2: fixed Fv/Fc, fit Fs/vs; exponent=2.\n'
-                + '\n'.join(report) + '\n'
-                + '\n'.join('# ' + line for line in self.fit_diagnostics) + '\n'
                 f'friction_v_nominal: {format_list(friction[:, 0])}\n'
                 f'friction_c_nominal: {format_list(friction[:, 1])}\n'
                 f'friction_s_nominal: {format_list(stribeck[:, 0])}\n'
-                f'friction_vs_nominal: {format_list(stribeck[:, 1])}\n')
+                f'friction_vs_nominal: {format_list(stribeck[:, 1])}\n'
+                + '\n'.join(report) + '\n'
+                + '\n'.join('# ' + line for line in self.fit_diagnostics) + '\n'
+                )
 
     def _fit_stribeck(self, joint, times, velocity, acceleration, torque, dt, fv, fc):
         speeds, excesses = [], []
