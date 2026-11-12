@@ -31,6 +31,13 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
   auto_declare<std::vector<double>>("friction_error_gain", {5.0, 5.0, 5.0, 5.0, 5.0, 5.0});
 
   auto_declare<std::vector<double>>("estop_decel", {17.5, 12.5, 20.0, 40.0, 40.0, 50.0});
+  auto_declare<std::vector<double>>("execution.path_position_tolerance", std::vector<double>(6, 0.1));
+  auto_declare<std::vector<double>>("execution.path_velocity_tolerance", std::vector<double>(6, 0.5));
+  auto_declare<std::vector<double>>("execution.goal_position_tolerance", std::vector<double>(6, 0.01));
+  auto_declare<std::vector<double>>("execution.goal_velocity_tolerance", std::vector<double>(6, 0.01));
+  auto_declare<double>("execution.goal_settle_duration", 0.3);
+  auto_declare<double>("execution.goal_time_tolerance", 5.0);
+  auto_declare<double>("execution.saturation_timeout", 1.0);
   
   return controller_interface::CallbackReturn::SUCCESS;
 }
@@ -64,6 +71,39 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   tau_fric_.setZero(n); tau_cmd_.setZero(n);
   integral_effort_.setZero(n);
   q_target_.setZero(n); dq_target_.setZero(n); ddq_target_.setZero(n);
+  current_execution_ = nullptr;
+
+  path_position_tolerance_ = get_node()->get_parameter("execution.path_position_tolerance").as_double_array();
+  path_velocity_tolerance_ = get_node()->get_parameter("execution.path_velocity_tolerance").as_double_array();
+  goal_position_tolerance_ = get_node()->get_parameter("execution.goal_position_tolerance").as_double_array();
+  goal_velocity_tolerance_ = get_node()->get_parameter("execution.goal_velocity_tolerance").as_double_array();
+  goal_settle_duration_ = get_node()->get_parameter("execution.goal_settle_duration").as_double();
+  goal_time_tolerance_ = get_node()->get_parameter("execution.goal_time_tolerance").as_double();
+  saturation_timeout_ = get_node()->get_parameter("execution.saturation_timeout").as_double();
+  for (const auto * values : {&path_position_tolerance_, &path_velocity_tolerance_,
+      &goal_position_tolerance_, &goal_velocity_tolerance_}) {
+    if (values->size() != n || !std::all_of(values->begin(), values->end(),
+        [](double value) {return std::isfinite(value) && value > 0.0;})) {
+      RCLCPP_ERROR(get_node()->get_logger(), "Execution tolerances require six finite positive values");
+      return controller_interface::CallbackReturn::ERROR;
+    }
+  }
+  // The upstream planner's action deadline is trajectory duration + 12 seconds.
+  if (!std::isfinite(goal_settle_duration_) || goal_settle_duration_ <= 0.0 ||
+      !std::isfinite(goal_time_tolerance_) || goal_time_tolerance_ < goal_settle_duration_ ||
+      goal_time_tolerance_ > 10.0 || !std::isfinite(saturation_timeout_) ||
+      saturation_timeout_ <= 0.0) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+      "Require 0 < goal_settle_duration <= goal_time_tolerance <= 10 s and positive saturation_timeout");
+    return controller_interface::CallbackReturn::ERROR;
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if (goal_position_tolerance_[i] > path_position_tolerance_[i] ||
+        goal_velocity_tolerance_[i] > path_velocity_tolerance_[i]) {
+      RCLCPP_ERROR(get_node()->get_logger(), "Goal tolerances must not exceed path tolerances");
+      return controller_interface::CallbackReturn::ERROR;
+    }
+  }
 
   auto kp_v = get_node()->get_parameter("kp").as_double_array();
   auto kv_v = get_node()->get_parameter("kv").as_double_array();
@@ -141,10 +181,12 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
       friction_error_gain_[i] = error_gain_v[i];
   }
 
-  cmd_buffer_.writeFromNonRT(0);
+  cmd_buffer_.writeFromNonRT(ModeCommand{0, ++command_sequence_});
   cmd_sub_ = get_node()->create_subscription<std_msgs::msg::Int32>(
     "~/system_cmd", rclcpp::SystemDefaultsQoS(),
-    [this](const std_msgs::msg::Int32::SharedPtr msg) { cmd_buffer_.writeFromNonRT(msg->data); });
+    [this](const std_msgs::msg::Int32::SharedPtr msg) {
+      cmd_buffer_.writeFromNonRT(ModeCommand{msg->data, ++command_sequence_});
+    });
 
   try {
     std::string urdf_path = ament_index_cpp::get_package_share_directory("lite6_description") + "/urdf/lite6.urdf";
@@ -186,18 +228,23 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   size_t n = joint_names_.size();
   // Never reuse a bias learned before deactivation or a hardware restart.
   integral_effort_.setZero();
+  execution_stop_latched_ = false;
 
   for (size_t i = 0; i < n; ++i) {
     double initial_pos = state_interfaces_[i].get_value();
     q_[i] = initial_pos;
     dq_[i] = state_interfaces_[n + i].get_value();
+    if (!std::isfinite(q_[i]) || !std::isfinite(dq_[i])) {
+      trajectory_enabled_.store(false);
+      return controller_interface::CallbackReturn::ERROR;
+    }
     reference_interfaces_[i] = initial_pos;
     reference_interfaces_[n + i] = 0.0;
     reference_interfaces_[2 * n + i] = 0.0;
   }
   
   system_state_ = SystemState::NORMAL;
-  cmd_buffer_.writeFromNonRT(0);
+  cmd_buffer_.writeFromNonRT(ModeCommand{0, ++command_sequence_});
   // Force a fresh NORMAL observation on the first successful update.
   // Never infer a mode from the last received system_cmd value.
   status_publish_counter_ = 0;
@@ -211,7 +258,8 @@ controller_interface::CallbackReturn Lite6CTCController::on_deactivate(const rcl
   trajectory_enabled_.store(false);
   std::lock_guard<std::mutex> lock(trajectory_mutex_);
   if (active_trajectory_) {
-    active_trajectory_->result.store(TrajectoryResult::DEACTIVATED);
+    auto expected = TrajectoryResult::RUNNING;
+    active_trajectory_->result.compare_exchange_strong(expected, TrajectoryResult::DEACTIVATED);
   }
   return controller_interface::CallbackReturn::SUCCESS;
 }
@@ -219,12 +267,16 @@ controller_interface::CallbackReturn Lite6CTCController::on_deactivate(const rcl
 controller_interface::return_type Lite6CTCController::update(
   const rclcpp::Time & time, const rclcpp::Duration & period)
 {
-  if (period.seconds() > 0.0) update_trajectory_reference(time, period);
-  return update_and_write_commands(time, period);
+  current_execution_ = trajectory_buffer_.readFromRT()->get();
+  try {
+    return update_and_write_commands(time, period);
+  } catch (const std::exception &) {
+    return fail_controller(TrajectoryResult::CONTROL_EXCEPTION);
+  }
 }
 
 controller_interface::return_type Lite6CTCController::update_and_write_commands(
-  const rclcpp::Time & , const rclcpp::Duration & period)
+  const rclcpp::Time & time, const rclcpp::Duration & period)
 {
   double dt = period.seconds();
   if (dt <= 0.0) return controller_interface::return_type::OK;
@@ -234,11 +286,16 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   for (size_t i = 0; i < n; ++i) {
     q_[i] = state_interfaces_[i].get_value();
     dq_[i] = state_interfaces_[n + i].get_value();
+    if (!std::isfinite(q_[i]) || !std::isfinite(dq_[i]))
+      return fail_controller(TrajectoryResult::INVALID_STATE, static_cast<int>(i));
   }
 
+  update_trajectory_reference(time, period);
+
   // 2. State Machine & Kinematic Deceleration Trajectory Generation
-  int32_t* cmd_ptr = cmd_buffer_.readFromRT();
-  int32_t current_cmd = cmd_ptr ? *cmd_ptr : 0;
+  const auto * cmd_ptr = cmd_buffer_.readFromRT();
+  const int32_t current_cmd = cmd_ptr->value;
+  current_command_sequence_ = cmd_ptr->sequence;
 
   if (current_cmd == 1 && system_state_ != SystemState::ESTOP) {
       system_state_ = SystemState::ESTOP;
@@ -246,11 +303,13 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       estop_dq_ = dq_;
   } else if (current_cmd == 2 && system_state_ == SystemState::NORMAL) {
       system_state_ = SystemState::SYS_ID;
-  } else if (current_cmd == 0 && system_state_ != SystemState::NORMAL) {
+  } else if (current_cmd == 0 && system_state_ != SystemState::NORMAL &&
+      (!execution_stop_latched_ || current_command_sequence_ > execution_stop_sequence_)) {
       Eigen::Map<Eigen::VectorXd> map_q_d(reference_interfaces_.data(), n);
       if ((map_q_d - q_).cwiseAbs().maxCoeff() < 0.05 &&
           dq_.cwiseAbs().maxCoeff() < 0.01) {
           system_state_ = SystemState::NORMAL;
+          execution_stop_latched_ = false;
           for(size_t i=0; i<n; ++i) {
               reference_interfaces_[i] = q_[i];
               reference_interfaces_[n+i] = 0.0;
@@ -258,6 +317,8 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
           }
       }
   }
+
+  check_trajectory_path();
 
   Eigen::Map<Eigen::VectorXd> map_q_d(reference_interfaces_.data(), n);
   Eigen::Map<Eigen::VectorXd> map_dq_d(reference_interfaces_.data() + n, n);
@@ -294,6 +355,8 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   // 3. Error Calculation
   e_ = q_target_ - q_;
   de_ = dq_target_ - dq_;
+  if (!e_.allFinite() || !de_.allFinite() || !ddq_target_.allFinite())
+    return fail_controller(TrajectoryResult::INVALID_COMMAND);
 
   // 4. Branching Control Law
   if (system_state_ == SystemState::SYS_ID) {
@@ -324,29 +387,35 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       }
   }
 
+  if (!a_d_.allFinite() || !tau_cmd_.allFinite())
+    return fail_controller(TrajectoryResult::INVALID_COMMAND);
+
   // 5. Limit the TOTAL effort, then update the bias for the NEXT control cycle.
   for (size_t i = 0; i < n; ++i) {
       const double raw_effort = tau_cmd_[i];
-      if (!std::isfinite(raw_effort) || !std::isfinite(e_[i])) {
-          tau_cmd_[i] = 0.0;
-          integral_effort_[i] = 0.0;
-      } else {
-          tau_cmd_[i] = std::clamp(raw_effort, -max_effort_[i], max_effort_[i]);
-          if (system_state_ != SystemState::SYS_ID && ki_[i] > 0.0) {
-              // During ESTOP retain the holding bias without integrating position
-              // error. Back-calculation still unwinds bias if braking saturates.
-              // NORMAL resumes from this state; trajectory completion never resets it.
-              const double error_rate = system_state_ == SystemState::NORMAL ?
-                  ki_[i] * e_[i] : 0.0;
-              const double rate = error_rate +
-                  antiwindup_gain_[i] * (tau_cmd_[i] - raw_effort);
-              integral_effort_[i] = std::clamp(
-                  integral_effort_[i] + dt * rate,
-                  -integral_max_effort_[i], integral_max_effort_[i]);
-          }
+      effort_saturated_[i] = std::abs(raw_effort) > max_effort_[i];
+      tau_cmd_[i] = std::clamp(raw_effort, -max_effort_[i], max_effort_[i]);
+      if (system_state_ != SystemState::SYS_ID && ki_[i] > 0.0) {
+          // During ESTOP retain the holding bias without integrating position
+          // error. Back-calculation still unwinds bias if braking saturates.
+          // NORMAL resumes from this state; trajectory completion never resets it.
+          const double error_rate = system_state_ == SystemState::NORMAL ?
+              ki_[i] * e_[i] : 0.0;
+          const double rate = error_rate +
+              antiwindup_gain_[i] * (tau_cmd_[i] - raw_effort);
+          integral_effort_[i] = std::clamp(
+              integral_effort_[i] + dt * rate,
+              -integral_max_effort_[i], integral_max_effort_[i]);
       }
-      [[maybe_unused]] bool set_ok = command_interfaces_[i].set_value(tau_cmd_[i]);
   }
+  if (!integral_effort_.allFinite())
+    return fail_controller(TrajectoryResult::INVALID_COMMAND);
+  for (size_t i = 0; i < n; ++i) {
+    if (!command_interfaces_[i].set_value(tau_cmd_[i]))
+      return fail_controller(TrajectoryResult::COMMAND_WRITE, static_cast<int>(i));
+  }
+  // No success is published until this cycle's feedback and command writes pass.
+  finish_trajectory_cycle(dt);
 
   // 6. Publish shadow visualization at 200Hz (1000Hz / 5).
   publish_counter_++;
@@ -376,7 +445,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
     if (rt_status_pub_->trylock()) {
       auto & status = rt_status_pub_->msg_;
       status.stamp = get_node()->now();
-      const auto & execution = *trajectory_buffer_.readFromRT();
+      const auto * execution = current_execution_;
       status.trajectory_start = builtin_interfaces::msg::Time{};
       status.trajectory_id.fill(0);
       if (execution && execution->started) {

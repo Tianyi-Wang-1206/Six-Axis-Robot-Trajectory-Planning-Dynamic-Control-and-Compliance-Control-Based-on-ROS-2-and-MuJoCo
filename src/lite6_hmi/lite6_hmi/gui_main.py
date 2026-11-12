@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Lite6 industrial HMI. Visual presentation is unchanged from the original."""
 import os
 import sys
 import math

@@ -62,7 +62,8 @@ void Lite6CTCController::configure_trajectory_action()
     },
     [this](const std::shared_ptr<TrajectoryGoal> goal) {
       std::lock_guard<std::mutex> lock(trajectory_mutex_);
-      if (!active_trajectory_ || active_trajectory_->goal != goal)
+      if (!active_trajectory_ || active_trajectory_->goal != goal ||
+          active_trajectory_->result.load() != TrajectoryResult::RUNNING)
         return rclcpp_action::CancelResponse::REJECT;
       active_trajectory_->cancel.store(true);
       return rclcpp_action::CancelResponse::ACCEPT;
@@ -83,28 +84,26 @@ void Lite6CTCController::update_trajectory_reference(
   const rclcpp::Time & time, const rclcpp::Duration & period)
 {
   // The non-RT buffer retains ownership; no allocations, action calls or blocking locks here.
-  const auto & execution = *trajectory_buffer_.readFromRT();
+  auto * execution = current_execution_;
   if (!execution || execution->result.load() != TrajectoryResult::RUNNING) return;
   const size_t n = joint_names_.size();
   if (execution->cancel.load()) {
     for (size_t i = 0; i < n; ++i) {
-      reference_interfaces_[i] = state_interfaces_[i].get_value();
+      reference_interfaces_[i] = q_[i];
       reference_interfaces_[n + i] = 0.0;
       reference_interfaces_[2 * n + i] = 0.0;
     }
-    execution->result.store(TrajectoryResult::CANCELED);
-    return;
-  }
-  if (execution->endpoint_applied) {
-    // A full CTC update has consumed the exact endpoint before completion is reported.
-    execution->result.store(TrajectoryResult::SUCCEEDED);
+    execution->cancel_applied = true;
     return;
   }
   if (execution->started) execution->elapsed += period.seconds();
   else {
     execution->started = true;
     execution->start_time_ns = time.nanoseconds();
+    execution->start_mode = static_cast<int>(system_state_);
   }
+  // Hold the exact endpoint while the physical robot settles; keep timing it.
+  if (execution->endpoint_applied) return;
 
   const auto & points = execution->goal->get_goal()->trajectory.points;
   const auto next = std::upper_bound(points.begin(), points.end(), execution->elapsed,
@@ -121,6 +120,124 @@ void Lite6CTCController::update_trajectory_reference(
   }
   execution->sample.store(index);
   execution->endpoint_applied = index + 1 == points.size();
+}
+
+void Lite6CTCController::request_execution_stop()
+{
+  if (!execution_stop_latched_) {
+    execution_stop_sequence_ = current_command_sequence_;
+    execution_stop_latched_ = true;
+  }
+  if (system_state_ != SystemState::ESTOP) {
+    // Invalid feedback is handled by fail_controller(), not fed into the brake tracker.
+    if (q_.allFinite() && dq_.allFinite()) {
+      estop_q_ = q_;
+      estop_dq_ = dq_;
+    }
+    system_state_ = SystemState::ESTOP;
+  }
+  status_publish_pending_ = true;
+}
+
+void Lite6CTCController::fail_trajectory(
+  TrajectoryResult reason, int joint, double value, double limit)
+{
+  request_execution_stop();
+  auto * execution = current_execution_;
+  if (!execution || execution->result.load() != TrajectoryResult::RUNNING) return;
+  execution->failure_joint = joint;
+  execution->failure_value = value;
+  execution->failure_limit = limit;
+  execution->result.store(reason);
+}
+
+controller_interface::return_type Lite6CTCController::fail_controller(
+  TrajectoryResult reason, int joint)
+{
+  trajectory_enabled_.store(false);
+  fail_trajectory(reason, joint);
+  integral_effort_.setZero();
+  tau_cmd_.setZero();
+  // Best effort only: an inaccessible interface cannot be made writable here.
+  // ERROR asks controller_manager to deactivate this controller as well.
+  for (auto & command : command_interfaces_) {
+    try { (void)command.set_value(0.0); } catch (const std::exception &) {}
+  }
+  return controller_interface::return_type::ERROR;
+}
+
+void Lite6CTCController::check_trajectory_path()
+{
+  auto * execution = current_execution_;
+  if (!execution || execution->result.load() != TrajectoryResult::RUNNING ||
+      execution->cancel.load() || !execution->started) return;
+  // A trajectory admitted while already in ESTOP is the existing recovery
+  // reference-sync operation. Check its references, not the braking targets.
+  if (execution->start_mode != static_cast<int>(system_state_)) {
+    fail_trajectory(TrajectoryResult::MODE_CHANGED);
+    return;
+  }
+  const size_t n = joint_names_.size();
+  for (size_t i = 0; i < n; ++i) {
+    const double position_error = std::abs(reference_interfaces_[i] - q_[i]);
+    const double velocity_error = std::abs(reference_interfaces_[n + i] - dq_[i]);
+    if (position_error > path_position_tolerance_[i]) {
+      fail_trajectory(TrajectoryResult::PATH_POSITION, static_cast<int>(i),
+        position_error, path_position_tolerance_[i]);
+      return;
+    }
+    if (velocity_error > path_velocity_tolerance_[i]) {
+      fail_trajectory(TrajectoryResult::PATH_VELOCITY, static_cast<int>(i),
+        velocity_error, path_velocity_tolerance_[i]);
+      return;
+    }
+  }
+}
+
+void Lite6CTCController::finish_trajectory_cycle(double dt)
+{
+  auto * execution = current_execution_;
+  if (!execution || execution->result.load() != TrajectoryResult::RUNNING) return;
+  // Numerical/interface failures have already taken precedence over cancellation.
+  if (execution->cancel.load()) {
+    if (execution->cancel_applied) execution->result.store(TrajectoryResult::CANCELED);
+    return;
+  }
+  for (size_t i = 0; i < joint_names_.size(); ++i) {
+    auto & duration = execution->saturation_duration[i];
+    duration = effort_saturated_[i] ? duration + dt : 0.0;
+    if (duration >= saturation_timeout_) {
+      fail_trajectory(TrajectoryResult::SATURATION, static_cast<int>(i),
+        duration, saturation_timeout_);
+      return;
+    }
+  }
+  if (!execution->endpoint_applied) return;
+
+  double worst_ratio = 0.0;
+  int worst_joint = -1;
+  for (size_t i = 0; i < joint_names_.size(); ++i) {
+    const double ratio = std::max(
+      std::abs(reference_interfaces_[i] - q_[i]) / goal_position_tolerance_[i],
+      std::abs(dq_[i]) / goal_velocity_tolerance_[i]);
+    if (ratio > worst_ratio) {worst_ratio = ratio; worst_joint = static_cast<int>(i);}
+  }
+  // Do not credit an unobserved scheduling gap as continuously settled time.
+  if (worst_ratio <= 1.0) {
+    execution->settled_duration = execution->was_settled && dt <= 0.1 ?
+      execution->settled_duration + dt : 0.0;
+    execution->was_settled = true;
+  } else {
+    execution->settled_duration = 0.0;
+    execution->was_settled = false;
+  }
+  const double end_time = seconds(execution->goal->get_goal()->trajectory.points.back().time_from_start);
+  // The deadline includes the continuous settling window, not just first entry.
+  if (execution->elapsed > end_time + goal_time_tolerance_) {
+    fail_trajectory(TrajectoryResult::GOAL_TIMEOUT, worst_joint, worst_ratio, 1.0);
+  } else if (execution->settled_duration >= goal_settle_duration_) {
+    execution->result.store(TrajectoryResult::SUCCEEDED);
+  }
 }
 
 void Lite6CTCController::monitor_trajectory()
@@ -141,7 +258,7 @@ void Lite6CTCController::monitor_trajectory()
     return;
   }
   auto result = std::make_shared<FollowTrajectory::Result>();
-  if (execution->cancel.load()) {
+  if (outcome == TrajectoryResult::CANCELED) {
     // The cancel callback returns before rclcpp_action enters CANCELING.
     if (!goal->is_canceling()) return;
     result->error_code = FollowTrajectory::Result::SUCCESSFUL;
@@ -151,8 +268,38 @@ void Lite6CTCController::monitor_trajectory()
     result->error_code = FollowTrajectory::Result::SUCCESSFUL;
     goal->succeed(result);
   } else {
-    result->error_code = FollowTrajectory::Result::INVALID_GOAL;
-    result->error_string = "CTC controller deactivated";
+    result->error_code = outcome == TrajectoryResult::GOAL_TIMEOUT ?
+      FollowTrajectory::Result::GOAL_TOLERANCE_VIOLATED :
+      FollowTrajectory::Result::PATH_TOLERANCE_VIOLATED;
+    switch (outcome) {
+      case TrajectoryResult::PATH_POSITION:
+        result->error_string = "Path position tolerance violated [rad]"; break;
+      case TrajectoryResult::PATH_VELOCITY:
+        result->error_string = "Path velocity tolerance violated [rad/s]"; break;
+      case TrajectoryResult::GOAL_TIMEOUT:
+        result->error_string = "Goal tolerance deadline exceeded: position/velocity must remain "
+          "within tolerance for " + std::to_string(goal_settle_duration_) +
+          " s; normalized endpoint error"; break;
+      case TrajectoryResult::SATURATION:
+        result->error_string = "Continuous effort saturation timeout [s]"; break;
+      case TrajectoryResult::INVALID_STATE:
+        result->error_string = "Non-finite position/velocity feedback; controller stopped"; break;
+      case TrajectoryResult::INVALID_COMMAND:
+        result->error_string = "Non-finite control calculation; controller stopped"; break;
+      case TrajectoryResult::COMMAND_WRITE:
+        result->error_string = "Effort interface write failed; controller stopped"; break;
+      case TrajectoryResult::MODE_CHANGED:
+        result->error_string = "Controller mode changed during trajectory execution"; break;
+      case TrajectoryResult::CONTROL_EXCEPTION:
+        result->error_string = "Exception in control update; controller stopped"; break;
+      default:
+        result->error_string = "CTC controller deactivated"; break;
+    }
+    if (execution->failure_joint >= 0) {
+      result->error_string += "; " + joint_names_[execution->failure_joint] +
+        ", observed=" + std::to_string(execution->failure_value) +
+        ", limit=" + std::to_string(execution->failure_limit);
+    }
     goal->abort(result);
   }
   active_trajectory_.reset();

@@ -50,3 +50,13 @@ ctc_controller:
 
     # Deceleration (rad/s^2) of each joint when the emergency stop is triggered. This is used to compute the deceleration trajectory for each joint.
     estop_decel: [17.5, 12.5, 20.0, 40.0, 40.0, 50.0]  # 5x of the joint acceleration limits.
+
+    # Physical execution checks, in joint1..joint6 order; all values must be positive.
+    # A path error aborts immediately, including while holding the endpoint.
+    execution.path_position_tolerance: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]  # rad
+    execution.path_velocity_tolerance: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]  # rad/s
+    execution.goal_position_tolerance: [0.00015, 0.00015, 0.00015, 0.00015, 0.00015, 0.00015]  # rad
+    execution.goal_velocity_tolerance: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01]  # rad/s
+    execution.goal_settle_duration: 0.3  # Continuous in-tolerance time after the endpoint [s].
+    execution.goal_time_tolerance: 5.0  # Endpoint deadline allowance incl. settling [s], <= 10.
+    execution.saturation_timeout: 1.0  # Continuous clipping of any joint's total effort [s].

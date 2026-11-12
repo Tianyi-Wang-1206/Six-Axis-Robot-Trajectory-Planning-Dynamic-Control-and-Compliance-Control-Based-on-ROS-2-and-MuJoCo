@@ -5,6 +5,7 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include <array>
 #include "controller_interface/controller_interface.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "control_msgs/action/follow_joint_trajectory.hpp"
@@ -43,7 +44,11 @@ protected:
 private:
   using FollowTrajectory = control_msgs::action::FollowJointTrajectory;
   using TrajectoryGoal = rclcpp_action::ServerGoalHandle<FollowTrajectory>;
-  enum class TrajectoryResult { RUNNING, SUCCEEDED, CANCELED, DEACTIVATED };
+  enum class TrajectoryResult {
+    RUNNING, SUCCEEDED, CANCELED, DEACTIVATED, PATH_POSITION, PATH_VELOCITY,
+    GOAL_TIMEOUT, SATURATION, INVALID_STATE, INVALID_COMMAND, COMMAND_WRITE, MODE_CHANGED,
+    CONTROL_EXCEPTION
+  };
   struct TrajectoryExecution {
     explicit TrajectoryExecution(std::shared_ptr<TrajectoryGoal> handle) : goal(std::move(handle)) {}
     const std::shared_ptr<TrajectoryGoal> goal;
@@ -55,10 +60,33 @@ private:
     int64_t start_time_ns = 0;
     bool started = false;
     bool endpoint_applied = false;
+    bool cancel_applied = false;
+    int start_mode = 0;
+    double settled_duration = 0.0;
+    bool was_settled = false;
+    std::array<double, 6> saturation_duration{};
+    // Written before publishing a terminal result; read only after that result.
+    int failure_joint = -1;
+    double failure_value = 0.0;
+    double failure_limit = 0.0;
   };
   void configure_trajectory_action();
   bool valid_trajectory_goal(const FollowTrajectory::Goal & goal) const;
   void monitor_trajectory();
+  void check_trajectory_path();
+  void finish_trajectory_cycle(double dt);
+  void fail_trajectory(TrajectoryResult reason, int joint = -1,
+    double value = 0.0, double limit = 0.0);
+  controller_interface::return_type fail_controller(TrajectoryResult reason, int joint = -1);
+  void request_execution_stop();
+  // Borrowed from the RT buffer once per update; valid until the next RT read.
+  TrajectoryExecution * current_execution_ = nullptr;
+  std::vector<double> path_position_tolerance_, path_velocity_tolerance_;
+  std::vector<double> goal_position_tolerance_, goal_velocity_tolerance_;
+  double goal_settle_duration_ = 0.3;
+  double goal_time_tolerance_ = 5.0;
+  double saturation_timeout_ = 1.0;
+  std::array<bool, 6> effort_saturated_{};
   std::vector<double> reference_interfaces_;
   std::atomic<bool> trajectory_enabled_{false};
   std::mutex trajectory_mutex_;  // Non-real-time callbacks only.
@@ -97,7 +125,12 @@ private:
   Eigen::VectorXd estop_decel_;
   
   rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr cmd_sub_;
-  realtime_tools::RealtimeBuffer<int32_t> cmd_buffer_;
+  struct ModeCommand {int32_t value = 0; uint64_t sequence = 0;};
+  realtime_tools::RealtimeBuffer<ModeCommand> cmd_buffer_;
+  std::atomic<uint64_t> command_sequence_{0};
+  uint64_t current_command_sequence_ = 0;
+  uint64_t execution_stop_sequence_ = 0;
+  bool execution_stop_latched_ = false;
 
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr shadow_pub_;
   std::shared_ptr<realtime_tools::RealtimePublisher<sensor_msgs::msg::JointState>> rt_shadow_pub_;
