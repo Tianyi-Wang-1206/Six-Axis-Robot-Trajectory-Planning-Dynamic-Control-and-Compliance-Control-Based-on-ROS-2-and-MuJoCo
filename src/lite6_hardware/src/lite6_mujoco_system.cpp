@@ -31,6 +31,7 @@ int64_t Lite6MujocoSystem::steady_now_ns()
 
 void Lite6MujocoSystem::stop_physics()
 {
+  gripper_.deactivate();
   stop_requested_.store(true);
   if (physics_thread_.joinable()) {physics_thread_.join();}
   diagnostics_->active.store(false);
@@ -60,8 +61,8 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_init(
   qvel_indices_.clear();
   ctrl_indices_.clear();
 
-  if (info_.joints.size() != kJoints) {
-    RCLCPP_ERROR(rclcpp::get_logger("Lite6MujocoSystem"), "Expected exactly six joints");
+  if (info_.joints.size() != kJoints + 2) {
+    RCLCPP_ERROR(rclcpp::get_logger("Lite6MujocoSystem"), "Expected six arm joints and two state-only gripper joints");
     return hardware_interface::CallbackReturn::ERROR;
   }
   try {
@@ -81,7 +82,7 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_init(
   }
 
   // 1. Initialize hardware interface state and command vectors
-  size_t num_joints = info_.joints.size();
+  size_t num_joints = kJoints;
   hw_commands_effort_.resize(num_joints, 0.0);
   hw_states_position_.resize(num_joints, 0.0);
   hw_states_velocity_.resize(num_joints, 0.0);
@@ -119,7 +120,8 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_init(
   friction_models_.clear();
   friction_models_.reserve(num_joints);
   RCLCPP_INFO(rclcpp::get_logger("Lite6MujocoSystem"), "Mapping joints and motors...");
-  for (const auto & joint : info_.joints) {
+  for (size_t index = 0; index < kJoints; ++index) {
+    const auto & joint = info_.joints[index];
     const auto friction = std::find_if(
       kLite6LuGreParameters.begin(), kLite6LuGreParameters.end(),
       [&joint](const JointFrictionParameters & entry) {return joint.name == entry.name;});
@@ -158,6 +160,12 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_init(
       joint.name.c_str(), joint_id, act_id);
   }
 
+  try {
+    gripper_.initialize(m_model, m_data);
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR(rclcpp::get_logger("Lite6MujocoSystem"), "Gripper initialization: %s", e.what());
+    return hardware_interface::CallbackReturn::ERROR;
+  }
   mj_forward(m_model, m_data);
   StateSnapshot initial;
   publish_snapshot(initial);
@@ -181,6 +189,7 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_configure(
   }
   configure_diagnostics();
   configure_visualization();
+  gripper_.configure(get_node());
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -199,6 +208,7 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_activate(
   publish_snapshot(initial);
   stop_requested_.store(false);
   activation_ns_ = steady_now_ns();
+  gripper_.activate();
   diagnostics_->active.store(true);
   try {
     physics_thread_ = std::thread(&Lite6MujocoSystem::physics_loop, this);
@@ -255,7 +265,7 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_error(
 std::vector<hardware_interface::StateInterface> Lite6MujocoSystem::export_state_interfaces()
 {
   std::vector<hardware_interface::StateInterface> state_interfaces;
-  for (size_t i = 0; i < info_.joints.size(); ++i) {
+  for (size_t i = 0; i < kJoints; ++i) {
     state_interfaces.emplace_back(hardware_interface::StateInterface(
       info_.joints[i].name, hardware_interface::HW_IF_POSITION, &hw_states_position_[i]));
     state_interfaces.emplace_back(hardware_interface::StateInterface(
@@ -263,13 +273,20 @@ std::vector<hardware_interface::StateInterface> Lite6MujocoSystem::export_state_
     state_interfaces.emplace_back(hardware_interface::StateInterface(
       info_.joints[i].name, hardware_interface::HW_IF_EFFORT, &hw_states_effort_[i]));
   }
+  for (size_t i = 0; i < 2; ++i) {
+    const std::string name = i == 0 ? "gripper_left_finger" : "gripper_right_finger";
+    state_interfaces.emplace_back(name, "position", &gripper_feedback_.position[i]);
+    state_interfaces.emplace_back(name, "velocity", &gripper_feedback_.velocity[i]);
+    state_interfaces.emplace_back(name, "acceleration", &gripper_feedback_.acceleration[i]);
+    state_interfaces.emplace_back(name, "effort", &gripper_feedback_.effort[i]);
+  }
   return state_interfaces;
 }
 
 std::vector<hardware_interface::CommandInterface> Lite6MujocoSystem::export_command_interfaces()
 {
   std::vector<hardware_interface::CommandInterface> command_interfaces;
-  for (size_t i = 0; i < info_.joints.size(); ++i) {
+  for (size_t i = 0; i < kJoints; ++i) {
     command_interfaces.emplace_back(hardware_interface::CommandInterface(
       info_.joints[i].name, hardware_interface::HW_IF_EFFORT, &hw_commands_effort_[i]));
   }
@@ -282,7 +299,8 @@ hardware_interface::return_type Lite6MujocoSystem::read(
   if (diagnostics_->fault.load() != Fault::NONE) {return hardware_interface::return_type::ERROR;}
   // Only a complete snapshot crosses threads. Never read the live mjData here.
   const auto snapshot = states_.read();
-  for (size_t i = 0; i < info_.joints.size(); ++i) {
+  gripper_feedback_ = snapshot.gripper;
+  for (size_t i = 0; i < kJoints; ++i) {
     hw_states_position_[i] = snapshot.position[i];
     hw_states_velocity_[i] = snapshot.velocity[i];
     hw_states_effort_[i] = snapshot.effort[i];
@@ -305,6 +323,9 @@ hardware_interface::return_type Lite6MujocoSystem::read(
     sample.position = snapshot.position;
     sample.velocity = snapshot.velocity;
     sample.effort = snapshot.effort;
+    sample.gripper_position = snapshot.gripper.position;
+    sample.gripper_velocity = snapshot.gripper.velocity;
+    sample.gripper_acceleration = snapshot.gripper.acceleration;
     sysid_publisher_->unlockAndPublish();
   }
   return hardware_interface::return_type::OK;
@@ -361,9 +382,10 @@ bool Lite6MujocoSystem::advance_physics(int64_t boundary_ns, EffortCommand & app
     m_data->qfrc_applied[dof] = -friction_models_[i].step(
       m_data->qvel[dof], m_model->opt.timestep);
   }
+  gripper_.step(boundary_ns, now);
   const double expected_time = m_data->time + m_model->opt.timestep;
   mj_step(m_model, m_data);
-  bool valid = std::isfinite(m_data->time) && std::abs(m_data->time - expected_time) < 1e-9;
+  bool valid = gripper_.finite() && std::isfinite(m_data->time) && std::abs(m_data->time - expected_time) < 1e-9;
   for (size_t i = 0; i < kJoints; ++i) {
     valid = valid && std::isfinite(m_data->qpos[qpos_indices_[i]]) &&
       std::isfinite(m_data->qvel[qvel_indices_[i]]) &&
@@ -380,6 +402,7 @@ void Lite6MujocoSystem::publish_snapshot(StateSnapshot & snapshot)
     snapshot.velocity[i] = m_data->qvel[qvel_indices_[i]];
     snapshot.effort[i] = m_data->qfrc_actuator[qvel_indices_[i]];
   }
+  snapshot.gripper = gripper_.feedback();
   snapshot.simulation_time = m_data->time;
   snapshot.published_ns = steady_now_ns();
   if (snapshot.started) {
@@ -409,6 +432,8 @@ void Lite6MujocoSystem::configure_visualization()
       lite6_interfaces::msg::SimulationState message;
       message.position = state.position;
       message.velocity = state.velocity;
+      message.gripper_position = state.gripper.position;
+      message.gripper_velocity = state.gripper.velocity;
       message.simulation_time = state.simulation_time;
       message.active = diagnostics->active.load() && state.started &&
         diagnostics->fault.load() == Fault::NONE;
@@ -504,6 +529,7 @@ void Lite6MujocoSystem::physics_loop()
   } catch (...) {
     diagnostics_->fault.store(Fault::PHYSICS_EXCEPTION);
   }
+  gripper_.deactivate();
   diagnostics_->active.store(false);
 }
 

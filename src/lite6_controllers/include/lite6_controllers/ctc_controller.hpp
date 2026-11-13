@@ -102,6 +102,8 @@ private:
 
   pinocchio::Model pin_model_;
   pinocchio::Data pin_data_;
+  // Full articulated dynamics; command/reference/estop vectors stay six-axis.
+  Eigen::VectorXd dynamics_q_, dynamics_dq_, dynamics_ddq_;
 
   Eigen::VectorXd e_, de_, a_d_, tau_fric_, tau_cmd_;
   Eigen::VectorXd q_target_, dq_target_, ddq_target_;

@@ -59,6 +59,11 @@ controller_interface::InterfaceConfiguration Lite6CTCController::state_interface
   // Keep positions first, followed by velocities, in the requested interface order.
   for (const auto & joint : joint_names_) config.names.push_back(joint + "/position");
   for (const auto & joint : joint_names_) config.names.push_back(joint + "/velocity");
+  for (const auto * name : {"gripper_left_finger", "gripper_right_finger"}) {
+    for (const auto * field : {"position", "velocity", "acceleration"}) {
+      config.names.push_back(std::string(name) + "/" + field);
+    }
+  }
   return config;
 }
 
@@ -205,7 +210,21 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   try {
     std::string urdf_path = ament_index_cpp::get_package_share_directory("lite6_description") + "/urdf/lite6.urdf";
     pinocchio::urdf::buildModel(urdf_path, pin_model_);
+    if (pin_model_.nq != 8 || pin_model_.nv != 8) {
+      throw std::runtime_error("Expected six arm coordinates and two gripper coordinates");
+    }
+    for (size_t i = 0; i < 8; ++i) {
+      const auto name = i < 6 ? joint_names_[i] :
+        (i == 6 ? std::string("gripper_left_finger") : std::string("gripper_right_finger"));
+      const auto id = pin_model_.getJointId(name);
+      if (id >= pin_model_.njoints || pin_model_.joints[id].idx_q() != static_cast<int>(i)) {
+        throw std::runtime_error("Unexpected dynamics joint ordering");
+      }
+    }
     pin_data_ = pinocchio::Data(pin_model_);
+    dynamics_q_ = Eigen::VectorXd::Zero(8);
+    dynamics_dq_ = Eigen::VectorXd::Zero(8);
+    dynamics_ddq_ = Eigen::VectorXd::Zero(8);
   } catch (const std::exception& e) {
     RCLCPP_ERROR(get_node()->get_logger(), "Failed to load URDF");
     return controller_interface::CallbackReturn::ERROR;
@@ -305,6 +324,16 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       return fail_controller(TrajectoryResult::INVALID_STATE, static_cast<int>(i));
   }
 
+  dynamics_q_.head(6) = q_;
+  dynamics_dq_.head(6) = dq_;
+  for (size_t i = 0; i < 2; ++i) {
+    dynamics_q_[6+i] = state_interfaces_[2*n+3*i].get_value();
+    dynamics_dq_[6+i] = state_interfaces_[2*n+3*i+1].get_value();
+    dynamics_ddq_[6+i] = state_interfaces_[2*n+3*i+2].get_value();
+  }
+  if (!dynamics_q_.allFinite() || !dynamics_dq_.allFinite() || !dynamics_ddq_.tail(2).allFinite())
+    return fail_controller(TrajectoryResult::INVALID_STATE);
+
   update_trajectory_reference(time, period);
 
   // 2. State Machine & Kinematic Deceleration Trajectory Generation
@@ -379,14 +408,16 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       integral_effort_.setZero();
       // Rotor inertia is known in every mode; only friction is unidentified.
       a_d_.noalias() = ddq_target_ + (Kp_ * e_) + (Kv_ * de_);
-      pinocchio::rnea(pin_model_, pin_data_, q_, dq_, a_d_);
+      dynamics_ddq_.head(6) = a_d_;
+      pinocchio::rnea(pin_model_, pin_data_, dynamics_q_, dynamics_dq_, dynamics_ddq_);
       for(size_t i = 0; i < n; ++i) {
           tau_cmd_[i] = pin_data_.tau[i] + (armature_[i] * a_d_[i]);
       }
   } 
   else {
       a_d_.noalias() = ddq_target_ + (Kp_ * e_) + (Kv_ * de_);
-      pinocchio::rnea(pin_model_, pin_data_, q_, dq_, a_d_);
+      dynamics_ddq_.head(6) = a_d_;
+      pinocchio::rnea(pin_model_, pin_data_, dynamics_q_, dynamics_dq_, dynamics_ddq_);
       for(size_t i = 0; i < n; ++i) {
           // Steady-sliding Stribeck envelope; retain the existing smooth
           // reference/error-based direction policy and measured viscous term.

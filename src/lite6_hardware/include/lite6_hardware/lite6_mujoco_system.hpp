@@ -15,6 +15,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "lite6_hardware/lugre_friction.hpp"
 #include "lite6_hardware/simulation_exchange.hpp"
+#include "lite6_hardware/gripper_control.hpp"
 #include "lite6_interfaces/msg/sys_id_sample.hpp"
 #include "lite6_interfaces/msg/simulation_state.hpp"
 #include "lite6_interfaces/msg/mouse_perturbation.hpp"
@@ -61,6 +62,7 @@ private:
   struct StateSnapshot
   {
     std::array<double, kJoints> position{}, velocity{}, effort{};
+    GripperControl::Feedback gripper;
     double simulation_time = 0.0;
     double max_lag = 0.0;
     int64_t origin_ns = 0, boundary_ns = 0, published_ns = 0, command_ns = 0;
@@ -96,6 +98,9 @@ private:
   void release_model();
   void configure_diagnostics();
   void configure_visualization();
+
+  GripperControl gripper_;
+  GripperControl::Feedback gripper_feedback_;
 
   // mjData and LuGre state belong exclusively to physics_thread_ while active.
   mjModel * m_model = nullptr;

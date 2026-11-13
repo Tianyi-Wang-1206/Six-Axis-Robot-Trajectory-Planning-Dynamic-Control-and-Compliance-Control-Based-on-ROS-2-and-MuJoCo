@@ -56,6 +56,14 @@ public:
       qpos_[i] = model_->jnt_qposadr[joint];
       qvel_[i] = model_->jnt_dofadr[joint];
     }
+    for (size_t i = 0; i < 2; ++i) {
+      const int id = mj_name2id(model_.get(), mjOBJ_JOINT,
+        i == 0 ? "gripper_left_finger" : "gripper_right_finger");
+      if (id < 0) {throw std::runtime_error("Missing gripper display joint");}
+      gripper_qpos_[i] = model_->jnt_qposadr[id];
+      gripper_qvel_[i] = model_->jnt_dofadr[id];
+      data_->qpos[gripper_qpos_[i]] = shadow_->qpos[gripper_qpos_[i]] = i == 0 ? -0.0081 : 0.0081;
+    }
     mj_forward(model_.get(), data_.get());
     mj_forward(model_.get(), shadow_.get());
     mjv_defaultCamera(&camera_);
@@ -79,6 +87,12 @@ public:
         for (size_t i = 0; i < 6; ++i) {
           data_->qpos[qpos_[i]] = state.position[i];
           data_->qvel[qvel_[i]] = state.velocity[i];
+        }
+        for (size_t i = 0; i < 2; ++i) {
+          if (!std::isfinite(state.gripper_position[i]) || !std::isfinite(state.gripper_velocity[i])) {return;}
+          data_->qpos[gripper_qpos_[i]] = state.gripper_position[i];
+          data_->qvel[gripper_qvel_[i]] = state.gripper_velocity[i];
+          shadow_->qpos[gripper_qpos_[i]] = state.gripper_position[i];
         }
         data_->time = state.simulation_time;
         active_ = state.active;
@@ -319,6 +333,7 @@ private:
   mjvScene scene_{};
   mjrContext context_{};
   std::array<int, 6> qpos_{}, qvel_{};
+  std::array<int, 2> gripper_qpos_{}, gripper_qvel_{};
   rclcpp::Publisher<Target>::SharedPtr publisher_;
   rclcpp::Subscription<State>::SharedPtr state_subscription_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr shadow_subscription_;

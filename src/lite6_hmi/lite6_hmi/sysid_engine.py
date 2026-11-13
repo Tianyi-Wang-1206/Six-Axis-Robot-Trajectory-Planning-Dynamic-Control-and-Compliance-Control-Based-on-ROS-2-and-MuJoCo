@@ -37,7 +37,12 @@ class SysIdEngine:
     def __init__(self):
         desc = get_package_share_directory('lite6_description')
         planner = get_package_share_directory('lite6_planner')
-        urdf = os.path.join(desc, 'urdf', 'lite6.urdf')
+        # Full dynamics uses measured fingers; preflight uses their complete swept envelope.
+        self.dynamics_model = pin.buildModelFromUrdf(os.path.join(desc, 'urdf', 'lite6.urdf'))
+        self.dynamics_data = self.dynamics_model.createData()
+        if self.dynamics_model.nq != 8 or self.dynamics_model.nv != 8:
+            raise ValueError('Expected six arm and two gripper coordinates')
+        urdf = os.path.join(desc, 'urdf', 'lite6_arm.urdf')
         self.model = pin.buildModelFromUrdf(urdf)
         self.data = self.model.createData()
         with open(os.path.join(planner, 'config', 'kinematic_limits.yaml')) as stream:
@@ -369,11 +374,12 @@ class SysIdEngine:
         path = root / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ') +
                        f'_{session}.npz')
         keys = ('t', 'read_time', 'simulation_time', 'step', 'command_sequence',
-                'control_period', 'physics_lag', 'command_age', 'q', 'dq', 'tau_cmd')
+                'control_period', 'physics_lag', 'command_age', 'q', 'dq', 'tau_cmd',
+                'gripper_q', 'gripper_dq', 'gripper_ddq')
         arrays = {key: np.asarray([sample[key] for sample in self.record_data],
                                   dtype=np.int64 if key in ('step', 'command_sequence') else float)
                   for key in keys}
-        metadata = dict(schema=1, session=str(session), excitation_start_ros=origin,
+        metadata = dict(schema=2, session=str(session), excitation_start_ros=origin,
                         t_is_relative=origin is not None,
                         duration=self.T_total, high_speed_duration=self.high_speed_duration,
                         low_fit_windows=self.low_fit_windows,
@@ -415,7 +421,7 @@ class SysIdEngine:
             f'max applied command age={timing[:, 2].max():.6f} s')
         return (simulation[unique] + offset, *(
             np.array([d[key] for d in samples], dtype=float)[unique]
-            for key in ('q', 'dq', 'tau_cmd')))
+            for key in ('q', 'dq', 'tau_cmd', 'gripper_q', 'gripper_dq', 'gripper_ddq')))
 
     def calculate_least_squares(self) -> str:
         """Fit Fv/Fc first; freeze them while estimating Fs-Fc and vs.
@@ -426,13 +432,16 @@ class SysIdEngine:
         if self.high_speed_duration is None or not self.low_fit_windows:
             raise ValueError('Generate the two-stage SysID trajectory before fitting')
         self.fit_diagnostics = []
-        t_seq, q_seq, dq_seq, tau_seq = self._physical_samples()
+        t_seq, q_seq, dq_seq, tau_seq, gq_seq, gv_seq, ga_seq = self._physical_samples()
         if len(t_seq) < 5:
             raise ValueError('Fewer than five distinct physical snapshots')
         if (not np.isfinite(t_seq).all() or np.any(np.diff(t_seq) <= 0) or
                 any(x.shape != (len(t_seq), 6) or not np.isfinite(x).all()
                     for x in (q_seq, dq_seq, tau_seq))):
             raise ValueError('Invalid SysID samples or non-increasing timestamps')
+        if any(x.shape != (len(t_seq), 2) or not np.isfinite(x).all()
+               for x in (gq_seq, gv_seq, ga_seq)):
+            raise ValueError('Missing or invalid gripper dynamics feedback')
         if t_seq[0] > 0.25 or t_seq[-1] < self.T_total - 0.25:
             raise ValueError(f'Incomplete excitation recording: {t_seq[0]:.4f}..{t_seq[-1]:.4f} s; '
                              f'expected 0..{self.T_total:.4f} s on the CTC clock')
@@ -452,13 +461,20 @@ class SysIdEngine:
         low = t_uniform >= self.high_speed_duration
         ddq[low] = savgol_filter(dq, low_window, polyorder=3, deriv=1,
                                 delta=dt, axis=0)[low]
-        rigid_torque = np.array([pin.rnea(self.model, self.data, qi, vi, ai).copy()
-                                 for qi, vi, ai in zip(q, dq, ddq)])
+        gq, gv, ga = [interp1d(t_seq, values, axis=0)(t_uniform)
+                      for values in (gq_seq, gv_seq, ga_seq)]
+        full_q = np.column_stack((q, gq))
+        full_v = np.column_stack((dq, gv))
+        full_a = np.column_stack((ddq, ga))
+        rigid_torque = np.array([
+            pin.rnea(self.dynamics_model, self.dynamics_data, qi, vi, ai)[:6].copy()
+            for qi, vi, ai in zip(full_q, full_v, full_a)])
         # Full coupled inertia torque M(q)*ddq + rotor inertia, not a per-axis
         # scalar approximation. This bounds the dynamic term in a static fit.
         inertia_torque = np.zeros_like(rigid_torque)
-        bias = np.array([pin.rnea(self.model, self.data, qi, vi, np.zeros(6)).copy()
-                         for qi, vi in zip(q[low], dq[low])])
+        bias = np.array([
+            pin.rnea(self.dynamics_model, self.dynamics_data, qi, vi, np.zeros(8))[:6].copy()
+            for qi, vi in zip(full_q[low], full_v[low])])
         inertia_torque[low] = rigid_torque[low] - bias + self.ARMATURE * ddq[low]
         residual = tau - rigid_torque - self.ARMATURE * ddq
         friction = np.zeros((6, 2))

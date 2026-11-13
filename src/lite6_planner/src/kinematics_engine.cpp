@@ -108,6 +108,14 @@ bool KinematicsEngine::load_ik_config(const std::string& file) {
 bool KinematicsEngine::init_robot_model(const std::string& urdf, const std::string& srdf) {
   try {
     pinocchio::urdf::buildModel(urdf,pin_model_);
+    const auto flange = pin_model_.getFrameId("link6");
+    const auto tcp = pin_model_.getFrameId("link_eef");
+    if (flange >= pin_model_.nframes || tcp >= pin_model_.nframes ||
+        pin_model_.frames[flange].parentJoint != pin_model_.frames[tcp].parentJoint) {
+      throw std::runtime_error("Expected a fixed flange-to-TCP transform");
+    }
+    flange_to_tcp_ = pin_model_.frames[flange].placement.actInv(
+      pin_model_.frames[tcp].placement).toHomogeneousMatrix();
     std::vector<std::string> dirs;
     for(const auto& pkg:ament_index_cpp::get_packages_with_prefixes()) dirs.push_back(pkg.second+"/share");
     pinocchio::urdf::buildGeom(pin_model_,urdf,pinocchio::COLLISION,geom_model_,dirs);
@@ -388,7 +396,8 @@ IKResult KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
   }
 
   double raw[8][6];
-  raw_inverse_kinematics(T,raw);
+  // The analytical solver targets the original flange; all public poses use TCP.
+  raw_inverse_kinematics(T * flange_to_tcp_.inverse(),raw);
   struct Candidate {std::array<double,6> q; double cost;};
   std::vector<Candidate> candidates;
   bool blocked=false, jumped=false, singular=false;

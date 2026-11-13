@@ -11,3 +11,7 @@ float64 command_age
 float64[6] position
 float64[6] velocity
 float64[6] effort
+# Physical finger feedback for the full eight-coordinate rigid-body model.
+float64[2] gripper_position
+float64[2] gripper_velocity
+float64[2] gripper_acceleration

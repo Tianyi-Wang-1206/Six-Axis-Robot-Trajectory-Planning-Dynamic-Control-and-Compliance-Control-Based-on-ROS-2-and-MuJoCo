@@ -27,8 +27,8 @@ from std_msgs.msg import Int32
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
 from lite6_interfaces.action import IndustrialMotion
-from lite6_interfaces.msg import SupervisorState, MotionRejection, SysIdSample
-from lite6_interfaces.srv import SupervisorCommand, SubmitSysIdTrajectory
+from lite6_interfaces.msg import SupervisorState, MotionRejection, SysIdSample, GripperState
+from lite6_interfaces.srv import SupervisorCommand, SubmitSysIdTrajectory, GripperCommand
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from lite6_hmi.sysid_engine import SysIdEngine
@@ -96,6 +96,7 @@ class ROS2Worker(QThread):
     sysid_preparation_signal = pyqtSignal()
     command_error_signal = pyqtSignal(str)
     recovery_complete_signal = pyqtSignal()
+    gripper_signal = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -137,6 +138,12 @@ class ROS2Worker(QThread):
         self.joint_sub = self.node.create_subscription(
             JointState, "/joint_states", self.joint_cb, 200)
         self.sysid_sample_sub = None
+        self.gripper_state = None
+        self.last_gripper_rx_time = 0.0
+        self._gripper_future = None
+        self.gripper_client = self.node.create_client(GripperCommand, "/gripper/command")
+        self.gripper_sub = self.node.create_subscription(
+            GripperState, "/gripper/state", self._gripper_cb, 1)
 
         self.current_goal_handle = None
         self._motion_pending = False
@@ -166,7 +173,7 @@ class ROS2Worker(QThread):
         try:
             import os
             path = os.path.join(get_package_share_directory("lite6_description"),
-                                "urdf", "lite6.urdf")
+                                "urdf", "lite6_arm.urdf")
             self.model = pin.buildModelFromUrdf(path)
             self.data = self.model.createData()
             self.eef_frame_id = self.model.getFrameId("link_eef")
@@ -179,6 +186,55 @@ class ROS2Worker(QThread):
         except Exception as exc:
             self.sysid_calc = None
             self.node.get_logger().error(f"SysIdEngine initialization failed: {exc}")
+
+    def _gripper_cb(self, msg):
+        with self.state_lock:
+            self.gripper_state = msg
+            self.last_gripper_rx_time = time.monotonic()
+        self.gripper_signal.emit(msg)
+
+    def gripper_ready(self):
+        with self.state_lock:
+            s, g = self.supervisor_state, self.gripper_state
+            now = time.monotonic()
+            return bool(s is not None and g is not None and g.ready and g.active
+                        and now - self.last_gripper_rx_time < 0.25
+                        and now - self.last_supervisor_rx_time < 0.25
+                        and s.mode == SupervisorState.MODE_NORMAL
+                        and s.motion_phase == SupervisorState.MOTION_IDLE
+                        and s.motion_allowed and not s.estop_latched
+                        and not self.sysid_preparation_status and not self._motion_pending
+                        and self._gripper_future is None)
+
+    def command_gripper(self, command, stiffness=0.0, damping=0.0, max_force=0.0):
+        with self.state_lock:
+            if not self.gripper_ready():
+                self._report_error("Gripper requires fresh robot Ready feedback")
+                return
+            if not self.gripper_client.service_is_ready():
+                self._report_error("Gripper service unavailable")
+                return
+            request = GripperCommand.Request()
+            request.command = command
+            request.stiffness, request.damping, request.max_force = stiffness, damping, max_force
+            try:
+                future = self.gripper_client.call_async(request)
+                self._gripper_future = future
+                future.add_done_callback(self._gripper_response)
+            except Exception as exc:
+                self._gripper_future = None
+                self._report_error(f"Gripper request failed: {exc}")
+
+    def _gripper_response(self, future):
+        with self.state_lock:
+            if self._gripper_future is future:
+                self._gripper_future = None
+        try:
+            response = future.result()
+            if not response.accepted:
+                self._report_error(f"Gripper rejected: {response.detail}")
+        except Exception as exc:
+            self._report_error(f"Gripper request failed: {exc}")
 
     def run(self):
         try:
@@ -400,6 +456,9 @@ class ROS2Worker(QThread):
                 'q': np.asarray(msg.position, dtype=float),
                 'dq': np.asarray(msg.velocity, dtype=float),
                 'tau_cmd': np.asarray(msg.effort, dtype=float),
+                'gripper_q': np.asarray(msg.gripper_position, dtype=float),
+                'gripper_dq': np.asarray(msg.gripper_velocity, dtype=float),
+                'gripper_ddq': np.asarray(msg.gripper_acceleration, dtype=float),
             })
 
     def joint_cb(self, msg):

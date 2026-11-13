@@ -5,11 +5,12 @@ import math
 import numpy as np
 import rclpy
 from lite6_interfaces.action import IndustrialMotion
+from lite6_interfaces.srv import GripperCommand
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QLineEdit, QTabWidget, QGroupBox,
-    QFormLayout, QGridLayout, QMessageBox, QFrame, QStyle, QProgressBar
+    QFormLayout, QGridLayout, QMessageBox, QFrame, QStyle, QProgressBar, QDoubleSpinBox
 )
 from PyQt5.QtGui import QFont, QDoubleValidator, QPalette, QColor
 from lite6_hmi.supervisor_worker import ROS2Worker, Lite6StateMachine
@@ -148,6 +149,7 @@ class PyQtHMI(QMainWindow):
         # lock. Always deliver the notice after that command has unwound.
         self.worker.command_error_signal.connect(self.on_command_error, Qt.QueuedConnection)
         self.worker.recovery_complete_signal.connect(self.on_recovery_completed)
+        self.worker.gripper_signal.connect(self.on_gripper_updated)
         self._supervisor_offline_displayed = False
 
         # Render the cached snapshot as well as future transitions. A Worker
@@ -160,6 +162,81 @@ class PyQtHMI(QMainWindow):
         self.watchdog_timer = QTimer()
         self.watchdog_timer.timeout.connect(self.check_connection_watchdog)
         self.watchdog_timer.start(500)
+        self.gripper_timer = QTimer(self)
+        self.gripper_timer.timeout.connect(self.refresh_gripper_controls)
+        self.gripper_timer.start(100)
+
+    def setup_gripper_tab(self, tab):
+        layout = QVBoxLayout(tab)
+        self.gripper_status = QLabel("Waiting for gripper feedback...")
+        self.gripper_status.setWordWrap(True)
+        layout.addWidget(self.gripper_status)
+        note = QLabel("Wide gripper · Open / Close only\n"
+                      "Motion requires robot Ready. Leaving Ready engages the brake; "
+                      "send a new command after recovery.\nTCP: 81.1 mm along flange Z.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        actions = QHBoxLayout()
+        self.btn_gripper_open = QPushButton("Open / 松开")
+        self.btn_gripper_close = QPushButton("Close / 夹紧")
+        self.btn_gripper_open.clicked.connect(
+            lambda: self.worker.command_gripper(GripperCommand.Request.OPEN))
+        self.btn_gripper_close.clicked.connect(
+            lambda: self.worker.command_gripper(GripperCommand.Request.CLOSE))
+        actions.addWidget(self.btn_gripper_open)
+        actions.addWidget(self.btn_gripper_close)
+        layout.addLayout(actions)
+        group = QGroupBox("Impedance parameters")
+        form = QFormLayout(group)
+        self.gripper_parameters = []
+        for label, minimum, maximum, value, step in (
+                ("Stiffness K (N/m)", 100, 20000, 4000, 100),
+                ("Damping D (N·s/m)", 1, 200, 40, 1),
+                ("Motor force limit (N)", 0.5, 10, 10, 0.5)):
+            entry = QDoubleSpinBox()
+            entry.setRange(minimum, maximum)
+            entry.setDecimals(1)
+            entry.setSingleStep(step)
+            entry.setValue(value)
+            form.addRow(label, entry)
+            self.gripper_parameters.append(entry)
+        self.btn_gripper_apply = QPushButton("Apply parameters")
+        self.btn_gripper_apply.clicked.connect(lambda: self.worker.command_gripper(
+            GripperCommand.Request.CONFIGURE, *(x.value() for x in self.gripper_parameters)))
+        form.addRow(self.btn_gripper_apply)
+        self.gripper_applied = QLabel("Applied parameters: waiting for feedback")
+        self.gripper_applied.setWordWrap(True)
+        form.addRow(self.gripper_applied)
+        layout.addWidget(group)
+        layout.addStretch()
+        self._gripper_parameters_loaded = False
+        for button in (self.btn_gripper_open, self.btn_gripper_close, self.btn_gripper_apply):
+            button.setEnabled(False)
+
+    def on_gripper_updated(self, msg):
+        self.gripper_status.setText(
+            f"{msg.detail}\nMotor effort: {msg.effort:.2f} N · "
+            f"Brake: {'engaged' if msg.brake_engaged else 'released'}")
+        self.gripper_applied.setText(
+            f"Applied: K={msg.stiffness:g} N/m, D={msg.damping:g} N·s/m, "
+            f"limit={msg.max_force:g} N")
+        if not self._gripper_parameters_loaded:
+            for widget, value in zip(self.gripper_parameters,
+                                     (msg.stiffness, msg.damping, msg.max_force)):
+                widget.setValue(value)
+            self._gripper_parameters_loaded = True
+        self.refresh_gripper_controls()
+
+    def refresh_gripper_controls(self):
+        enabled = self.worker.gripper_ready()
+        for button in (self.btn_gripper_open, self.btn_gripper_close, self.btn_gripper_apply):
+            button.setEnabled(enabled)
+        # The transport checks heartbeat age independently of the state label.
+        import time
+        with self.worker.state_lock:
+            stale = time.monotonic() - self.worker.last_gripper_rx_time > 0.25
+        if stale:
+            self.gripper_status.setText("Gripper feedback offline; controls disabled")
 
     def setup_ui(self):
         main_widget = QWidget()
@@ -232,6 +309,10 @@ class PyQtHMI(QMainWindow):
         tab_sysid = QWidget()
         self.tabs.addTab(tab_sysid, "System Identification")
         self.setup_sysid_tab(tab_sysid)
+
+        tab_gripper = QWidget()
+        self.tabs.addTab(tab_gripper, "Gripper")
+        self.setup_gripper_tab(tab_gripper)
 
         # 3. Bottom Control Frame: Overrides, Home, Fault Recovery and E-Stop
         bot_frame = QWidget()

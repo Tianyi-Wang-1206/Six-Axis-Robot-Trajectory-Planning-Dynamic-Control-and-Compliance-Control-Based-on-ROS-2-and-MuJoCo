@@ -18,6 +18,7 @@ find_package(realtime_tools REQUIRED)
 find_package(Threads REQUIRED)
 find_package(glfw3 REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 
 set(MUJOCO_DIR $ENV{MUJOCO_DIR})
 if(NOT MUJOCO_DIR)
@@ -28,7 +29,7 @@ set(CMAKE_INSTALL_RPATH "${MUJOCO_DIR}/lib")
 include_directories(include ${MUJOCO_DIR}/include)
 link_directories(${MUJOCO_DIR}/lib)
 
-add_library(${PROJECT_NAME} SHARED src/lite6_mujoco_system.cpp)
+add_library(${PROJECT_NAME} SHARED src/lite6_mujoco_system.cpp src/gripper_control.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
@@ -41,6 +42,7 @@ ament_target_dependencies(${PROJECT_NAME}
   diagnostic_msgs
   lite6_interfaces
   realtime_tools
+  std_msgs
 )
 target_link_libraries(${PROJECT_NAME} mujoco Threads::Threads)
 
@@ -65,6 +67,6 @@ install(DIRECTORY config
 
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME})
-ament_export_dependencies(rclcpp hardware_interface pluginlib ament_index_cpp diagnostic_msgs lite6_interfaces realtime_tools)
+ament_export_dependencies(rclcpp hardware_interface pluginlib ament_index_cpp diagnostic_msgs lite6_interfaces realtime_tools std_msgs)
 
 ament_package()

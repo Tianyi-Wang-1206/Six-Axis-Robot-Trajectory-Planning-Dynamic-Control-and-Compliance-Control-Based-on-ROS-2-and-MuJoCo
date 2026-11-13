@@ -71,6 +71,7 @@ private:
   std::vector<double> ground_size_{3.0,3.0,0.1};
   std::vector<double> ground_pos_{0.0,0.0,-0.05};
   std::array<double,6> ik_weights_{{1.5,1.5,1.2,1.0,1.0,0.8}};
+  Eigen::Matrix4d flange_to_tcp_ = Eigen::Matrix4d::Identity();
   pinocchio::Model pin_model_;
   pinocchio::GeometryModel geom_model_;
 };

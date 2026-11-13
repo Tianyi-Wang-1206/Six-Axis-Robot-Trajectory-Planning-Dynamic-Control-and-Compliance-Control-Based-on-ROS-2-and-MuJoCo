@@ -1,0 +1,14 @@
+uint8 OPEN=1
+uint8 CLOSE=2
+uint8 CONFIGURE=3
+uint8 command
+# Used only for CONFIGURE; atomic, validated update of impedance parameters.
+# K: 100..20000 N/m; D: 1..200 N*s/m; force: 0.5..10 N (single motor).
+float64 stiffness
+float64 damping
+float64 max_force
+---
+# Accepted into the physics queue, not a claim of physical completion.
+bool accepted
+uint64 sequence
+string detail

@@ -54,7 +54,7 @@ public:
     const auto desc=ament_index_cpp::get_package_share_directory("lite6_description");
     const auto pkg=ament_index_cpp::get_package_share_directory("lite6_planner");
     if(!kinematics_.load_ik_config(pkg+"/config/ik_config.yaml")||
-       !kinematics_.init_robot_model(desc+"/urdf/lite6.urdf",pkg+"/config/lite6.srdf")||
+       !kinematics_.init_robot_model(desc+"/urdf/lite6_arm.urdf",pkg+"/config/lite6.srdf")||
        !kinematics_.load_limits(pkg+"/config/kinematic_limits.yaml"))
       throw std::runtime_error("Lite6 planning model / YAML initialization failed");
     io_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
