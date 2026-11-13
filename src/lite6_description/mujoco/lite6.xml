@@ -28,8 +28,8 @@
   </default>
 
   <asset>
-    <material name="white" rgba="0.9 0.9 0.88 1" specular="0.08" shininess="0.15"/>
-    <material name="silver" rgba=".753 .753 .753 1" specular="0.18" shininess="0.25"/>
+    <material name="white" rgba="1 1 1 1"/>
+    <material name="silver" rgba=".753 .753 .753 1"/>
 
     <!-- Same STL triangles with explicit original face normals. Loading STL
          directly regenerates smooth normals and hides the shell's facets. -->
