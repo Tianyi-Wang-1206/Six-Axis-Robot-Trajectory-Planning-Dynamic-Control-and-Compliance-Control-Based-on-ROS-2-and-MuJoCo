@@ -178,9 +178,9 @@ class PyQtHMI(QMainWindow):
         note.setWordWrap(True)
         layout.addWidget(note)
         actions = QHBoxLayout()
-        self.btn_gripper_open = QPushButton("Open / 松开")
-        self.btn_gripper_close = QPushButton("Close / 夹紧")
-        self.btn_gripper_stop = QPushButton("Stop / 停止")
+        self.btn_gripper_open = QPushButton("Open")
+        self.btn_gripper_close = QPushButton("Close")
+        self.btn_gripper_stop = QPushButton("Stop")
         self.btn_gripper_open.clicked.connect(
             lambda: self.worker.command_gripper(GripperCommand.Request.OPEN))
         self.btn_gripper_close.clicked.connect(
