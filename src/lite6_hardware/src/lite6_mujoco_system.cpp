@@ -18,6 +18,7 @@ namespace lite6_hardware
 Lite6MujocoSystem::~Lite6MujocoSystem()
 {
   if (diagnostics_timer_) {diagnostics_timer_->cancel();}
+  if (visualization_timer_) {visualization_timer_->cancel();}
   stop_physics();
   release_model();
 }
@@ -179,6 +180,7 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_configure(
       lite6_interfaces::msg::SysIdSample>>(sysid_transport_);
   }
   configure_diagnostics();
+  configure_visualization();
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -196,6 +198,7 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_activate(
   StateSnapshot initial;
   publish_snapshot(initial);
   stop_requested_.store(false);
+  activation_ns_ = steady_now_ns();
   diagnostics_->active.store(true);
   try {
     physics_thread_ = std::thread(&Lite6MujocoSystem::physics_loop, this);
@@ -338,6 +341,16 @@ hardware_interface::return_type Lite6MujocoSystem::write(
 
 bool Lite6MujocoSystem::advance_physics(int64_t boundary_ns, EffortCommand & applied)
 {
+  // Only this thread touches live mjData. Recompute the native spring against
+  // the current physics state, rather than holding a force computed at 60 Hz.
+  mju_zero(m_data->xfrc_applied, 6 * m_model->nbody);
+  const auto target = visualization_->targets.read();
+  const auto now = steady_now_ns();
+  if (target.issued_ns >= activation_ns_ && target.issued_ns <= boundary_ns &&
+    now >= target.issued_ns && now - target.issued_ns < 200000000 && target.perturb.active)
+  {
+    mjv_applyPerturbForce(m_model, m_data, &target.perturb);
+  }
   // A command takes effect at the first step START at or after its submission.
   // In particular, a new command cannot be applied to overdue historical steps.
   EffortCommand next;
@@ -375,6 +388,69 @@ void Lite6MujocoSystem::publish_snapshot(StateSnapshot & snapshot)
   }
   states_.publish(snapshot);
   diagnostics_->snapshots.publish(snapshot);
+  visualization_->snapshots.publish(snapshot);
+}
+
+void Lite6MujocoSystem::configure_visualization()
+{
+  if (visualization_timer_) {return;}
+  const auto node = get_node();
+  if (!node) {return;}
+  const auto exchange = visualization_;
+  const auto diagnostics = diagnostics_;
+  auto publisher = node->create_publisher<lite6_interfaces::msg::SimulationState>(
+    "/simulation/visual_state", rclcpp::QoS(1).best_effort());
+  // A dedicated consumer: neither read() nor the diagnostics timer shares its
+  // triple buffer. Callbacks capture shared storage, never the hardware object.
+  visualization_timer_ = node->create_wall_timer(std::chrono::milliseconds(8),
+    [exchange, diagnostics, publisher] {
+      if (!publisher->get_subscription_count()) {return;}
+      const auto state = exchange->snapshots.read();
+      lite6_interfaces::msg::SimulationState message;
+      message.position = state.position;
+      message.velocity = state.velocity;
+      message.simulation_time = state.simulation_time;
+      message.active = diagnostics->active.load() && state.started &&
+        diagnostics->fault.load() == Fault::NONE;
+      publisher->publish(message);
+    });
+  std::array<int, kJoints> bodies{};
+  for (size_t i = 0; i < kJoints; ++i) {
+    bodies[i] = mj_name2id(m_model, mjOBJ_BODY, ("link" + std::to_string(i + 1)).c_str());
+  }
+  mouse_subscription_ = node->create_subscription<lite6_interfaces::msg::MousePerturbation>(
+    "/simulation/mouse_perturbation", rclcpp::QoS(1).best_effort(),
+    [exchange, bodies](const lite6_interfaces::msg::MousePerturbation & message) {
+      MouseTarget target;
+      mjv_defaultPerturb(&target.perturb);
+      const auto now = steady_now_ns();
+      auto finite = [](const auto & values) {
+          return std::all_of(values.begin(), values.end(),
+            [](double v) {return std::isfinite(v) && std::abs(v) <= 100.0;});
+        };
+      const bool valid = message.issued_ns > 0 && message.issued_ns <= now &&
+        now - message.issued_ns < 200000000 &&
+        std::find(bodies.begin(), bodies.end(), message.body_id) != bodies.end() &&
+        (message.active == mjPERT_TRANSLATE || message.active == mjPERT_ROTATE) &&
+        finite(message.refpos) && finite(message.refselpos) &&
+        finite(message.refquat) && finite(message.localpos) &&
+        std::isfinite(message.localmass) && message.localmass > 0 && message.localmass < 100;
+      if (valid) {
+        target.issued_ns = message.issued_ns;
+        target.perturb.select = message.body_id;
+        target.perturb.active = message.active;
+        mju_copy3(target.perturb.refpos, message.refpos.data());
+        mju_copy3(target.perturb.refselpos, message.refselpos.data());
+        mju_copy4(target.perturb.refquat, message.refquat.data());
+        if (mju_normalize4(target.perturb.refquat) < 1e-6) {
+          target.perturb.active = 0;
+        }
+        mju_copy3(target.perturb.localpos, message.localpos.data());
+        target.perturb.localmass = message.localmass;
+      }
+      // Release, invalid messages and stale messages all clear the spring.
+      exchange->targets.publish(target);
+    });
 }
 
 void Lite6MujocoSystem::physics_loop()

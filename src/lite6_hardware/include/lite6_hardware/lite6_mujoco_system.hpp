@@ -16,6 +16,8 @@
 #include "lite6_hardware/lugre_friction.hpp"
 #include "lite6_hardware/simulation_exchange.hpp"
 #include "lite6_interfaces/msg/sys_id_sample.hpp"
+#include "lite6_interfaces/msg/simulation_state.hpp"
+#include "lite6_interfaces/msg/mouse_perturbation.hpp"
 #include "realtime_tools/realtime_publisher.hpp"
 
 #include <mujoco/mujoco.h>
@@ -76,6 +78,16 @@ private:
     std::atomic<int64_t> last_write_ns{0};
     std::atomic<int64_t> max_write_interval_ns{0};
   };
+  struct MouseTarget
+  {
+    mjvPerturb perturb{};
+    int64_t issued_ns = 0;
+  };
+  struct Visualization
+  {
+    detail::LatestSnapshot<StateSnapshot> snapshots;
+    detail::LatestSnapshot<MouseTarget> targets;
+  };
   static int64_t steady_now_ns();
   void physics_loop();
   bool advance_physics(int64_t boundary_ns, EffortCommand & applied);
@@ -83,6 +95,7 @@ private:
   void stop_physics();
   void release_model();
   void configure_diagnostics();
+  void configure_visualization();
 
   // mjData and LuGre state belong exclusively to physics_thread_ while active.
   mjModel * m_model = nullptr;
@@ -95,6 +108,10 @@ private:
   detail::LatestSnapshot<StateSnapshot> states_;
   std::shared_ptr<Diagnostics> diagnostics_ = std::make_shared<Diagnostics>();
   rclcpp::TimerBase::SharedPtr diagnostics_timer_;
+  std::shared_ptr<Visualization> visualization_ = std::make_shared<Visualization>();
+  rclcpp::TimerBase::SharedPtr visualization_timer_;
+  rclcpp::Subscription<lite6_interfaces::msg::MousePerturbation>::SharedPtr mouse_subscription_;
+  int64_t activation_ns_ = 0;  // Set before starting the physics thread.
   rclcpp::Publisher<lite6_interfaces::msg::SysIdSample>::SharedPtr sysid_transport_;
   // Published from read(), never from the physics thread; fixed-size and nonblocking.
   std::shared_ptr<realtime_tools::RealtimePublisher<lite6_interfaces::msg::SysIdSample>>

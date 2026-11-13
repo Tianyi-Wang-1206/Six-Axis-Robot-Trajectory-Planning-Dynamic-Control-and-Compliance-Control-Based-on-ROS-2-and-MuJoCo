@@ -16,8 +16,15 @@ find_package(diagnostic_msgs REQUIRED)
 find_package(lite6_interfaces REQUIRED)
 find_package(realtime_tools REQUIRED)
 find_package(Threads REQUIRED)
+find_package(glfw3 REQUIRED)
+find_package(sensor_msgs REQUIRED)
 
 set(MUJOCO_DIR $ENV{MUJOCO_DIR})
+if(NOT MUJOCO_DIR)
+  set(MUJOCO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../mujoco-3.9.0")
+endif()
+get_filename_component(MUJOCO_DIR "${MUJOCO_DIR}" ABSOLUTE)
+set(CMAKE_INSTALL_RPATH "${MUJOCO_DIR}/lib")
 include_directories(include ${MUJOCO_DIR}/include)
 link_directories(${MUJOCO_DIR}/lib)
 
@@ -36,6 +43,11 @@ ament_target_dependencies(${PROJECT_NAME}
   realtime_tools
 )
 target_link_libraries(${PROJECT_NAME} mujoco Threads::Threads)
+
+add_executable(mujoco_viewer src/mujoco_viewer.cpp)
+ament_target_dependencies(mujoco_viewer rclcpp ament_index_cpp sensor_msgs lite6_interfaces)
+target_link_libraries(mujoco_viewer mujoco glfw Threads::Threads)
+install(TARGETS mujoco_viewer DESTINATION lib/${PROJECT_NAME})
 
 pluginlib_export_plugin_description_file(hardware_interface lite6_hardware.xml)
 

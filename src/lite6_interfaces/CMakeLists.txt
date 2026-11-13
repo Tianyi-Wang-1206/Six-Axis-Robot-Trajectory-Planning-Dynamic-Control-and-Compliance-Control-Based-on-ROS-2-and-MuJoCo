@@ -12,6 +12,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/IndustrialMotion.action"
   "msg/ControllerStatus.msg"
   "msg/SysIdSample.msg"
+  "msg/SimulationState.msg"
+  "msg/MousePerturbation.msg"
   "msg/SupervisorState.msg"
   "msg/MotionRejection.msg"
   "srv/SupervisorCommand.srv"

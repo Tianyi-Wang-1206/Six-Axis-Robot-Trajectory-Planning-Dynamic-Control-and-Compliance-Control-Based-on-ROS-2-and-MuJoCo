@@ -11,7 +11,7 @@ At the core, a custom **Computed Torque Control (CTC)** controller based on **ro
 
 To bridge the gap between nominal simulation parameters and real-world physical discrepancies, an automated **system identification** (SysID) framework is integrated to extract joint-level viscous/Coulomb friction and motor armature coefficients, which are difficult to measure directly during manufacturing. Utilizing a bounded **Fourier excitation trajectory** coupled with an offline **Least-Squares solver**, the identified parameters align closely with the ground-truth physical properties defined in the URDF and MuJoCo XML files. Furthermore, the architecture incorporates a robust software emergency stop (E-Stop) and active recovery state machine. Upon triggering, it overrides high-level commands to execute precise, kinematic-limit-aware deceleration trajectories that safely halt the manipulator, while providing a seamless recovery sequence back to the active closed-loop tracking state.
 
-To facilitate real-time diagnostics and visual verification of tracking performance, the framework incorporates a synchronized **"shadow robot"** virtual twin. This visualization layer is driven directly by the real-time C++ CTC controller via a lock-free `RealtimePublisher`. It renders the exact internal target commands (`q_target_`) at 1000Hz (downsampled to 200Hz for RViz), representing the manipulator's theoretical kinematic state under zero-disturbance conditions. The shadow robot depicts pure kinematic targets, while the closed-loop CTC controller forces the physical manipulator to overcome physical disturbances (gravity, Coriolis, joint friction, etc.) to track this reference.
+To facilitate real-time diagnostics and visual verification of tracking performance, the framework incorporates a synchronized **"shadow robot"** virtual twin. This visualization layer is driven directly by the real-time C++ CTC controller via a lock-free `RealtimePublisher`. Press **S** in the native MuJoCo window to show the translucent cyan target robot. It renders the exact internal target commands (`q_target_`) at 1000Hz (published at 200Hz for the MuJoCo viewer), representing the manipulator's theoretical kinematic state under zero-disturbance conditions. The shadow robot depicts pure kinematic targets, while the closed-loop CTC controller forces the physical manipulator to overcome physical disturbances (gravity, Coriolis, joint friction, etc.) to track this reference.
 
 For detailed mathematical derivations of the analytical IK and Jacobian matrices, please refer to [Kinematics.pdf](Kinematics.pdf).
 
@@ -80,16 +80,15 @@ graph TB
     end
 
     %% Subgraph: MuJoCo Simulation Environment (1000Hz)
-    subgraph Sub_MuJoCo [MuJoCo Simulation Environment — 1000Hz]
+    subgraph Sub_MuJoCo [MuJoCo Simulation Environment — 10000Hz]
         HW[Lite6MujocoSystem<br/>Hardware Interface]:::Custom
         Engine[MuJoCo<br/>Effort Mode]:::Physics
         HW <-->|mj_step / C API| Engine
     end
 
     %% Subgraph: Shadow Robot Twin (Visualization Helper)
-    subgraph Sub_Display [Robot Graphical Display — 200Hz]
-        ShadowRSP[Shadow Robot<br/>State Publisher]:::Util
-        RViz[RViz2 Visualization]:::Util
+    subgraph Sub_Display [Native MuJoCo Display — 60 FPS]
+        Viewer[MuJoCo Native Viewer<br/>Separate process]:::Util
     end
 
     %% System Connections (Data Flow)
@@ -106,9 +105,9 @@ graph TB
     Worker -.->|SysID Mode Commands:<br/>Int32 /system_cmd| CTC
     
     %% Shadow Robot Flow (Direct from CTC)
-    CTC -.->|"RT Publisher (1000Hz -> 200Hz)"<br/>Topic /shadow/joint_states| ShadowRSP
-    ShadowRSP -.->|Shadow TFs| RViz
-    JSB -.->|Main Robot TFs| RViz
+    CTC -.->|"RT Publisher (1000Hz -> 200Hz)"<br/>Topic /shadow/joint_states| Viewer
+    HW -.->|Physics snapshots 125Hz| Viewer
+    Viewer -.->|Mouse spring target| HW
 
     %% Frequencies & Details annotations
     style Sub_GUI fill:#f4f6f9,stroke:#bdc3c7,stroke-width:2px;
@@ -363,6 +362,7 @@ chmod +x ./run_docker.sh
 
 **2. Build and Launch (Inside Docker):**
 ```bash
+rm -rf build install log
 colcon build --symlink-install
 source install/setup.bash
 ros2 launch lite6_bringup system_bringup.launch.py
@@ -392,10 +392,66 @@ rosdep install --from-paths src --ignore-src -r -y
 
 **3. Compile and Launch:**
 ```bash
+rm -rf build install log
 colcon build --symlink-install
 source install/setup.bash
 ros2 launch lite6_bringup system_bringup.launch.py
 ```
+
+### Native MuJoCo studio
+
+![Native MuJoCo studio](media/mujoco_studio.png)
+
+Bringup now opens a minimal native MuJoCo/GLFW window instead of RViz. It uses
+MuJoCo's official `mjv` / `mjr` renderer and perturbation APIs, without the generic
+`simulate` application's model editor, actuator sliders, reset, pause or profiler
+panels. The existing HMI remains responsible for robot commands.
+
+The scene places the robot on a 2.4 × 1.5 m workbench in a softly lit studio.
+The tabletop is at `z=0`, with the floor 0.8 m below it, preserving the base frame
+and existing Cartesian commands. The tabletop and floor have collision geometry;
+the legs and background are visual decoration, not planner collision obstacles.
+The planner's existing collision model is unchanged.
+
+| Input | Action |
+| --- | --- |
+| Left drag / right drag / wheel | Orbit / pan / zoom |
+| Double-click a robot link | Select the link |
+| Ctrl + right drag | Apply a spring force to the selected link |
+| Ctrl + left drag | Apply a spring torque |
+| Shift while dragging | Use the horizontal movement/rotation plane |
+| Home / S / H | Restore camera / toggle cyan target robot / toggle help |
+| Esc | Close the viewer; physics and HMI continue running |
+
+```bash
+# Default: 1280 × 800, 60 FPS target, shadows enabled
+ros2 launch lite6_bringup system_bringup.launch.py
+# Lower GPU cost, or start with the target overlay visible
+ros2 launch lite6_bringup system_bringup.launch.py viewer_shadows:=false viewer_shadow:=true
+# Headless operation
+ros2 launch lite6_bringup system_bringup.launch.py viewer:=false
+# Reopen only the display while the system is running
+ros2 run lite6_hardware mujoco_viewer
+```
+
+`viewer_fps` accepts 15–240 (default 60); achieved FPS is shown in the window and
+depends on GPU, display refresh and system load. The scene uses one shadow-casting
+light, a 2048-pixel shadow map, simple static decorations and no planar reflections.
+GLFW/OpenGL and ROS display callbacks all run on the viewer's main thread. The
+viewer owns separate model/data instances and never steps or edits live physics.
+The physics thread publishes fixed-size snapshots through its own lock-free triple
+buffer; a non-real-time timer forwards them at 125 Hz with queue depth one. Rendering
+never waits on or locks the 0.1 ms physics loop. Stale feedback is labelled CONNECTING
+and disables dragging. The shadow overlay is optional and expires with stale data.
+
+Mouse targets cross a separate lock-free buffer and `mjv_applyPerturbForce` computes
+the spring against actual state on each physics step. Every step clears previous
+mouse forces. Button/Ctrl release, focus loss, minimization and normal closure send
+a release; a 200 ms steady-clock expiry also clears forces after a viewer crash or
+lost connection. The viewer and hardware must run on the same host (shared monotonic
+clock). No mouse shortcut teleports joints, changes actuators or pauses physics.
+See the [official MuJoCo visualization documentation](https://mujoco.readthedocs.io/en/stable/programming/visualization.html)
+for the native camera and perturbation model.
 
 ## 🔮 Future Work
 This framework is actively evolving. Upcoming features include:
