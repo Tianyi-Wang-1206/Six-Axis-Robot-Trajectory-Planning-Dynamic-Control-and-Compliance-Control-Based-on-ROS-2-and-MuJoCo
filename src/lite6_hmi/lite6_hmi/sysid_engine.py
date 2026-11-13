@@ -1,4 +1,7 @@
 import os
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 
 import coal
 import numpy as np
@@ -21,13 +24,15 @@ class SysIdEngine:
     MIN_DURATION = 6.0  # Keep useful recording time after the 1 s end trims.
     MAX_DURATION = 120.0  # Fourier stage; low-speed experiments are appended.
     LOW_SPEEDS = (0.004, 0.008, 0.014, 0.022, 0.034, 0.048)  # rad/s, both signs
-    LOW_CRUISE = 2.0
+    LOW_CRUISE = 3.0
     LOW_SETTLE = 1.0
     LOW_END_GUARD = 0.3
     LOW_DWELL = 0.4
     LOW_PRE_SPEED = 0.08
     LOW_PRE_CRUISE = 0.6
     STAGE_DWELL = 1.0
+    LOW_DERIVATIVE_WINDOW = 0.2  # s; centered, inside the guarded plateau.
+    MIN_STEADY_DURATION = 0.3  # Continuous accepted data, not scattered samples.
 
     def __init__(self):
         desc = get_package_share_directory('lite6_description')
@@ -356,6 +361,62 @@ class SysIdEngine:
         ddq = np.sum(-self.a[i] * wl * sn + self.b[i] * wl * cs)
         return q, dq, ddq
 
+    def save_recording(self, session, origin, directory=None):
+        """Save raw physical snapshots before validation; no pickle is needed to replay."""
+        root = Path(directory) if directory is not None else Path(
+            os.environ.get('ROS_HOME', str(Path.home() / '.ros'))) / 'lite6_sysid'
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ') +
+                       f'_{session}.npz')
+        keys = ('t', 'read_time', 'simulation_time', 'step', 'command_sequence',
+                'control_period', 'physics_lag', 'command_age', 'q', 'dq', 'tau_cmd')
+        arrays = {key: np.asarray([sample[key] for sample in self.record_data],
+                                  dtype=np.int64 if key in ('step', 'command_sequence') else float)
+                  for key in keys}
+        metadata = dict(schema=1, session=str(session), excitation_start_ros=origin,
+                        t_is_relative=origin is not None,
+                        duration=self.T_total, high_speed_duration=self.high_speed_duration,
+                        low_fit_windows=self.low_fit_windows,
+                        low_directions=np.asarray(self.low_directions).tolist(),
+                        derivative_window=self.LOW_DERIVATIVE_WINDOW,
+                        min_steady_duration=self.MIN_STEADY_DURATION)
+        # Exclusive creation protects existing experiments even on a repeated ID.
+        with path.open('xb') as stream:
+            np.savez_compressed(stream, **arrays, metadata=json.dumps(metadata))
+        return path
+
+    def _physical_samples(self):
+        """Differentiate on physics time; use ROS time only to locate the experiment."""
+        samples = self.record_data
+        if len(samples) < 5:
+            raise ValueError('Insufficient physical snapshots for system identification')
+        steps = np.array([d['step'] for d in samples], dtype=np.int64)
+        simulation = np.array([d['simulation_time'] for d in samples], dtype=float)
+        phase = np.array([d['t'] for d in samples], dtype=float)
+        timing = np.array([[d[k] for k in ('control_period', 'physics_lag', 'command_age')]
+                           for d in samples], dtype=float)
+        if (not np.isfinite(simulation).all() or not np.isfinite(phase).all() or
+                not np.isfinite(timing).all() or np.any(timing < 0) or
+                np.any(np.diff(steps) < 0) or np.any(np.diff(simulation) < 0)):
+            raise ValueError('Invalid or reset physical snapshot clock')
+        if not np.allclose(np.diff(simulation), np.diff(steps) * 0.0001,
+                           rtol=0, atol=1e-7):
+            raise ValueError('Physical time does not match the fixed 0.1 ms step sequence')
+        # ROS-to-steady pairing has small measurement jitter; never differentiate
+        # using it. A clock jump invalidates the reference-window alignment.
+        offset = float(np.median(phase - simulation))
+        if np.max(np.abs(phase - simulation - offset)) > 0.005:
+            raise ValueError('ROS/physics clock mapping changed by more than 5 ms')
+        unique = np.r_[True, np.diff(steps) > 0]
+        self.fit_diagnostics.append(
+            f'Timing: {len(steps)} observations, {np.count_nonzero(~unique)} repeated steps; '
+            f'max physics lag={timing[:, 1].max():.6f} s, '
+            f'max control period={timing[:, 0].max():.6f} s, '
+            f'max applied command age={timing[:, 2].max():.6f} s')
+        return (simulation[unique] + offset, *(
+            np.array([d[key] for d in samples], dtype=float)[unique]
+            for key in ('q', 'dq', 'tau_cmd')))
+
     def calculate_least_squares(self) -> str:
         """Fit Fv/Fc first; freeze them while estimating Fs-Fc and vs.
 
@@ -364,17 +425,14 @@ class SysIdEngine:
         """
         if self.high_speed_duration is None or not self.low_fit_windows:
             raise ValueError('Generate the two-stage SysID trajectory before fitting')
-        if len(self.record_data) < 5:
-            raise ValueError('Insufficient recorded samples for system identification')
-        t_seq = np.array([d['t'] for d in self.record_data], dtype=float)
-        q_seq = np.array([d['q'] for d in self.record_data], dtype=float)
-        dq_seq = np.array([d['dq'] for d in self.record_data], dtype=float)
-        tau_seq = np.array([d['tau_cmd'] for d in self.record_data], dtype=float)
+        self.fit_diagnostics = []
+        t_seq, q_seq, dq_seq, tau_seq = self._physical_samples()
+        if len(t_seq) < 5:
+            raise ValueError('Fewer than five distinct physical snapshots')
         if (not np.isfinite(t_seq).all() or np.any(np.diff(t_seq) <= 0) or
                 any(x.shape != (len(t_seq), 6) or not np.isfinite(x).all()
                     for x in (q_seq, dq_seq, tau_seq))):
             raise ValueError('Invalid SysID samples or non-increasing timestamps')
-        self.fit_diagnostics = []
         if t_seq[0] > 0.25 or t_seq[-1] < self.T_total - 0.25:
             raise ValueError(f'Incomplete excitation recording: {t_seq[0]:.4f}..{t_seq[-1]:.4f} s; '
                              f'expected 0..{self.T_total:.4f} s on the CTC clock')
@@ -388,8 +446,20 @@ class SysIdEngine:
         if len(t_uniform) < window:
             raise ValueError('Recording is too short for acceleration estimation')
         ddq = savgol_filter(dq, window, polyorder=3, deriv=1, delta=dt, axis=0)
+        low_window = max(5, int(self.LOW_DERIVATIVE_WINDOW / dt) | 1)
+        if len(t_uniform) < low_window:
+            raise ValueError('Recording is too short for low-speed acceleration estimation')
+        low = t_uniform >= self.high_speed_duration
+        ddq[low] = savgol_filter(dq, low_window, polyorder=3, deriv=1,
+                                delta=dt, axis=0)[low]
         rigid_torque = np.array([pin.rnea(self.model, self.data, qi, vi, ai).copy()
                                  for qi, vi, ai in zip(q, dq, ddq)])
+        # Full coupled inertia torque M(q)*ddq + rotor inertia, not a per-axis
+        # scalar approximation. This bounds the dynamic term in a static fit.
+        inertia_torque = np.zeros_like(rigid_torque)
+        bias = np.array([pin.rnea(self.model, self.data, qi, vi, np.zeros(6)).copy()
+                         for qi, vi in zip(q[low], dq[low])])
+        inertia_torque[low] = rigid_torque[low] - bias + self.ARMATURE * ddq[low]
         residual = tau - rigid_torque - self.ARMATURE * ddq
         friction = np.zeros((6, 2))
         stribeck = np.zeros((6, 2))
@@ -413,7 +483,8 @@ class SysIdEngine:
                 friction[i] = result.x
                 high_rmse = np.sqrt(np.mean((design @ result.x - residual[valid, i])**2))
                 fs, vs, low_rmse, count = self._fit_stribeck(
-                    i, t_uniform, dq[:, i], ddq[:, i], residual[:, i], dt, *result.x)
+                    i, t_uniform, dq[:, i], ddq[:, i], residual[:, i], dt, *result.x,
+                    inertia_torque[:, i])
                 stribeck[i] = (fs, vs)
                 report.append(f'# joint{i+1}: high-speed RMSE={high_rmse:.6g} Nm '
                               f'({valid.sum()} samples); low-speed RMSE={low_rmse:.6g} Nm '
@@ -437,7 +508,8 @@ class SysIdEngine:
                 + '\n'.join('# ' + line for line in self.fit_diagnostics) + '\n'
                 )
 
-    def _fit_stribeck(self, joint, times, velocity, acceleration, torque, dt, fv, fc):
+    def _fit_stribeck(self, joint, times, velocity, acceleration, torque, dt, fv, fc,
+                      inertia_torque):
         speeds, excesses = [], []
         count = 0
         failures = []
@@ -445,19 +517,39 @@ class SysIdEngine:
             reference = scalar_velocity * self.low_directions[joint]
             in_window = (times >= start) & (times <= end)
             speed_ok = np.abs(velocity - reference) <= max(0.0005, 0.15 * abs(reference))
-            acceleration_ok = np.abs(acceleration) <= max(0.002, 0.1 * abs(reference))
+            # Reject material dynamics, while tolerating small measured ripple
+            # whose inertia torque is below the fit's absolute/relative budget.
+            # The independent acceleration cap still rejects rapid speed drift.
+            torque_budget = max(0.002, 0.01 * fc)  # Nm, same floor as residual QC.
+            acceleration_limit = max(0.01, 0.5 * abs(reference))  # rad/s^2
+            acceleration_ok = ((np.abs(acceleration) <= acceleration_limit) &
+                               (np.abs(inertia_torque) <= torque_budget))
             mask = in_window & speed_ok & acceleration_ok
-            samples = np.count_nonzero(mask)
             available = np.count_nonzero(in_window)
+            # Retain only runs that actually remain steady for 0.3 s. Counting
+            # scattered accepted points used to overstate the stable duration.
+            edges = np.diff(np.r_[False, mask, False].astype(np.int8))
+            runs = list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)))
+            longest = max(((end_i - start_i - 1) * dt for start_i, end_i in runs), default=0.)
+            mask[:] = False
+            for start_i, end_i in runs:
+                if (end_i - start_i - 1) * dt >= self.MIN_STEADY_DURATION - 1e-9:
+                    mask[start_i:end_i] = True
+            samples = np.count_nonzero(mask)
             duration = samples * dt
             speed_rejected = np.count_nonzero(in_window & ~speed_ok) / max(available, 1)
             acceleration_rejected = np.count_nonzero(in_window & ~acceleration_ok) / max(available, 1)
             diagnostic = (f'Joint {joint+1}, {reference:+.4f} rad/s, [{start:.3f}, {end:.3f}] s: '
-                          f'{samples}/{available} samples, {duration:.4f} s stable (need 0.3000 s); '
+                          f'{samples}/{available} samples in steady runs, {duration:.4f} s total; '
+                          f'longest run {longest:.4f} s (need {self.MIN_STEADY_DURATION:.4f} s); '
                           f'velocity rejected {speed_rejected:.1%}, '
-                          f'acceleration rejected {acceleration_rejected:.1%}')
+                          f'acceleration/dynamics rejected {acceleration_rejected:.1%}; '
+                          f'acceleration cap={acceleration_limit:.5g} rad/s^2, '
+                          f'inertia torque budget={torque_budget:.5g} Nm; '
+                          f'|acceleration| p95={np.percentile(np.abs(acceleration[in_window]), 95) if available else float("nan"):.5g} rad/s^2, '
+                          f'|inertia torque| p95={np.percentile(np.abs(inertia_torque[in_window]), 95) if available else float("nan"):.5g} Nm')
             self.fit_diagnostics.append(diagnostic)
-            if samples < 20 or duration < 0.3:
+            if samples < 20:
                 failures.append(diagnostic)
                 continue
             v = velocity[mask]

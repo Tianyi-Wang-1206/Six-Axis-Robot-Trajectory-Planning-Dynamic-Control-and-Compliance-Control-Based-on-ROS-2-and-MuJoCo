@@ -234,12 +234,43 @@ effort during one trajectory containing two experiments:
    produce an explicit failure instead of nominal parameter output.
 
 Both stages respect the entered excursion bounds, joint motion limits and
-collision checks. The default low-speed experiment adds 51.4 seconds and needs
-0.1952 rad of excursion per joint within the existing 10% margin. Each speed pair
+collision checks. The default low-speed experiment adds 63.4 seconds and needs
+0.2432 rad of excursion per joint within the existing 10% margin. Each speed pair
 returns to the workspace center. The Supervisor session and controller mode
 sequence remain the same. Rigid-body torque and the known rotor inertia are
 subtracted before fitting; rotor inertia and LuGre dynamic parameters are not
 identified.
+
+Identification uses `/simulation/sysid_samples`, a separate observational stream
+containing the physical step number, simulation time, ROS-mapped step time,
+position, velocity, applied effort, control period, physics lag and command age.
+Repeated physical steps are removed before differentiation; ROS time only aligns
+the experiment windows. Clock resets, inconsistent step timing, clock mapping
+jumps over 5 ms and telemetry gaps fail validation. The existing `/joint_states`
+stream and motion control remain unchanged. The extra stream is published only
+while subscribed; the HMI subscribes during SysID.
+
+Low-speed cruises last 3 s, leaving 1.7 s after the settling/end guards. Only
+continuous accepted runs of at least 0.3 s enter the fit. Low-speed acceleration
+uses a centered 0.2 s Savitzky–Golay derivative; the Fourier stage retains its
+0.1 s derivative. Samples must satisfy the existing velocity tolerance, an
+acceleration cap of `max(0.01, 0.5*abs(reference_speed))` rad/s², and a full coupled
+inertia-torque budget of `max(0.002, 0.01*Fc)` Nm. These engineering tolerances
+permit small velocity ripple while bounding dynamics relative to the friction
+fit's residual budget; they are not the robot's physical acceleration limits.
+Fit residual and speed-coverage checks still apply. Output includes rejection
+rates, longest steady runs, acceleration/torque percentiles and timing diagnostics.
+
+Before estimation, raw experiments are saved as pickle-free `.npz` files in
+`${ROS_HOME:-~/.ros}/lite6_sysid/`, with trajectory-window metadata and a companion
+`.txt` result or failure report. The output displays the archive path. Files are
+retained for diagnosis; archive errors are reported without interrupting the
+controlled return to NORMAL.
+
+SYS_ID endpoint tolerances are 0.04 rad and 0.005 rad/s, below the existing NORMAL
+restoration guards (0.05 rad and 0.01 rad/s). Configuration rejects incompatible
+SYS_ID tolerances. NORMAL endpoint tolerances, path protection, emergency stop,
+reference playback and the Supervisor mode sequence retain their existing behavior.
 
 The steady-sliding curve is
 `Fv*v + [Fc + (Fs-Fc)*exp(-(v/vs)^2)]*sign(v)` (fixed exponent 2).

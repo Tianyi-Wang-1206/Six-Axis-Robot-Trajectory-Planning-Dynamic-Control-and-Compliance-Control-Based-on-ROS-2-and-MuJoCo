@@ -172,6 +172,12 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_init(
 hardware_interface::CallbackReturn Lite6MujocoSystem::on_configure(
   const rclcpp_lifecycle::State &)
 {
+  if (const auto node = get_node(); node && !sysid_publisher_) {
+    sysid_transport_ = node->create_publisher<lite6_interfaces::msg::SysIdSample>(
+      "/simulation/sysid_samples", rclcpp::QoS(200).best_effort());
+    sysid_publisher_ = std::make_shared<realtime_tools::RealtimePublisher<
+      lite6_interfaces::msg::SysIdSample>>(sysid_transport_);
+  }
   configure_diagnostics();
   return hardware_interface::CallbackReturn::SUCCESS;
 }
@@ -268,7 +274,7 @@ std::vector<hardware_interface::CommandInterface> Lite6MujocoSystem::export_comm
 }
 
 hardware_interface::return_type Lite6MujocoSystem::read(
-  const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
+  const rclcpp::Time & /*time*/, const rclcpp::Duration & period)
 {
   if (diagnostics_->fault.load() != Fault::NONE) {return hardware_interface::return_type::ERROR;}
   // Only a complete snapshot crosses threads. Never read the live mjData here.
@@ -277,6 +283,26 @@ hardware_interface::return_type Lite6MujocoSystem::read(
     hw_states_position_[i] = snapshot.position[i];
     hw_states_velocity_[i] = snapshot.velocity[i];
     hw_states_effort_[i] = snapshot.effort[i];
+  }
+  if (snapshot.started && diagnostics_->sysid_observed.load() &&
+      sysid_publisher_ && sysid_publisher_->trylock()) {
+    // Pair ROS and steady-clock observations here. Never label an old physical
+    // snapshot as a new state merely because another controller cycle ran.
+    const auto observed = get_node()->now();
+    const auto observed_ns = steady_now_ns();
+    auto & sample = sysid_publisher_->msg_;
+    sample.read_stamp = observed;
+    sample.physics_lag = std::max(0.0, 1e-9 * (observed_ns - snapshot.boundary_ns));
+    sample.stamp = observed - rclcpp::Duration::from_seconds(sample.physics_lag);
+    sample.simulation_time = snapshot.simulation_time;
+    sample.step = snapshot.steps;
+    sample.command_sequence = snapshot.command_sequence;
+    sample.control_period = period.seconds();
+    sample.command_age = std::max(0.0, 1e-9 * (snapshot.boundary_ns - snapshot.command_ns));
+    sample.position = snapshot.position;
+    sample.velocity = snapshot.velocity;
+    sample.effort = snapshot.effort;
+    sysid_publisher_->unlockAndPublish();
   }
   return hardware_interface::return_type::OK;
 }
@@ -414,11 +440,14 @@ void Lite6MujocoSystem::configure_diagnostics()
     "/simulation/diagnostics", rclcpp::QoS(1).best_effort());
   const auto clock = node->get_clock();
   const auto diagnostics = diagnostics_;
+  const auto sysid_transport = sysid_transport_;
   const auto hardware_name = info_.name;
   // No captured hardware pointer: an in-flight callback remains valid even
   // during plugin destruction. All ROS formatting/publication is non-RT.
   diagnostics_timer_ = node->create_wall_timer(std::chrono::milliseconds(100),
-    [diagnostics, publisher, clock, hardware_name] {
+    [diagnostics, publisher, clock, hardware_name, sysid_transport] {
+      diagnostics->sysid_observed.store(
+        sysid_transport && sysid_transport->get_subscription_count() > 0);
       const auto snapshot = diagnostics->snapshots.read();
       const int64_t now = steady_now_ns();
       const bool active = diagnostics->active.load();

@@ -83,7 +83,7 @@ private:
   TrajectoryExecution * current_execution_ = nullptr;
   std::vector<double> path_position_tolerance_, path_velocity_tolerance_;
   std::vector<double> goal_position_tolerance_, goal_velocity_tolerance_;
-  std::vector<double> sysid_goal_position_tolerance_;
+  std::vector<double> sysid_goal_position_tolerance_, sysid_goal_velocity_tolerance_;
   double goal_settle_duration_ = 0.3;
   double goal_time_tolerance_ = 5.0;
   double saturation_timeout_ = 1.0;

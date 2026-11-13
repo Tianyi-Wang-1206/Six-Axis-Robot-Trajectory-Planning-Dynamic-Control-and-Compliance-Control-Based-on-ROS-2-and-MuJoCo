@@ -15,6 +15,8 @@
 #include "rclcpp/rclcpp.hpp"
 #include "lite6_hardware/lugre_friction.hpp"
 #include "lite6_hardware/simulation_exchange.hpp"
+#include "lite6_interfaces/msg/sys_id_sample.hpp"
+#include "realtime_tools/realtime_publisher.hpp"
 
 #include <mujoco/mujoco.h>
 
@@ -69,6 +71,7 @@ private:
     // Separate consumer from read(), so publishing never races state acquisition.
     detail::LatestSnapshot<StateSnapshot> snapshots;
     std::atomic<bool> active{false};
+    std::atomic<bool> sysid_observed{false};
     std::atomic<Fault> fault{Fault::NONE};
     std::atomic<int64_t> last_write_ns{0};
     std::atomic<int64_t> max_write_interval_ns{0};
@@ -92,6 +95,10 @@ private:
   detail::LatestSnapshot<StateSnapshot> states_;
   std::shared_ptr<Diagnostics> diagnostics_ = std::make_shared<Diagnostics>();
   rclcpp::TimerBase::SharedPtr diagnostics_timer_;
+  rclcpp::Publisher<lite6_interfaces::msg::SysIdSample>::SharedPtr sysid_transport_;
+  // Published from read(), never from the physics thread; fixed-size and nonblocking.
+  std::shared_ptr<realtime_tools::RealtimePublisher<lite6_interfaces::msg::SysIdSample>>
+    sysid_publisher_;
 
   std::vector<double> hw_commands_effort_;
   std::vector<double> hw_states_position_;

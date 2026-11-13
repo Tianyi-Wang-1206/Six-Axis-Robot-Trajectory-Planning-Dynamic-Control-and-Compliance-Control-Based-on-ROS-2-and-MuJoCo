@@ -13,6 +13,8 @@ find_package(hardware_interface REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
+find_package(lite6_interfaces REQUIRED)
+find_package(realtime_tools REQUIRED)
 find_package(Threads REQUIRED)
 
 set(MUJOCO_DIR $ENV{MUJOCO_DIR})
@@ -30,6 +32,8 @@ ament_target_dependencies(${PROJECT_NAME}
   pluginlib
   ament_index_cpp
   diagnostic_msgs
+  lite6_interfaces
+  realtime_tools
 )
 target_link_libraries(${PROJECT_NAME} mujoco Threads::Threads)
 
@@ -49,6 +53,6 @@ install(DIRECTORY config
 
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME})
-ament_export_dependencies(rclcpp hardware_interface pluginlib ament_index_cpp diagnostic_msgs)
+ament_export_dependencies(rclcpp hardware_interface pluginlib ament_index_cpp diagnostic_msgs lite6_interfaces realtime_tools)
 
 ament_package()

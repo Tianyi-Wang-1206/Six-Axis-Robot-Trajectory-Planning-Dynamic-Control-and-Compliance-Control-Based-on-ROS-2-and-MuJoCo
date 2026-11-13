@@ -58,7 +58,9 @@ ctc_controller:
     execution.goal_position_tolerance: [0.00015, 0.00015, 0.00015, 0.00015, 0.00015, 0.00015]  # rad
     # SYS_ID has no friction compensation or integral action: allow bounded static error.
     # Applies only in CTC SYS_ID mode; NORMAL pre/return alignment retains the precision above.
-    execution.sysid_goal_position_tolerance: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]  # rad
+    # Below the unchanged NORMAL restoration guards: 0.05 rad and 0.01 rad/s.
+    execution.sysid_goal_position_tolerance: [0.04, 0.04, 0.04, 0.04, 0.04, 0.04]  # rad
+    execution.sysid_goal_velocity_tolerance: [0.005, 0.005, 0.005, 0.005, 0.005, 0.005]  # rad/s
     execution.goal_velocity_tolerance: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]  # rad/s
     execution.goal_settle_duration: 1.0  # Continuous in-tolerance time after the endpoint [s].
     

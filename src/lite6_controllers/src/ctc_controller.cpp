@@ -35,6 +35,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
   auto_declare<std::vector<double>>("execution.path_velocity_tolerance", std::vector<double>(6, 0.5));
   auto_declare<std::vector<double>>("execution.goal_position_tolerance", std::vector<double>(6, 0.01));
   auto_declare<std::vector<double>>("execution.sysid_goal_position_tolerance", std::vector<double>(6, 0.01));
+  auto_declare<std::vector<double>>("execution.sysid_goal_velocity_tolerance", std::vector<double>(6, 0.005));
   auto_declare<std::vector<double>>("execution.goal_velocity_tolerance", std::vector<double>(6, 0.01));
   auto_declare<double>("execution.goal_settle_duration", 0.3);
   auto_declare<double>("execution.goal_time_tolerance", 5.0);
@@ -78,12 +79,14 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   path_velocity_tolerance_ = get_node()->get_parameter("execution.path_velocity_tolerance").as_double_array();
   goal_position_tolerance_ = get_node()->get_parameter("execution.goal_position_tolerance").as_double_array();
   sysid_goal_position_tolerance_ = get_node()->get_parameter("execution.sysid_goal_position_tolerance").as_double_array();
+  sysid_goal_velocity_tolerance_ = get_node()->get_parameter("execution.sysid_goal_velocity_tolerance").as_double_array();
   goal_velocity_tolerance_ = get_node()->get_parameter("execution.goal_velocity_tolerance").as_double_array();
   goal_settle_duration_ = get_node()->get_parameter("execution.goal_settle_duration").as_double();
   goal_time_tolerance_ = get_node()->get_parameter("execution.goal_time_tolerance").as_double();
   saturation_timeout_ = get_node()->get_parameter("execution.saturation_timeout").as_double();
   for (const auto * values : {&path_position_tolerance_, &path_velocity_tolerance_,
-      &goal_position_tolerance_, &sysid_goal_position_tolerance_, &goal_velocity_tolerance_}) {
+      &goal_position_tolerance_, &sysid_goal_position_tolerance_, &goal_velocity_tolerance_,
+      &sysid_goal_velocity_tolerance_}) {
     if (values->size() != n || !std::all_of(values->begin(), values->end(),
         [](double value) {return std::isfinite(value) && value > 0.0;})) {
       RCLCPP_ERROR(get_node()->get_logger(), "Execution tolerances require six finite positive values");
@@ -100,6 +103,14 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
     return controller_interface::CallbackReturn::ERROR;
   }
   for (size_t i = 0; i < n; ++i) {
+    // Leave margin below the existing NORMAL restoration guards (0.05 / 0.01).
+    if (sysid_goal_position_tolerance_[i] >= 0.05 ||
+        sysid_goal_velocity_tolerance_[i] >= 0.01 ||
+        sysid_goal_velocity_tolerance_[i] > path_velocity_tolerance_[i]) {
+      RCLCPP_ERROR(get_node()->get_logger(),
+        "SYS_ID goal tolerances must be below NORMAL restoration guards (0.05 rad, 0.01 rad/s) and within path tolerances");
+      return controller_interface::CallbackReturn::ERROR;
+    }
     if (goal_position_tolerance_[i] > path_position_tolerance_[i] ||
         sysid_goal_position_tolerance_[i] > path_position_tolerance_[i] ||
         goal_velocity_tolerance_[i] > path_velocity_tolerance_[i]) {

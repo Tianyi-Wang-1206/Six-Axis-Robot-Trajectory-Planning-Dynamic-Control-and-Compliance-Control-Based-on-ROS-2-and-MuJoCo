@@ -27,7 +27,7 @@ from std_msgs.msg import Int32
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
 from lite6_interfaces.action import IndustrialMotion
-from lite6_interfaces.msg import SupervisorState, MotionRejection
+from lite6_interfaces.msg import SupervisorState, MotionRejection, SysIdSample
 from lite6_interfaces.srv import SupervisorCommand, SubmitSysIdTrajectory
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -136,6 +136,7 @@ class ROS2Worker(QThread):
             SupervisorState, "/supervisor/state", self._supervisor_cb, qos)
         self.joint_sub = self.node.create_subscription(
             JointState, "/joint_states", self.joint_cb, 200)
+        self.sysid_sample_sub = None
 
         self.current_goal_handle = None
         self._motion_pending = False
@@ -161,7 +162,6 @@ class ROS2Worker(QThread):
         self.sysid_record_data = []
         self.sysid_start_ros_time = None
         self.sysid_q0_locked = [0.0] * 6
-        self._last_sysid_sample_time = None
 
         try:
             import os
@@ -266,6 +266,15 @@ class ROS2Worker(QThread):
                 pass
             self._revision = msg.revision
             self.supervisor_state = msg
+            # Subscribe during preparation/alignment so discovery finishes before
+            # excitation. Ordinary motion has no extra 1 kHz telemetry traffic.
+            if msg.mode == SupervisorState.MODE_SYSID and self.sysid_sample_sub is None:
+                self.sysid_sample_sub = self.node.create_subscription(
+                    SysIdSample, "/simulation/sysid_samples", self.sysid_sample_cb,
+                    QoSProfile(depth=200, reliability=ReliabilityPolicy.BEST_EFFORT))
+            elif msg.mode != SupervisorState.MODE_SYSID and self.sysid_sample_sub is not None:
+                self.node.destroy_subscription(self.sysid_sample_sub)
+                self.sysid_sample_sub = None
             if msg.mode == SupervisorState.MODE_SYSID and msg.session_id == self._sysid_session:
                 if self._begin_pending:
                     self._set_sysid_preparation_status("")
@@ -369,9 +378,32 @@ class ROS2Worker(QThread):
                 context=IndustrialMotion.Goal.CONTEXT_RECOVERY, session_id=sid):
             self.trigger_estop("Could not dispatch recovery reference synchronization")
 
+    def sysid_sample_cb(self, msg):
+        # Preserve raw observations, including repeated physical steps, for the
+        # archive. Deduplication and clock validation belong to the estimator.
+        with self.state_lock:
+            s = self.supervisor_state
+            if (self.sysid_calc is None or s is None or
+                    s.mode != SupervisorState.MODE_SYSID or
+                    s.sysid_phase != SupervisorState.SYSID_EXCITING or
+                    s.session_id != self._sysid_session):
+                return
+            self.sysid_record_data.append({
+                't': msg.stamp.sec + msg.stamp.nanosec * 1e-9,
+                'read_time': msg.read_stamp.sec + msg.read_stamp.nanosec * 1e-9,
+                'simulation_time': msg.simulation_time,
+                'step': msg.step,
+                'command_sequence': msg.command_sequence,
+                'control_period': msg.control_period,
+                'physics_lag': msg.physics_lag,
+                'command_age': msg.command_age,
+                'q': np.asarray(msg.position, dtype=float),
+                'dq': np.asarray(msg.velocity, dtype=float),
+                'tau_cmd': np.asarray(msg.effort, dtype=float),
+            })
+
     def joint_cb(self, msg):
         monotonic_now = time.monotonic()
-        msg_stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         index = {name: i for i, name in enumerate(msg.name)}
         # Don't treat incomplete / malformed packets as healthy telemetry.
         if any(name not in index or index[name] >= len(msg.position)
@@ -386,29 +418,6 @@ class ROS2Worker(QThread):
             if not all(math.isfinite(x) for x in self.q_curr + self.dq_curr):
                 return
             self.last_state_rx_time = monotonic_now
-            s = self.supervisor_state
-            # Data capture is enabled by a Supervisor-authored SysID phase,
-            # not by local timers or manually assigned GUI state strings.
-            if (self.sysid_calc is not None and s is not None and
-                    s.mode == SupervisorState.MODE_SYSID and
-                    s.sysid_phase == SupervisorState.SYSID_EXCITING and
-                    s.session_id == self._sysid_session):
-                if (self._last_sysid_sample_time is None or
-                        msg_stamp > self._last_sysid_sample_time):
-                    self._last_sysid_sample_time = msg_stamp
-                    # Keep both stages and their transition samples for acceleration
-                    # estimation. The engine applies separate guarded fit windows.
-                    complete_effort = all(index[name] < len(msg.effort) and
-                                          index[name] < len(msg.velocity)
-                                          for name in self.joint_names)
-                    if (complete_effort and
-                            all(math.isfinite(x) for x in self.tau_curr)):
-                        self.sysid_record_data.append({
-                            "t": msg_stamp,  # Converted using the CTC origin, never receipt time.
-                            "q": np.array(self.q_curr, dtype=float),
-                            "dq": np.array(self.dq_curr, dtype=float),
-                            "tau_cmd": np.array(self.tau_curr, dtype=float),
-                        })
             if monotonic_now - self.last_ui_update_time < 0.033:
                 return
             if self.model is not None:
@@ -712,7 +721,6 @@ class ROS2Worker(QThread):
                 self._phase_actions.clear()
                 self.sysid_record_data.clear()
                 self.sysid_start_ros_time = None
-                self._last_sysid_sample_time = None
                 self.sysid_q0_locked = prep_pose
                 self.node.get_logger().info(engine.trajectory_summary + '; reference period 1 ms')
                 self.node.get_logger().info(
@@ -792,22 +800,33 @@ class ROS2Worker(QThread):
             self._calculation_active = True
             origin = self.sysid_start_ros_time
             engine = self.sysid_calc
-            recorded = ([dict(sample, t=sample['t'] - origin) for sample in self.sysid_record_data
-                         if 0.0 <= sample['t'] - origin <= engine.T_total]
-                        if origin is not None else [])
+            recorded = [dict(sample, t=sample['t'] - origin if origin is not None else sample['t'])
+                        for sample in self.sysid_record_data]
         # Numerical estimation can be CPU-heavy; never block ROS heartbeat
         # subscriptions while waiting for the LS solve.
         threading.Thread(target=self._calculate_sysid,
                          args=(session, engine, recorded, origin), daemon=True).start()
 
     def _calculate_sysid(self, session, engine, recorded, origin):
+        archive = None
+        outcome = 'Calculation did not finish'
         try:
+            engine.record_data = recorded
+            # Archive before fitting, so malformed/incomplete experiments survive
+            # quality-check failures. An I/O failure must not alter mode recovery.
+            try:
+                archive = engine.save_recording(session, origin)
+                self.node.get_logger().info(f'SysID raw recording: {archive}')
+            except Exception as exc:
+                self.node.get_logger().warn(f'Could not archive SysID recording: {exc}')
             if origin is None:
                 raise ValueError("No CTC excitation start timestamp received")
             if not recorded:
                 raise ValueError("No joint samples were recorded during excitation")
-            engine.record_data = recorded
             result_text = engine.calculate_least_squares()
+            outcome = result_text
+            if archive is not None:
+                result_text += f'\n# Raw recording: {archive}\n'
             if self._sysid_phase_is(session, SupervisorState.SYSID_CALCULATING):
                 self.sysid_yaml_signal.emit(result_text)
                 if not self._send_command(
@@ -815,10 +834,12 @@ class ROS2Worker(QThread):
                         session=session, done=lambda resp: self._calculation_done_reply(resp, session)):
                     self._abort_sysid(session, "Cannot acknowledge calculation completion")
         except Exception as exc:
+            outcome = str(exc)
             if self._sysid_phase_is(session, SupervisorState.SYSID_CALCULATING):
                 # Data quality failure is not a motion failure. The Supervisor
                 # performs the same guarded return sequence and retains the cause.
-                self.sysid_yaml_signal.emit('# Calculation Failed: ' + str(exc).replace('\n', '\n# '))
+                archive_note = f'\n# Raw recording: {archive}' if archive is not None else ''
+                self.sysid_yaml_signal.emit('# Calculation Failed: ' + str(exc).replace('\n', '\n# ') + archive_note)
                 self._report_error(f"SysID estimation failed; restoring NORMAL: {exc}")
                 if not self._send_command(
                         SupervisorCommand.Request.CMD_SYSID_CALCULATION_FAILED,
@@ -826,6 +847,11 @@ class ROS2Worker(QThread):
                         done=lambda resp: self._calculation_done_reply(resp, session)):
                     self._abort_sysid(session, "Cannot request controlled SysID exit")
         finally:
+            if archive is not None:
+                try:
+                    archive.with_suffix('.txt').write_text(outcome, encoding='utf-8')
+                except OSError as exc:
+                    self.node.get_logger().warn(f'Could not save SysID result: {exc}')
             with self.state_lock:
                 self._calculation_active = False
 
