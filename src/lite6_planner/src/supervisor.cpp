@@ -14,6 +14,7 @@ constexpr auto kModeTimeout=std::chrono::seconds(8);
 constexpr auto kSettleDuration=std::chrono::milliseconds(300);
 constexpr auto kSettleFeedbackGap=std::chrono::milliseconds(100);
 constexpr auto kDispatchTimeout=std::chrono::seconds(15);
+constexpr auto kValidationTimeout=std::chrono::seconds(120);
 constexpr auto kCalculationTimeout=std::chrono::seconds(60);
 constexpr double kSettleSpeed=0.01; // Stricter than the planner's 0.02 rad/s admission guard.
 }
@@ -109,6 +110,11 @@ Supervisor::Effects Supervisor::observe_controller(uint8_t mode) {
   const auto previous=state_.controller_mode;
   seen_controller_=true;controller_time_=Clock::now();
   state_.controller_mode=mode;
+  // Keep the initiating fault visible while the controller acknowledges ESTOP.
+  if(state_.mode==S::MODE_ESTOP) {
+    if(previous!=mode) changed_unlocked();
+    return fx;
+  }
   if(mode==CS::MODE_ESTOP&&state_.mode!=S::MODE_ESTOP&&state_.mode!=S::MODE_RECOVERING) {
     fault_unlocked("CTC reports ESTOP",true,fx);
     fx.ctc_command=-1; // already in ESTOP; do not echo a redundant command
@@ -154,6 +160,7 @@ Supervisor::Effects Supervisor::watchdog() {
        phase==S::SYSID_COMPLETING||
        (phase==S::SYSID_WAIT_CONTROLLER_MODE&&state_.waiting_for_settle));
     const bool requires_sysid=(phase==S::SYSID_READY_FOR_EXCITATION||
+       phase==S::SYSID_VALIDATING||
        phase==S::SYSID_EXCITING||phase==S::SYSID_CALCULATING||phase==S::SYSID_POST_ALIGN||
        (phase==S::SYSID_WAIT_NORMAL_MODE&&state_.waiting_for_settle));
     if((requires_normal&&state_.controller_mode!=CS::MODE_NORMAL)||
@@ -176,7 +183,8 @@ Supervisor::Effects Supervisor::watchdog() {
   const auto now=Clock::now();
   if(phase_deadline_!=Clock::time_point{}&&now>phase_deadline_) {
     fault_unlocked(state_.waiting_for_settle?"Physical settling timed out":
-        "Sequence phase timed out (mode acknowledgement / client response)",true,fx);
+        (state_.sysid_phase==S::SYSID_VALIDATING?"SysID trajectory validation timed out":
+        "Sequence phase timed out (mode acknowledgement / client response)"),true,fx);
     return fx;
   }
   if(state_.waiting_for_settle&&stable_since_!=Clock::time_point{}&&
@@ -266,10 +274,31 @@ bool Supervisor::reserve_motion(const std::string& key,uint8_t context,uint64_t 
   changed_unlocked("Motion admitted for planning");
   return true;
 }
+bool Supervisor::begin_excitation_validation(uint64_t session,std::string& why) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  if(state_.mode!=S::MODE_SYSID||session==0||session!=state_.session_id||
+      state_.sysid_phase!=S::SYSID_READY_FOR_EXCITATION||state_.waiting_for_settle||
+      !active_key_.empty()||!fresh_joint_unlocked()||!fresh_controller_unlocked()||
+      state_.controller_mode!=CS::MODE_SYSID||Clock::now()>phase_deadline_) {
+    why="Supervisor does not permit SysID validation";return false;
+  }
+  state_.sysid_phase=S::SYSID_VALIDATING;
+  phase_deadline_=Clock::now()+kValidationTimeout;
+  changed_unlocked("Validating SysID trajectory; arm remains at alignment pose");
+  return true;
+}
+void Supervisor::end_excitation_validation(uint64_t session) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  if(state_.mode!=S::MODE_SYSID||state_.session_id!=session||
+      state_.sysid_phase!=S::SYSID_VALIDATING) return;
+  state_.sysid_phase=S::SYSID_READY_FOR_EXCITATION;
+  phase_deadline_=Clock::now()+kDispatchTimeout;
+  changed_unlocked("SysID validation rejected; waiting for client abort or retry");
+}
 bool Supervisor::reserve_excitation(uint64_t session,std::string& key,std::string& why) {
   std::lock_guard<std::mutex> guard(mutex_);
   if(state_.mode!=S::MODE_SYSID||session==0||session!=state_.session_id||
-      state_.sysid_phase!=S::SYSID_READY_FOR_EXCITATION||
+      state_.sysid_phase!=S::SYSID_VALIDATING||Clock::now()>phase_deadline_||
       state_.waiting_for_settle||!active_key_.empty()||!fresh_joint_unlocked()||!fresh_controller_unlocked()||
       state_.controller_mode!=CS::MODE_SYSID) {
     why="Supervisor does not permit SysID excitation";return false;
@@ -353,9 +382,9 @@ Supervisor::Effects Supervisor::finish_motion(const std::string& key,bool succes
     state_.last_error_code=1;
     changed_unlocked("Motion completed: "+message);
   } else {
-    state_.last_error_code=code;
+    if(state_.mode!=S::MODE_ESTOP) state_.last_error_code=code;
     if(state_.mode==S::MODE_ESTOP) {
-      changed_unlocked("Motion stopped under ESTOP");
+      changed_unlocked(); // Cancellation acknowledgement must not hide the fault.
     } else if(state_.mode==S::MODE_SYSID||state_.mode==S::MODE_RECOVERING) {
       fault_unlocked("Sequence motion failed: "+message,true,fx);
     } else if(state_.mode==S::MODE_NORMAL) {

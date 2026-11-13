@@ -6,6 +6,7 @@
 #include <vector>
 #include <Eigen/Dense>
 #include <pinocchio/multibody/model.hpp>
+#include <pinocchio/multibody/data.hpp>
 #include <pinocchio/multibody/geometry.hpp>
 #include "lite6_planner/motion_tolerances.hpp"
 
@@ -38,6 +39,13 @@ struct IKDiagnostics {
 
 class KinematicsEngine {
 public:
+  struct CollisionWorkspace {
+    pinocchio::Data data;
+    pinocchio::GeometryData geometry;
+    CollisionWorkspace(const pinocchio::Model& model,const pinocchio::GeometryModel& geoms)
+      : data(model),geometry(geoms) {}
+  };
+  CollisionWorkspace collision_workspace() const {return {pin_model_,geom_model_};}
   KinematicsEngine();
   bool load_limits(const std::string& yaml_path);
   bool load_ik_config(const std::string& yaml_path);
@@ -53,6 +61,8 @@ public:
   // Geometry only (non-finite inputs are rejected). Callers validate joint limits
   // with the allowance appropriate to observations, targets or sampled trajectories.
   bool check_collision(const std::array<double, 6>& q, std::string* detail=nullptr) const;
+  bool check_collision(const std::array<double,6>& q,CollisionWorkspace& workspace,
+      std::string* detail=nullptr) const;
   bool joint_valid(const std::array<double,6>& q,
       double epsilon=tolerance::kJointPosition) const;
   Eigen::Matrix4d forward_pose(const std::array<double,6>& q) const;

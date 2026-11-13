@@ -147,12 +147,9 @@
     <motor name="gripper" joint="gripper_left_finger" forcerange="-10 10" ctrlrange="-10 10"/>
   </actuator>
 
-  <!-- Coupled jaws and normally engaged brakes. Only the physics thread
-       changes brake references/activation; the arm control path is untouched. -->
+  <!-- Mechanical jaw coupling only. STOP removes drive; no unlimited brake. -->
   <equality>
     <joint name="gripper_coupling" joint1="gripper_left_finger" joint2="gripper_right_finger" polycoef="0 -1 0 0 0"/>
-    <joint name="gripper_left_brake" joint1="gripper_left_finger" polycoef="-0.0081 0 0 0 0" solref="0.002 1"/>
-    <joint name="gripper_right_brake" joint1="gripper_right_finger" polycoef="0.0081 0 0 0 0" solref="0.002 1"/>
   </equality>
   <keyframe>
     <key name="home" qpos="0 0 0 0 0 0 -0.0081 0.0081" ctrl="0 0 0 0 0 0 0"/>

@@ -31,6 +31,8 @@ public:
   // Key is an opaque ROS action UUID (hex) or a unique SysID excitation token.
   bool reserve_motion(const std::string& key,uint8_t context,uint64_t session,std::string& why);
   bool reserve_excitation(uint64_t session,std::string& key,std::string& why);
+  bool begin_excitation_validation(uint64_t session,std::string& why);
+  void end_excitation_validation(uint64_t session);
   bool permitted(const std::string& key) const;
   bool change_motion_phase(const std::string& key,uint8_t phase);
   bool request_cancel(const std::string& key);

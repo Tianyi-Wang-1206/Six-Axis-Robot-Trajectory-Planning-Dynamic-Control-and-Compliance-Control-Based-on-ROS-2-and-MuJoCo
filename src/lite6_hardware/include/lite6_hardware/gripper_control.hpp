@@ -4,17 +4,16 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <vector>
 #include <mujoco/mujoco.h>
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/int32.hpp>
 #include "lite6_hardware/simulation_exchange.hpp"
 #include "lite6_interfaces/msg/gripper_state.hpp"
-#include "lite6_interfaces/msg/supervisor_state.hpp"
 #include "lite6_interfaces/srv/gripper_command.hpp"
 
 namespace lite6_hardware
 {
-// Independent binary gripper controller. All MuJoCo access is on the physics
+// Independent OPEN/CLOSE/STOP drive. All MuJoCo access is on the physics
 // thread; ROS callbacks exchange commands/status without locks or allocation in step().
 class GripperControl
 {
@@ -33,41 +32,49 @@ public:
   bool finite() const;
 
 private:
+  struct Parameters {
+    double stiffness, damping, max_force, max_velocity, max_acceleration;
+    double position_tolerance, stationary_velocity, settle_time, travel_timeout;
+    double grasp_force, grasp_confirm_time, grasp_loss_time, contact_normal_cosine;
+  } parameters_{};
   struct Command {
     int64_t issued_ns = 0;
     uint64_t sequence = 0, epoch = 0;
     uint8_t action = 0;
-    double stiffness = 4000.0, damping = 40.0, max_force = 10.0;
   };
   struct Snapshot {
     Feedback feedback;
     uint8_t state = State::BLOCKED;
-    bool brake = true, ready = false;
+    bool ready = false;
     uint64_t sequence = 0;
-    double stiffness = 4000.0, damping = 40.0, max_force = 10.0, effort = 0.0;
+    double effort = 0.0;
   };
   struct Channel {
     detail::SpscQueue<Command, 32> commands;
+    // STOP cannot be refused because the motion queue is full.
+    detail::LatestSnapshot<Command> stops;
     detail::LatestSnapshot<Snapshot> snapshots;
-    std::atomic<int64_t> ready_until{0}, physics_stamp{0};
+    std::atomic<int64_t> physics_stamp{0};
     std::atomic<uint64_t> epoch{0};
     std::atomic<bool> active{false};
     // Only mutually exclusive ROS callbacks access these fields.
     uint64_t sequence = 0;
-    bool estop_inhibit = false, saw_nonready = false;
   };
-  void brake();
+  void stop_drive(uint8_t state);
+  int grasp_contact();
   void publish(bool ready);
   mjModel * model_ = nullptr;
   mjData * data_ = nullptr;
-  std::array<int, 2> qpos_{}, dof_{}, brakes_{}, bodies_{};
+  std::array<int, 2> qpos_{}, dof_{}, joints_{}, tips_{};
+  int robot_root_ = -1;
+  std::vector<std::array<double, 2>> contact_forces_;
   int motor_ = -1;
   Snapshot state_;
-  double target_ = -0.0081, elapsed_ = 0.0, settled_ = 0.0;
-  uint64_t motion_epoch_ = 0;
+  double open_ = 0.0, closed_ = 0.0, target_ = 0.0, reference_ = 0.0, reference_velocity_ = 0.0;
+  double elapsed_ = 0.0, settled_ = 0.0, grasp_time_ = 0.0, lost_time_ = 0.0;
+  int candidate_object_ = -1, grasped_object_ = -1;
+  uint8_t action_ = Service::Request::STOP;
   std::shared_ptr<Channel> channel_ = std::make_shared<Channel>();
-  rclcpp::Subscription<lite6_interfaces::msg::SupervisorState>::SharedPtr supervisor_;
-  rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr estop_;
   rclcpp::Service<Service>::SharedPtr service_;
   rclcpp::TimerBase::SharedPtr timer_;
 };

@@ -400,12 +400,19 @@ private:
   }
   void on_sysid_trajectory(const lite6_interfaces::srv::SubmitSysIdTrajectory::Request& req,
       lite6_interfaces::srv::SubmitSysIdTrajectory::Response& resp) {
-    // Validate early before occupying the single motion slot.
+    std::string key,why;
+    if(!supervisor_.begin_excitation_validation(req.session_id,why)) {
+      resp.accepted=false;resp.message=why;
+      resp.revision=supervisor_.snapshot().revision;return;
+    }
+    publish_state();
+    // Received work has its own bounded validation deadline. Heartbeat and
+    // cancellation checks remain active; CTC has not received any motion yet.
     try {
       const auto authorized=[this,&req] {
         const auto state=supervisor_.snapshot();
         return !shutdown_.load()&&state.mode==S::MODE_SYSID&&
-            state.session_id==req.session_id&&state.sysid_phase==S::SYSID_READY_FOR_EXCITATION&&
+            state.session_id==req.session_id&&state.sysid_phase==S::SYSID_VALIDATING&&
             !state.waiting_for_settle;
       };
       if(!authorized()) throw std::runtime_error("SysID session is no longer ready");
@@ -418,6 +425,7 @@ private:
           throw std::runtime_error("SysID references must use an exact 1 ms grid starting at zero");
       }
     } catch(const std::exception& e) {
+      supervisor_.end_excitation_validation(req.session_id);
       resp.accepted=false;resp.message=std::string("SysID trajectory rejected: ")+e.what();
       resp.revision=supervisor_.snapshot().revision;return;
     }
@@ -429,13 +437,14 @@ private:
            std::abs(actual_.dq[i])>0.02) {
           resp.accepted=false;
           resp.message="SysID reference start differs from stationary physical state";
+          supervisor_.end_excitation_validation(req.session_id);
           resp.revision=supervisor_.snapshot().revision;
           return;
         }
       }
     }
-    std::string key,why;
     if(!supervisor_.reserve_excitation(req.session_id,key,why)) {
+      supervisor_.end_excitation_validation(req.session_id);
       resp.accepted=false;resp.message=why;
       resp.revision=supervisor_.snapshot().revision;return;
     }

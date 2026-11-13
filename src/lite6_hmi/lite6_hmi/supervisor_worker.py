@@ -70,6 +70,7 @@ def _view_state(msg):
             S.SYSID_PRE_ALIGN: Lite6StateMachine.SYSID_PRE_ALIGN,
             S.SYSID_WAIT_CONTROLLER_MODE: Lite6StateMachine.SYSID_SEND_CMD,
             S.SYSID_READY_FOR_EXCITATION: "SYSID: READY FOR EXCITATION...",
+            S.SYSID_VALIDATING: "SYSID: VALIDATING TRAJECTORY...",
             S.SYSID_EXCITING: Lite6StateMachine.SYSID_RUNNING,
             S.SYSID_CALCULATING: Lite6StateMachine.SYSID_CALC,
             S.SYSID_POST_ALIGN: Lite6StateMachine.SYSID_POST_ALIGN,
@@ -140,7 +141,6 @@ class ROS2Worker(QThread):
         self.sysid_sample_sub = None
         self.gripper_state = None
         self.last_gripper_rx_time = 0.0
-        self._gripper_future = None
         self.gripper_client = self.node.create_client(GripperCommand, "/gripper/command")
         self.gripper_sub = self.node.create_subscription(
             GripperState, "/gripper/state", self._gripper_cb, 1)
@@ -195,40 +195,26 @@ class ROS2Worker(QThread):
 
     def gripper_ready(self):
         with self.state_lock:
-            s, g = self.supervisor_state, self.gripper_state
-            now = time.monotonic()
-            return bool(s is not None and g is not None and g.ready and g.active
-                        and now - self.last_gripper_rx_time < 0.25
-                        and now - self.last_supervisor_rx_time < 0.25
-                        and s.mode == SupervisorState.MODE_NORMAL
-                        and s.motion_phase == SupervisorState.MOTION_IDLE
-                        and s.motion_allowed and not s.estop_latched
-                        and not self.sysid_preparation_status and not self._motion_pending
-                        and self._gripper_future is None)
+            g = self.gripper_state
+            return bool(g is not None and g.ready and g.active
+                        and time.monotonic() - self.last_gripper_rx_time < 0.25)
 
-    def command_gripper(self, command, stiffness=0.0, damping=0.0, max_force=0.0):
+    def command_gripper(self, command):
         with self.state_lock:
             if not self.gripper_ready():
-                self._report_error("Gripper requires fresh robot Ready feedback")
+                self._report_error("Gripper hardware is inactive or feedback is stale")
                 return
             if not self.gripper_client.service_is_ready():
                 self._report_error("Gripper service unavailable")
                 return
             request = GripperCommand.Request()
             request.command = command
-            request.stiffness, request.damping, request.max_force = stiffness, damping, max_force
             try:
-                future = self.gripper_client.call_async(request)
-                self._gripper_future = future
-                future.add_done_callback(self._gripper_response)
+                self.gripper_client.call_async(request).add_done_callback(self._gripper_response)
             except Exception as exc:
-                self._gripper_future = None
                 self._report_error(f"Gripper request failed: {exc}")
 
     def _gripper_response(self, future):
-        with self.state_lock:
-            if self._gripper_future is future:
-                self._gripper_future = None
         try:
             response = future.result()
             if not response.accepted:

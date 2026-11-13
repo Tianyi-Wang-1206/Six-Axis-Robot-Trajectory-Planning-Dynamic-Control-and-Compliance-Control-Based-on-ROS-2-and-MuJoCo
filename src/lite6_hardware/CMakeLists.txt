@@ -19,6 +19,7 @@ find_package(Threads REQUIRED)
 find_package(glfw3 REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 set(MUJOCO_DIR $ENV{MUJOCO_DIR})
 if(NOT MUJOCO_DIR)
@@ -44,7 +45,7 @@ ament_target_dependencies(${PROJECT_NAME}
   realtime_tools
   std_msgs
 )
-target_link_libraries(${PROJECT_NAME} mujoco Threads::Threads)
+target_link_libraries(${PROJECT_NAME} mujoco Threads::Threads yaml-cpp)
 
 add_executable(mujoco_viewer src/mujoco_viewer.cpp)
 ament_target_dependencies(mujoco_viewer rclcpp ament_index_cpp sensor_msgs lite6_interfaces)

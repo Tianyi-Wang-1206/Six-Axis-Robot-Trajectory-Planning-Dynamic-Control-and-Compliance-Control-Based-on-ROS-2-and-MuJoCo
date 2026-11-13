@@ -157,13 +157,18 @@ Eigen::Matrix4d KinematicsEngine::forward_pose(const std::array<double,6>& q) co
 }
 
 bool KinematicsEngine::check_collision(const std::array<double,6>& q,std::string* detail) const {
+  auto workspace=collision_workspace();
+  return check_collision(q,workspace,detail);
+}
+bool KinematicsEngine::check_collision(const std::array<double,6>& q,
+    CollisionWorkspace& workspace,std::string* detail) const {
   if(detail) detail->clear();
   if (!all_finite(q)) {
     if(detail) *detail="Non-finite joint configuration";
     return true;
   }
-  pinocchio::Data data(pin_model_);
-  pinocchio::GeometryData geometry_data(geom_model_);
+  auto& data=workspace.data;
+  auto& geometry_data=workspace.geometry;
   const Eigen::Map<const Eigen::Matrix<double,6,1>> qe(q.data());
   pinocchio::forwardKinematics(pin_model_,data,qe);
   pinocchio::updateGeometryPlacements(pin_model_,data,geom_model_,geometry_data);

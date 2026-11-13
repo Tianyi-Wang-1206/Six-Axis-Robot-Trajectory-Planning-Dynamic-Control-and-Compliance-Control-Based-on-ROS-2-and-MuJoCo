@@ -1,0 +1,17 @@
+# Lite6 wide gripper drive approximation. Loaded once at hardware initialization.
+# OPEN/CLOSE/STOP are the public commands; these are simulation calibration values,
+# not settings exposed by the original Lite6 I/O gripper. Restart after editing.
+gripper:
+  stiffness: 4000.0                 # N/m, position tracking / finite holding force
+  damping: 40.0                     # N*s/m
+  max_force: 10.0                   # N, single coupled motor; ~5 N per jaw before losses
+  max_velocity: 0.05                # m/s per finger, must not exceed URDF rating
+  max_acceleration: 0.5             # m/s^2, reference acceleration
+  position_tolerance: 0.00025       # m per finger
+  stationary_velocity: 0.001        # m/s
+  settle_time: 0.15                 # s, endpoint confirmation
+  travel_timeout: 8.0               # s without endpoint / confirmed grasp
+  grasp_force: 0.2                  # N minimum inward normal force on EACH fingertip
+  grasp_confirm_time: 0.25          # s, same moving object and stationary jaws
+  grasp_loss_time: 0.10             # s, debounce missing contact / changed object
+  contact_normal_cosine: 0.7        # inward normal alignment with closing direction

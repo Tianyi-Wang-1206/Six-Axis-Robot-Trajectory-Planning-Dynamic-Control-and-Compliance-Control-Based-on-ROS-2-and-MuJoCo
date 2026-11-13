@@ -303,8 +303,14 @@ rejected by velocity and acceleration checks; the fit quality limits remain enfo
 
 The Supervisor requires all joint speeds to remain at or below 0.01 rad/s for
 300 ms before advancing SysID alignment/mode transitions and emergency-stop
-recovery. Settling has an 8 s timeout, client dispatch has a 15 s timeout, and
-estimation has a 60 s timeout. An estimation/data-quality failure follows a
+recovery. Settling has an 8 s timeout and client dispatch has a 15 s timeout.
+Once a trajectory is received, `SYSID_VALIDATING` gives the planner a separate
+bounded 120 s validation window; the arm stays at the alignment pose. A local
+collision workspace is reused throughout this check. Hardware heartbeats,
+mode checks and cancellation remain active, and no excitation is dispatched
+before validation succeeds. Estimation has a 60 s timeout. The initiating ESTOP
+diagnostic is retained through controller-mode and cancellation acknowledgements.
+An estimation/data-quality failure follows a
 guarded return to NORMAL and retains its diagnostic; motion failures, missing
 feedback and transition timeouts still enter ESTOP. A mode acknowledgement alone
 does not authorize the next motion before the physical robot has settled.
@@ -326,6 +332,38 @@ does not authorize the next motion before the physical robot has settled.
 <p align="center">
   <img src="media/demo_estop.gif" width="1080" alt="E-Stop"/>
 </p>
+
+### 5. Independent Lite6 Wide Gripper
+
+The Gripper tab and `/gripper/command` provide `OPEN=1`, `CLOSE=2`, and `STOP=3`.
+The gripper is independent of the arm Supervisor: normal arm motion, SysID and
+the arm's **software** E-Stop do not cancel a gripper command or remove its
+holding force. Commands require active gripper hardware and fresh physics
+feedback. Hardware deactivation still makes the gripper unavailable.
+
+`STOP` removes motor drive. Passive friction stops the jaws; there is no ideal
+position brake and no promise of retaining an object after stopping. A held
+`CLOSE` continues finite-force clamping during arm motion. This models the
+[Lite6 open/close/stop interface](https://docs.lite6.ufactory.cc/5.End-Effector.html),
+not the robot's physical power-cut emergency-stop circuit.
+
+Calibration lives in `src/lite6_hardware/config/gripper.yaml`, loaded at hardware
+initialization; restart after editing. The GUI cannot change these parameters.
+The defaults limit each finger's reference to 0.05 m/s and 0.5 m/s², with a
+10 N coupled motor force limit (approximately 5 N per jaw before losses).
+A measured-speed torque envelope reduces motoring force to zero at the speed
+limit and brakes overspeed with bounded force. Positions and velocities are
+never overwritten to enforce limits; sufficiently large external forces can
+still backdrive a physical force-limited actuator.
+
+`GRASPED` is a **simulation estimate**, not a sensor supplied by the Lite6 I/O
+gripper. It requires sustained inward normal force on both fingertips against
+the same movable rigid object, stationary jaws, and a gap above the closed
+endpoint. Robot self-contact, finger bases, fixed obstacles and single-sided
+contact do not qualify. Contact loss is debounced and returns the state to
+`CLOSING`; a continuing CLOSE may regrasp or reach `CLOSED`. An obstruction that
+never establishes a grasp or endpoint times out with motor drive off. STOP
+always clears grasp status and remains available even when the motion queue is full.
 
 ## 🚀 Quick Start & Reproduction Guide
 
@@ -474,7 +512,7 @@ for the native camera and perturbation model.
 
 ## 🔮 Future Work
 This framework is actively evolving. Upcoming features include:
-- **End-Effector Integration:** Adding URDF and controller support for parallel jaw grippers to facilitate pick-and-place tasks.
+- **Manipulation Tasks:** Extend the integrated wide gripper with object scenes and pick-and-place workflows.
 - **Friction Modeling Improvement:** Replacing the current model with the LuGre friction model.
 - **Advanced Control Algorithms:** Impedance control, admittance control, etc.
 

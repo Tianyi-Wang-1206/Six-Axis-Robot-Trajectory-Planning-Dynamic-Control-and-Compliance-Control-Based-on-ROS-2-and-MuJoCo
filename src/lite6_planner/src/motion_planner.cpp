@@ -539,6 +539,8 @@ void MotionPlanner::verify_trajectory(const trajectory_msgs::msg::JointTrajector
     fail(Action::Result::ERR_INVALID_INPUT,"Trajectory exceeds point limit");
   double prev_time=-1.0;
   std::array<double,6> prev_q{},prev_acc{};
+  // One workspace per validation call, safe across independent planning threads.
+  auto collisions=engine_.collision_workspace();
   for(size_t k=0;k<traj.points.size();++k) {
     if(k%32==0) check_cancelled(cancel);
     const auto& p=traj.points[k];
@@ -578,9 +580,9 @@ void MotionPlanner::verify_trajectory(const trajectory_msgs::msg::JointTrajector
     }
     if(k==0) {
       std::string collision;
-      if(engine_.check_collision(q,&collision))
+      if(engine_.check_collision(q,collisions,&collision))
         fail(Action::Result::ERR_LIMIT_VIOLATION,"Trajectory sample 0, t="+std::to_string(time)+" s: "+collision);
-    } else {
+    } else if(q!=prev_q) {
       double biggest=0;
       for(int j=0;j<6;++j) biggest=std::max(biggest,std::abs(q[j]-prev_q[j]));
       const int pieces=std::max(1,static_cast<int>(std::ceil(biggest/0.04)));
@@ -589,7 +591,7 @@ void MotionPlanner::verify_trajectory(const trajectory_msgs::msg::JointTrajector
         const double s=static_cast<double>(z)/pieces;
         for(int j=0;j<6;++j) mid[j]=(1-s)*prev_q[j]+s*q[j];
         std::string collision;
-        if(engine_.check_collision(mid,&collision)) fail(Action::Result::ERR_LIMIT_VIOLATION,
+        if(engine_.check_collision(mid,collisions,&collision)) fail(Action::Result::ERR_LIMIT_VIOLATION,
           "Trajectory segment "+std::to_string(k-1)+" -> "+std::to_string(k)+
           ", subdivision "+std::to_string(z)+"/"+std::to_string(pieces)+
           ", approximate t="+std::to_string(prev_time+s*(time-prev_time))+" s: "+collision);

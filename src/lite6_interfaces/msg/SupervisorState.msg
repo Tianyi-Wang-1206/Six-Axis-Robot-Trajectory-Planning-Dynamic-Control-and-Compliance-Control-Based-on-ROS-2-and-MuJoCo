@@ -36,6 +36,8 @@ uint8 SYSID_POST_ALIGN=6
 uint8 SYSID_WAIT_NORMAL_MODE=7
 uint8 SYSID_RETURN_ALIGN=8
 uint8 SYSID_COMPLETING=9
+# Planner-side validation of the received trajectory, before CTC dispatch.
+uint8 SYSID_VALIDATING=10
 uint8 sysid_phase
 
 # No phase entry action is permitted until continuous physical settling is confirmed.
