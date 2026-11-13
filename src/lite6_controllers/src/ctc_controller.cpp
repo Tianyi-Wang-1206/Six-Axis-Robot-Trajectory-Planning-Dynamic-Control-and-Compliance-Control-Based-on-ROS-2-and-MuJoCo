@@ -243,6 +243,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   // Never reuse a bias learned before deactivation or a hardware restart.
   integral_effort_.setZero();
   execution_stop_latched_ = false;
+  shadow_publish_phase_ = 0;
 
   for (size_t i = 0; i < n; ++i) {
     double initial_pos = state_interfaces_[i].get_value();
@@ -431,10 +432,11 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   // No success is published until this cycle's feedback and command writes pass.
   finish_trajectory_cycle(dt);
 
-  // 6. Publish shadow visualization at 200Hz (1000Hz / 5).
-  publish_counter_++;
-  if (publish_counter_ >= publish_rate_divider_) {
-      publish_counter_ = 0;
+  // 6. Publish shadow visualization at 60 Hz using elapsed control time.
+  shadow_publish_phase_ += period.nanoseconds() * shadow_publish_rate_hz_;
+  if (shadow_publish_phase_ >= 1000000000) {
+      // Retain fractional periods, but never burst to catch up after a stall.
+      shadow_publish_phase_ %= 1000000000;
       
       // trylock() ensures we never block the 1000Hz loop.
       if (rt_shadow_pub_->trylock()) {

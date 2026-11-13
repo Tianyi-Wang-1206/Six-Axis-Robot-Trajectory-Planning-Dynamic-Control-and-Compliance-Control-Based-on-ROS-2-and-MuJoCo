@@ -39,7 +39,8 @@ public:
       throw std::runtime_error("fps must be in [15, 240]");
     }
     show_shadow_ = node_->declare_parameter("shadow", false);
-    const bool shadows = node_->declare_parameter("shadows", true);
+    // Cast shadows amplify overlapping STL surfaces in close-up views.
+    const bool shadows = node_->declare_parameter("shadows", false);
     const auto path = ament_index_cpp::get_package_share_directory("lite6_description") +
       "/mujoco/scene.xml";
     char error[1024]{};
@@ -63,6 +64,7 @@ public:
     mjv_defaultScene(&scene_);
     mjr_defaultContext(&context_);
     options_.geomgroup[3] = 0;  // Collision meshes must not cover the visual meshes.
+    options_.flags[mjVIS_CONVEXHULL] = 0;  // Render the full visual meshes.
     options_.sitegroup[4] = 0;
     reset_camera();
 
@@ -100,9 +102,19 @@ public:
         shadow_dirty_ = true;
       });
 
-    glfwWindowHint(GLFW_SAMPLES, 4);
+    glfwWindowHint(GLFW_SAMPLES, 8);
     glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
-    window_.reset(glfwCreateWindow(1280, 800, "Lite6 | MuJoCo Studio", nullptr, nullptr));
+    int width = 1920, height = 1080;
+    if (auto * monitor = glfwGetPrimaryMonitor()) {
+      int work_x, work_y, work_width, work_height;
+      glfwGetMonitorWorkarea(monitor, &work_x, &work_y, &work_width, &work_height);
+      // Leave room for window decorations, including on scaled desktops.
+      if (work_width > 80 && work_height > 100) {
+        width = std::min(width, work_width - 80);
+        height = std::min(height, work_height - 100);
+      }
+    }
+    window_.reset(glfwCreateWindow(width, height, "Lite6 | MuJoCo Studio", nullptr, nullptr));
     if (!window_) {throw std::runtime_error("Cannot create an OpenGL window (check DISPLAY)");}
     glfwMakeContextCurrent(window_.get());
     glfwSwapInterval(1);

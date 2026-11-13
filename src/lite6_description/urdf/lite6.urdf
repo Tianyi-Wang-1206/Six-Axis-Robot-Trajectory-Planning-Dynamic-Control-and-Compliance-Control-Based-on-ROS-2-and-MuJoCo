@@ -16,12 +16,12 @@
     </inertial>
     <visual>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <geometry><mesh filename="package://lite6_description/assets/visual/link_base.stl"/></geometry>
+      <geometry><mesh filename="package://lite6_description/mujoco/assets/visual/link_base.stl"/></geometry>
       <material name="White"/>
     </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <geometry><mesh filename="package://lite6_description/assets/collision/link_base.stl"/></geometry>
+      <geometry><mesh filename="package://lite6_description/mujoco/assets/collision/link_base.stl"/></geometry>
     </collision>
   </link>
 
@@ -33,12 +33,12 @@
     </inertial>
     <visual>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <geometry><mesh filename="package://lite6_description/assets/visual/link1.stl"/></geometry>
+      <geometry><mesh filename="package://lite6_description/mujoco/assets/visual/link1.stl"/></geometry>
       <material name="White"/>
     </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <geometry><mesh filename="package://lite6_description/assets/collision/link1.stl"/></geometry>
+      <geometry><mesh filename="package://lite6_description/mujoco/assets/collision/link1.stl"/></geometry>
     </collision>
   </link>
 
@@ -59,12 +59,12 @@
     </inertial>
     <visual>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <geometry><mesh filename="package://lite6_description/assets/visual/link2.stl"/></geometry>
+      <geometry><mesh filename="package://lite6_description/mujoco/assets/visual/link2.stl"/></geometry>
       <material name="White"/>
     </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <geometry><mesh filename="package://lite6_description/assets/collision/link2.stl"/></geometry>
+      <geometry><mesh filename="package://lite6_description/mujoco/assets/collision/link2.stl"/></geometry>
     </collision>
   </link>
 
@@ -85,12 +85,12 @@
     </inertial>
     <visual>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <geometry><mesh filename="package://lite6_description/assets/visual/link3.stl"/></geometry>
+      <geometry><mesh filename="package://lite6_description/mujoco/assets/visual/link3.stl"/></geometry>
       <material name="White"/>
     </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <geometry><mesh filename="package://lite6_description/assets/collision/link3.stl"/></geometry>
+      <geometry><mesh filename="package://lite6_description/mujoco/assets/collision/link3.stl"/></geometry>
     </collision>
   </link>
 
@@ -111,12 +111,12 @@
     </inertial>
     <visual>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <geometry><mesh filename="package://lite6_description/assets/visual/link4.stl"/></geometry>
+      <geometry><mesh filename="package://lite6_description/mujoco/assets/visual/link4.stl"/></geometry>
       <material name="White"/>
     </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <geometry><mesh filename="package://lite6_description/assets/collision/link4.stl"/></geometry>
+      <geometry><mesh filename="package://lite6_description/mujoco/assets/collision/link4.stl"/></geometry>
     </collision>
   </link>
 
@@ -137,12 +137,12 @@
     </inertial>
     <visual>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <geometry><mesh filename="package://lite6_description/assets/visual/link5.stl"/></geometry>
+      <geometry><mesh filename="package://lite6_description/mujoco/assets/visual/link5.stl"/></geometry>
       <material name="White"/>
     </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <geometry><mesh filename="package://lite6_description/assets/collision/link5.stl"/></geometry>
+      <geometry><mesh filename="package://lite6_description/mujoco/assets/collision/link5.stl"/></geometry>
     </collision>
   </link>
 
@@ -163,12 +163,12 @@
     </inertial>
     <visual>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <geometry><mesh filename="package://lite6_description/assets/visual/link6.stl"/></geometry>
+      <geometry><mesh filename="package://lite6_description/mujoco/assets/visual/link6.stl"/></geometry>
       <material name="Silver"/>
     </visual>
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <geometry><mesh filename="package://lite6_description/assets/collision/link6.stl"/></geometry>
+      <geometry><mesh filename="package://lite6_description/mujoco/assets/collision/link6.stl"/></geometry>
     </collision>
   </link>
 

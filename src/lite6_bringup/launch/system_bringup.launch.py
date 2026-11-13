@@ -70,7 +70,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('viewer', default_value='true', description='Open native MuJoCo window'),
         DeclareLaunchArgument('viewer_fps', default_value='60', description='Render rate, 15..240 Hz'),
-        DeclareLaunchArgument('viewer_shadows', default_value='true', description='Render cast shadows'),
+        DeclareLaunchArgument('viewer_shadows', default_value='false', description='Render cast shadows (may show mesh artifacts)'),
         DeclareLaunchArgument('viewer_shadow', default_value='false', description='Show cyan target robot'),
         control_node, rsp_node, viewer_node, jsb_spawner, ctc_spawner,
         # 2. Launch the planner and HMI after the direct trajectory CTC controller is ready.

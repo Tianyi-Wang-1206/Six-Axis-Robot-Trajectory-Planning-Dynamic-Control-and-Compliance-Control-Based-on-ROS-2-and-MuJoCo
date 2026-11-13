@@ -6,6 +6,7 @@
 #include <atomic>
 #include <mutex>
 #include <array>
+#include <cstdint>
 #include "controller_interface/controller_interface.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "control_msgs/action/follow_joint_trajectory.hpp"
@@ -145,9 +146,10 @@ private:
   SystemState last_reported_state_ = SystemState::NORMAL;
   bool status_publish_pending_ = true;
 
-  // Downsample shadow visualization to 200Hz without flooding the network.
-  int publish_rate_divider_ = 5; 
-  int publish_counter_ = 0;
+  // Nanoseconds * Hz phase accumulator: retain the remainder for an average
+  // 60 Hz even though 1000 Hz is not an integer multiple of the publish rate.
+  static constexpr int64_t shadow_publish_rate_hz_ = 60;
+  int64_t shadow_publish_phase_ = 0;
 };
 
 }  // namespace lite6_controllers

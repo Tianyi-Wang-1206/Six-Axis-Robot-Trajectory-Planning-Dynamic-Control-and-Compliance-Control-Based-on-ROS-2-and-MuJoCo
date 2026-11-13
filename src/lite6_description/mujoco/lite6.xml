@@ -28,16 +28,18 @@
   </default>
 
   <asset>
-    <material name="white" rgba="1 1 1 1"/>
-    <material name="silver" rgba=".753 .753 .753 1"/>
+    <material name="white" rgba="0.9 0.9 0.88 1" specular="0.08" shininess="0.15"/>
+    <material name="silver" rgba=".753 .753 .753 1" specular="0.18" shininess="0.25"/>
 
-    <mesh file="visual/link_base.stl"/>
-    <mesh file="visual/link1.stl"/>
-    <mesh file="visual/link2.stl"/>
-    <mesh file="visual/link3.stl"/>
-    <mesh file="visual/link4.stl"/>
-    <mesh file="visual/link5.stl"/>
-    <mesh file="visual/link6.stl"/>
+    <!-- Same STL triangles with explicit original face normals. Loading STL
+         directly regenerates smooth normals and hides the shell's facets. -->
+    <mesh file="visual/link_base.obj"/>
+    <mesh file="visual/link1.obj"/>
+    <mesh file="visual/link2.obj"/>
+    <mesh file="visual/link3.obj"/>
+    <mesh file="visual/link4.obj"/>
+    <mesh file="visual/link5.obj"/>
+    <mesh file="visual/link6.obj"/>
     <mesh name="link_base_c" file="collision/link_base.stl"/>
     <mesh name="link1_c" file="collision/link1.stl"/>
     <mesh name="link2_c" file="collision/link2.stl"/>
