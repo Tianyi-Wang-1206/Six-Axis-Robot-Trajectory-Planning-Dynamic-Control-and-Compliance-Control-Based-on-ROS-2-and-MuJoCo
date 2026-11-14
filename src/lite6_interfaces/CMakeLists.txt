@@ -10,6 +10,8 @@ find_package(trajectory_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/IndustrialMotion.action"
+  "msg/ComplianceSettings.msg"
+  "msg/ComplianceCommand.msg"
   "msg/ControllerStatus.msg"
   "msg/SysIdSample.msg"
   "msg/SimulationState.msg"
@@ -28,4 +30,5 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 )
 
 ament_export_dependencies(rosidl_default_runtime)
+install(DIRECTORY include/ DESTINATION include/${PROJECT_NAME})
 ament_package()

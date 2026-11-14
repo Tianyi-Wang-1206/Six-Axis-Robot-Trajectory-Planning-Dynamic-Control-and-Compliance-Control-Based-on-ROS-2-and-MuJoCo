@@ -106,13 +106,19 @@ void Supervisor::fault_unlocked(const std::string& reason,bool estop,Effects& ef
 Supervisor::Effects Supervisor::observe_controller(uint8_t mode) {
   std::lock_guard<std::mutex> guard(mutex_);
   Effects fx;
-  if(mode!=CS::MODE_NORMAL&&mode!=CS::MODE_ESTOP&&mode!=CS::MODE_SYSID) return fx;
+  if(mode<CS::MODE_NORMAL||mode>CS::MODE_COMPLIANCE_STOPPING) return fx;
   const auto previous=state_.controller_mode;
   seen_controller_=true;controller_time_=Clock::now();
   state_.controller_mode=mode;
   // Keep the initiating fault visible while the controller acknowledges ESTOP.
   if(state_.mode==S::MODE_ESTOP) {
     if(previous!=mode) changed_unlocked();
+    return fx;
+  }
+  if(state_.mode==S::MODE_COMPLIANCE_SWITCHING && mode==compliance_target_) {
+    state_.mode=mode==CS::MODE_NORMAL?S::MODE_NORMAL:static_cast<uint8_t>(mode+3);
+    phase_deadline_=Clock::time_point{};
+    changed_unlocked("Compliance transition acknowledged by controller");
     return fx;
   }
   if(mode==CS::MODE_ESTOP&&state_.mode!=S::MODE_ESTOP&&state_.mode!=S::MODE_RECOVERING) {
@@ -152,6 +158,11 @@ Supervisor::Effects Supervisor::watchdog() {
   }
   if(state_.mode==S::MODE_NORMAL&&state_.controller_mode!=CS::MODE_NORMAL) {
     fault_unlocked("Unexpected controller mode in NORMAL operation",true,fx);
+    return fx;
+  }
+  if(state_.mode>=S::MODE_JOINT_IMPEDANCE&&state_.mode<=S::MODE_TEACH&&
+     state_.controller_mode!=state_.mode-3) {
+    fault_unlocked("Unexpected controller mode in compliance operation",true,fx);
     return fx;
   }
   if(state_.mode==S::MODE_SYSID) {
@@ -406,6 +417,34 @@ Supervisor::Reply Supervisor::command(uint8_t event,uint64_t session,const std::
     r.accepted=true;
     fault_unlocked("ESTOP: "+reason,true,r.effects);
     break;
+  case C::Request::CMD_JOINT_IMPEDANCE:
+  case C::Request::CMD_CARTESIAN_IMPEDANCE:
+  case C::Request::CMD_TEACH:
+  case C::Request::CMD_EXIT_COMPLIANCE: {
+    const bool compliant=state_.mode>=S::MODE_JOINT_IMPEDANCE&&state_.mode<=S::MODE_TEACH;
+    const bool exiting=event==C::Request::CMD_EXIT_COMPLIANCE;
+    const uint8_t target=exiting?CS::MODE_NORMAL:static_cast<uint8_t>(event-4);
+    const bool same=compliant&&target==state_.controller_mode;
+    if(session!=0||state_.estop_latched||!active_key_.empty()||
+       !fresh_joint_unlocked()||!fresh_controller_unlocked()||
+       !(compliant||(state_.mode==S::MODE_NORMAL&&state_.controller_mode==CS::MODE_NORMAL))||
+       (exiting&&!compliant)) {
+      reject("Compliance requires idle NORMAL/compliance mode and fresh feedback");break;
+    }
+    if(!exiting&&!same&&(stable_since_==Clock::time_point{}||
+       Clock::now()-stable_since_<kSettleDuration)) {
+      reject("Release the arm and wait until stationary before changing compliance mode");break;
+    }
+    r.effects.ctc_command=exiting?6:static_cast<int>(event-5);
+    if(!same) {
+      compliance_target_=target;
+      state_.mode=S::MODE_COMPLIANCE_SWITCHING;
+      phase_deadline_=Clock::now()+kModeTimeout;
+    }
+    changed_unlocked(same?"Compliance settings accepted":"Waiting for compliance mode acknowledgement");
+    r.accepted=true;
+    break;
+  }
   case C::Request::CMD_BEGIN_RECOVERY:
     if(state_.mode!=S::MODE_ESTOP||!state_.estop_latched||session!=0||
        !active_key_.empty()||!fresh_joint_unlocked()||!fresh_controller_unlocked()||

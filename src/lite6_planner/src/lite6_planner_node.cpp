@@ -14,6 +14,8 @@
 #include <lite6_interfaces/msg/supervisor_state.hpp>
 #include <lite6_interfaces/msg/motion_rejection.hpp>
 #include <lite6_interfaces/srv/supervisor_command.hpp>
+#include <lite6_interfaces/msg/compliance_command.hpp>
+#include <lite6_interfaces/compliance_validation.hpp>
 #include <lite6_interfaces/srv/submit_sys_id_trajectory.hpp>
 
 #include <algorithm>
@@ -64,6 +66,8 @@ public:
     rejection_pub_=create_publisher<lite6_interfaces::msg::MotionRejection>(
       "/supervisor/motion_rejections",rclcpp::QoS(32).reliable());
     cmd_pub_=create_publisher<std_msgs::msg::Int32>("/ctc_controller/system_cmd",10);
+    compliance_pub_=create_publisher<lite6_interfaces::msg::ComplianceCommand>(
+      "/ctc_controller/compliance_cmd",10);
     rclcpp::SubscriptionOptions sensor_options;
     sensor_options.callback_group=io_group_;
     controller_sub_=create_subscription<lite6_interfaces::msg::ControllerStatus>(
@@ -98,7 +102,17 @@ public:
       [this](const std::shared_ptr<lite6_interfaces::srv::SupervisorCommand::Request> req,
              std::shared_ptr<lite6_interfaces::srv::SupervisorCommand::Response> resp) {
         std::lock_guard<std::mutex> transition(transition_mutex_);
+        const bool compliance=req->command>=8&&req->command<=10;
+        if(compliance&&!lite6_interfaces::valid_compliance_settings(req->compliance)) {
+          resp->accepted=false;resp->message="Invalid compliance gains / sensitivity";return;
+        }
         auto reply=supervisor_.command(req->command,req->session_id,req->reason);
+        if(reply.accepted&&compliance) {
+          lite6_interfaces::msg::ComplianceCommand msg;
+          msg.command=reply.effects.ctc_command;msg.settings=req->compliance;
+          compliance_pub_->publish(msg);
+          reply.effects.ctc_command=-1;
+        }
         resp->accepted=reply.accepted;resp->session_id=reply.session_id;
         resp->revision=reply.revision;resp->message=reply.message;
         do_effects(reply.effects);publish_state();
@@ -141,6 +155,7 @@ private:
   rclcpp::CallbackGroup::SharedPtr io_group_;
   rclcpp::CallbackGroup::SharedPtr validation_group_;
   std::atomic<bool> shutdown_{false};
+  rclcpp::Publisher<lite6_interfaces::msg::ComplianceCommand>::SharedPtr compliance_pub_;
   rclcpp::Publisher<S>::SharedPtr state_pub_;
   rclcpp::Publisher<lite6_interfaces::msg::MotionRejection>::SharedPtr rejection_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr cmd_pub_;

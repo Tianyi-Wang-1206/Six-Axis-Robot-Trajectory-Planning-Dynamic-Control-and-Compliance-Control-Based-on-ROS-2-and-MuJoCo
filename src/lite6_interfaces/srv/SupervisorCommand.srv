@@ -9,6 +9,13 @@ uint8 CMD_ABORT_SYSID=6
 # Estimation/data-quality failure after excitation; restore NORMAL under supervision.
 uint8 CMD_SYSID_CALCULATION_FAILED=7
 
+uint8 CMD_JOINT_IMPEDANCE=8
+uint8 CMD_CARTESIAN_IMPEDANCE=9
+uint8 CMD_TEACH=10
+uint8 CMD_EXIT_COMPLIANCE=11
+
+# Used only by the three compliance events.
+ComplianceSettings compliance
 uint8 command
 
 # For session-scoped operations use the ID returned by BEGIN_*.

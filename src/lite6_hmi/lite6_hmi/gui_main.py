@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtGui import QFont, QDoubleValidator, QPalette, QColor
 from lite6_hmi.supervisor_worker import ROS2Worker, Lite6StateMachine
+from lite6_hmi.compliance_tab import ComplianceTab
 
 
 class PyQtHMI(QMainWindow):
@@ -283,6 +284,9 @@ class PyQtHMI(QMainWindow):
         tab_gripper = QWidget()
         self.tabs.addTab(tab_gripper, "Gripper")
         self.setup_gripper_tab(tab_gripper)
+
+        self.compliance_tab = ComplianceTab(self.worker)
+        self.tabs.addTab(self.compliance_tab, "Compliance / Teaching")
 
         # 3. Bottom Control Frame: Overrides, Home, Fault Recovery and E-Stop
         bot_frame = QWidget()

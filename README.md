@@ -215,6 +215,18 @@ The **torque-domain integrator** corrects residual steady-state error, while **b
 
 MuJoCo simulates **LuGre dynamic friction**, including internal friction state, while the controller uses a simpler viscous/Coulomb compensation model. This creates a useful model-mismatch setting for trajectory tracking and disturbance-rejection experiments. Tracking accuracy should be reported with the trajectory, load, gains and measured errors; configured tolerances alone are not an accuracy benchmark.
 
+### Encoder-Based Compliance and Drag Teaching
+
+The **Compliance / Teaching** tab selects joint-space impedance, Cartesian-space impedance at `link_eef`, or drag teaching. Enter from stationary NORMAL mode. Entry captures the measured joint/TCP equilibrium; applying gains in the same mode preserves it unless **Capture current equilibrium** is selected. Joint gains use Nm/rad and Nm s/rad; Cartesian translation uses N/m and N s/m, and rotation uses Nm/rad and Nm s/rad. Cartesian axes are world-aligned.
+
+These controllers use encoder position/velocity, model gravity, and (only for teaching) bounded nominal friction compensation. They do not consume effort feedback, contact forces, applied-force truth, or hidden LuGre state. They retain physical inertia rather than attempting arbitrary inertia shaping. NORMAL CTC and SYS_ID control laws and planner algorithms remain unchanged.
+
+Teaching sensitivity ranges from 1 (firm) to 5 (light). Increasing it reduces joint damping from 4 to 1 Nm s/rad and increases friction assistance from 35% to 85%; static starting resistance remains. Gains change smoothly over a 0.15 s time constant. Teaching has zero position stiffness, so **Stop and return to NORMAL** brakes and holds the measured stopping pose. Mode switching requires stationary feedback, while same-mode gain updates are allowed during interaction. The shared **STOP (E-STOP)** button remains available in every mode; recovery uses the existing supervised recovery sequence.
+
+In the MuJoCo viewer, select a link and use Ctrl + right drag for force or Ctrl + left drag for torque. **Capture point** stores measured joint angles. **Start recording** captures timestamped encoder positions at up to 100 Hz, capped at 60,000 samples. Leaving teaching, stale feedback, or a clock discontinuity stops recording. Exported JSON contains radians and timestamps, never measured force. Recordings require smoothing, retiming, and path validation before future playback; this tab does not add a playback planner.
+
+The Supervisor excludes planning and identification while compliance is active and waits for controller acknowledgement on entry/exit. Compliance adds soft joint-limit walls, a 1.5 rad/s joint-speed stop, a 0.01 rad numerical allowance at hard limits, torque slew limiting, and persistent-saturation stopping. Existing MuJoCo contacts remain physical constraints; no additional online geometric collision planner is introduced.
+
 ### 3. Supervisor, Execution Monitoring & Software E-Stop
 
 An event-driven **finite-state machine** coordinates INITIALIZING, NORMAL, SYSID, ESTOP, RECOVERING and SOFT_FAULT modes, alongside separate motion phases. FAULT is a reserved interface value with no current entry transition. Session IDs and guarded events correlate identification and recovery operations. Controller acknowledgements and physical feedback govern transitions; accepting a service request does not mean the physical transition has completed.

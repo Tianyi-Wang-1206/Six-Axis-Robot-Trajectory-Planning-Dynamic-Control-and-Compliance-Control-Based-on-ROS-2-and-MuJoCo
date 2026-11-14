@@ -15,6 +15,7 @@
 #include "realtime_tools/realtime_buffer.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "lite6_interfaces/msg/controller_status.hpp"
+#include "lite6_interfaces/msg/compliance_command.hpp"
 #include "realtime_tools/realtime_publisher.hpp"
 
 #include "pinocchio/multibody/model.hpp"
@@ -121,7 +122,22 @@ private:
   Eigen::VectorXd max_effort_;
   double tanh_slope_;
 
-  enum class SystemState { NORMAL, ESTOP, SYS_ID };
+  enum class SystemState { NORMAL, ESTOP, SYS_ID, JOINT_IMPEDANCE, CARTESIAN_IMPEDANCE, TEACH, COMPLIANCE_STOPPING };
+  bool compliance_active() const;
+  void configure_compliance();
+  void process_compliance_command(int32_t command, const lite6_interfaces::msg::ComplianceSettings& settings);
+  void compute_compliance(double dt);
+  lite6_interfaces::msg::ComplianceSettings compliance_settings_, compliance_filtered_;
+  Eigen::Matrix<double,6,1> compliance_q_=Eigen::Matrix<double,6,1>::Zero();
+  Eigen::Matrix<double,6,1> compliance_last_tau_=Eigen::Matrix<double,6,1>::Zero();
+  Eigen::Matrix<double,6,Eigen::Dynamic> compliance_jacobian_;
+  pinocchio::SE3 compliance_pose_;
+  pinocchio::FrameIndex compliance_frame_=0;
+  uint64_t compliance_sequence_=0;
+  double compliance_saturation_time_=0.0;
+  std::atomic<bool> compliance_blocks_trajectory_{false};
+  std::atomic<bool> emergency_pending_{false};
+  rclcpp::Subscription<lite6_interfaces::msg::ComplianceCommand>::SharedPtr compliance_sub_;
   SystemState system_state_ = SystemState::NORMAL;
   
   // Kinematic Deceleration Tracker
@@ -129,7 +145,12 @@ private:
   Eigen::VectorXd estop_decel_;
   
   rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr cmd_sub_;
-  struct ModeCommand {int32_t value = 0; uint64_t sequence = 0;};
+  struct ModeCommand {
+    int32_t value=0; uint64_t sequence=0;
+    lite6_interfaces::msg::ComplianceSettings settings;
+    ModeCommand()=default;
+    ModeCommand(int32_t v,uint64_t s):value(v),sequence(s) {}
+  };
   realtime_tools::RealtimeBuffer<ModeCommand> cmd_buffer_;
   std::atomic<uint64_t> command_sequence_{0};
   uint64_t current_command_sequence_ = 0;

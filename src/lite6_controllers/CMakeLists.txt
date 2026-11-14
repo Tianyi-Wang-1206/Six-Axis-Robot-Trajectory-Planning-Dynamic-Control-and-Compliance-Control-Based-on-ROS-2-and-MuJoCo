@@ -23,7 +23,7 @@ include_directories(${Boost_INCLUDE_DIRS})
 find_package(pinocchio REQUIRED)
 find_package(std_msgs REQUIRED)
 # 2. Compile the controller library
-add_library(${PROJECT_NAME} SHARED src/ctc_controller.cpp src/trajectory_execution.cpp)
+add_library(${PROJECT_NAME} SHARED src/ctc_controller.cpp src/trajectory_execution.cpp src/compliance_control.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)

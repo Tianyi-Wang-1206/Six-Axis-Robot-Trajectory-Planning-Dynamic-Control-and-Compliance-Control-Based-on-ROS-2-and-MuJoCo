@@ -197,6 +197,8 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   cmd_sub_ = get_node()->create_subscription<std_msgs::msg::Int32>(
     "~/system_cmd", rclcpp::SystemDefaultsQoS(),
     [this](const std_msgs::msg::Int32::SharedPtr msg) {
+      if(msg->data<0||msg->data>6|| (msg->data>=3&&msg->data<=5)) return;
+      if(msg->data==1) emergency_pending_.store(true);
       cmd_buffer_.writeFromNonRT(ModeCommand{msg->data, ++command_sequence_});
     });
 
@@ -246,6 +248,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   status_publish_counter_ = 0;
   status_publish_pending_ = true;
 
+  configure_compliance();
   configure_trajectory_action();
   return controller_interface::CallbackReturn::SUCCESS;
 }
@@ -256,6 +259,8 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   // Never reuse a bias learned before deactivation or a hardware restart.
   integral_effort_.setZero();
   execution_stop_latched_ = false;
+  compliance_blocks_trajectory_.store(false);
+  emergency_pending_.store(false);
 
   for (size_t i = 0; i < n; ++i) {
     double initial_pos = state_interfaces_[i].get_value();
@@ -331,7 +336,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
 
   // 2. State Machine & Kinematic Deceleration Trajectory Generation
   const auto * cmd_ptr = cmd_buffer_.readFromRT();
-  const int32_t current_cmd = cmd_ptr->value;
+  const int32_t current_cmd = emergency_pending_.exchange(false) ? 1 : cmd_ptr->value;
   current_command_sequence_ = cmd_ptr->sequence;
 
   if (current_cmd == 1 && system_state_ != SystemState::ESTOP) {
@@ -355,6 +360,8 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       }
   }
 
+  process_compliance_command(current_cmd, cmd_ptr->settings);
+  compliance_blocks_trajectory_.store(compliance_active()||system_state_==SystemState::COMPLIANCE_STOPPING);
   check_trajectory_path();
 
   Eigen::Map<Eigen::VectorXd> map_q_d(reference_interfaces_.data(), n);
@@ -363,6 +370,9 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
 
   if (system_state_ == SystemState::NORMAL || system_state_ == SystemState::SYS_ID) {
       q_target_ = map_q_d; dq_target_ = map_dq_d; ddq_target_ = map_ddq_d;
+  } else if (compliance_active()) {
+      q_target_=compliance_q_; dq_target_.setZero(); ddq_target_.setZero();
+      if(system_state_==SystemState::TEACH) q_target_=q_;
   } else {
       for (size_t i = 0; i < n; ++i) {
           if (std::abs(estop_dq_[i]) > 1e-4) {
@@ -396,7 +406,9 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
     return fail_controller(TrajectoryResult::INVALID_COMMAND);
 
   // 4. Branching Control Law
-  if (system_state_ == SystemState::SYS_ID) {
+  if (compliance_active()) {
+      compute_compliance(dt);
+  } else if (system_state_ == SystemState::SYS_ID) {
       // Identification must contain neither friction nor learned bias compensation.
       integral_effort_.setZero();
       // Rotor inertia is known in every mode; only friction is unidentified.
@@ -430,7 +442,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       const double raw_effort = tau_cmd_[i];
       effort_saturated_[i] = std::abs(raw_effort) > max_effort_[i];
       tau_cmd_[i] = std::clamp(raw_effort, -max_effort_[i], max_effort_[i]);
-      if (system_state_ != SystemState::SYS_ID && ki_[i] > 0.0) {
+      if (system_state_ != SystemState::SYS_ID && !compliance_active() && ki_[i] > 0.0) {
           // During ESTOP retain the holding bias without integrating position
           // error. Back-calculation still unwinds bias if braking saturates.
           // NORMAL resumes from this state; trajectory completion never resets it.
@@ -486,6 +498,14 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
         case SystemState::ESTOP:
           status.mode = lite6_interfaces::msg::ControllerStatus::MODE_ESTOP;
           break;
+        case SystemState::JOINT_IMPEDANCE:
+          status.mode = lite6_interfaces::msg::ControllerStatus::MODE_JOINT_IMPEDANCE; break;
+        case SystemState::CARTESIAN_IMPEDANCE:
+          status.mode = lite6_interfaces::msg::ControllerStatus::MODE_CARTESIAN_IMPEDANCE; break;
+        case SystemState::TEACH:
+          status.mode = lite6_interfaces::msg::ControllerStatus::MODE_TEACH; break;
+        case SystemState::COMPLIANCE_STOPPING:
+          status.mode = lite6_interfaces::msg::ControllerStatus::MODE_COMPLIANCE_STOPPING; break;
         case SystemState::SYS_ID:
           status.mode = lite6_interfaces::msg::ControllerStatus::MODE_SYSID;
           break;

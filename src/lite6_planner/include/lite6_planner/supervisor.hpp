@@ -55,6 +55,7 @@ private:
   Clock::time_point controller_time_{},joint_time_{},phase_deadline_{};
   Clock::time_point stable_since_{};
   std::string sysid_failure_;
+  uint8_t compliance_target_=0;
   bool seen_controller_=false,seen_joint_=false;
   std::string active_key_;
   bool cancel_requested_=false;

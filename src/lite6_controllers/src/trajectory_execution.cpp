@@ -55,7 +55,7 @@ void Lite6CTCController::configure_trajectory_action()
     get_node(), "~/follow_joint_trajectory",
     [this](const rclcpp_action::GoalUUID &, std::shared_ptr<const FollowTrajectory::Goal> goal) {
       std::lock_guard<std::mutex> lock(trajectory_mutex_);
-      if (!trajectory_enabled_.load() || trajectory_reserved_ || !valid_trajectory_goal(*goal))
+      if (!trajectory_enabled_.load() || compliance_blocks_trajectory_.load() || trajectory_reserved_ || !valid_trajectory_goal(*goal))
         return rclcpp_action::GoalResponse::REJECT;
       trajectory_reserved_ = true;
       return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;

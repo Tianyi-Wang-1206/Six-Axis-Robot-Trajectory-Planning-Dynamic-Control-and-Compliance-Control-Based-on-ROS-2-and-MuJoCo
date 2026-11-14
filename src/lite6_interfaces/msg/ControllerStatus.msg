@@ -8,6 +8,10 @@ uint8 MODE_NORMAL=1
 uint8 MODE_ESTOP=2
 uint8 MODE_SYSID=3
 
+uint8 MODE_JOINT_IMPEDANCE=4
+uint8 MODE_CARTESIAN_IMPEDANCE=5
+uint8 MODE_TEACH=6
+uint8 MODE_COMPLIANCE_STOPPING=7
 uint8 mode
 
 # Actual first control-cycle timestamp of the most recent trajectory.

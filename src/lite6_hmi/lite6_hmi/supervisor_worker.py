@@ -32,6 +32,7 @@ from lite6_interfaces.srv import SupervisorCommand, SubmitSysIdTrajectory, Gripp
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from lite6_hmi.sysid_engine import SysIdEngine
+from lite6_hmi.teaching_recording import TeachingRecording
 
 
 class Lite6StateMachine:
@@ -62,6 +63,14 @@ def _view_state(msg):
         return Lite6StateMachine.SOFT_ERROR
     if msg.mode == S.MODE_RECOVERING:
         return Lite6StateMachine.RECOVERING
+    compliance_labels = {
+        S.MODE_JOINT_IMPEDANCE: "JOINT IMPEDANCE",
+        S.MODE_CARTESIAN_IMPEDANCE: "CARTESIAN IMPEDANCE",
+        S.MODE_TEACH: "DRAG TEACHING",
+        S.MODE_COMPLIANCE_SWITCHING: "COMPLIANCE: SWITCHING / STOPPING...",
+    }
+    if msg.mode in compliance_labels:
+        return compliance_labels[msg.mode]
     if msg.mode == S.MODE_SYSID:
         if msg.waiting_for_settle:
             return "SYSID: WAITING FOR PHYSICAL SETTLING..."
@@ -117,6 +126,7 @@ class ROS2Worker(QThread):
         self._stopping = False
 
         self.joint_names = [f"joint{i}" for i in range(1, 7)]
+        self.teaching = TeachingRecording()
         self.q_curr = [0.0] * 6
         self.dq_curr = [0.0] * 6
         self.tau_curr = [0.0] * 6
@@ -266,7 +276,7 @@ class ROS2Worker(QThread):
         for message in messages:
             self._report_error(message)
 
-    def _send_command(self, event, session=0, reason="", done=None):
+    def _send_command(self, event, session=0, reason="", done=None, compliance=None):
         if not self.command_client.service_is_ready():
             self._report_error("Supervisor command service is unavailable")
             return False
@@ -274,6 +284,8 @@ class ROS2Worker(QThread):
         req.command = event
         req.session_id = int(session)
         req.reason = str(reason)
+        if compliance is not None:
+            req.compliance = compliance
         try:
             future = self.command_client.call_async(req)
             future.add_done_callback(lambda f: self._command_response(f, done))
@@ -308,6 +320,8 @@ class ROS2Worker(QThread):
                 pass
             self._revision = msg.revision
             self.supervisor_state = msg
+            if msg.mode != SupervisorState.MODE_TEACH:
+                self.teaching.stop()
             # Subscribe during preparation/alignment so discovery finishes before
             # excitation. Ordinary motion has no extra 1 kHz telemetry traffic.
             if msg.mode == SupervisorState.MODE_SYSID and self.sysid_sample_sub is None:
@@ -463,6 +477,8 @@ class ROS2Worker(QThread):
             if not all(math.isfinite(x) for x in self.q_curr + self.dq_curr):
                 return
             self.last_state_rx_time = monotonic_now
+            self.teaching.observe(msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
+                                  self.q_curr)
             if monotonic_now - self.last_ui_update_time < 0.033:
                 return
             if self.model is not None:
