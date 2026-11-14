@@ -116,6 +116,19 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_init(
     return hardware_interface::CallbackReturn::ERROR;
   }
 
+  const std::array<const char *, 2> object_joints{
+    "grasp_cylinder_free", "grasp_box_free"};
+  for (size_t i = 0; i < object_joints.size(); ++i) {
+    const int joint = mj_name2id(m_model, mjOBJ_JOINT, object_joints[i]);
+    if (joint < 0 || m_model->jnt_type[joint] != mjJNT_FREE) {
+      RCLCPP_FATAL(rclcpp::get_logger("Lite6MujocoSystem"),
+        "Missing scene free joint: %s", object_joints[i]);
+      release_model();
+      return hardware_interface::CallbackReturn::ERROR;
+    }
+    object_qpos_indices_[i] = m_model->jnt_qposadr[joint];
+  }
+
   // 3. Mapping joints and motors
   friction_models_.clear();
   friction_models_.reserve(num_joints);
@@ -402,6 +415,10 @@ void Lite6MujocoSystem::publish_snapshot(StateSnapshot & snapshot)
     snapshot.velocity[i] = m_data->qvel[qvel_indices_[i]];
     snapshot.effort[i] = m_data->qfrc_actuator[qvel_indices_[i]];
   }
+  for (size_t i = 0; i < object_qpos_indices_.size(); ++i) {
+    std::copy_n(m_data->qpos + object_qpos_indices_[i], 7,
+      snapshot.object_qpos.begin() + 7 * i);
+  }
   snapshot.gripper = gripper_.feedback();
   snapshot.simulation_time = m_data->time;
   snapshot.published_ns = steady_now_ns();
@@ -434,6 +451,7 @@ void Lite6MujocoSystem::configure_visualization()
       message.velocity = state.velocity;
       message.gripper_position = state.gripper.position;
       message.gripper_velocity = state.gripper.velocity;
+      message.object_qpos = state.object_qpos;
       message.simulation_time = state.simulation_time;
       message.active = diagnostics->active.load() && state.started &&
         diagnostics->fault.load() == Fault::NONE;

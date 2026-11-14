@@ -63,6 +63,7 @@ private:
   {
     std::array<double, kJoints> position{}, velocity{}, effort{};
     GripperControl::Feedback gripper;
+    std::array<double, 14> object_qpos{};
     double simulation_time = 0.0;
     double max_lag = 0.0;
     int64_t origin_ns = 0, boundary_ns = 0, published_ns = 0, command_ns = 0;
@@ -127,6 +128,7 @@ private:
   std::vector<double> hw_states_velocity_;
   std::vector<double> hw_states_effort_;
 
+  std::array<int, 2> object_qpos_indices_{};
   std::vector<int> qpos_indices_;
   std::vector<int> qvel_indices_;
   std::vector<int> ctrl_indices_;

@@ -64,6 +64,15 @@ public:
       gripper_qvel_[i] = model_->jnt_dofadr[id];
       data_->qpos[gripper_qpos_[i]] = shadow_->qpos[gripper_qpos_[i]] = i == 0 ? -0.0081 : 0.0081;
     }
+    const std::array<const char *, 2> object_joints{
+      "grasp_cylinder_free", "grasp_box_free"};
+    for (size_t i = 0; i < object_joints.size(); ++i) {
+      const int joint = mj_name2id(model_.get(), mjOBJ_JOINT, object_joints[i]);
+      if (joint < 0 || model_->jnt_type[joint] != mjJNT_FREE) {
+        throw std::runtime_error("Missing scene object free joint");
+      }
+      object_qpos_[i] = model_->jnt_qposadr[joint];
+    }
     mj_forward(model_.get(), data_.get());
     mj_forward(model_.get(), shadow_.get());
     mjv_defaultCamera(&camera_);
@@ -71,6 +80,7 @@ public:
     mjv_defaultPerturb(&perturb_);
     mjv_defaultScene(&scene_);
     mjr_defaultContext(&context_);
+    options_.geomgroup[4] = 1;  // Movable scene objects.
     options_.geomgroup[3] = 0;  // Collision meshes must not cover the visual meshes.
     options_.flags[mjVIS_CONVEXHULL] = 0;  // Render the full visual meshes.
     options_.sitegroup[4] = 0;
@@ -93,6 +103,17 @@ public:
           data_->qpos[gripper_qpos_[i]] = state.gripper_position[i];
           data_->qvel[gripper_qvel_[i]] = state.gripper_velocity[i];
           shadow_->qpos[gripper_qpos_[i]] = state.gripper_position[i];
+        }
+        for (size_t i = 0; i < object_qpos_.size(); ++i) {
+          const auto first = state.object_qpos.begin() + 7 * i;
+          if (!std::all_of(first, first + 7, [](double v) {return std::isfinite(v);})) {
+            return;
+          }
+          const double norm = std::hypot(std::hypot(first[3], first[4]),
+            std::hypot(first[5], first[6]));
+          if (norm < 1e-6) {return;}
+          std::copy_n(first, 7, data_->qpos + object_qpos_[i]);
+          mju_normalize4(data_->qpos + object_qpos_[i] + 3);
         }
         data_->time = state.simulation_time;
         active_ = state.active;
@@ -197,7 +218,9 @@ public:
         if (show_shadow_ && Clock::now() - last_shadow_ < std::chrono::milliseconds(500)) {
           if (shadow_dirty_) {mj_forward(model_.get(), shadow_.get()); shadow_dirty_ = false;}
           const int first = scene_.ngeom;
-          mjv_addGeoms(model_.get(), shadow_.get(), &options_, nullptr, mjCAT_DYNAMIC, &scene_);
+          auto shadow_options = options_;
+          shadow_options.geomgroup[4] = 0;  // Scene objects have no target/ghost copy.
+          mjv_addGeoms(model_.get(), shadow_.get(), &shadow_options, nullptr, mjCAT_DYNAMIC, &scene_);
           for (int i = first; i < scene_.ngeom; ++i) {
             auto & g = scene_.geoms[i];
             g.rgba[0] = 0.12f; g.rgba[1] = 0.8f; g.rgba[2] = 0.95f; g.rgba[3] = 0.22f;
@@ -333,6 +356,7 @@ private:
   mjvPerturb perturb_{};
   mjvScene scene_{};
   mjrContext context_{};
+  std::array<int, 2> object_qpos_{};
   std::array<int, 6> qpos_{}, qvel_{};
   std::array<int, 2> gripper_qpos_{}, gripper_qvel_{};
   rclcpp::Publisher<Target>::SharedPtr publisher_;

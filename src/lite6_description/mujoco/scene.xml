@@ -69,6 +69,23 @@
     <!-- Original 2.4 x 1.5 m bench. Its TOP surface is exactly z=0. -->
     <geom name="workbench_top" type="box" pos="0.3 0 -0.045"
           size="1.2 0.75 0.045" material="worktop"/>
+    <!-- Movable grasp objects: SI units; bottoms rest on the z=0 tabletop.
+         Physical contacts are required for support and gripping. These scene
+         bodies are not part of the planner's URDF collision model. -->
+    <body name="grasp_cylinder" pos="0.30 -0.12 0.05">
+      <freejoint name="grasp_cylinder_free"/>
+      <!-- Diameter 30 mm, height 100 mm, mass 500 g. -->
+      <geom name="grasp_cylinder_geom" type="cylinder" size="0.015 0.05"
+            group="4" mass="0.5" rgba="0.23 0.48 0.72 1" condim="4"
+            friction="1 0.005 0.0001"/>
+    </body>
+    <body name="grasp_box" pos="0.30 0.12 0.04">
+      <freejoint name="grasp_box_free"/>
+      <!-- 40 x 30 x 80 mm, mass 300 g; grip across the 30 mm width. -->
+      <geom name="grasp_box_geom" type="box" size="0.02 0.015 0.04"
+            group="4" mass="0.3" rgba="0.82 0.43 0.18 1" condim="4"
+            friction="1 0.005 0.0001"/>
+    </body>
     <geom class="studio_decor" type="box" pos="0.3 0 -0.105"
           size="1.16 0.71 0.015" material="frame"/>
 
