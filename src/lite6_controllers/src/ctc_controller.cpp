@@ -230,8 +230,9 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
     return controller_interface::CallbackReturn::ERROR;
   }
 
-  // Initialize the standard ROS publisher
-  shadow_pub_ = get_node()->create_publisher<sensor_msgs::msg::JointState>("/shadow/joint_states", rclcpp::SystemDefaultsQoS());
+  // Visualization needs the latest target, not a queue of obsolete samples.
+  shadow_pub_ = get_node()->create_publisher<sensor_msgs::msg::JointState>(
+    "/shadow/joint_states", rclcpp::QoS(1).reliable());
   
   // Wrap it in the RealtimePublisher
   rt_shadow_pub_ = std::make_shared<realtime_tools::RealtimePublisher<sensor_msgs::msg::JointState>>(shadow_pub_);
@@ -262,7 +263,6 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   // Never reuse a bias learned before deactivation or a hardware restart.
   integral_effort_.setZero();
   execution_stop_latched_ = false;
-  shadow_publish_phase_ = 0;
 
   for (size_t i = 0; i < n; ++i) {
     double initial_pos = state_interfaces_[i].get_value();
@@ -463,23 +463,14 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   // No success is published until this cycle's feedback and command writes pass.
   finish_trajectory_cycle(dt);
 
-  // 6. Publish shadow visualization at 60 Hz using elapsed control time.
-  shadow_publish_phase_ += period.nanoseconds() * shadow_publish_rate_hz_;
-  if (shadow_publish_phase_ >= 1000000000) {
-      // Retain fractional periods, but never burst to catch up after a stall.
-      shadow_publish_phase_ %= 1000000000;
-      
-      // trylock() ensures we never block the 1000Hz loop.
-      if (rt_shadow_pub_->trylock()) {
-          rt_shadow_pub_->msg_.header.stamp = get_node()->now();
-          
-          for (size_t i = 0; i < n; ++i) {
-              rt_shadow_pub_->msg_.position[i] = q_target_[i];
-              // rt_shadow_pub_->msg_.velocity[i] = dq_target_[i];    // Optional: Uncomment if you want to publish target velocities
-              // rt_shadow_pub_->msg_.effort[i] = tau_cmd_[i];    // Optional: Uncomment if you want to publish commanded efforts
-          }
-          rt_shadow_pub_->unlockAndPublish();
-      }
+  // 6. Offer this cycle's actual reference to the display.
+  if (rt_shadow_pub_->trylock()) {
+    rt_shadow_pub_->msg_.header.stamp = time;
+    for (size_t i = 0; i < n; ++i) {
+      rt_shadow_pub_->msg_.position[i] = q_target_[i];
+      // rt_shadow_pub_->msg_.velocity[i] = dq_target_[i];
+    }
+    rt_shadow_pub_->unlockAndPublish();
   }
 
   // 7. Publish the actual internal CTC mode, observed by the Supervisor.

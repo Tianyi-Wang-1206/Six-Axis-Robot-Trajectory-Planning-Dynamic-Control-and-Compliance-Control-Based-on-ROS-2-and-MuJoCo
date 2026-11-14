@@ -98,6 +98,7 @@ public:
         active_ = state.active;
         last_state_ = Clock::now();
         dirty_ = true;
+        shadow_dirty_ = true;  // The shadow shares measured gripper positions.
       });
     shadow_subscription_ = node_->create_subscription<sensor_msgs::msg::JointState>(
       "/shadow/joint_states", rclcpp::QoS(1).best_effort(),
