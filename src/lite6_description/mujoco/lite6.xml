@@ -1,7 +1,15 @@
 <mujoco model="ufactory_lite6">
   <compiler angle="radian" meshdir="assets" autolimits="true"/>
 
-  <option integrator="implicit" timestep="0.0001"/>
+  <option
+    integrator="implicit"
+    timestep="0.0001"
+    solver="Newton"
+    cone="elliptic"
+    iterations="100"
+    tolerance="1e-10"
+    impratio="10"
+  />
 
   <default>
     <default class="lite6">
@@ -22,6 +30,12 @@
       </default>
       <default class="collision">
         <geom group="3" mass="0" density="0"/>
+        <!-- Stiff, critically damped pad/housing contact at the 0.1 ms physics
+             step. Keep impedance in (0,1) and match the grasp objects/table.
+             Zero margin preserves native mesh/cylinder contact generation. -->
+        <default class="gripper_contact">
+          <geom solimp="0.99 0.999 0.0001" solref="0.002 1"/>
+        </default>
       </default>
       <site size="0.001" rgba="0.5 0.5 0.5 0.3" group="4"/>
     </default>
@@ -110,20 +124,20 @@
                   <body name="gripper_body" pos="0 0 0" quat="1 0 0 0">
                     <inertial pos="0.0 0.0 0.026" quat="1 0 0 0" mass="0.26" diaginertia="0.00016117 0.000118 0.00014455" />
                     <geom class="visual" mesh="gripper_lite_body" material="white" />
-                    <geom name="gripper_lite_body_c" class="collision" mesh="gripper_lite_body_c" />
+                    <geom name="gripper_lite_body_c" class="gripper_contact" mesh="gripper_lite_body_c" />
                     <body name="gripper_left_finger" pos="0 0 0.054" quat="1 0 0 0">
                       <inertial pos="0.0 -0.01 0.01" quat="1 0 0 0" mass="0.024" diaginertia="1.961e-6 2.274e-6 1.238e-6" />
                       <joint name="gripper_left_finger" pos="0 0 0" axis="0 1 0" type="slide" limited="true" range="-0.0081 -1e-5" frictionloss="0.4" />
                       <geom mesh="gripper_lite_left_finger_wide" class="visual" material="black" />
-                      <geom name="gripper_left_finger_base" class="collision" mesh="gripper_lite_left_finger_wide_base" material="black" condim="1" solimp="2 1 0.01" solref="0.01 1" friction="6 0.5 0.1" />
-                      <geom name="gripper_left_finger" class="collision" mesh="gripper_lite_left_finger_wide_tip" material="black" condim="4" solimp="2 1 0.01" solref="0.01 1" friction="6 0.5 0.1" />
+                      <geom name="gripper_left_finger_base" class="gripper_contact" mesh="gripper_lite_left_finger_wide_base" material="black" condim="1" friction="6 0.5 0.1" />
+                      <geom name="gripper_left_finger" class="gripper_contact" mesh="gripper_lite_left_finger_wide_tip" material="black" condim="4" friction="6 0.5 0.1" />
                     </body>
                     <body name="gripper_right_finger" pos="0 0 0.054" quat="1 0 0 0">
                       <inertial pos="0.0 0.01 0.01" quat="1 0 0 0" mass="0.024" diaginertia="1.961e-6 2.274e-6 1.238e-6" />
                       <joint name="gripper_right_finger" pos="0 0 0" axis="0 1 0" type="slide" limited="true" range="1e-5 0.0081" frictionloss="0.4" />
                       <geom mesh="gripper_lite_right_finger_wide" class="visual" material="black" />
-                      <geom name="gripper_right_finger_base" class="collision" mesh="gripper_lite_right_finger_wide_base" material="black" condim="1" solimp="2 1 0.01" solref="0.01 1" friction="5 0.5 0.1" />
-                      <geom name="gripper_right_finger" class="collision" mesh="gripper_lite_right_finger_wide_tip" material="black" condim="4" solimp="2 1 0.01" solref="0.01 1" friction="5 0.5 0.1" />
+                      <geom name="gripper_right_finger_base" class="gripper_contact" mesh="gripper_lite_right_finger_wide_base" material="black" condim="1" friction="6 0.5 0.1" />
+                      <geom name="gripper_right_finger" class="gripper_contact" mesh="gripper_lite_right_finger_wide_tip" material="black" condim="4" friction="6 0.5 0.1" />
                     </body>
                     <site name="end_effector" pos="0 0 0.0811" />
                   </body>
@@ -149,7 +163,8 @@
 
   <!-- Mechanical jaw coupling only. STOP removes drive; no unlimited brake. -->
   <equality>
-    <joint name="gripper_coupling" joint1="gripper_left_finger" joint2="gripper_right_finger" polycoef="0 -1 0 0 0"/>
+    <joint name="gripper_coupling" joint1="gripper_left_finger" joint2="gripper_right_finger" polycoef="0 -1 0 0 0"
+           solimp="0.99 0.999 0.0001" solref="0.002 1"/>
   </equality>
   <keyframe>
     <key name="home" qpos="0 0 0 0 0 0 -0.0081 0.0081" ctrl="0 0 0 0 0 0 0"/>
