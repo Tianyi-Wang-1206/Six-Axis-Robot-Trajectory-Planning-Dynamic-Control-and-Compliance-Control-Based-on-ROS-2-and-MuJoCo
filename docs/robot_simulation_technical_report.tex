@@ -1,0 +1,1947 @@
+\documentclass[11pt,a4paper]{report}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=23mm]{geometry}
+\usepackage{amsmath,amssymb,bm,booktabs,longtable,array,tabularx}
+\usepackage{tikz,pgfplots,graphicx,pdflscape}
+\usetikzlibrary{arrows.meta,positioning,calc}
+\pgfplotsset{compat=1.18}
+\usepackage{caption,microtype,enumitem}
+\usepackage[hidelinks]{hyperref}
+\setlist{nosep}
+\setlength{\emergencystretch}{3em}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+\setcounter{tocdepth}{1}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcommand{\id}[1]{\texttt{\small\detokenize{#1}}}
+\newcommand{\file}[1]{\nolinkurl{#1}}
+\newcommand{\src}[1]{\textit{Implementation:} \file{#1}.}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\SO}{\mathrm{SO}(3)}
+\newcommand{\SE}{\mathrm{SE}(3)}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\sat}{\operatorname{sat}}
+\newcommand{\sgn}{\operatorname{sgn}}
+\newcommand{\RNEA}{\operatorname{RNEA}}
+\newcommand{\atan}{\operatorname{atan2}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+\newcommand{\skew}[1]{[#1]_{\times}}
+\newcommand{\N}{\mathsf{NORMAL}}
+\newcommand{\E}{\mathsf{ESTOP}}
+\newcommand{\Y}{\mathsf{SYSID}}
+\newcommand{\Rec}{\mathsf{RECOVERING}}
+\newcommand{\SF}{\mathsf{SOFT\_FAULT}}
+\tikzset{
+ >=Latex,
+ block/.style={draw,thick,rounded corners=1.5pt,align=center,minimum height=12mm,text width=31mm,fill=blue!4,font=\small},
+ auxiliary/.style={block,fill=orange!8},
+ sum/.style={draw,circle,thick,minimum size=7mm,inner sep=0pt},
+ wire/.style={->,thick},
+ tap/.style={circle,fill=black,inner sep=1.4pt},
+ labelbox/.style={fill=white,inner sep=1.5pt,font=\small},
+ note/.style={align=left,font=\small},
+ state/.style={draw,rounded corners,align=center,font=\small,minimum height=9mm,text width=33mm,fill=blue!4},
+ edge/.style={-{Latex},thick},
+ lab/.style={font=\scriptsize,align=center,fill=white,inner sep=2pt}
+}
+\begin{document}
+\begin{center}
+{\LARGE\bfseries Six-Axis Robot Simulation\\Technical Report}\par
+\vspace{4mm}
+{\large Planning, Control, Friction Identification, and Supervision}\par
+14 November 2026
+\end{center}
+
+\section*{Project declaration}
+This is a simulation project intended solely for education and research.
+The robot model originates from the publicly available
+\href{https://github.com/google-deepmind/mujoco_menagerie}{MuJoCo Menagerie}.
+Except for parameters supplied with that robot model in the official
+MuJoCo Menagerie repository, all parameters used in this project are the
+author's own reasonable assumptions for simulation and do not represent
+data from a real robot. This includes additional model settings, friction
+parameters, controller gains, planning limits, and supervisory thresholds.
+All planning and control algorithms are designed for research purposes;
+they do not represent the technology or algorithms used on a real robot.
+
+\section*{Preface}
+This report connects the current implementation's motion planning,
+computed-torque control, friction simulation and identification, and
+supervisory state machine. It follows a command from geometric planning
+through simulated execution and feedback. Equations and configured values
+describe the current code; theoretical interpretations and implementation
+limits are identified explicitly.
+
+\tableofcontents
+\chapter{System architecture}\label{ch:architecture}
+The ROS~2 system combines an operator interface, a planning and supervision
+node, a computed-torque controller, and a MuJoCo backend. Planning produces
+complete sampled joint trajectories outside the control update. The
+controller writes six arm effort commands; a separate gripper controller
+runs in the simulation backend.
+
+The configured control period is 1 ms and the fixed physics step is 0.1 ms.
+These are configured rates, not guarantees of achieved wall-clock timing.
+The six-coordinate planning model uses fixed gripper geometry with swept
+finger envelopes. The eight-coordinate dynamics model includes both moving
+fingers, whose observed motion contributes to arm inverse dynamics.
+Throughout this report, measured or physical feedback means feedback from
+the simulated plant. It does not denote measurements from real hardware.
+Symbols are local to their section; in particular, supervisory freshness
+predicates are distinct from friction coefficients.
+
+\section{Authority and interfaces}
+The authoritative arm state machine is \id{Supervisor}, implemented in \id{supervisor.cpp}. It is owned by \id{IndustrialPlannerNode}. The HMI sends events and reacts to published snapshots. It does not own a second writable global state machine. The computed-torque controller (CTC) owns its actual low-level mode and trajectory execution. The Supervisor must observe that mode before completing a mode-switch sequence.
+
+The whole robot also includes a gripper with an independent hardware-side state machine. Arm ESTOP does not, by itself, issue a gripper STOP. Thus ``robot state'' cannot be represented faithfully by a single arm-mode enumeration. Hardware/controller lifecycle and simulation availability influence observations and readiness but are not additional values of \id{SupervisorState.mode}.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=15mm and 19mm]
+\node[state] (hmi) {HMI / ROS clients\\events and entry actions};
+\node[state,right=of hmi] (sup) {Planner node\\Supervisor};
+\node[state,right=of sup] (ctc) {CTC\\actual mode / action};
+\node[state,below=of sup] (hw) {MuJoCo hardware\\joint observations};
+\node[state,below=of hmi] (grip) {Independent gripper\\command / state};
+\draw[edge] (hmi) -- node[lab,above]{commands / goals} (sup);
+\draw[edge] (sup) -- node[lab,above]{mode commands / FJT} (ctc);
+\draw[edge] (ctc.south) -- ++(0,-5mm) -| node[lab,near start,right]{status / results} (sup.south east);
+\draw[edge] (hw) -- node[lab,right]{joint states} (sup);
+\draw[edge] (hmi) -- (grip);
+\draw[edge] (sup.north) -- ++(0,8mm) -| node[lab,near start,above]{authoritative snapshots} (hmi.north);
+\end{tikzpicture}
+\caption{Control authority and observations. FJT denotes FollowJointTrajectory. Reverse gripper feedback and CTC/hardware control signals are omitted for clarity.}
+\end{figure}
+
+\begin{longtable}{L{.34\linewidth}L{.60\linewidth}}
+\toprule Interface & Role \\\midrule\endhead
+\id{/supervisor/state} & Reliable, transient-local, depth-one authoritative snapshot. Published on a 100 ms heartbeat and selected callbacks. \\
+\id{/supervisor/command} & Guarded discrete events; service acceptance is not physical completion. \\
+\id{industrial_motion} & Supervisor-owned IndustrialMotion action: MOVEJ=0, MOVEP=1, MOVEL=2, MOVEC=3. \\
+\id{/supervisor/submit_sysid_trajectory} & Session-scoped trajectory validation and excitation submission. \\
+\id{/supervisor/motion_rejections} & Reliable admission diagnostics, keyed by upper action UUID; depth 32. Rejected goals have no accepted-action result. \\
+\id{/ctc_controller/system_cmd} & Integer mode requests issued as Supervisor effects; HMI may issue emergency fallback value 1. \\
+\id{/ctc_controller/status} & Actual CTC mode and trajectory UUID/start timestamp. \\
+\id{/ctc_controller/follow_joint_trajectory} & Downstream action for ordinary motion, alignment, reference synchronization, and excitation. \\
+\id{/joint_states} & Six arm positions and velocities used for observation freshness, planning, and settling. \\
+\id{/gripper/command}, \id{/gripper/state} & Independent queued commands and physical state observations. \\
+\id{/simulation/sysid_samples} & Recorded excitation samples consumed by the HMI estimator; not a Supervisor transition input. \\
+\bottomrule
+\end{longtable}
+
+\chapter{Kinematics and motion planning}\label{ch:planning}
+\section{Planning pipeline}
+The planner generates a complete six-joint reference trajectory before
+execution. Its inputs are a motion command, an observed joint configuration
+and velocity, and velocity/acceleration scaling factors. Its output is a
+\file{trajectory_msgs/msg/JointTrajectory} containing position, velocity,
+acceleration, and relative time. There is no sampling-based obstacle search,
+trajectory blending across commands, or torque-constrained optimization in
+this planning pipeline.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[>=Latex,
+ b/.style={draw,rounded corners,align=center,text width=42mm,minimum height=12mm,font=\small},
+ node distance=8mm and 9mm]
+\node[b] (in) {Command and observed\\$q_0,\dot q_0$};
+\node[b,below=of in] (guard) {Input, near-rest, joint-limit,\\and start-collision checks};
+\node[b,below left=10mm and 3mm of guard] (ptp) {MoveJ / MoveP\\Joint target / ranked IK};
+\node[b,below right=10mm and 3mm of guard] (cart) {MoveL / MoveC\\Cartesian path and sequential IK};
+\node[b,below=of ptp] (r6) {Six-axis Ruckig\\$q(t),\dot q(t),\ddot q(t)$};
+\node[b,below=of cart] (r1) {Natural joint spline\\and scalar Ruckig $s(t)$};
+\node[b,below=55mm of guard] (out) {1 ms sampling, limit checks,\\and collision validation};
+\node[b,below=of out] (ctrl) {Sampled trajectory\\to the CTC controller};
+\draw[->] (in)--(guard);
+\draw[->] (guard)--(ptp); \draw[->] (guard)--(cart);
+\draw[->] (ptp)--(r6); \draw[->] (cart)--(r1);
+\draw[->] (r6.south)|-(out.west); \draw[->] (r1.south)|-(out.east);
+\draw[->] (out)--(ctrl);
+\end{tikzpicture}
+\caption{Planning data flow. Supervisory admission and state transitions are omitted.}
+\end{figure}
+
+\section{Frames, robot geometry, and numerical conventions}
+\subsection{Notation}
+Let $q=[q_1,\ldots,q_6]^T$ denote the six revolute joint angles in radians.
+Translations are in metres and time in seconds. A transform
+\begin{equation}
+ {}^A T_B=\begin{bmatrix}{}^A R_B&{}^A p_B\\0&1\end{bmatrix}\in\SE
+\end{equation}
+maps coordinates from frame $B$ into frame $A$. Frame $0$ is
+\file{link_base}, frame $F$ is the flange \file{link6}, and frame $E$ is the
+TCP \file{link_eef}. All public Cartesian poses refer to $E$ in the model
+base frame. The action carries \file{geometry_msgs/Pose}, without a frame
+identifier; the planner does not transform arbitrary client frames.
+
+The numerical model has $n_q=n_v=6$. Gripper fingers are fixed in the planning
+model and are represented by conservative swept collision volumes. This
+model is separate from the full articulated dynamics URDF.
+
+\subsection{URDF transforms}
+For joint $i$, the fixed origin translation is $t_i$ and the fixed rotation is
+\begin{equation}
+ \bar R_i=R_z(\psi_i)R_y(\theta_i)R_x(\phi_i),\qquad
+ A_i(q_i)=\begin{bmatrix}\bar R_iR_z(q_i)&t_i\\0&1\end{bmatrix}.
+ \label{eq:urdf}
+\end{equation}
+Every joint axis is $(0,0,1)$ in its own joint frame. The origin rotation
+must be applied \emph{before} the variable rotation. Table~\ref{tab:origins}
+contains the decimal values actually stored in the planning URDF.
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+Joint & $t_i$ [m] & $(\phi_i,\theta_i,\psi_i)$ [rad] & Parent $\to$ child \\
+\midrule
+1 & $(0,0,0.2435)$ & $(0,0,0)$ & base $\to$ 1\\
+2 & $(0,0,0)$ & $(1.5708,-1.5708,3.1416)$ & 1 $\to$ 2\\
+3 & $(0.2002,0,0)$ & $(-3.1416,0,1.5708)$ & 2 $\to$ 3\\
+4 & $(0.087,-0.22761,0)$ & $(1.5708,0,0)$ & 3 $\to$ 4\\
+5 & $(0,0,0)$ & $(1.5708,0,0)$ & 4 $\to$ 5\\
+6 & $(0,0.0625,0)$ & $(-1.5708,0,0)$ & 5 $\to$ 6\\
+TCP & $(0,0,0.0811)$ & $(0,0,0)$ & 6 $\to$ E\\
+\bottomrule
+\end{tabular}
+\caption{Fixed transforms in the planning URDF.}\label{tab:origins}
+\end{table}
+
+The analytical solver uses ideal right angles and the constants
+\begin{equation}
+ h=0.2435,\quad a_2=0.2002,\quad a_3=0.087,\quad
+ d_4=0.22761,\quad d_6=0.0625.
+\end{equation}
+Replacing $1.5708$ by $\pi/2$ or $3.1416$ by $\pi$ is appropriate for the
+symbolic derivation below, but is not an exact transcription of the runtime
+URDF. The local IK correction and FK verification address finite discrepancies.
+
+\subsection{TCP and flange distinction}
+The fixed transform is extracted from Pinocchio frame placements at model
+initialization, with a check that flange and TCP share a parent joint:
+\begin{equation}
+ {}^F T_E=\begin{bmatrix}I&(0,0,0.0811)^T\\0&1\end{bmatrix},\qquad
+ {}^0 T_F^{\star}={}^0 T_E^{\star}({}^F T_E)^{-1}.
+ \label{eq:tcp}
+\end{equation}
+The analytical IK receives the flange target on the right, whereas FK,
+Cartesian paths, residual checks, and Jacobians use the TCP. Confusing these
+frames introduces an 81.1 mm error even when the flange solution is correct.
+
+\section{Forward kinematics}
+\subsection{Runtime evaluation}
+The complete mapping is
+\begin{equation}
+ {}^0 T_E(q)=A_1(q_1)A_2(q_2)\cdots A_6(q_6){}^F T_E.
+ \label{eq:fk}
+\end{equation}
+\file{KinematicsEngine::forward_pose} evaluates this mapping through
+Pinocchio \file{forwardKinematics} and \file{updateFramePlacements}, then
+returns the world placement of \file{link_eef}. The fixed base identifies
+world coordinates with the base coordinates used here.
+
+\subsection{Explicit idealized chain}
+Write $c_i=\cos q_i$ and $s_i=\sin q_i$. For the ideal right-angle origins,
+the six rotations in Equation~\eqref{eq:urdf} become
+\begin{align}
+ R_1&=\begin{bmatrix}c_1&-s_1&0\\s_1&c_1&0\\0&0&1\end{bmatrix},&
+ R_2&=\begin{bmatrix}s_2&c_2&0\\0&0&1\\c_2&-s_2&0\end{bmatrix},\\
+ R_3&=\begin{bmatrix}s_3&c_3&0\\c_3&-s_3&0\\0&0&-1\end{bmatrix},&
+ R_4&=\begin{bmatrix}c_4&-s_4&0\\0&0&-1\\s_4&c_4&0\end{bmatrix},\\
+ R_5&=\begin{bmatrix}c_5&-s_5&0\\0&0&-1\\s_5&c_5&0\end{bmatrix},&
+ R_6&=\begin{bmatrix}c_6&-s_6&0\\0&0&1\\-s_6&-c_6&0\end{bmatrix}.
+\end{align}
+Together with Table~\ref{tab:origins}, these give all homogeneous matrices
+without assuming a different Denavit--Hartenberg convention.
+
+The ideal wrist is spherical: the fourth and fifth joint origins coincide,
+and the sixth axis passes through that point. Let $p_W$ be this wrist centre,
+$\delta=q_2-q_3$, and define
+\begin{align}
+ r&=a_2\sin q_2+a_3\cos\delta-d_4\sin\delta,\\
+ z&=a_2\cos q_2-a_3\sin\delta-d_4\cos\delta.
+\end{align}
+Then the idealized position and orientation satisfy
+\begin{align}
+ p_W&=(r\cos q_1,r\sin q_1,h+z)^T,\\
+ R_F&=R_1R_2R_3R_4R_5R_6,\\
+ p_F&=p_W+d_6R_Fe_z,\qquad
+ p_E=p_W+(d_6+0.0811)R_Fe_z,
+ \quad e_z=(0,0,1)^T.
+ \label{eq:position}
+\end{align}
+These compact expressions also explain the position/orientation decoupling
+used by the analytical inverse solver. They are explanatory ideal-model
+formulae; Equation~\eqref{eq:fk} with the stored URDF values remains authoritative.
+
+\section{Inverse kinematics}
+\subsection{Analytical branch generation}
+\src{KinematicsEngine::raw_inverse_kinematics}
+
+The generated C++ algebra produces eight candidate rows. A readable geometric
+form of that same ideal-model branch structure follows. Let $(R_F^\star,p_F^\star)$
+be the flange target obtained from Equation~\eqref{eq:tcp}, and set
+\begin{equation}
+ p_W^\star=p_F^\star-d_6R_F^\star e_z=(x_W,y_W,z_W)^T.
+\end{equation}
+For shoulder sign $\epsilon_s\in\{-1,+1\}$,
+\begin{equation}
+ q_1=\atan(\epsilon_s y_W,\epsilon_s x_W),\quad
+ x=x_W\cos q_1+y_W\sin q_1,\quad z=z_W-h.
+\end{equation}
+The two elbow branches $\epsilon_e\in\{-1,+1\}$ follow from
+\begin{align}
+ K&=\frac{x^2+z^2+a_2^2-a_3^2-d_4^2}{2a_2},\\
+ q_2&=\atan\!\left(K,\epsilon_e\sqrt{x^2+z^2-K^2}\right)-\atan(z,x).
+ \label{eq:elbow}
+\end{align}
+To recover $q_3$, define $X=x-a_2\sin q_2$ and $Z=z-a_2\cos q_2$. Then
+\begin{align}
+ C&=a_3X-d_4Z,\qquad S=-d_4X-a_3Z,\\
+ \delta&=\atan(S,C),\qquad q_3=q_2-\delta.
+\end{align}
+The common denominator $a_3^2+d_4^2$ of $\cos\delta$ and $\sin\delta$
+cancels in the two-argument arctangent.
+
+For each shoulder/elbow pair, form
+\begin{equation}
+ B=(R_1R_2R_3)^TR_F^\star=[b_{ij}].
+\end{equation}
+The wrist rotation $R_4R_5R_6$ has entries
+\begin{equation}
+ b_{13}=-c_4s_5,\quad b_{23}=-c_5,\quad b_{33}=-s_4s_5,
+ \quad b_{21}=-s_5c_6,\quad b_{22}=s_5s_6.
+\end{equation}
+For wrist sign $\epsilon_w\in\{-1,+1\}$ and $\sin q_5\ne0$,
+\begin{align}
+ q_5&=\atan\!\left(\epsilon_w\sqrt{1-b_{23}^2},-b_{23}\right),\\
+ q_4&=\atan(-\epsilon_w b_{33},-\epsilon_w b_{13}),\\
+ q_6&=\atan(\epsilon_w b_{22},-\epsilon_w b_{21}).
+ \label{eq:wrist}
+\end{align}
+Thus $2\times2\times2=8$ algebraic branches exist generically, not eight
+necessarily valid robot configurations. Limits, degeneracies, singularities,
+and collisions can eliminate or merge branches.
+
+The generated implementation replaces a negative square-root argument by
+zero when it lies in $[-10^{-5},0)$, and by NaN when it is below $-10^{-5}$.
+This is an algebraic tolerance on the generated radicands, not a Cartesian
+workspace margin. Divisions by zero at degenerate configurations can still
+produce non-finite candidates. There is no dedicated wrist-singularity
+routine that locks $q_4$ to its observed value and solves only for $q_6$.
+Subsequent validation determines whether a generated candidate is usable.
+
+\subsection{Joint wrapping and proximity ranking}
+\src{KinematicsEngine::solve_optimal_ik}
+
+A raw angle $\bar q_i$ is replaced by its closest limit-admissible equivalent
+relative to $q_{\mathrm{ref},i}$:
+\begin{align}
+ k_{\min}&=\left\lceil\frac{q_i^{\min}-\bar q_i-10^{-10}}{2\pi}\right\rceil,
+ &k_{\max}&=\left\lfloor\frac{q_i^{\max}-\bar q_i+10^{-10}}{2\pi}\right\rfloor,\\
+ k_i&=\clip\!\left(\operatorname{round}\frac{q_{\mathrm{ref},i}-\bar q_i}{2\pi},
+ k_{\min},k_{\max}\right),
+ &q_i&=\bar q_i+2\pi k_i.
+\end{align}
+If $k_{\min}>k_{\max}$, that branch is rejected. This preserves multi-turn
+joint coordinates rather than forcing every angle into $[-\pi,\pi]$.
+Only the nearest admissible wrapping of each analytical row is retained;
+all possible multi-turn routes are not enumerated.
+
+After correction and validation, candidates are ranked by
+\begin{equation}
+ C(q)=\sum_{i=1}^{6}w_i(q_i-q_{\mathrm{ref},i})^2,\qquad
+ w=(1.5,1.5,1.2,1.0,1.0,0.8).
+ \label{eq:ikcost}
+\end{equation}
+Candidates within $10^{-5}$ rad in maximum joint difference are deduplicated.
+The term ``optimal IK'' means lowest cost among these retained candidates;
+it is not a global trajectory-cost optimum.
+
+For Cartesian continuation, the reference is the previous knot. Before local
+correction, any joint change greater than $0.5$ rad rejects the branch.
+The code does not repeat this exact jump test after correction; it therefore
+should not be described as a strict bound on the final corrected knot gap.
+MoveP uses non-continuous IK and does not apply this jump filter.
+
+\subsection{Local closed-loop pose correction}
+Let $T(q)$ denote the numerical TCP FK and $T^\star$ the desired TCP pose.
+At each correction iteration, the body-frame error is
+\begin{equation}
+ e=\log\!\left(T(q)^{-1}T^\star\right)^\vee
+   =\begin{bmatrix}e_v\\e_\omega\end{bmatrix}\in\R^6.
+\end{equation}
+The logarithm is Pinocchio's \file{log6}; its linear component is the
+$\mathrm{SE}(3)$ logarithmic coordinate, not simply the world translation
+difference. Using the local TCP Jacobian $J_L$, define
+\begin{equation}
+ D=\diag(\ell^{-1}I_3,I_3),\quad \ell=0.25\ \mathrm{m},\qquad
+ \widetilde J=DJ_L=U\Sigma V^T,\quad \widetilde e=De.
+\end{equation}
+The implementation takes a damped least-squares step
+\begin{align}
+ \lambda&=0.001+0.06
+ \left[\frac{\max(0,0.05-\sigma_{\min})}{0.05}\right]^2,\\
+ \Delta q&=V\diag\!\left(\frac{\sigma_j}{\sigma_j^2+\lambda^2}\right)U^T\widetilde e,\\
+ \Delta q&\leftarrow\Delta q\min\left(1,\frac{0.12}{\norm{\Delta q}_\infty}\right),
+ \qquad q\leftarrow q+\Delta q.
+ \label{eq:dls}
+\end{align}
+A zero correction is left unchanged. This is a local small-error update,
+without an explicit logarithm differential, line search, or global restart.
+At most eight iterations are performed. Each step is limited to $0.12$ rad
+in infinity norm; the implementation does not impose a separate total
+correction-radius bound.
+
+Iterations stop early when the position error is below $5\times10^{-5}$ m
+and the orientation error below $5\times10^{-4}$ rad. Joint limits are
+rechecked after updates. A surviving candidate must finally satisfy
+\begin{align}
+ \norm{p(q)-p^\star}&\le2\times10^{-4}\ \mathrm{m},\\
+ \left|\operatorname{angle}\!\left(R(q)^TR^\star\right)\right|
+ &\le2\times10^{-3}\ \mathrm{rad}.
+ \label{eq:ikres}
+\end{align}
+These final residual bounds are less strict than the early-stop thresholds.
+Continuous-mode singularity screening and collision rejection then follow,
+and the ranking cost is recomputed using the corrected angles.
+
+\subsection{Rejection semantics}
+Each analytical row records its first failing check. The order is finite
+solution and admissible wrapping, pre-correction jump, joint limits, local
+correction, final joint limits, FK residual, continuous-mode singularity,
+and collision. The public IK interface also rejects non-finite inputs and
+rotations with $\norm{R^TR-I}_F>10^{-5}$ or $|\det R-1|>10^{-5}$.
+
+When no candidate remains, aggregate error precedence is singularity, branch
+jump, joint limit/collision, then no mathematical solution. A result is
+therefore not a complete classification of every rejected branch; the
+associated diagnostics provide the branch-specific reasons.
+
+\section{Jacobian and singularity analysis}
+\subsection{Geometric Jacobian at the TCP}
+Let $o_i$ be the origin of joint $i$ and $z_i$ its unit rotation axis, both
+expressed in the base frame. These are obtained after the fixed origin
+transform of that joint; blindly taking the previous link's $z$ axis would
+ignore the URDF origin twists. The TCP geometric Jacobian is
+\begin{equation}
+ J_W(q)=\begin{bmatrix}
+ z_1\times(p_E-o_1)&\cdots&z_6\times(p_E-o_6)\\
+ z_1&\cdots&z_6
+ \end{bmatrix},\qquad
+ \begin{bmatrix}\dot p_E\\\omega_W\end{bmatrix}=J_W(q)\dot q.
+ \label{eq:jac}
+\end{equation}
+Pinocchio calls this frame convention \file{LOCAL_WORLD_ALIGNED}: its origin
+is the TCP and its axes align with the world. The spatial vector order is
+\emph{linear first, angular second}. The local TCP Jacobian used in
+Equation~\eqref{eq:dls} obeys
+\begin{equation}
+ J_L=\diag(R_E^T,R_E^T)J_W.
+\end{equation}
+Since both Jacobians refer to the same point, only a rotation is required
+here. Shifting from flange to TCP instead gives, with $r_{FE}=p_E-p_F$,
+\begin{equation}
+ J_{v,E}=J_{v,F}-\skew{r_{FE}}J_{\omega,F},\qquad
+ J_{\omega,E}=J_{\omega,F}.
+\end{equation}
+For completeness, acceleration satisfies
+$[\ddot p_E^T,\dot\omega_W^T]^T=J_W\ddot q+\dot J_W\dot q$.
+The Cartesian planner does not explicitly integrate this differential
+inverse relation; it uses sampled IK and spline derivatives.
+
+\subsection{Implemented numerical criterion}
+\file{check_singularity} calculates
+\begin{equation}
+ \widetilde J_W=\begin{bmatrix}J_{v,W}/\ell\\J_{\omega,W}\end{bmatrix},\qquad
+ \mu(q)=\sigma_{\min}(\widetilde J_W),\qquad \ell=0.25\ \mathrm{m}.
+\end{equation}
+Normalizing the linear rows avoids comparing metres and radians without a
+length scale. With angular coordinates treated as dimensionless, $\mu$ is
+dimensionless. The isotropic row scaling commutes with frame rotation, so
+local and world-aligned versions have identical singular values at the same
+TCP. A different length scale or TCP changes the numerical conditioning.
+
+For continuous IK, the rejection threshold is
+\begin{equation}
+ \mu(q)<\max(0.003,\tau_{\mathrm{yaml}}),\qquad
+ \tau_{\mathrm{yaml}}=0.001.
+\end{equation}
+Thus the effective default threshold is $0.003$, not $0.001$. Non-finite
+joint input gives a singularity score of zero.
+
+The check is applied to corrected Cartesian IK knots. It is not applied to
+the initial knot, every spline interior point, or all final trajectory
+samples. MoveJ and MoveP have no mandatory singularity rejection. These
+choices allow joint-space motion through configurations where Cartesian
+velocity inversion would be ill-conditioned, but they do not certify an
+entire Cartesian spline as uniformly nonsingular.
+
+\subsection{Ideal-model geometric interpretation}
+A wrist-centre decomposition gives the following zero factors for the ideal
+six-axis geometric Jacobian, up to an overall sign of its determinant:
+\begin{equation}
+ \det J\ \propto\
+ r\,a_2\bigl(a_3\cos q_3+d_4\sin q_3\bigr)\sin q_5.
+ \label{eq:det}
+\end{equation}
+The three factors describe a wrist centre on the shoulder axis, a degenerate
+planar elbow mapping, and aligned wrist axes. For example, the planar
+Jacobian of $(r,z)$ with respect to $(q_2,q_3)$ has determinant
+$a_2(a_3\cos q_3+d_4\sin q_3)$.
+This derivation explains the ideal geometry; it does not replace the
+numerical SVD. Rounded URDF rotations also perturb exact ideal-model singularity surfaces.
+
+\section{Motion inputs and configured limits}
+\begin{table}[htbp]
+\centering
+\begin{tabular}{@{}clrrr@{}}
+\toprule
+Joint & Position interval [rad] & $v_i$ & $a_i$ & $j_i$ \\
+\midrule
+1 & $[-6.28319,6.28319]$ & 3.14 & 3.5 & 200\\
+2 & $[-2.61799,2.61799]$ & 3.14 & 2.5 & 200\\
+3 & $[0,4.97419]$ & 3.14 & 4.0 & 200\\
+4 & $[-6.28319,6.28319]$ & 3.14 & 8.0 & 200\\
+5 & $[-1.62316,1.62316]$ & 3.14 & 8.0 & 200\\
+6 & $[-6.28319,6.28319]$ & 3.14 & 10.0 & 200\\
+\bottomrule
+\end{tabular}
+\caption{Joint limits from \file{kinematic_limits.yaml}; velocity, acceleration,
+and jerk units are rad/s, rad/s$^2$, and rad/s$^3$.}
+\end{table}
+The Cartesian limits are $v_p=1.0$ m/s, $a_p=3.0$ m/s$^2$,
+$v_R=2.5$ rad/s, and $a_R=5.0$ rad/s$^2$. Let $\gamma_v$ and $\gamma_a$
+be the requested scale factors. Both must be finite and in $[0.01,1]$.
+Jerk limits are required YAML values and are not multiplied by either scale.
+
+Observed joint positions may lie at most $10^{-4}$ rad beyond a soft limit;
+the planning copy is then projected to the boundary. Both the original
+observed configuration and the projected configuration are collision-checked.
+The planner requires $|\dot q_{0,i}|\le0.02$ rad/s. Only velocities with
+magnitude at most $10^{-5}$ rad/s are set to zero; larger admitted velocities
+are preserved in the initial-state structure. Outward velocity at a projected
+joint boundary causes rejection.
+
+Normal joint targets use a much tighter $10^{-8}$ rad position allowance.
+A narrow exception exists for internal recovery or identification alignment
+requests that send the observed position back as the target: the observation
+allowance can be used when every target joint is within $10^{-4}$ rad of the
+measurement. This does not change the allowance for ordinary motion goals.
+
+Cartesian quaternion inputs must be finite, have norm at least $10^{-9}$,
+and differ from unit norm by at most $10^{-3}$. Accepted quaternions are
+normalized before conversion to rotation matrices.
+
+\section{Joint-space point-to-point trajectories}
+\subsection{MoveJ and MoveP semantics}
+MoveJ takes a direct joint target. MoveP takes a TCP pose, solves IK with
+$q_{\mathrm{ref}}=q_0$ and continuous mode disabled, and tries the ranked
+candidates in order. MoveP is a Cartesian \emph{endpoint} command; the
+intermediate TCP path is the result of a joint-space trajectory, not a
+straight line.
+
+If one MoveP route fails with a joint-limit/collision result, the next IK
+candidate is tried. Cancellation and other errors are propagated immediately.
+No detour is searched around an obstacle. When the requested MoveP pose is
+already within $10^{-5}$ m and $10^{-4}$ rad of the current FK pose, the
+planner requests a joint-space return to the same joint position instead of
+running IK.
+
+\subsection{Six-axis jerk-limited Ruckig call}
+\src{MotionPlanner::ruckig_ptp}
+
+The input boundary states are
+\begin{align}
+ (q(0),\dot q(0),\ddot q(0))&=(q_0,\dot q_0,0),\\
+ (q(T),\dot q(T),\ddot q(T))&=(q_{\mathrm{target}},0,0),
+\end{align}
+subject to
+\begin{equation}
+ |\dot q_i|\le\gamma_v v_i,\qquad
+ |\ddot q_i|\le\gamma_a a_i,\qquad
+ |\dddot q_i|\le j_i.
+\end{equation}
+Initial velocity must also satisfy the scaled velocity limit. Initial
+acceleration is assumed zero because no measured acceleration is supplied.
+The near-rest guard limits, but does not eliminate, this modeling assumption.
+
+The implementation uses \file{Ruckig<6>::calculate} with the library's default
+synchronization behavior; no custom synchronization mode is set. It obtains
+one multi-axis trajectory and samples it using \file{at_time}. A constant
+jerk segment of duration $\tau$ has the familiar polynomial form
+\begin{align}
+ a(\tau)&=a_0+j\tau,\\
+ v(\tau)&=v_0+a_0\tau+\tfrac12j\tau^2,\\
+ q(\tau)&=q_0+v_0\tau+\tfrac12a_0\tau^2+\tfrac16j\tau^3.
+\end{align}
+Ruckig chooses the segment sequence and timing; the planner does not
+implement a separate seven-phase construction or prove global collision-aware
+time optimality.
+
+Samples are emitted at $0,0.001,0.002,\ldots$ s and at the exact final
+Ruckig time. The last interval can be shorter than 1 ms. Durations greater
+than 300 s or invalid durations are rejected. A duration below $10^{-10}$ s
+produces two zero-velocity, zero-acceleration points at 0 and 1 ms. The full
+sampled trajectory is then validated, including collision checks.
+
+\section{Cartesian geometric paths}
+\subsection{Common orientation interpolation}
+MoveL and MoveC use a normalized path parameter $s\in[0,1]$. Let $T_0$ be
+FK at the initial joints and $T_1$ the target TCP pose. The rotation follows
+a single relative angle-axis interpolation:
+\begin{equation}
+ \phi=\log(R_0^TR_1)^\vee,\quad L_R=\norm{\phi},\qquad
+ R(s)=R_0\exp(s\skew{\phi}).
+ \label{eq:orientation}
+\end{equation}
+This uses the principal relative rotation chosen by Eigen's angle-axis
+conversion. At a rotation of exactly $\pi$, the axis sign is inherently
+ambiguous. The world angular velocity is $(R_0\phi)\dot s$, so
+\begin{equation}
+ \norm{\omega}=L_R|\dot s|,\qquad
+ \norm{\dot\omega}=L_R|\ddot s|.
+\end{equation}
+For negligible angle, the code keeps $R_0$ constant. MoveC validates the
+auxiliary pose quaternion but does not use its orientation in the path;
+only the auxiliary position defines the circle.
+
+\subsection{MoveL}
+For a line segment,
+\begin{equation}
+ p(s)=p_0+s(p_1-p_0),\quad
+ L_p=\norm{p_1-p_0},\quad
+ \norm{p'(s)}=L_p,\quad p''(s)=0.
+\end{equation}
+Translation and orientation share the same $s(t)$, so they begin and end
+together. Pure translation and pure rotation are supported.
+
+\subsection{MoveC}
+Let $p_a$ be the auxiliary position. Define
+\begin{align}
+ u&=p_a-p_0,\quad v=p_1-p_0,\quad
+ L=\max(\norm{u},\norm{v},\norm{p_1-p_a}),\\
+ n&=\frac{u\times v}{\norm{u\times v}},\quad
+ e_1=\frac{u}{\norm{u}},\quad e_2=n\times e_1,\\
+ x&=v^Te_1,\quad y=v^Te_2,\quad
+ c_x=\frac{\norm{u}}2,\quad
+ c_y=\frac{x^2+y^2-2xc_x}{2y},\\
+ c&=p_0+c_xe_1+c_ye_2,\quad
+ \rho=\norm{p_0-c},\quad
+ a=\frac{p_0-c}{\rho},\quad b=n\times a.
+\end{align}
+The centre $c$ is equidistant from the three input points. Angles of the
+auxiliary and end points are measured using
+\begin{equation}
+ \theta(p)=\atan((p-c)^Tb,(p-c)^Ta)\pmod{2\pi},
+ \qquad \theta(p)\in[0,2\pi).
+\end{equation}
+The end angle is increased by $2\pi$ if it precedes the auxiliary angle by
+more than $10^{-9}$ rad, and the resulting arc is checked for validity.
+Writing its final angle as $\Theta$ gives
+\begin{equation}
+ p(s)=c+\rho\bigl(\cos(\Theta s)a+\sin(\Theta s)b\bigr),\quad
+ L_p=\rho\Theta,\quad B_p=\norm{p''(s)}=\rho\Theta^2.
+ \label{eq:circle}
+\end{equation}
+The auxiliary position lies at $s_a=\theta(p_a)/\Theta$. It need not be the
+midpoint in arc length or time, and its specified orientation is not imposed.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[>=Latex,scale=1.05]
+\coordinate (c) at (0,0);
+\coordinate (p0) at (2.5,0);
+\coordinate (pa) at (1.25,2.165);
+\coordinate (p1) at (-1.915,1.607);
+\draw[gray!45,dashed] (c) circle (2.5);
+\draw[very thick,blue,->] (p0) arc[start angle=0,end angle=140,radius=2.5];
+\draw[->] (c)--(3,0) node[right] {$a$};
+\draw[->] (c)--(0,2.9) node[above] {$b$};
+\draw[dashed] (c)--(pa) node[midway,right] {$\rho$};
+\draw[dashed] (c)--(p1);
+\draw[->] (.65,0) arc[start angle=0,end angle=140,radius=.65];
+\node at (.1,.95) {$\Theta$};
+\foreach \p in {p0,pa,p1,c} \fill (\p) circle (1.8pt);
+\node[below right] at (p0) {$p_0,\ s=0$};
+\node[above right] at (pa) {$p_a,\ s=s_a$};
+\node[above left] at (p1) {$p_1,\ s=1$};
+\node[below left] at (c) {$c$};
+\end{tikzpicture}
+\caption{MoveC geometry in its circle plane; schematic, not a robot pose.
+Orientation is interpolated separately by Equation~\eqref{eq:orientation}.}
+\end{figure}
+
+The code rejects $L<10^{-5}$ m, $\norm{u\times v}<10^{-5}L^2$,
+$|y|<10^{-8}L$, or non-finite/radius values $\rho\le10^{-5}$ m.
+It also requires the auxiliary angle and the remaining arc angle to be at
+least $10^{-6}$ rad, the total arc to be no greater than $2\pi+10^{-6}$ rad,
+and the reconstructed auxiliary point error to be at most $10^{-6}L$.
+Coincident start/end full circles are degenerate for this three-point input.
+
+For either path type, if both $L_p$ and $L_R$ are below $10^{-7}$, the planner
+returns a joint-space same-position Ruckig motion.
+
+\section{From Cartesian poses to a joint spline}
+\subsection{Sequential IK and refinement}
+The initial number of uniform path segments is
+\begin{equation}
+ N=\max\left(8,\left\lceil\max\left(\frac{L_p}{0.005},
+ \frac{L_R}{0.025}\right)\right\rceil\right),\qquad s_k=k/N.
+\end{equation}
+The first knot is the observed/projected $q_0$. For each $k=1,\ldots,N$,
+continuous IK is solved at $T(s_k)$ using $q_{k-1}$ as reference, and the
+lowest-cost candidate is selected. This is greedy continuation: there is no
+global branch graph or backtracking if a later knot has no admissible solution.
+An IK failure terminates the request immediately rather than invoking spline
+refinement.
+
+A natural cubic spline is fitted through the knots. It must remain within
+joint limits over every polynomial segment, and its TCP FK is compared with
+the desired Cartesian path at offsets $1/4$, $1/2$, and $3/4$ of every segment.
+The allowed residuals are
+\begin{equation}
+ \epsilon_{p,\mathrm{path}}=7\times10^{-4}\ \mathrm{m},\qquad
+ \epsilon_{R,\mathrm{path}}=7\times10^{-3}\ \mathrm{rad}.
+\end{equation}
+A failed spline limit or residual check doubles $N$ and repeats sequential
+IK and fitting. There are at most four attempts, and $N$ must not exceed
+20,000. This check does not establish a maximum residual at every real $s$;
+it checks selected interior points, in addition to IK knot verification.
+
+\subsection{Natural cubic equations}
+Let $h_s=1/N$ and $m_k=q''(s_k)\in\R^6$. The natural boundary conditions and
+interior tridiagonal equations are
+\begin{equation}
+ m_0=m_N=0,\qquad
+ m_{k-1}+4m_k+m_{k+1}
+ =\frac{6}{h_s^2}(q_{k+1}-2q_k+q_{k-1}).
+\end{equation}
+A Thomas elimination/back-substitution solves this system for all six joints.
+For $u=s-s_k\in[0,h_s]$,
+\begin{align}
+ q(s)&=a_k+b_ku+c_ku^2+d_ku^3,\\
+ a_k&=q_k,\quad
+ b_k=\frac{q_{k+1}-q_k}{h_s}-\frac{h_s}{6}(2m_k+m_{k+1}),\\
+ c_k&=\tfrac12m_k,\qquad d_k=\frac{m_{k+1}-m_k}{6h_s}.
+\end{align}
+Consequently,
+\begin{equation}
+ q'=b_k+2c_ku+3d_ku^2,\qquad q''=2c_k+6d_ku,\qquad q'''=6d_k.
+\end{equation}
+The spline is $C^2$ in $s$; its third derivative can jump at knots. Natural
+boundary conditions constrain $q''(s)$, not $q'(s)$. Zero endpoint velocities
+and accelerations in time are imposed by the scalar time law.
+
+\subsection{Position extrema and derivative bounds}
+To prevent joint-limit overshoot between knots, every scalar polynomial is
+checked at $u=0,h_s$ and at all real roots of
+\begin{equation}
+ b_{k,i}+2c_{k,i}u+3d_{k,i}u^2=0
+\end{equation}
+inside $(0,h_s)$. Linear derivative cases are handled separately. This is an
+analytic position-extremum check, subject to numerical root tolerances.
+
+For each joint, conservative derivative bounds are collected over all segments:
+\begin{align}
+ D_{1,i}&=\max_k\bigl(|b_{k,i}|+2|c_{k,i}|h_s+3|d_{k,i}|h_s^2\bigr),\\
+ D_{2,i}&=\max_k\bigl(2|c_{k,i}|+6|d_{k,i}|h_s\bigr),\\
+ D_{3,i}&=\max_k6|d_{k,i}|.
+ \label{eq:derivativebounds}
+\end{align}
+These triangle-inequality bounds need not be tight, but are available without
+sampling derivatives at a potentially insufficient set of points.
+
+\section{Cartesian time parameterization}
+\subsection{Chain rule}
+The time trajectory is $q(t)=q(s(t))$. Its derivatives are
+\begin{align}
+ \dot q&=q'\dot s,\\
+ \ddot q&=q''\dot s^2+q'\ddot s,\\
+ \dddot q&=q'''\dot s^3+3q''\dot s\ddot s+q'\dddot s.
+ \label{eq:chainrule}
+\end{align}
+The planner first chooses constant scalar bounds $V,A,J_s$ on
+$|\dot s|,|\ddot s|,|\dddot s|$. Their units are s$^{-1}$, s$^{-2}$,
+and s$^{-3}$. The spline coordinate $s$ is dimensionless.
+
+\subsection{Implemented conservative budgets}
+Bounds start at infinity; each applicable expression below reduces the
+current bound by a minimum operation. A term is omitted when its denominator
+is at most $10^{-10}$, matching the implementation's numerical convention.
+For the ideal Cartesian path,
+\begin{align}
+ V&\le\frac{\gamma_vv_p}{L_p},&
+ A&\le\frac{0.45\gamma_aa_p}{L_p},&
+ V&\le\sqrt{\frac{0.45\gamma_aa_p}{B_p}},\\
+ V&\le\frac{\gamma_vv_R}{L_R},&
+ A&\le\frac{\gamma_aa_R}{L_R}.&&
+\end{align}
+Here $B_p=0$ for MoveL and $B_p=\rho\Theta^2$ for MoveC. The translational
+acceleration bound follows from
+$\norm{\ddot p}\le B_pV^2+L_pA$; allocating $0.45$ to each nonzero term
+leaves at least ten percent margin when both are active. For a straight line,
+the implementation still uses the $0.45$ tangential budget.
+
+Joint derivative bounds further restrict the speed:
+\begin{equation}
+ V\le\min_i\left\{
+ \frac{0.95\gamma_vv_i}{D_{1,i}},\quad
+ \sqrt{\frac{0.45\gamma_aa_i}{D_{2,i}}},\quad
+ \sqrt[3]{\frac{0.30j_i}{D_{3,i}}}\right\}.
+ \label{eq:vbound}
+\end{equation}
+After this final $V$ is fixed, the acceleration and jerk bounds are reduced by
+\begin{align}
+ A&\le\min_i\left\{
+ \frac{0.45\gamma_aa_i}{D_{1,i}},\quad
+ \frac{0.30j_i}{3D_{2,i}V}\right\},\\
+ J_s&\le\min_i\frac{0.30j_i}{D_{1,i}}.
+ \label{eq:ajbound}
+\end{align}
+Each minimum is over applicable nonzero-denominator terms, together with the
+previously established Cartesian bounds. Non-finite or non-positive final
+bounds cause a planning error. Combining these inequalities gives, on each
+smooth piece,
+\begin{align}
+ |\dot q_i|&\le0.95\gamma_vv_i,\\
+ |\ddot q_i|&\le0.90\gamma_aa_i,\\
+ |\dddot q_i|&\le0.90j_i.
+\end{align}
+The jerk inequality has three budgets of $0.30j_i$, corresponding exactly to
+the three terms in Equation~\eqref{eq:chainrule}. The spline acceleration is
+continuous, so knot crossings do not create acceleration impulses. Jerk can
+have finite jumps and need not be continuous at spline or Ruckig phase boundaries.
+
+These joint bounds concern the joint spline itself. The Cartesian bounds
+are derived for the requested ideal line/arc and orientation interpolation.
+Since the spline only approximates that path in pose, a small pose residual
+alone does not prove the same velocity or acceleration bounds for its actual
+TCP motion. The implementation does not separately verify actual TCP speed
+and acceleration through $J\dot q$ and $J\ddot q+\dot J\dot q$.
+
+\subsection{Scalar Ruckig and output sampling}
+A \file{Ruckig<1>} calculation uses
+\begin{equation}
+ (s,\dot s,\ddot s)(0)=(0,0,0),\qquad
+ (s,\dot s,\ddot s)(T)=(1,0,0)
+\end{equation}
+with bounds $(V,A,J_s)$. Each time sample is evaluated using
+Equation~\eqref{eq:chainrule} to publish $q,\dot q,\ddot q$.
+The nominal interval is 1 ms with an exact final endpoint; duration must be
+positive and at most 300 s. Final validation permits at most 300,000 points,
+so this point budget can reject a nominally valid duration near 300 s.
+
+A relevant boundary-condition distinction is that Cartesian planning always
+starts with $\dot s=0$, hence $\dot q=0$, even if the near-rest guard admitted
+a small nonzero observed joint velocity. PTP passes that admitted velocity
+to Ruckig. Cartesian planning does not fit a time law to match it or construct
+a moving-start blend. This is part of the current implementation contract.
+
+\section{Collision model and detection}
+\subsection{Geometry and pair construction}
+\src{KinematicsEngine::init_robot_model}
+
+Pinocchio loads collision geometry from the planning URDF; visual meshes
+are not used as a substitute. The arm and gripper body use the specified
+collision meshes. The finger geometry consists of two swept boxes per finger.
+All robot collision pairs are added, after which the SRDF exclusions are
+removed. The current excluded link pairs are listed in Table~\ref{tab:srdf}.
+Pairs sharing a rigid parent are also governed by the geometry library's
+pair-generation behavior; the code does not implement an independent custom
+pair enumerator.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+SRDF reason & Excluded link pairs \\
+\midrule
+Adjacent & (base,1), (1,2), (2,3), (3,4), (4,5), (5,6)\\
+Never & (2,5), (2,6), (3,5), (3,6), (4,6)\\
+\bottomrule
+\end{tabular}
+\caption{The labels are literal SRDF reasons. ``Never'' is a model assumption,
+not a runtime proof that collision is impossible.}\label{tab:srdf}
+\end{table}
+
+A Coal box named \file{ground_plane} is then added with size
+$(3.0,3.0,0.1)$ m and centre $(0,0,-0.05)$ m. Its top is at $z=0$ and its
+horizontal extent is $[-1.5,1.5]^2$ m; it is a finite box, not an infinite
+mathematical plane. Every existing robot collision geometry is explicitly
+paired with this ground object after SRDF filtering. There is no additional
+external obstacle map or dynamic scene-object input in this engine.
+
+\subsection{Conservative gripper envelope}
+For each split finger mesh, the generation script finds the local vertex
+bounds $(l_x,l_y,l_z)$ and $(u_x,u_y,u_z)$. With permitted finger displacement
+$g\in[g_{\min},g_{\max}]$ along the local $y$ direction, the swept bounds are
+\begin{equation}
+ l^{\mathrm{sweep}}=(l_x,l_y+g_{\min},l_z),\qquad
+ u^{\mathrm{sweep}}=(u_x,u_y+g_{\max},u_z).
+\end{equation}
+The generated box has centre $(l^{\mathrm{sweep}}+u^{\mathrm{sweep}})/2$ and
+size $u^{\mathrm{sweep}}-l^{\mathrm{sweep}}+2\times10^{-6}(1,1,1)^T$ m.
+Each face thus receives a $1\,\mu$m padding. Fingers are fixed at their
+mount origins in the planning URDF. This encloses every opening represented
+by the full URDF's stroke, without querying asynchronous gripper state.
+It can reject a route that would be free for a particular opening. No held
+workpiece is automatically added to this geometry.
+
+\subsection{Configuration queries}
+For each $q$, the engine updates link and geometry placements and invokes
+\file{pinocchio::computeCollisions(..., true)}, stopping at the first reported
+collision. Coal supplies the underlying geometry collision calculation.
+The boolean query is
+\begin{equation}
+ \mathcal C(q)=\bigvee_{(a,b)\in\mathcal P}
+ \left[\mathcal G_a(q)\cap\mathcal G_b(q)\ne\varnothing\right],
+\end{equation}
+where $\mathcal P$ is the enabled pair set. Non-finite input is treated as
+colliding. The query does not itself enforce joint limits; callers perform
+that check with the tolerance appropriate to the context. It does not return
+clearance, add a general safety inflation, or impose a signed-distance cost.
+A diagnostic can name the first detected pair. Final trajectory validation
+reuses one data/geometry workspace within the validation call.
+
+\subsection{Trajectory collision sampling}
+IK candidates and initial configurations are checked before trajectory
+validation. During final validation, the first trajectory position is checked.
+For every changed successive pair $(q_{k-1},q_k)$, define
+\begin{equation}
+ M_k=\max\left(1,\left\lceil
+ \frac{\norm{q_k-q_{k-1}}_\infty}{0.04}\right\rceil\right).
+\end{equation}
+The additional configurations are
+\begin{equation}
+ q_{k,z}=(1-z/M_k)q_{k-1}+(z/M_k)q_k,\qquad z=1,\ldots,M_k.
+\end{equation}
+Thus the largest per-joint spacing on this interpolation is at most $0.04$
+rad. Identical successive configurations are skipped. Under ordinary 1 ms
+sampling and the 3.14 rad/s joint limit, the spacing is usually already much
+smaller, so most intervals need only their endpoint checked.
+
+This is discrete collision testing of samples on straight joint-space
+chords. It is not continuous collision detection of swept geometry, and the
+chord need not coincide with the underlying curved Ruckig/spline segment.
+Neither minimum clearance nor a between-sample collision guarantee is
+established. Actual tracking error and geometry mismatch are also outside
+this nominal collision calculation.
+
+\section{Final validation and execution interface}
+\subsection{What is checked}
+\file{MotionPlanner::verify_trajectory} requires the exact joint order
+\file{joint1} through \file{joint6}, between 2 and 300,000 points, six values
+per position/velocity/acceleration array, finite values, and strictly
+increasing timestamps. Each sample is checked against the unscaled configured
+YAML limits, with allowances from Table~\ref{tab:tolerances}. Scaled bounds
+are imposed during generation; this validator does not take the user scales
+as an argument.
+
+With jerk checking enabled, the discrete diagnostic is
+\begin{equation}
+ \widehat j_{k,i}=
+ \frac{\ddot q_{k,i}-\ddot q_{k-1,i}}{t_k-t_{k-1}},\qquad
+ |\widehat j_{k,i}|\le1.001j_i+10^{-3}.
+\end{equation}
+This checks mean acceleration change, not the peak instantaneous jerk.
+For internally generated motions, the continuous-piece jerk bounds arise
+from Ruckig or Equations~\eqref{eq:vbound}--\eqref{eq:ajbound}. The validator
+alone does not prove those bounds for an arbitrary externally supplied
+sample sequence, nor does it prove derivative consistency among the three
+sample arrays.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Quantity & Allowance / threshold & Meaning \\
+\midrule
+Observed position & $10^{-4}$ rad & Admission and projection\\
+Joint target / IK / spline & $10^{-8}$ rad & Position-limit allowance\\
+Velocity set to zero & $10^{-5}$ rad/s & Observation deadband\\
+Near-rest admission & $0.02$ rad/s & Maximum observed magnitude\\
+Sample position & $10^{-6}$ rad & Configured position-limit allowance\\
+Sample velocity & $10^{-5}$ rad/s & Configured velocity-limit allowance\\
+Sample acceleration & $10^{-4}$ rad/s$^2$ & Configured acceleration allowance\\
+IK final position residual & $2\times10^{-4}$ m & Numerical FK agreement\\
+IK final rotation residual & $2\times10^{-3}$ rad & Numerical FK agreement\\
+Spline path position residual & $7\times10^{-4}$ m & Selected interior checks\\
+Spline path rotation residual & $7\times10^{-3}$ rad & Selected interior checks\\
+\bottomrule
+\end{tabular}
+\caption{Tolerances serve different purposes and must not be interchanged.}
+\label{tab:tolerances}
+\end{table}
+
+\subsection{Controller consumption}
+The controller receives the complete sampled trajectory through its
+\file{follow_joint_trajectory} action. It requires the first time to be zero
+and final velocity/acceleration magnitudes to be at most $10^{-8}$; it also
+rejects unsupported action options. These endpoint requirements are separate
+from the planner validator's checks.
+
+At an update time, the controller selects the latest due sample and holds
+its position, velocity, and acceleration references unchanged until a later
+sample becomes due. This is a zero-order hold, not reconstruction of the
+continuous spline or Ruckig polynomial. Consequently, smoothness statements
+in this report describe the generated mathematical trajectory; the held
+reference signals are discrete and the physical tracking response depends
+on the controller and robot. Control laws and endpoint monitoring are described in Chapters~\ref{ch:control} and~\ref{ch:supervisor}.
+
+\chapter{Computed-torque control}\label{ch:control}
+The controller combines inverse dynamics, rotor inertia compensation,
+simplified friction compensation, and an integral torque bias. Position and
+velocity feedback first determine commanded acceleration. The sum of torque
+terms is then limited before being sent to the simulated actuators.
+The following signal-flow diagrams show the normal-mode calculation,
+including the one-cycle ordering of integral-state updates. All parameter
+vectors are ordered from joint 1 to joint 6 and refer to the supplied
+controller configuration.
+\newgeometry{margin=13mm}
+\begin{landscape}
+
+
+\begin{center}
+  {\Large\bfseries Computed-torque signal flow}\\[2mm]
+  {Normal operation; six arm joints; nominal update rate: $1\,\mathrm{kHz}$}
+\end{center}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \node[block] (error) at (1.8,0)
+    {Tracking errors\\$e=q_d-q$\\$\dot e=\dot q_d-\dot q$};
+  \node[block] (accel) at (6,0)
+    {Acceleration command\\$a=\ddot q_d+K_p e+K_v\dot e$};
+  \node[block,text width=40mm] (rnea) at (11,0)
+    {Rigid-body inverse dynamics\\$\tau_{\rm rb}=S\,\RNEA(Q,V,A)$};
+  \node[auxiliary,text width=40mm] (rotor) at (11,2.5)
+    {Rotor inertia compensation\\$\tau_a=J_a a$};
+  \node[auxiliary,text width=40mm] (fric) at (11,-2.7)
+    {Friction compensation\\$\tau_f=F_v\dot q+F_c\tanh(\alpha v_c)$\\
+     $v_c=\dot q_d+\Lambda e$};
+  \node[auxiliary,text width=40mm] (integral) at (11,-5.5)
+    {Torque-domain integrator\\with back-calculation\\Output: $b[k]$ (Fig.~\ref{fig:integral})};
+  \node[sum] (total) at (15.4,0) {$+$};
+  \node[block,text width=25mm] (limit) at (19,0)
+    {Total torque limit\\$u=\sat_{\tau_{\max}}(r)$};
+  \coordinate (output) at (23.4,0);
+  \node[sum] (residual) at (19,-5.5) {$\Sigma$};
+
+  \draw[wire] (-0.6,1.4) node[above right,font=\small] {$q_d,\dot q_d$}
+    -| ([xshift=-8mm]error.north);
+  \draw[wire] (-0.6,-1.5) node[below right,font=\small] {$q,\dot q$ (measured)}
+    -| (error.south);
+  \draw[wire] (error) -- node[labelbox] {$e,\dot e$} (accel);
+  \draw[wire] (6,1.5) node[above,font=\small] {$\ddot q_d$} -- (accel);
+  % Keep the acceleration label below the wire, clear of the upward branch.
+  \draw[wire] (accel) -- node[labelbox,below=2pt,pos=.4] {$a$} (rnea);
+  \node[tap] (atap) at (8.2,0) {};
+  \draw[wire] (atap) |- (rotor.west);
+  \draw[wire] (rotor.east) -| node[pos=.75,right,font=\small] {$\tau_a$} (total.north);
+  \draw[wire] (rnea) -- node[labelbox] {$\tau_{\rm rb}$} (total);
+  \draw[wire] (7.4,-2.7) node[left,font=\small] {$\dot q,\dot q_d,e$} -- (fric);
+  \draw[wire] (fric.east) -- (14,-2.7) -- (14,-.8)
+    -- node[labelbox,pos=.3] {$\tau_f$} (total.south west);
+  \draw[wire] (7.4,-5.5) node[left,font=\small] {$e[k],\Delta t_k$} -- (integral);
+  \draw[wire] ([xshift=8mm]integral.north) -- (11.8,-4.2) -- (15.4,-4.2)
+    -- node[labelbox,pos=.4] {$b[k]$} (total.south);
+  \draw[wire] (total) -- node[labelbox,above=2pt,pos=.35] {$r$} (limit);
+  \draw[wire] (limit) -- node[labelbox] {$u$} (output);
+  % Place the interface description above the output, away from feedback.
+  \node[note,anchor=south east] at (23.4,.45) {Six joint effort\\command interfaces};
+  \node[tap] (rawtap) at (17,0) {};
+  \node[tap] (utap) at (21.2,0) {};
+  \draw[wire] (rawtap) -- (17,-3.8) -| (residual.north);
+  \node[font=\small,anchor=south east] at (residual.north) {$-$};
+  \draw[wire] (utap) |- (residual.east);
+  \node[font=\small,anchor=south west] at (residual.east) {$+$};
+  \draw[wire] (residual.west) -- node[labelbox] {$\delta\tau[k]=u[k]-r[k]$}
+    (integral.east);
+  \draw[wire] (11,4.1) node[above,align=center,font=\small]
+    {Measured full-model state: $Q,V$\\Measured finger acceleration: $\ddot q_g$}
+    -- (13.6,4.1) -- (13.6,1) -| ([xshift=12mm]rnea.north);
+\end{tikzpicture}
+\caption{Core signal flow. All four torque terms enter the summation with a
+positive sign. Repeated signal labels denote the same sampled signal; the
+robot plant and its measurement loop are outside this controller-only view.}
+\label{fig:overview}
+\end{figure}
+
+\vspace{-2mm}
+\textbf{Model dimensions and coupling.}
+The commanded arm vectors are in $\mathbb R^6$. The inverse-dynamics model
+includes both finger coordinates $q_g\in\mathbb R^2$:
+\[
+ Q=\begin{bmatrix}q\\q_g\end{bmatrix},\qquad
+ V=\begin{bmatrix}\dot q\\\dot q_g\end{bmatrix},\qquad
+ A=\begin{bmatrix}a\\\ddot q_g\end{bmatrix},\qquad
+ S=\begin{bmatrix}I_6&0_{6\times2}\end{bmatrix},\qquad
+ \tau_{\rm rb}=S\bigl[M(Q)A+C(Q,V)V+g(Q)\bigr].
+\]
+Thus finger motion contributes to the arm inverse dynamics. Rotor inertia
+$J_a=\diag(\texttt{armature})$ is added separately. The integral state is a
+torque bias: it is added after inverse dynamics, not inside $a$.
+
+\clearpage
+\begin{center}
+  {\Large\bfseries Friction compensation: expanded signal flow}
+\end{center}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \node[block,text width=22mm] (lambda) at (3,-2) {$\Lambda$};
+  \node[sum] (vs) at (6,0) {$+$};
+  \node[block,text width=22mm] (alpha) at (9,0) {$\alpha I_6$};
+  \node[block,text width=26mm] (tanh) at (12.8,0) {Elementwise\\$\tanh(\cdot)$};
+  \node[block,text width=22mm] (fc) at (16.5,0) {$F_c$};
+  \node[block,text width=22mm] (fv) at (12.8,3) {$F_v$};
+  \node[sum] (sum) at (20,0) {$+$};
+  \draw[wire] (0,0) node[left] {$\dot q_d$} -- (vs);
+  \draw[wire] (0,-2) node[left] {$e$} -- (lambda);
+  \draw[wire] (lambda.east) -| (vs.south);
+  \draw[wire] (vs) -- node[labelbox] {$v_c$} (alpha);
+  \draw[wire] (alpha) -- (tanh);
+  \draw[wire] (tanh) -- (fc);
+  \draw[wire] (fc) -- node[labelbox] {$\tau_c$} (sum);
+  \draw[wire] (0,3) node[left] {$\dot q$} -- (fv);
+  % Label the horizontal segment explicitly, not the elbow of a -| path.
+  \draw[wire] (fv.east) -- node[labelbox,above=2pt] {$\tau_v$}
+    (20,3) -- (sum.north);
+  \draw[wire] (sum) -- (23,0) node[right] {$\tau_f$};
+\end{tikzpicture}
+\caption{Parallel viscous and smoothed Coulomb compensation. Viscous
+compensation uses measured velocity; Coulomb direction uses reference
+velocity plus position-error injection.}
+\label{fig:friction}
+\end{figure}
+
+\begin{align*}
+  e[k]&=q_d[k]-q[k], &
+  v_c[k]&=\dot q_d[k]+\Lambda e[k],\\
+  \tau_v[k]&=F_v\dot q[k], &
+  \tau_c[k]&=F_c\tanh\!\bigl(\alpha v_c[k]\bigr),\\
+  \tau_f[k]&=\tau_v[k]+\tau_c[k].
+\end{align*}
+Here $F_v$, $F_c$, and $\Lambda$ are diagonal matrices. The hyperbolic tangent
+acts componentwise. At zero reference velocity, position error still supplies
+a smooth directional Coulomb compensation signal. This block implements a
+viscous-plus-smoothed-Coulomb compensator; it does not contain a LuGre state.
+
+\bigskip
+\textbf{Parameter mapping and configured values (joint 1 through joint 6).}
+\begin{center}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{lll}
+Symbol & ROS parameter & Configured value \\
+\hline
+$\diag(F_v)$ & \texttt{friction\_v\_nominal}
+  & $(1.002,1.009,0.506,0.201,0.101,0.051)$ $\mathrm{N\,m\,s/rad}$\\
+$\diag(F_c)$ & \texttt{friction\_c\_nominal}
+  & $(1.499,1.498,0.999,0.499,0.200,0.099)$ $\mathrm{N\,m}$\\
+$\Lambda$ & \texttt{friction\_error\_gain} & $5I_6$ $\mathrm{s^{-1}}$\\
+$\alpha$ & \texttt{tanh\_slope} & $300$ $\mathrm{s/rad}$\\
+$K_p$ & \texttt{kp} & $3000I_6$ $\mathrm{s^{-2}}$\\
+$K_v$ & \texttt{kv} & $100I_6$ $\mathrm{s^{-1}}$\\
+$J_a$ & \texttt{armature} & $0.1I_6$ $\mathrm{kg\,m^2}$
+\end{tabular}
+\end{center}
+
+\clearpage
+\begin{center}
+  {\Large\bfseries Discrete torque integrator and anti-windup}
+\end{center}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \node[block,text width=20mm] (ki) at (2,1.6) {$K_i$};
+  \node[block,text width=20mm] (kaw) at (2,-1.6) {$K_{\rm aw}$};
+  \node[sum] (rate) at (5,1.6) {$+$};
+  \node[block,text width=20mm] (dt) at (8,1.6) {$\Delta t_k I_6$};
+  \node[sum] (accum) at (11,1.6) {$+$};
+  \node[block,text width=27mm] (clip) at (14.2,1.6)
+    {Integral torque limit\\$\sat_{b_{\max}}(\cdot)$};
+  \node[block,text width=24mm] (delay) at (18.4,1.6)
+    {One-cycle memory\\$z^{-1}$\\$b[0]=0$};
+  \draw[wire] (-.3,1.6) node[left] {$e[k]$} -- (ki);
+  \draw[wire] (ki) -- (rate);
+  \draw[wire] (-.3,-1.6) node[left] {$\delta\tau[k]$} -- (kaw);
+  \draw[wire] (kaw.east) -| (rate.south);
+  \draw[wire] (rate) -- node[labelbox] {$\dot b_{\rm upd}[k]$} (dt);
+  \draw[wire] (dt) -- (accum);
+  \draw[wire] (accum) -- (clip);
+  \draw[wire] (clip) -- node[labelbox] {$b[k+1]$} (delay);
+  \draw[wire] (delay) -- (23,1.6) node[right] {$b[k]$};
+  \node[tap] (btap) at (21,1.6) {};
+  \draw[wire] (btap) -- (21,-2.7) -| (accum.south);
+  \node[note,anchor=north] at (16,-2.9) {Retained torque state};
+\end{tikzpicture}
+\caption{Explicit discrete update for joints with $k_{i,j}>0$. The current
+command uses $b[k]$; saturation feedback updates $b[k+1]$ for the next cycle.
+The unit delay prevents an algebraic loop.}
+\label{fig:integral}
+\end{figure}
+
+\vspace{-3mm}
+\begin{align*}
+ r[k]&=\tau_{\rm rb}[k]+J_a a[k]+\tau_f[k]+b[k],\\
+ u[k]&=\sat_{\tau_{\max}}\!\bigl(r[k]\bigr),
+ &\delta\tau[k]&=u[k]-r[k],\\
+ b[k+1]&=\sat_{b_{\max}}\!\left(
+ b[k]+\Delta t_k\left[K_i e[k]+K_{\rm aw}\delta\tau[k]\right]\right).
+\end{align*}
+For each joint $j$, $[\sat_\ell(x)]_j=\min(\ell_j,\max(-\ell_j,x_j))$.
+The controller uses the actual update period $\Delta t_k$ (nominally
+$1\,\mathrm{ms}$). The two limits have different roles: $\tau_{\max}$ limits
+the total output torque, while $b_{\max}$ limits the retained integral torque.
+Back-calculation uses saturation of the \emph{total} torque, including inverse
+dynamics, rotor inertia, friction compensation, and the integral bias.
+
+\medskip
+If $k_{i,j}=0$, the implementation forces $b_j=0$ and disables both error
+integration and back-calculation for that joint. Activation initializes all
+integral states to zero. During normal operation, trajectory completion does
+not reset the retained state; error integration has no deadband.
+
+\begin{center}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{lll}
+Symbol & ROS parameter & Configured value (joint 1 through joint 6)\\
+\hline
+$\diag(K_i)$ & \texttt{ki}
+  & $(5000,5000,3500,1750,750,400)$ $\mathrm{N\,m/(rad\,s)}$\\
+$K_{\rm aw}$ & \texttt{antiwindup\_gain} & $10I_6$ $\mathrm{s^{-1}}$\\
+$b_{\max}$ & \texttt{integral\_max\_effort}
+  & $(12.5,12.5,8.5,4.25,1.75,0.9)$ $\mathrm{N\,m}$\\
+$\tau_{\max}$ & \texttt{max\_effort}
+  & $(50,50,32,32,32,20)$ $\mathrm{N\,m}$
+\end{tabular}
+\end{center}
+
+\end{landscape}
+\restoregeometry
+
+\section{Mode-dependent control}\label{sec:control-modes}
+The preceding diagrams describe NORMAL mode. In SYS\_ID, the controller
+retains the same acceleration feedback, rigid-body inverse dynamics, rotor
+inertia compensation, and total effort limits, but disables friction
+compensation and sets the integral bias to zero on every update.
+
+On entering ESTOP, the controller initializes an internal braking reference
+from measured position and velocity. Each joint reference decelerates at its
+configured constant magnitude until zero velocity, then holds position.
+If a zero crossing falls inside a step, position is integrated only up to
+that crossing. Speeds at or below $10^{-4}$ rad/s are set to zero. The
+configured decelerations are $(17.5,12.5,20,40,40,50)$ rad/s$^2$.
+This kinematic reference has no jerk-limited transition or independent
+collision replan. Actual stopping depends on torque limits and simulated
+dynamics.
+
+ESTOP retains rigid-body, rotor, and friction compensation. Its integral
+bias is retained with saturation back-calculation, but without position-error
+integration. For an enabled joint, its update is therefore
+\[
+ b_j[k+1]=\sat_{b_{\max,j}}\bigl(b_j[k]
+ +\Delta t_k k_{{\rm aw},j}(u_j[k]-r_j[k])\bigr).
+\]
+The supervisory recovery protocol in Chapter~\ref{ch:supervisor} controls
+when NORMAL can be restored. Software ESTOP is a simulated braking and
+holding function, not a hardware emergency-stop function.
+
+\section{Residual-error interpretation}
+Let $\widehat\tau_f$ denote the configured friction compensation shown above. Assuming matching rigid-body and rotor models, correctly accounted gripper coupling, and no saturation, define
+\begin{equation}
+ M_{\rm eff}=M_{aa}(Q)+J_a,\qquad
+ d_f=\tau_f-\widehat\tau_f,
+\end{equation}
+Subtracting the dynamics gives
+\begin{equation}
+ M_{\rm eff}\bigl(\ddot e+K_v\dot e+K_pe\bigr)=d_f-b.
+ \label{eq:error}
+\end{equation}
+For a constant or sufficiently slowly varying residual torque in a stable closed loop, integral action can gradually establish $b\simeq d_f$, provided the required bias lies within the integral and output limits. This reduces, and may eliminate, steady-state position error. It explains how final positioning can improve without identifying every LuGre parameter: simplified compensation supplies the main velocity-dependent torque, while integral feedback adjusts the remaining holding torque.
+
+This conclusion is conditional. The integrator is not a LuGre observer and cannot instantaneously cancel reversal hysteresis, rapid Stribeck changes, or all nonlinear resistance. Increasing its gain can also cause overshoot, oscillation, or stick-slip. For a single-axis approximation with frozen inertia and a constant residual, the error characteristic polynomial is
+\begin{equation}
+ s^3+k_vs^2+k_ps+\frac{k_i}{m_{\rm eff}}=0.
+\end{equation}
+In addition to positive gains, the Routh stability condition for this approximation requires $k_vk_p>k_i/m_{\rm eff}$. This demonstrates that integral gain cannot be increased arbitrarily; it is not a stability proof for the actual coupled LuGre closed loop.
+
+\chapter{Friction simulation and identification}\label{ch:friction}
+\section{Model Roles and Notation}
+The arm has six revolute joints, with $q,\dot q,\ddot q\in\mathbb R^6$. Here, friction coefficients are parameters of a joint torque model, rather than dimensionless contact friction coefficients. For one joint, let $v=\dot q$, let $z$ denote the equivalent bristle deflection, and let $\tau_f$ denote the signed friction torque that the drive must overcome. The friction generalized force applied to the simulated joint is $-\tau_f$.
+
+\begin{table}[htbp]
+\centering
+\caption{Roles of the three layers in the current implementation.}
+\begin{tabularx}{\linewidth}{lXX}
+\toprule
+Layer & Model or algorithm & Purpose\\
+\midrule
+MuJoCo simulation & Independent LuGre state $z_j$ for each joint & Generate velocity- and history-dependent friction loads\\
+Offline identification & Two-parameter nonnegative linear least squares & Estimate $\widehat F_{v,j},\widehat F_{c,j}$ from motion data\\
+Normal control & CTC, simplified friction compensation, and torque integration & Compensate dominant friction and correct residual tracking errors\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Use the full-model state $Q,V$ and arm selector $S$ defined in
+Chapter~\ref{ch:control}, including both moving gripper fingers.
+In the absence of contact or external disturbance torques, the arm torque balance is
+\begin{equation}
+ \tau_{\rm act}=S\RNEA(Q,V,\dot V)+J_a\ddot q+\tau_f,
+ \qquad J_a=0.1I_6\;\mathrm{kg\,m^2}.
+ \label{eq:balance}
+\end{equation}
+The equivalent rotor inertia is provided by MuJoCo's \texttt{armature} setting and subtracted as a known quantity during identification; this procedure does not estimate it. The disturbance assumption in Eq.~\eqref{eq:balance} matters: collisions, external dragging, or unmodeled payloads prevent the dynamics residual from being interpreted entirely as friction.
+
+\section{LuGre Friction Simulation}
+\subsection{Continuous Model and Physical Interpretation}
+LuGre represents friction memory through an equivalent bristle-deflection state. The equations below use the notation and torque units of the current code. Define the Stribeck envelope, expressed in torque units, as
+\begin{align}
+ G(v)&=F_c+(F_s-F_c)\exp\!\left[-\left(\frac{v}{v_s}\right)^2\right],\label{eq:G}\\
+ \dot z&=v-\frac{\sigma_0|v|}{G(v)}z,\label{eq:z}\\
+ \tau_f&=\sigma_0z+\sigma_1\dot z+\sigma_2v.\label{eq:lugre}
+\end{align}
+Some formulations instead use the deflection-valued function $g(v)=G(v)/\sigma_0$, giving $\dot z=v-|v|z/g(v)$. These conventions are equivalent, but mixing them would incorrectly omit $\sigma_0$.
+
+\begin{table}[htbp]
+\centering
+\caption{LuGre variables and parameters.}
+\begin{tabular}{lll}
+\toprule
+Symbol & Meaning & Unit\\
+\midrule
+$z$ & Equivalent bristle deflection & $\mathrm{rad}$\\
+$F_c$ & High-speed Coulomb sliding torque & $\mathrm{N\,m}$\\
+$F_s$ & Maximum low-speed Stribeck envelope torque & $\mathrm{N\,m}$\\
+$v_s$ & Characteristic Stribeck velocity & $\mathrm{rad/s}$\\
+$\sigma_0$ & Bristle stiffness & $\mathrm{N\,m/rad}$\\
+$\sigma_1$ & Bristle deflection-rate damping coefficient & $\mathrm{N\,m\,s/rad}$\\
+$\sigma_2$ & Viscous friction coefficient & $\mathrm{N\,m\,s/rad}$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At a constant nonzero velocity, setting $\dot z=0$ gives
+\begin{equation}
+ z_{\rm ss}(v)=\frac{G(v)}{\sigma_0}\sgn(v),\qquad
+ \tau_{f,\rm ss}(v)=G(v)\sgn(v)+\sigma_2v.
+ \label{eq:ss}
+\end{equation}
+At high speed, $G(v)\to F_c$; near zero speed, the envelope approaches $F_s$. During reversal, $z$ cannot jump immediately to its new steady state, so friction is not a single-valued static function of velocity. At $v=0$, the implemented equation gives $\dot z=0$: the existing deflection is retained and the torque is $\sigma_0z$. If the initial state is $z=0$, the initial stationary torque is also zero. Holding torque develops through small displacements; this is not an ideal constraint that automatically selects an arbitrary static friction torque at zero velocity. Stored elastic energy also means that the instantaneous friction torque need not always have the same sign as the current velocity.
+
+\subsection{Configured Parameters and Simulation Integration}
+\begin{table}[htbp]
+\centering
+\caption{Simulation parameters in \texttt{lugre\_friction.hpp}; units are listed in the preceding table.}
+\begin{tabular}{crrrrrr}
+\toprule
+Joint & $F_c$ & $F_s$ & $v_s$ & $\sigma_0$ & $\sigma_1$ & $\sigma_2$\\
+\midrule
+1 & 1.5 & 1.725 & 0.02 & 3000 & 0.075 & 1.0\\
+2 & 1.5 & 1.725 & 0.02 & 3000 & 0.075 & 1.0\\
+3 & 1.0 & 1.150 & 0.02 & 2000 & 0.050 & 0.5\\
+4 & 0.5 & 0.575 & 0.02 & 1000 & 0.025 & 0.2\\
+5 & 0.2 & 0.230 & 0.02 & 400 & 0.010 & 0.1\\
+6 & 0.1 & 0.115 & 0.02 & 200 & 0.005 & 0.05\\
+\bottomrule
+\end{tabular}
+\end{table}
+All six axes use $F_s/F_c=1.15$. MuJoCo's built-in \texttt{damping} and \texttt{frictionloss} are zero for the arm joints, avoiding duplicate friction contributions alongside the custom LuGre model. The gripper fingers have separate native friction settings and are outside these six LuGre models.
+
+The physics timestep is $h=0.0001\,\mathrm{s}$, corresponding to $10\,\mathrm{kHz}$; the nominal controller rate is $1\,\mathrm{kHz}$. Before each call to \texttt{mj\_step}, the current joint velocity is read and friction is injected through \texttt{qfrc\_applied}$=-\tau_f$. MuJoCo's \texttt{implicit} integrator advances the robot dynamics, while custom code advances the bristle state separately. The exact state update below therefore does not imply exact integration of the full coupled system.
+
+\subsection{Discrete Bristle-State Update}
+The code first computes the torque for the current step from $(z_n,v_n)$, then advances the internal state. Let
+\begin{equation}
+ \rho_n=\frac{\sigma_0|v_n|}{G(v_n)},\qquad
+ \dot z_n=v_n-\rho_n z_n,\qquad
+ \tau_{f,n}=\sigma_0z_n+\sigma_1\dot z_n+\sigma_2v_n.
+\end{equation}
+Holding velocity constant within one physics step allows analytical integration of the state equation:
+\begin{equation}
+ z_{n+1}=\begin{cases}
+ z_n+(z_{\rm ss}(v_n)-z_n)(1-e^{-\rho_n h}),&v_n\ne0,\\
+ z_n,&v_n=0.
+ \end{cases}\label{eq:discrete}
+\end{equation}
+The implementation evaluates $1-e^{-\rho_n h}$ as $-\operatorname{expm1}(-\rho_n h)$ to reduce subtractive cancellation near zero velocity, and uses fused multiply-add operations. The initial state is $z_0=0$. There is no velocity deadband, state clipping, or replacement of the dynamic state by its steady-state value. Equation~\eqref{eq:discrete} avoids the explicit-Euler timestep restriction associated with stiff bristle dynamics; its exactness applies only to the scalar state equation with velocity held constant over the step.
+
+\section{Why Identification Uses a Simplified Model}
+\subsection{Identification Model and Velocity Range}
+The current implementation fits the following model independently for each joint:
+\begin{equation}
+ \widehat\tau_f(v)=\widehat F_v v+
+ \widehat F_c\tanh(\alpha v),\qquad
+ \alpha=300\;\mathrm{s/rad},\quad \widehat F_v,\widehat F_c\ge0.
+ \label{eq:fitmodel}
+\end{equation}
+Only samples with $|v|\ge0.05\,\mathrm{rad/s}$ are retained for regression. With the configured $v_s=0.02$, the threshold gives
+\begin{equation}
+ \frac{G(0.05)-F_c}{F_c}=0.15e^{-6.25}
+ \simeq2.90\times10^{-4},\qquad
+ \tanh(300\times0.05)=\tanh(15)\simeq1.
+\end{equation}
+Consequently, when the bristle state is close to steady state, this velocity range mainly reflects $F_c\sgn(v)+\sigma_2v$ and is suitable for identifying the dominant sliding friction. Velocity filtering does not guarantee that post-reversal bristle transients have disappeared, nor does it remove acceleration-estimation errors.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+ width=.88\linewidth,height=6.1cm,
+ xlabel={$v\;(\mathrm{rad/s})$},ylabel={$\tau_f\;(\mathrm{N\,m})$},
+ xmin=0,xmax=.12,ymin=0,ymax=1.9,grid=major,
+ legend style={at={(.98,.05)},anchor=south east,font=\small},
+ samples=240,domain=.00001:.12]
+ \addplot[blue,thick] {1.5+.225*exp(-(x/.02)^2)+x};
+ \addlegendentry{LuGre positive steady-state branch}
+ \addplot[orange!80!black,thick,dashed,domain=0:.12] {x+1.5*tanh(300*x)};
+ \addlegendentry{Simplified: $F_v=1,F_c=1.5$}
+ \addplot[black,densely dotted,forget plot] coordinates {(.05,0) (.05,1.9)};
+ \node[anchor=north west,font=\small] at (axis cs:.052,1.88) {Fitting speed threshold};
+\end{axis}
+\end{tikzpicture}
+\caption{Analytical curves computed from the assumed simulation parameters of joint 1, not recorded data or fitted results. Only positive velocities are shown. The LuGre limit as $v\to0^+$ does not represent the actual friction at $v=0$ for arbitrary motion histories. The plot illustrates the high-speed approximation, not hysteresis.}
+\label{fig:steady}
+\end{figure}
+
+\subsection{Parameter Complexity and Identifiability}
+A full LuGre model has six parameters and one unmeasured dynamic state per joint. Fitting all six axes can therefore involve 36 friction parameters, together with the treatment of initial bristle states. Unknown parameters are coupled through the state equation, generally requiring repeated integration and nonlinear optimization. In particular, at high-speed steady motion, $\dot z\simeq0$ and the elastic contribution approaches $F_c\sgn(v)$, so the data weakly constrain $\sigma_0,\sigma_1,F_s,v_s$. More parameters do not automatically provide more usable information.
+
+The current scheme estimates only two parameters per joint, or 12 in total. With $\alpha$ fixed, the model is linear in the unknown coefficients, making nonnegative constraints, matrix-conditioning checks, and repeated experiments straightforward. Evaluating a full LuGre model in real time is not inherently expensive. The main benefits of simplification are reduced identification, hidden-state handling, and tuning effort, rather than an assumed inability of the controller to compute LuGre dynamics.
+
+The tradeoff is the omission of low-speed Stribeck variation, presliding stiffness, and reversal memory. The fitted values should therefore be interpreted as effective parameters over the selected velocity range. Ideally they are close to $\sigma_2,F_c$, but they do not identify the complete LuGre dynamics.
+
+\section{Identification Workflow and Fourier Excitation}
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+ node distance=5mm,>=Latex,
+ step/.style={draw,rounded corners,fill=blue!3,text width=12.5cm,
+ align=center,inner sep=5pt,font=\small}]
+ \node[step] (a) {Select a center pose and six amplitude bounds; generate, scale, and check the Fourier trajectory};
+ \node[step,below=of a] (b) {Perform pre-alignment; enter identification control, disable friction compensation, and clear the integral bias};
+ \node[step,below=of b] (c) {Execute references on a 1 ms grid; record simulated states, actual actuator torques, and timing data};
+ \node[step,below=of c] (d) {Archive raw data; validate clocks, remove duplicates, resample, and estimate actual acceleration};
+ \node[step,below=of d] (e) {Subtract eight-DOF rigid-body inverse dynamics and known rotor-inertia torque};
+ \node[step,below=of e] (f) {Trim endpoints and filter by speed; fit each axis with nonnegative least squares and check data quality};
+ \node[step,below=of f] (g) {Report parameter YAML, RMSE, and timing diagnostics; parameters are not applied automatically};
+ \foreach \from/\to in {a/b,b/c,c/d,d/e,e/f,f/g}
+   \draw[->,thick] (\from) -- (\to);
+\end{tikzpicture}
+\caption{Core identification data workflow. The Supervisor additionally handles phase transitions, alignment, and recovery on exit.}
+\end{figure}
+
+\subsection{Finite Fourier Trajectories}
+For joint $j$, the code uses $N_f=7$ harmonics. With $\omega_\ell=\ell\omega$,
+\begin{align}
+ q_{d,j}(t)&=q_{0,j}+\sum_{\ell=1}^{7}
+ \left[\frac{a_{j\ell}}{\omega_\ell}\sin(\omega_\ell t)
+ +\frac{b_{j\ell}}{\omega_\ell}(1-\cos(\omega_\ell t))\right],\\
+ \dot q_{d,j}(t)&=\sum_{\ell=1}^{7}
+ [a_{j\ell}\cos(\omega_\ell t)+b_{j\ell}\sin(\omega_\ell t)],\\
+ \ddot q_{d,j}(t)&=\sum_{\ell=1}^{7}\omega_\ell
+ [-a_{j\ell}\sin(\omega_\ell t)+b_{j\ell}\cos(\omega_\ell t)].
+\end{align}
+The coefficients satisfy
+\begin{equation}
+ \sum_\ell a_{j\ell}=0,\qquad
+ \sum_\ell\ell b_{j\ell}=0,\qquad
+ \sum_\ell b_{j\ell}/\ell=0.
+\end{equation}
+The first two constraints enforce zero velocity and acceleration at both ends of a complete period. The trajectory returns to $q_0$ at the endpoints by construction, and the third constraint also makes its mean position offset over a period zero.
+
+The implementation generates 16 candidate shapes using a 10 s base period and a fixed random seed of 42. Amplitudes are constrained by user bounds, the available distance to joint limits, and a factor of 0.90. Peak velocity, acceleration, and jerk checks combine sampled extrema with analytical derivative bounds. For a time-scaling factor $s$, these quantities scale by $1/s$, $1/s^2$, and $1/s^3$, respectively. The final duration is restricted to 6--120 s and aligned to an integer number of 1 ms control ticks. The resulting fundamental frequency is therefore not fixed at $0.1\,\mathrm{Hz}$.
+
+Candidates are scored using the normalized design matrix
+\begin{equation}
+ \widetilde X_j=\begin{bmatrix}
+ v_{j,1}/v_{\max,j}&\tanh(\alpha v_{j,1})\\
+ \vdots&\vdots\\
+ v_{j,m}/v_{\max,j}&\tanh(\alpha v_{j,m})
+ \end{bmatrix},\qquad
+ \eta=\min_j\lambda_{\min}\!\left(
+ \frac{\widetilde X_j^\top\widetilde X_j}{N_{\rm grid}}\right).
+\end{equation}
+Here $N_{\rm grid}=2049$ is the number of candidate evaluation grid points; matrix rows retain only valid time and velocity samples. The score emphasizes the least informative joint, with additional checks for velocity coverage in both directions. If geometry prevents a feasible path, amplitude contractions of $1,0.8,0.6,0.4$ are tried in order. The final trajectory is checked for self-collision, ground collision, and the gripper swept envelope before the control references are accepted for execution. A constant speed magnitude makes velocity and the approximate sign function nearly collinear, so excitation needs multiple speed magnitudes, not merely motion in both directions.
+
+\subsection{Control During Identification}
+During identification, CTC tracks the excitation using the SYS\_ID law in
+Section~\ref{sec:control-modes}.
+The controller disables friction compensation and clears the integral bias while retaining known inertia compensation and total torque saturation. This removes previously learned friction compensation and bias from the experiment, making tracking responses and residuals easier to interpret. It remains a closed-loop experiment, however: tracking error is not itself a measurement of friction torque. Correlated errors in closed-loop data can also affect the estimate; nonnegative least squares does not automatically guarantee statistical unbiasedness.
+
+\section{Simulation Data Processing and Nonnegative Least Squares}
+\subsection{Acquisition and Timing Consistency}
+Samples from \texttt{/simulation/sysid\_samples} contain arm positions and velocities, actuator torques, gripper positions/velocities/accelerations, physics step indices, simulation time, control periods, command sequence numbers, and latency diagnostics. Although the Python field is named \texttt{tau\_cmd}, its source is MuJoCo's \texttt{qfrc\_actuator}, not the controller's requested torque before saturation.
+
+Raw snapshots are archived as a compressed \texttt{.npz} recording before estimation checks. An archive failure is reported but does not by itself prevent estimation.
+
+The processing steps are:
+\begin{enumerate}
+ \item Check finite values and monotonic physics step indices and simulation time. Verify
+ $\Delta t_{\rm sim}=10^{-4}\Delta n_{\rm step}$ with an absolute tolerance of $10^{-7}$ s.
+ \item Align the experiment phase and simulation clocks using the median of their time difference. Reject deviations from this fixed offset exceeding 5 ms. Remove duplicate physics steps from the estimation data while preserving the raw archive.
+ \item Check coverage of the experiment endpoints, allowing 0.25 s at each end. Set the resampling interval $\Delta t_m$ to the median interval between distinct snapshots. Reject a maximum gap greater than $\max(0.05,5\Delta t_m)$ s.
+ \item Linearly interpolate positions, velocities, torques, and gripper states onto a uniform grid. Estimate $\widehat{\ddot q}$ by differentiating measured velocity with a third-order Savitzky--Golay polynomial, using an odd window of approximately 0.1 s and at least five samples.
+\end{enumerate}
+Differentiation uses the physics clock, rather than HMI callback arrival times. Actual acceleration is estimated from measured velocity instead of substituting reference acceleration; confusing the two would assign tracking discrepancies to friction parameters. The resampling grid follows actual snapshot intervals. A 1 kHz control rate does not establish that independent recorded samples are also available at 1 kHz.
+
+\subsection{Dynamics Residual and Regression}
+Using the resampled measured states, compute
+\begin{align}
+ \tau_{{\rm rb},k}&=S\RNEA\!\left(Q_k,V_k,
+ \begin{bmatrix}\widehat{\ddot q}_k\\\ddot q_{g,k}\end{bmatrix}\right),\\
+ y_k&=\tau_{{\rm act},k}-\tau_{{\rm rb},k}-J_a\widehat{\ddot q}_k.
+ \label{eq:residual}
+\end{align}
+Including gripper states in the full inverse dynamics avoids simply assigning motion-induced coupling torques to arm friction. The residual $y$ still contains differentiation, model, and timing errors; it is not a direct measurement of the true friction torque.
+
+For each axis, retain only samples satisfying
+\begin{equation}
+ 1<t_k<T-1,\qquad |v_{j,k}|\ge0.05\;\mathrm{rad/s}.
+\end{equation}
+Let $\theta_j=[\widehat F_{v,j},\widehat F_{c,j}]^\top$ and construct
+\begin{equation}
+ X_j=\begin{bmatrix}
+ v_{j,1}&\tanh(\alpha v_{j,1})\\
+ \vdots&\vdots\\
+ v_{j,m_j}&\tanh(\alpha v_{j,m_j})
+ \end{bmatrix},\qquad
+ \widehat\theta_j=\arg\min_{\theta_j\ge0}\|X_j\theta_j-y_j\|_2^2.
+ \label{eq:ls}
+\end{equation}
+The implementation uses \texttt{scipy.optimize.lsq\_linear}. Each joint requires at least 200 valid samples. After each design-matrix column is normalized by its Euclidean norm, the condition number must not exceed 1000. This normalization is used for the conditioning check; the actual fit uses $X_j$ in its original physical units.
+
+The output contains both six-axis parameter vectors, timing diagnostics, and the training-sample error
+\begin{equation}
+ \operatorname{RMSE}_j=\sqrt{\frac1{m_j}
+ \sum_{k=1}^{m_j}(X_{j,k}\widehat\theta_j-y_{j,k})^2}.
+\end{equation}
+If any axis fails the sample-count, conditioning, or solver checks, the parameter set is not returned as a successful result. The current code reports RMSE but defines neither an automatic RMSE acceptance threshold nor an independent validation set. A small training RMSE does not validate low-speed friction or reversal behavior. The output YAML is \emph{not automatically written back or applied} to the controller configuration.
+
+\section{Interpretation of configured compensation}
+The configured compensation coefficients in Chapter~\ref{ch:control} are
+close to the simulation's viscous and Coulomb parameters. This comparison
+is not an identification benchmark or evidence of real-machine accuracy.
+The estimator fits measured velocity, whereas the controller's Coulomb
+term uses reference velocity plus position-error injection. The controller
+has no LuGre state; the integral bias addresses residual error as described
+in Chapter~\ref{ch:control}. Neither training RMSE nor endpoint tolerances
+establish tracking performance for arbitrary motions.
+
+\chapter{Supervisory state machine}\label{ch:supervisor}
+\section{Formal state representation}
+A useful extended-state model is
+\begin{equation}
+ x=(m,p,y,r,c,w,\ell,s,k,a,d,t_c,t_q,t_s,f,\rho),
+\end{equation}
+where $m$ is the arm mode, $p$ the motion phase, $y$ the SysID phase, $r$ the recovery phase, $c$ the last observed CTC mode, $w$ the settling flag, $\ell$ the ESTOP latch, $s$ the session identifier, $k$ the active motion key, $a$ the cancellation flag, $d$ the optional phase deadline, $t_c,t_q$ the monotonic reception times, $t_s$ the start of a qualifying stationary interval, $f$ the retained estimation-failure reason, and $\rho$ the revision. The initial state is
+\begin{equation}
+ (m,p,y,r,c,s,\rho)=(\mathsf{INITIALIZING},\mathsf{IDLE},\mathsf{NONE},
+ \mathsf{NONE},\mathsf{UNKNOWN},0,1).
+\end{equation}
+This is an extended, timed discrete-event machine: it has continuous-valued observations and clocks, but it does not integrate robot dynamics itself. For an event $e$, the implementation evaluates a guard and returns effects:
+\begin{equation}
+ (x',u)=\delta(x,e),\qquad
+ u=(u_{\rm CTC},\mathrm{cancel\_active},\mathrm{cancel\_key},\mathrm{terminal\_success}).
+\end{equation}
+The effect value $u_{\rm CTC}=-1$ means no command. A rejected command leaves the state unchanged and returns a diagnostic. An ignored observation or stale completion is also not a transition. Mutex serialization gives each state mutation a definite order; this is not a guarantee of atomic network delivery.
+
+\subsection{Enumerations and numeric encodings}
+Prefixes \id{MODE_}, \id{MOTION_}, \id{SYSID_}, and \id{RECOVERY_} are omitted below where the column identifies the enumeration.
+\begin{longtable}{L{.20\linewidth}L{.73\linewidth}}
+\toprule Dimension & Values \\\midrule\endhead
+Arm mode $m$ & INITIALIZING=0; NORMAL=1; SYSID=2; ESTOP=3; RECOVERING=4; SOFT\_FAULT=5; FAULT=6. \\
+Motion $p$ & IDLE=0; PLANNING=1; WAITING\_CTC=2; EXECUTING=3; CANCELING=4. \\
+SysID $y$ & NONE=0; PRE\_ALIGN=1; WAIT\_CONTROLLER\_MODE=2; READY\_FOR\_EXCITATION=3; EXCITING=4; CALCULATING=5; POST\_ALIGN=6; WAIT\_NORMAL\_MODE=7; RETURN\_ALIGN=8; COMPLETING=9; VALIDATING=10. \\
+Recovery $r$ & NONE=0; SYNC\_REFERENCE=1; WAIT\_NORMAL\_MODE=2; SETTLING=3. \\
+Observed CTC $c$ & UNKNOWN=0; NORMAL=1; ESTOP=2; SYSID=3. \\
+CTC command & NORMAL=0; ESTOP=1; SYS\_ID=2. These are \emph{not} ControllerStatus values. \\
+\bottomrule
+\end{longtable}
+\id{MODE_FAULT} is declared and handled as a watchdog-exempt/display-error mode, but no current Supervisor transition assigns it. It must not be presented as a reachable generic fault destination. Current escalated failures enter ESTOP; ordinary accepted-motion failures can enter SOFT\_FAULT.
+
+The product of enumeration values contains many unreachable combinations. SysID and recovery phases have meaning only in their matching operating mode. In particular, ESTOP can coexist with CANCELING until the active task acknowledges termination. IDLE means the software slot is free, not that the physical arm is stationary.
+
+\subsection{Snapshot semantics}
+\id{snapshot()} computes freshness and \id{motion_allowed} at read time. A stale CTC observation is exposed as UNKNOWN while the stored observation remains available internally. Revision increases through \id{changed_unlocked()}, not for each heartbeat or freshness change. Repeated commands/cancel requests can still increase it, so it is a mutation revision rather than a count of distinct mode changes. The node supplies a ROS timestamp at publication.
+
+The snapshot includes \id{last_error_code} and \id{detail}; these are diagnostics, not transition inputs. \id{excitation_start} is CTC-authored and correlated to the downstream action UUID. It is accepted only for the active excitation, in EXCITING, with positive seconds, and only once. It is reset on SysID begin/excitation reservation, but may remain visible after exit; consumers must respect mode and session.
+
+\section{Observations, guards, and clocks}
+Let $t$ denote steady-clock time. Freshness uses reception age, independently of ROS timestamps:
+\begin{align}
+ F_c(t)&=\mathrm{seen}_c\land(t-t_c<0.8\,\mathrm{s}),\\
+ F_q(t)&=\mathrm{seen}_q\land(t-t_q<0.8\,\mathrm{s}),\qquad F=F_c\land F_q.
+\end{align}
+Before an observation reaches the Supervisor, the planner node requires a strictly increasing ROS message timestamp. Joint feedback must contain all names joint1 through joint6, with finite position and velocity entries. Invalid or incomplete messages do not refresh joint liveness. Controller observations refresh liveness only for NORMAL, ESTOP, or SYSID. Consequently, a ROS clock reset or repeated timestamp can prevent fresh reception from being credited even though monotonic timers continue to run.
+
+\subsection{Physical settling}
+Define the measured maximum arm speed
+\begin{equation}
+ v_\infty=\max_{i=1,\ldots,6}|\dot q_i|.
+\end{equation}
+Entering a settling gate resets $t_s$ and sets an 8 s phase deadline. Each joint observation resets the candidate interval if its gap exceeds 100 ms, its speed is nonfinite, or $v_\infty>0.01\,\mathrm{rad/s}$. A finite speed at or below this threshold starts a new candidate interval if necessary. The watchdog releases the gate only if
+\begin{equation}
+ B(t)= w\land(t_s\ne\varnothing)\land(t-t_s\ge0.3\,\mathrm{s})
+          \land(t-t_q<0.1\,\mathrm{s}).
+\end{equation}
+This is sampled evidence of continuous settling, not a proof of intersample motion bounds. The distinction between the observation-gap test ($>100$ ms) and final-age test ($<100$ ms) follows the implementation. The planner's ordinary near-rest admission check is weaker: $v_\infty\le0.02\,\mathrm{rad/s}$. Ordinary motion does not first pass the Supervisor's 300 ms settling gate.
+
+\subsection{Timeout inventory}
+\begin{longtable}{L{.33\linewidth}L{.16\linewidth}L{.44\linewidth}}
+\toprule Timer & Value & Meaning and scope \\\midrule\endhead
+Observation timeout & 800 ms & Controller and joint reception freshness; stale data escalates outside INITIALIZING, ESTOP, and FAULT. \\
+Supervisor heartbeat & 100 ms & Runs watchdog, downstream deadline check, and snapshot publication. \\
+Settling / mode switch & 8 s & Fresh deadline for each settling gate or dispatched mode acknowledgement. \\
+Client dispatch & 15 s & After settling releases a client phase; also after rejected validation returns to READY. \\
+Excitation validation & 120 s & READY to VALIDATING; reservation must occur before expiry. \\
+Parameter calculation & 60 s & Successful excitation to calculation event. \\
+CTC server discovery & 2 s & Wait inside dispatch; unavailable server terminates the task. \\
+CTC operation & $T+12$ s & From downstream operation setup, including acceptance and result wait; $T$ is trajectory duration. \\
+CTC endpoint settling & 1 s & Configured physical endpoint acceptance window. \\
+CTC endpoint allowance & 5 s & Configured allowance after nominal trajectory end, including settling. \\
+CTC saturation & 1 s & Continuous effort clipping on any joint triggers an execution failure. \\
+HMI liveness & 1.2 s & Supervisor heartbeat loss, after a 2 s boot grace, triggers direct ESTOP fallback. \\
+HMI ESTOP confirmation & 0.6 s & Missing Supervisor ESTOP acknowledgement triggers fallback; checked by a 500 ms Qt timer. \\
+\bottomrule
+\end{longtable}
+Watchdog deadline expiry uses $t>d$, not $t\ge d$. Checks occur on scheduled callbacks and may run late; these are not hard real-time response bounds. INITIALIZING has no Supervisor startup timeout. Ordinary planning clears the phase deadline and has no dedicated Supervisor planning-duration limit. Its cancellation predicate still checks authorization and observation freshness.
+
+\section{Top-level mode transitions}
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=17mm and 17mm]
+\node[state] (i) {INITIALIZING};
+\node[state,right=of i] (n) {NORMAL};
+\node[state,right=of n] (y) {SYSID};
+\node[state,below=of i] (f) {SOFT\_FAULT};
+\node[state,below=of n] (e) {ESTOP\\latched};
+\node[state,below=of y] (r) {RECOVERING};
+\draw[edge] (i) -- node[lab,above]{fresh joints +\\CTC NORMAL} (n);
+\draw[edge] (n) to[bend left=18] node[lab,above]{BEGIN\_SYSID} (y);
+\draw[edge] (y) to[bend left=18] node[lab,below]{return + settle} (n);
+\draw[edge] (n) -- node[lab,sloped,above]{motion failure} (f);
+\draw[edge] (f) to[bend left=24] node[lab,above]{ACK} (n);
+\draw[edge] (e) -- node[lab,above]{BEGIN\_RECOVERY} (r);
+\draw[edge] (r) to[bend right=20] node[lab,right]{sync, NORMAL,\\settle} (n);
+\draw[edge,dashed] (n) -- node[lab,right]{ESTOP / fault} (e);
+\draw[edge,dashed] (y) -- node[lab,sloped,below]{abort / fault} (e);
+\end{tikzpicture}
+\caption{Main paths. ESTOP commands are accepted from every mode; monitored faults can also lead to ESTOP from SOFT\_FAULT and RECOVERING. Not all global failure edges are drawn. FAULT is reserved, with no current entry path.}
+\end{figure}
+
+\subsection{Complete command-event table}
+Here $K_0$ means the active key is empty. $s_{\rm in}$ denotes the request session; $s$ denotes the current session. ``New session'' means allocation from a randomly seeded 64-bit counter. It is a correlation token, not an authentication credential.
+\begin{longtable}{L{.22\linewidth}L{.37\linewidth}L{.34\linewidth}}
+\toprule Event (wire value) & Acceptance guard & State update / effect \\\midrule\endhead
+ESTOP (1) & Always accepted. API convention is session zero; implementation does not enforce it for this event. & Enter ESTOP, latch stop, cancel active motion, request CTC command 1; invalidate sequence. \\
+BEGIN\_RECOVERY (2) & $m=\E$, $\ell$, $s_{\rm in}=0$, $K_0$, $F$, $c=\E$. & Enter RECOVERING / SYNC\_REFERENCE; allocate session; start settling gate. \\
+ACK\_SOFT\_FAULT (3) & $m=\SF$, $s_{\rm in}=0$, $K_0$, $F$, $c=\N$. & Enter NORMAL; clear last error to zero. No CTC mode command. \\
+BEGIN\_SYSID (4) & $m=\N$, $\neg\ell$, $s_{\rm in}=0$, $K_0$, $F$, $c=\N$. & Enter SYSID / PRE\_ALIGN; new session; clear excitation origin and retained estimation failure; start settling. \\
+SYSID\_CALCULATION\_DONE (5) & $m=\Y$, $s_{\rm in}=s\ne0$, $y=\mathsf{CALCULATING}$, $K_0$. & Enter POST\_ALIGN with settling. \\
+ABORT\_SYSID (6) & $m=\Y$, $s_{\rm in}=s\ne0$. & Enter latched ESTOP; cancel active task; CTC command 1. \\
+SYSID\_CALCULATION\_FAILED (7) & Same guard as calculation done. & Store failure reason (default if empty); enter POST\_ALIGN with settling for controlled return. \\
+Unknown value & Never accepted. & No state change. \\
+\bottomrule
+\end{longtable}
+A calculation event does not itself test freshness or the phase deadline. The watchdog performs those checks separately. Likewise, normal motion admission does not explicitly compare a client dispatch deadline. Therefore the tables describe actual serialized checks, not an idealized machine that rejects every event at the exact expiration instant.
+
+\subsection{Observation and watchdog events}
+\begin{longtable}{L{.37\linewidth}L{.56\linewidth}}
+\toprule Event / condition & Consequence \\\midrule\endhead
+Fresh NORMAL CTC plus fresh joint feedback during INITIALIZING & Enter NORMAL. Either the controller or joint callback can complete this condition. No initial 300 ms settling requirement. \\
+CTC reports ESTOP outside ESTOP and RECOVERING & Enter latched ESTOP; cancel motion. Do not echo a redundant CTC stop command. \\
+CTC reports SYSID while arm mode is not SYSID & Enter latched ESTOP and issue command 1, except that already-latched ESTOP observations are handled first and merely update observation/revision. \\
+Any valid CTC observation while arm mode is ESTOP & Update actual observation and revision if mode changed; retain initiating fault detail and latch. Never auto-recover. \\
+Freshness loss in watchdog & Enter latched ESTOP unless current mode is INITIALIZING, ESTOP, or FAULT (watchdog returns early). \\
+NORMAL with non-NORMAL CTC & Enter latched ESTOP. \\
+SysID phase / CTC mismatch & Enter latched ESTOP according to Table~\ref{tab:modeexpect}. \\
+Recovery SYNC\_REFERENCE with non-ESTOP CTC, or SETTLING with non-NORMAL CTC & Enter latched ESTOP. \\
+Active phase deadline expired & Enter latched ESTOP; detail distinguishes settling, validation, and other sequence timeouts. \\
+Settling predicate $B(t)$ true & Release gate and advance effects as specified by the SysID or recovery tables. \\
+\bottomrule
+\end{longtable}
+The watchdog order is: exempt-mode return, freshness, mode consistency, deadline, then settling release. A late settling confirmation does not override an already expired deadline. During an acknowledgement wait, the implementation allows the expected old mode until acknowledgement or timeout. Unexpected SYSID observations still receive the earlier controller-observation check.
+
+\subsection{Common fault entry}
+\id{fault_unlocked(reason,true,...)} sets $m=\E$, $\ell=\mathrm{true}$, $y=r=\mathsf{NONE}$, $s=0$, $w=\mathrm{false}$, clears the phase deadline, and records error $-7$. If a key is active, it remains owned, cancellation is set, and $p$ becomes CANCELING. It is cleared only by matching completion. This prevents recovery from overlapping an unfinished task. The CTC stop command is published before the slower cancellation path. The helper has a non-ESTOP branch, but current call sites use its ESTOP branch; ordinary SOFT\_FAULT entry is performed in \id{finish_motion()}.
+
+\section{Motion admission, execution, and cancellation}
+\subsection{Admission predicate}
+All contexts require an empty key, IDLE motion phase, fresh joint/CTC observations, and no settling gate. ESTOP latch blocks all contexts except recovery. Remaining guards are:
+\begin{longtable}{L{.20\linewidth}L{.73\linewidth}}
+\toprule Context & Additional requirements \\\midrule\endhead
+NORMAL (0) & $m=\N$, $c=\N$, request session zero. Any of the four supported motion command types. \\
+SYSID (1) & $m=\Y$, matching nonzero session. PRE\_ALIGN or RETURN\_ALIGN requires CTC NORMAL; POST\_ALIGN requires CTC SYSID. Node permits only MOVEJ. \\
+RECOVERY (2) & $m=\Rec$, matching nonzero session, SYNC\_REFERENCE phase, CTC ESTOP. Node permits only MOVEJ; latch remains set. \\
+\bottomrule
+\end{longtable}
+The node also rejects invalid command/context values or nonfinite scaling factors outside $[0.01,1]$. Reservation sets the UUID key, clears cancellation and any phase deadline, and enters PLANNING. Geometric, limit, collision, and near-rest checks then occur during planning; an accepted goal can therefore fail without any physical motion.
+
+The published convenience flag is exactly
+\begin{equation}
+ A_{\rm UI}=(m=\N)\land(p=\mathsf{IDLE})\land(c=\N)\land F\land\neg\ell.
+\end{equation}
+It is not a promise that a particular request will pass planning, and it intentionally does not advertise internal SysID/recovery authorization.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=10mm and 10mm,state/.append style={text width=28mm}]
+\node[state] (i) {IDLE};
+\node[state,right=of i] (p) {PLANNING};
+\node[state,right=of p] (w) {WAITING\_CTC};
+\node[state,right=of w] (e) {EXECUTING};
+\node[state,below=14mm of w] (c) {CANCELING};
+\draw[edge] (i)-- node[lab,above]{reserve} (p);
+\draw[edge] (p)-- node[lab,above]{dispatch} (w);
+\draw[edge] (w)-- node[lab,above]{CTC feedback} (e);
+\draw[edge] (p)--(c);
+\draw[edge] (w)-- node[lab,right]{cancel / fault} (c);
+\draw[edge] (e)--(c);
+\draw[edge] (c)-| node[lab,near start,below]{matching terminal callback} (i);
+\draw[edge] (e.north)--++(0,8mm)-|node[lab,near start,above]{matching completion / failure} (i.north);
+\end{tikzpicture}
+\caption{Motion phase projection. Failures can terminate directly from PLANNING or WAITING\_CTC. Excitation reserves directly into WAITING\_CTC, bypassing PLANNING.}
+\end{figure}
+CTC goal acceptance stores the downstream handle; \emph{feedback}, not the acceptance callback, advances WAITING\_CTC to EXECUTING. A short action may finish before an EXECUTING snapshot is published. \id{change_motion_phase()} allows only PLANNING to WAITING\_CTC and WAITING\_CTC to EXECUTING, plus idempotent repetition of the current phase for a matching, uncanceled key.
+
+\subsection{Permission during an operation}
+For a matching key, \id{permitted()} requires no cancellation and fresh observations. NORMAL requires CTC NORMAL. SysID PRE/RETURN\_ALIGN requires CTC NORMAL; other SysID phases use CTC SYSID. Recovery requires SYNC\_REFERENCE with CTC ESTOP. All other operating modes deny permission. The planner calls this predicate cooperatively while computing and around dispatch. A delayed CTC acceptance is canceled if the task has already lost permission or its operation record has disappeared.
+
+\subsection{Terminal-result rules}
+A completion with an empty or different key is ignored. For a matching key, success is authorized only if
+\begin{equation}
+ S_{\rm terminal}=S_{\rm reported}\land\neg a\land
+               (m\in\{\N,\Y,\Rec\}).
+\end{equation}
+This terminal check does not independently retest freshness; watchdog and cooperative permission checks provide that supervision. The slot is cleared before terminal handling. Authorized success records code 1 and advances the appropriate sequence. A failure after ESTOP preserves the initiating fault message/code. A failure or cancellation during SysID/recovery escalates to ESTOP. In NORMAL, a requested cancel or code $-8$ stays NORMAL; any other accepted-motion failure enters SOFT\_FAULT. A reported downstream success after cancellation cannot become upper-action success.
+
+A normal cancel asks CTC to replace reference positions with measured positions and reference velocity/acceleration with zero; it does not request ESTOP by itself. Cancellation acknowledgement is not a 300 ms physical-settling certificate. A later normal goal still faces the planner's near-rest check. Failure ordering can matter: a CTC execution fault may first produce SOFT\_FAULT through a result callback and then ESTOP through the actual CTC status observation.
+
+\section{System identification sequence}
+\subsection{Phase graph}
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=9mm and 18mm,state/.append style={text width=49mm}]
+\node[state] (a) {PRE\_ALIGN (1)\\settle, then MOVEJ};
+\node[state,below=of a] (b) {WAIT\_CONTROLLER\_MODE (2)\\settle; command 2; acknowledge};
+\node[state,below=of b] (c) {READY\_FOR\_EXCITATION (3)\\settle, then submit};
+\node[state,below=of c] (d) {VALIDATING (10)\\bounded trajectory verification};
+\node[state,below=of d] (e) {EXCITING (4)\\CTC action};
+\node[state,right=of e] (f) {CALCULATING (5)\\done or estimation failed};
+\node[state,above=of f] (g) {POST\_ALIGN (6)\\settle, then MOVEJ};
+\node[state,above=of g] (h) {WAIT\_NORMAL\_MODE (7)\\settle; command 0; acknowledge};
+\node[state,above=of h] (j) {RETURN\_ALIGN (8)\\settle, then MOVEJ};
+\node[state,above=of j] (k) {COMPLETING (9)\\settle, then NORMAL};
+\foreach \from/\to in {a/b,b/c,c/d,d/e,e/f,f/g,g/h,h/j,j/k}{\draw[edge] (\from)--(\to);}
+\draw[edge] (d.west) to[bend left=38] node[lab,left]{rejected\\validation} (c.west);
+\end{tikzpicture}
+\caption{Successful SysID progression, including controlled exit after estimation failure. Any accepted abort, sequence-motion failure, monitored mismatch, or expired deadline leads to ESTOP.}
+\end{figure}
+
+\subsection{Detailed phase transitions}
+\begin{longtable}{L{.22\linewidth}L{.35\linewidth}L{.36\linewidth}}
+\toprule Phase & Trigger / guard & Next state and timing \\\midrule\endhead
+PRE\_ALIGN & BEGIN\_SYSID enters with $w=1$. Settling releases client entry. Matching alignment action succeeds. & WAIT\_CONTROLLER\_MODE, $w=1$, 8 s settling deadline. \\
+WAIT\_CONTROLLER\_MODE & $B(t)$ while waiting. & Same phase, $w=0$; issue CTC command 2; new 8 s acknowledgement deadline. \\
+WAIT\_CONTROLLER\_MODE & CTC SYSID observation with $w=0$. & READY\_FOR\_EXCITATION, $w=1$, new 8 s settling deadline. \\
+READY\_FOR\_EXCITATION & $B(t)$. Then valid session submission, idle key, fresh observations, CTC SYSID, $w=0$, deadline not expired. & Settling release gives 15 s dispatch window; submission enters VALIDATING with 120 s deadline. \\
+VALIDATING & Validation rejects while session/phase still current. & READY\_FOR\_EXCITATION, new 15 s client window; no additional settling gate. \\
+VALIDATING & Validation succeeds; reserve with matching session, no active key, fresh observations, CTC SYSID, no settling, deadline not expired. & EXCITING; key \id{sysid-excitation:<session>}; motion WAITING\_CTC; clear phase deadline and excitation origin. \\
+EXCITING & Matching downstream success authorized. & CALCULATING; motion IDLE; 60 s deadline. \\
+CALCULATING & Matching DONE or FAILED command with idle key. & POST\_ALIGN, $w=1$, 8 s settling deadline; retain estimation failure if supplied. \\
+POST\_ALIGN & Settle, dispatch alignment, authorized action success. & WAIT\_NORMAL\_MODE, $w=1$, 8 s settling deadline. \\
+WAIT\_NORMAL\_MODE & $B(t)$. & Same phase, $w=0$; issue CTC command 0; 8 s acknowledgement deadline. \\
+WAIT\_NORMAL\_MODE & CTC NORMAL observation with $w=0$. & RETURN\_ALIGN, $w=1$, 8 s settling deadline. \\
+RETURN\_ALIGN & Settle, dispatch alignment, authorized action success. & COMPLETING, $w=1$, 8 s settling deadline. \\
+COMPLETING & $B(t)$. & NORMAL, SysID NONE, session zero, no deadline; result code 1 or estimation error $-14$. \\
+\bottomrule
+\end{longtable}
+Except where mode-command dispatch or completion overrides it, releasing a settling gate starts a 15 s client-dispatch deadline. Reserving alignment or excitation clears that phase deadline; the downstream action has its own $T+12$ s bound.
+
+\begin{table}[htbp]
+\centering
+\caption{CTC modes required by the SysID watchdog.}\label{tab:modeexpect}
+\begin{tabularx}{\linewidth}{L{.18\linewidth}X}
+\toprule Required CTC & SysID phases / conditions \\\midrule
+NORMAL & PRE\_ALIGN, RETURN\_ALIGN, COMPLETING; WAIT\_CONTROLLER\_MODE while $w=1$. \\
+SYSID & READY\_FOR\_EXCITATION, VALIDATING, EXCITING, CALCULATING, POST\_ALIGN; WAIT\_NORMAL\_MODE while $w=1$. \\
+No phase-specific equality & WAIT\_CONTROLLER\_MODE or WAIT\_NORMAL\_MODE while $w=0$, pending actual acknowledgement. Global observation checks still apply. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Client entry actions and validation}
+The HMI tracks its session and dispatches each eligible phase once per $(s,y)$ pair. It waits while \id{waiting_for_settle} is true. PRE\_ALIGN moves to the locked preparation pose using velocity/acceleration scales 1.0. POST\_ALIGN sends the current measured pose at scales 0.15 to synchronize references while CTC is still in SYSID. RETURN\_ALIGN moves to the preparation pose at scales 0.15 after CTC NORMAL is confirmed. These targets and scales are HMI choices, not hardcoded Supervisor guards. The service accepts any client that satisfies the same phase/session guards.
+
+Excitation verification occurs in a separate callback group so observation/watchdog callbacks can continue. It checks the trajectory through the planner, enforces the exact grid
+\begin{equation}
+ t_j=j\times 10^{-3}\,\mathrm{s},\qquad j=0,\ldots,n-1,
+\end{equation}
+and requires the first reference to match the observed physical state:
+\begin{equation}
+ \max_i|q_{0,i}^{\rm ref}-q_i|\le0.05\,\mathrm{rad},\qquad
+ \max_i|\dot q_i|\le0.02\,\mathrm{rad/s}.
+\end{equation}
+A rejected validation returns to READY when the session is still current. The current HMI then sends ABORT on submission failure rather than automatically retrying; another client could retry within the new dispatch window. Submission acceptance only acknowledges authorization/dispatch, not CTC acceptance or experiment success.
+
+The HMI records samples relative to the CTC-authored excitation start, performs estimation off the ROS callback thread, and emits DONE or FAILED. A missing origin or poor data is an estimation failure. Both outcomes follow the same controlled return path. At final completion, a retained estimation failure produces \id{ERROR_SYSID_ESTIMATION=-14} while arm mode is NORMAL. It does not enter SOFT\_FAULT. Subsequent successful operations may overwrite this informational error. Trajectory failure or user abort is different: it enters ESTOP and requires recovery.
+
+\section{Emergency stopping and recovery}
+ESTOP is a latched supervisory state, not a synonym for zero measured velocity or disconnected motor power. CTC enters a braking/holding mode. The Supervisor stops normal authorization immediately, requests CTC ESTOP, and cancels any current action. A subsequent CTC NORMAL observation alone cannot clear the Supervisor latch.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=11mm,state/.append style={text width=100mm}]
+\node[state] (e) {ESTOP: latched, observed CTC ESTOP, fresh feedback, empty slot};
+\node[state,below=of e] (s) {SYNC\_REFERENCE: settle, then session-scoped MOVEJ in CTC ESTOP};
+\node[state,below=of s] (w) {WAIT\_NORMAL\_MODE: settle, issue command 0, await CTC NORMAL};
+\node[state,below=of w] (t) {SETTLING: confirm CTC NORMAL and physical stationarity};
+\node[state,below=of t] (n) {NORMAL: clear recovery phase, session, deadline, and ESTOP latch};
+\draw[edge] (e)--node[lab,right]{BEGIN\_RECOVERY} (s);
+\draw[edge] (s)--node[lab,right]{authorized sync success} (w);
+\draw[edge] (w)--node[lab,right]{actual NORMAL observation} (t);
+\draw[edge] (t)--node[lab,right]{$B(t)$} (n);
+\end{tikzpicture}
+\caption{Recovery protocol. All intermediate gates use fresh feedback and bounded waiting. Failure returns to latched ESTOP.}
+\end{figure}
+
+\begin{longtable}{L{.28\linewidth}L{.65\linewidth}}
+\toprule Recovery phase & Transition details \\\midrule\endhead
+SYNC\_REFERENCE & Begin recovery allocates a session and an 8 s settling gate. Settling release gives 15 s to reserve a recovery MOVEJ. The HMI targets the measured pose at scales 0.1. CTC remains in ESTOP; the action synchronizes its reference rather than restoring NORMAL authority. \\
+WAIT\_NORMAL\_MODE & Authorized sync completion starts another 8 s settling gate. Release sends CTC command 0 and starts an 8 s acknowledgement deadline. CTC NORMAL is accepted only with no settling gate, fresh joints, and empty motion key. \\
+SETTLING & NORMAL acknowledgement starts a new 8 s settling gate. Confirmation returns to NORMAL, clears recovery phase and session, and clears the ESTOP latch. Recovery completion does not explicitly reset the last error code; successful sync normally sets it to 1. \\
+\bottomrule
+\end{longtable}
+The controller itself only restores NORMAL when
+\begin{equation}
+ \|q^{\rm ref}-q\|_\infty<0.05\,\mathrm{rad},\qquad
+ \|\dot q\|_\infty<0.01\,\mathrm{rad/s},
+\end{equation}
+and, after an execution stop, a newer command sequence is present. These strict inequalities differ from the Supervisor's non-strict speed threshold. Reference synchronization before command 0 is therefore essential. The software recovery guard restricts context, phase, and session; it does not enforce the HMI's exact target pose as an additional authorization rule.
+
+\section{CTC execution outcomes and diagnostic semantics}
+The controller reports physical completion only after endpoint application and continuous in-tolerance evidence. For tolerances $\epsilon_{q,i}$ and $\epsilon_{v,i}$, define
+\begin{equation}
+ R(t)=\max_i\left\{\frac{|q_i^{\rm ref}-q_i|}{\epsilon_{q,i}},
+                    \frac{|\dot q_i|}{\epsilon_{v,i}}\right\}.
+\end{equation}
+The current configuration requires $R\le1$ continuously for 1 s, with no credited scheduling gap above 0.1 s, before the endpoint deadline $T+5$ s. NORMAL position tolerance is $0.00015$ rad and velocity tolerance is $0.1$ rad/s; SYSID tolerances are $0.04$ rad and $0.005$ rad/s. These endpoint checks are distinct from Supervisor settling. Path limits are $0.1$ rad position error and $0.5$ rad/s reference-velocity error for every joint. Path failure, sustained saturation, mode change during execution, and endpoint timeout request a CTC execution stop. Invalid numerical/interface state can additionally return controller ERROR and zero efforts on a best-effort basis.
+
+CTC NORMAL includes the configured friction compensation and integral behavior. SYSID removes friction compensation and integral action while retaining modeled dynamics and known rotor inertia. ESTOP uses braking/holding behavior. These controller laws explain the distinct modes and tolerances; the control equations are given in Chapter~\ref{ch:control}.
+
+\begin{longtable}{L{.17\linewidth}L{.35\linewidth}L{.41\linewidth}}
+\toprule Code & IndustrialMotion meaning & Supervisory interpretation \\\midrule\endhead
+1 & SUCCESS & Must also pass terminal authorization. \\
+$-1$ & INVALID\_INPUT & Admission rejection or accepted planning failure, depending on where detected. \\
+$-2$ & NO\_IK\_SOLUTION & Accepted planning failure. \\
+$-3$ & LIMIT\_VIOLATION & Limit/collision or trajectory validation failure. \\
+$-4$ & SINGULARITY & Planner diagnostic. \\
+$-5$ & QUADRANT\_JUMP & Planner diagnostic. \\
+$-6$ & RUCKIG\_FAILED & Trajectory generation failure. \\
+$-7$ & EXECUTION\_ABORTED & Also used by Supervisor fault entry. \\
+$-8$ & CANCELLED & NORMAL cancellation need not fault; sequence cancellation faults. \\
+$-9$ & BUSY & Declared code; current reservation rejections use $-12$. \\
+$-10$ & NOT\_READY & Includes measured-state planning checks. \\
+$-11$ & TIMEOUT & Planner-node downstream operation deadline. \\
+$-12$ & SUPERVISOR\_DENIED & Guard/context denial at admission. \\
+$-13$ & INTERNAL & Caught planner exception. \\
+$-14$ & SYSID\_ESTIMATION & SupervisorState diagnostic, not an IndustrialMotion result constant. \\
+\bottomrule
+\end{longtable}
+The error code alone does not determine mode. Admission rejection leaves the Supervisor state unchanged. An accepted ordinary goal failing planning normally enters SOFT\_FAULT. The same failure during an internal sequence enters ESTOP. CTC status can subsequently escalate a soft fault.
+
+\section{Independent gripper state machine}
+\subsection{State and command inventory}
+The gripper publishes BLOCKED=0, STOPPED=1, OPENING=2, CLOSING=3, OPEN=4, CLOSED=5, GRASPED=6, FAULT=7. Commands are OPEN=1, CLOSE=2, STOP=3. The hardware publishes every 20 ms and accepts commands only when active with recent physics feedback. Service acceptance means queued, not physically applied. \id{applied_sequence} identifies the latest applied command. Epochs invalidate commands across activation changes.
+
+A useful whole-robot representation is
+\begin{equation}
+ X_{\rm robot}=(x_{\rm Supervisor},x_{\rm CTC},x_{\rm gripper},x_{\rm hardware}),
+\end{equation}
+with observation coupling but no automatic arm-to-gripper stop transition. The HMI gripper readiness check uses active/ready flags and a feedback age below 250 ms; the hardware's physics freshness threshold is 100 ms. Non-STOP commands older than 250 ms are discarded at application. STOP has a separate channel, so a full motion queue does not block a stop request.
+
+\begin{longtable}{L{.28\linewidth}L{.37\linewidth}L{.28\linewidth}}
+\toprule Source & Event / guard & Destination / effect \\\midrule\endhead
+Any & Inactive hardware or stale physics boundary & BLOCKED; motor drive off. Published state is also BLOCKED whenever not ready. \\
+BLOCKED & Hardware ready again & STOPPED; no automatic restart of motion. \\
+Any ready state & Due, current-epoch, newer STOP & STOPPED; drive off, dynamic counters cleared. \\
+Any ready state & Valid queued OPEN / CLOSE & OPENING / CLOSING; new target and reset counters. A retry can leave FAULT. \\
+OPENING / CLOSING & Both jaws at target and continuously stationary for 0.15 s & OPEN / CLOSED, respectively. \\
+Closing operation & Same movable external object with opposing fingertip contact and stationary jaws for 0.25 s & GRASPED; retain finite closing drive. \\
+GRASPED & Missing/changed contact or nonstationarity for 0.10 s & CLOSING; restart travel timer. \\
+OPEN / CLOSED & Endpoint/settling condition no longer satisfied & OPENING / CLOSING; restart travel timer. \\
+OPENING / CLOSING & Travel timer reaches 8 s & FAULT; drive off. \\
+\bottomrule
+\end{longtable}
+A newer OPEN/CLOSE can follow STOP, including in the same physics step if its sequence is newer; STOP is not a latched emergency mode. OPEN/CLOSED retain active control, whereas STOPPED removes drive and does not lock the jaws or guarantee grasp retention.
+
+For left/right jaw positions $z_L,z_R$ and target $z^*$, endpoint evidence is
+\begin{equation}
+ |z_L-z^*|<0.00025\,\mathrm{m},\quad
+ |z_R+z^*|<0.00025\,\mathrm{m},\quad
+ |\dot z_L|,|\dot z_R|<0.001\,\mathrm{m/s}.
+\end{equation}
+Grasp evidence requires inward normal force of at least 0.2 N on \emph{each} fingertip, associated with the same external movable rigid body, and contact-normal alignment cosine at least 0.7. Robot links, the world, and fixed objects do not qualify. GRASPED is a simulated contact estimate, not a measurement from a physical gripper. Endpoint detection has priority over grasp detection. Parameters come from \id{gripper.yaml} and are loaded at hardware initialization.
+
+\section{Concurrency, invariants, and implementation limits}
+\subsection{Ownership and stale-event isolation}
+All Supervisor mutations and snapshots use its mutex. The planner node additionally serializes transitions with their mode-command publications using \id{transition_mutex_}; this prevents a delayed NORMAL command effect from being published after a concurrent ESTOP transition in those paths. CTC operation records have their own mutex. Planning executes on a joined worker thread; trajectory validation has a separate callback group; the executor uses four threads.
+
+An upper action UUID owns a normal/alignment task. Excitation owns a token derived from its session; the controller's actual start timestamp is separately matched through the downstream action UUID. A stale completion cannot release a newer key. A cancellation that races with downstream acceptance is recorded and applied when the handle arrives. \id{finish_ctc()} removes the matching operation once; later duplicate callbacks are ignored.
+
+The following properties summarize the implemented policy under normal construction and valid adapter use:
+\begin{align}
+ \#\{\text{active arm motion keys}\}&\le1,\\
+ \ell\land\text{admitted motion}&\Longrightarrow\text{recovery context},\\
+ \text{sequence motion admitted}&\Longrightarrow s_{\rm in}=s\ne0,\\
+ \text{authorized terminal success}&\Longrightarrow\neg a\land m\in\{\N,\Y,\Rec\}.
+\end{align}
+These are code-derived properties, not machine-checked proofs. Session tokens do not prevent an external ROS client from bypassing the public planner interface and directly invoking CTC topics/actions. The architecture assumes clients follow the intended ownership boundary.
+
+\subsection{Client view and restart limitations}
+The HMI derives display labels from authoritative snapshots. Lower revisions are ignored; equal revisions may update freshness without being treated as new phase transitions. Local preparation flags, phase-action deduplication, and calculation-worker flags do not alter Supervisor authority. A Supervisor restart resets revision to 1, while a still-running HMI retains its last revision; the current HMI has no separate publisher epoch to reset that filter. Restart coordination is therefore an implementation limitation, distinct from the randomly seeded sequence-session mechanism.
+
+The HMI can send direct CTC ESTOP if Supervisor liveness fails or stop acknowledgement is delayed. It never directly sends NORMAL or SYSID. This fallback does not create a new authoritative Supervisor snapshot. If the Supervisor process disappears and no HMI fallback is running, no independent Supervisor heartbeat monitor is shown in the CTC implementation; its trajectory/error checks remain separate mechanisms.
+
+\subsection{Interpretation boundaries}
+\begin{itemize}
+\item CTC command publication is a request; only actual status confirms a mode switch. Service/action admission is also distinct from execution completion.
+\item A recovered or completed sequence requires several observed settling intervals, but ordinary IDLE/NORMAL status alone is not a stationary certificate.
+\item Phase deadlines bound specific waits. They do not impose a universal timeout on all computation or guarantee callback scheduling latency.
+\item Missing heartbeat escalation requests ESTOP; it cannot prove that an unreachable controller received the command or physically stopped.
+\item The current implementation exposes reserved FAULT and error values that are not all reached by current transitions. The report distinguishes interface vocabulary from reachable behavior.
+\end{itemize}
+
+
+\appendix
+\chapter{Implementation sources}
+The following basenames and symbols identify the implementation used for
+this report. Model entries are descriptions of their roles, not renamed
+files. Source code and configuration remain authoritative if they change.
+
+\begin{longtable}{L{.43\linewidth}L{.50\linewidth}}
+\toprule Source or symbol & Responsibility \\\midrule\endhead
+\file{kinematics_engine.cpp} & Forward and inverse kinematics, correction, singularity screening, collision queries. \\
+\file{motion_planner.cpp}, \file{motion_tolerances.hpp} & Motion generation, spline timing, trajectory validation and tolerances. \\
+\file{kinematic_limits.yaml}, \file{ik_config.yaml} & Configured motion limits, ground box and IK ranking weights. \\
+\file{generate_arm_model.py}; planning URDF and SRDF & Six-axis planning geometry, swept finger envelopes and pair exclusions. \\
+\file{ctc_controller.cpp}, \file{trajectory_execution.cpp} & Control laws, mode switching, sampled playback and endpoint monitoring. \\
+\file{ros2_controllers.yaml} & Active controller gains, effort limits and execution thresholds. \\
+\file{lugre_friction.hpp}; MuJoCo backend and robot XML & LuGre parameters and update, force injection, physical snapshots and physics settings. \\
+Full articulated dynamics URDF & Eight-coordinate rigid-body model used by control and identification. \\
+\file{sysid_engine.py} & Fourier excitation, clock checks, acceleration estimation and parameter fitting. \\
+\file{supervisor.cpp}, \file{supervisor.hpp}; \id{IndustrialPlannerNode} & State transitions, session ownership, ROS adaptation and action dispatch. \\
+\file{supervisor_worker.py}, \file{gui_main.py} & HMI state projection, sequence entry actions, data recording and estimation reporting. \\
+\file{gripper_control.cpp}, \file{gripper.yaml} & Gripper commands, drive approximation, contact evidence and state transitions. \\
+\file{IndustrialMotion.action}, \file{SupervisorCommand.srv}, \file{SubmitSysIdTrajectory.srv} & Motion and supervised operation contracts. \\
+\file{SupervisorState.msg}, \file{ControllerStatus.msg}, \file{SysIdSample.msg} & Supervisory state, controller status and identification telemetry. \\
+\bottomrule
+\end{longtable}
+\end{document}

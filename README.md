@@ -1,4 +1,10 @@
-# Lite6 Robotics Framework
+# Six-Axis Robot Simulation Framework
+
+> **Education and research only.** This is a simulation project. The robot model originates from the publicly available [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie).
+>
+> Except for parameters supplied with that robot model in the official MuJoCo Menagerie repository, all parameters used in this project are the author's own reasonable assumptions for simulation and do not represent data from a real robot. This includes additional model settings, friction parameters, controller gains, planning limits, and supervisory thresholds.
+>
+> All planning and control algorithms are designed for research purposes; they do not represent the technology or algorithms used on a real robot.
 
 ### ROS 2 Motion Planning, Torque Control & MuJoCo Simulation
 
@@ -7,7 +13,7 @@
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-yellow.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 
-**Lite6 Robotics Framework** is an integrated **ROS 2 robot software architecture** for a six-axis robotic arm. It brings together **motion planning**, **computed torque control**, **robot dynamics**, **system identification**, a **PyQt5 GUI**, **gripper control**, and **MuJoCo physics simulation** in one inspectable stack. The project uses the **UFactory Lite6** as a concrete platform for studying how a complete robot control system connects user commands to physical execution and feedback.
+**Six-Axis Robot Simulation Framework** is an integrated **ROS 2 robot software architecture** for a six-axis robotic arm. It brings together **motion planning**, **computed torque control**, **robot dynamics**, **system identification**, a **PyQt5 GUI**, **gripper control**, and **MuJoCo physics simulation** in one inspectable stack. The project uses a simulated six-axis arm to study how a complete robot control system connects user commands to motion execution and feedback.
 
 A custom C++ planner implements **MoveJ, MoveP, MoveL and MoveC** with **analytical inverse kinematics**, **Coal / HPP-FCL collision detection**, singularity checks and **Ruckig jerk-limited trajectory generation**, without a MoveIt 2 dependency. An event-driven **Supervisor state machine** coordinates planning, execution, cancellation, software emergency stop, recovery and identification. A custom **ros2_control** controller runs **Computed Torque Control (CTC)** with **Pinocchio inverse dynamics**, rotor inertia compensation, **friction compensation**, and **integral control with anti-windup**.
 
@@ -15,12 +21,10 @@ The simulation uses effort actuators, **LuGre friction**, an independent fixed-s
 
 This repository is intended as a **robotics software architecture reference** for robot arm simulation, trajectory tracking, model-based control and manipulation research. It includes the control and supervision logic as well as the surrounding interfaces, configuration, diagnostics and operator workflow. The supplied hardware backend is MuJoCo simulation; deployment on a physical arm requires a suitable hardware interface and separate validation.
 
-For mathematical background, see [Kinematics.pdf](Kinematics.pdf) and [Theory.pdf](Theory.pdf). The source and configuration files linked below describe the current implementation; the derivation documents may describe earlier design choices.
-
-> ⚠️ **Notice:** The robot model is based on the **UFactory Lite6** from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie). This is an independent research and educational project. Software protection and simulated emergency stop are not safety-certified hardware functions.
+For implementation details and mathematical background, see the consolidated [technical report](docs/robot_simulation_technical_report.tex), covering planning, control, friction simulation and identification, and supervisory state transitions. Source code and configuration remain authoritative.
 
 <p align="center">
-  <img src="media/demo_MoveJ.gif" width="1080" alt="Lite6 ROS 2 robotic arm motion planning and GUI overview"/>
+  <img src="media/demo_MoveJ.gif" width="1080" alt="ROS 2 robotic arm motion planning and GUI overview"/>
 </p>
 
 ## 📑 Table of Contents
@@ -97,17 +101,19 @@ graph TB
     VIEW -.->|mouse spring targets| HW
 ```
 
-### Package map and source entry points
+### Component map and source entry points
 
-| Package | Responsibility | Start reading here |
+The implementation is organized into seven ROS packages under `src/`. The entries below identify components by responsibility and list source basenames or model roles. Run `colcon list` from the repository root to inspect package names and locations.
+
+| Component | Responsibility | Start reading here |
 | --- | --- | --- |
-| `lite6_bringup` | Launch and process orchestration | [system_bringup.launch.py](src/lite6_bringup/launch/system_bringup.launch.py) |
-| `lite6_planner` | Kinematics, trajectory planning, collision validation and Supervisor | [motion_planner.cpp](src/lite6_planner/src/motion_planner.cpp), [supervisor.cpp](src/lite6_planner/src/supervisor.cpp), [ROS node](src/lite6_planner/src/lite6_planner_node.cpp) |
-| `lite6_controllers` | Effort controller and monitored trajectory execution | [ctc_controller.cpp](src/lite6_controllers/src/ctc_controller.cpp), [trajectory_execution.cpp](src/lite6_controllers/src/trajectory_execution.cpp) |
-| `lite6_hardware` | Physics thread, state exchange, gripper and native viewer | [lite6_mujoco_system.cpp](src/lite6_hardware/src/lite6_mujoco_system.cpp), [simulation_exchange.hpp](src/lite6_hardware/include/lite6_hardware/simulation_exchange.hpp) |
-| `lite6_hmi` | PyQt5 operator interface, ROS worker and SysID processing | [gui_main.py](src/lite6_hmi/lite6_hmi/gui_main.py), [supervisor_worker.py](src/lite6_hmi/lite6_hmi/supervisor_worker.py), [sysid_engine.py](src/lite6_hmi/lite6_hmi/sysid_engine.py) |
-| `lite6_interfaces` | Typed actions, services and status/telemetry messages | [IndustrialMotion.action](src/lite6_interfaces/action/IndustrialMotion.action), [SupervisorState.msg](src/lite6_interfaces/msg/SupervisorState.msg) |
-| `lite6_description` | URDF, MuJoCo scene, meshes and model-generation tools | [URDF](src/lite6_description/urdf/lite6.urdf), [scene.xml](src/lite6_description/mujoco/scene.xml) |
+| Bringup | Launch and process orchestration | `system_bringup.launch.py` |
+| Planning and supervision | Kinematics, trajectory planning, collision validation and Supervisor | `motion_planner.cpp`, `kinematics_engine.cpp`, `supervisor.cpp`; `IndustrialPlannerNode` |
+| Controllers | Effort controller and monitored trajectory execution | `ctc_controller.cpp`, `trajectory_execution.cpp` |
+| Simulation backend | Physics thread, state exchange, gripper and native viewer | `simulation_exchange.hpp`, `gripper_control.cpp`, `mujoco_viewer.cpp`; MuJoCo hardware implementation |
+| HMI | PyQt5 operator interface, ROS worker and SysID processing | `gui_main.py`, `supervisor_worker.py`, `sysid_engine.py` |
+| Interfaces | Typed actions, services and status/telemetry messages | `IndustrialMotion.action`, `SupervisorState.msg` |
+| Robot description | URDF, MuJoCo scene, meshes and model-generation tools | Full dynamics URDF, generated planning URDF, `scene.xml`, `generate_arm_model.py` |
 
 ### Control architecture
 
@@ -168,7 +174,7 @@ flowchart TD
 
 The **analytical inverse kinematics** engine checks joint limits, singularities, branch continuity and collision validity. Cartesian paths use a natural cubic joint spline with refinement based on forward-kinematics position and orientation residuals. Conservative derivative bounds account for joint velocity, acceleration and jerk when choosing the scalar Ruckig time law. This is a bounded approximation to the requested Cartesian path, not a claim of globally time-optimal Cartesian motion.
 
-**Collision detection** uses Coal (formerly HPP-FCL), URDF collision meshes, SRDF exclusions and a configured ground obstacle. The planner validates the starting configuration, trajectory samples and subdivisions between samples. It rejects invalid routes and reports diagnostics; it does not search arbitrary obstacle-avoiding detours. The arm planning model does not automatically include every MuJoCo object, movable gripper geometry or carried object. Scene extensions need corresponding planning-model work.
+**Collision detection** uses Coal (formerly HPP-FCL), URDF collision meshes, SRDF exclusions and a configured ground obstacle. The planner validates the starting configuration, trajectory samples and subdivisions between samples. It rejects invalid routes and reports diagnostics; it does not search arbitrary obstacle-avoiding detours. The planning model includes the gripper body and conservative finger envelopes covering the full jaw stroke. It does not automatically include arbitrary MuJoCo scene objects or carried objects. Scene extensions need corresponding planning-model work.
 
 <p align="center">
   <img src="media/demo_MoveJ.gif" width="1080" alt="MoveJ joint-space Ruckig trajectory planning"/>
@@ -193,7 +199,7 @@ For each arm joint, the NORMAL-mode control law is:
 e       = q_ref - q_measured
 de      = dq_ref - dq_measured
 a_cmd   = ddq_ref + Kp*e + Kv*de
-tau_ff  = RNEA(q, dq, a_cmd) + armature*a_cmd
+tau_ff  = RNEA(Q, V, [a_cmd, ddq_gripper])[:6] + armature*a_cmd
 tau_f   = Fv*dq + Fc*tanh(tanh_slope*(dq_ref + friction_error_gain*e))
 tau_raw = tau_ff + tau_f + tau_integral
 tau_cmd = clamp(tau_raw, -max_effort, max_effort)
@@ -203,13 +209,15 @@ tau_integral += dt*(Ki*e + antiwindup_gain*(tau_cmd - tau_raw))
 tau_integral  = clamp(tau_integral, -integral_max_effort, integral_max_effort)
 ```
 
+Here `Q` and `V` include the six arm joints and both gripper fingers; measured finger acceleration supplies `ddq_gripper`.
+
 The **torque-domain integrator** corrects residual steady-state error, while **back-calculation anti-windup** responds to saturation of the total requested effort. NORMAL mode integrates position error without an error deadband. Software ESTOP retains the holding bias and allows anti-windup, but stops accumulating position error. SYS_ID clears the integral and disables friction compensation while retaining known rotor inertia compensation. Setting a joint's `ki` to zero disables its integral action.
 
 MuJoCo simulates **LuGre dynamic friction**, including internal friction state, while the controller uses a simpler viscous/Coulomb compensation model. This creates a useful model-mismatch setting for trajectory tracking and disturbance-rejection experiments. Tracking accuracy should be reported with the trajectory, load, gains and measured errors; configured tolerances alone are not an accuracy benchmark.
 
 ### 3. Supervisor, Execution Monitoring & Software E-Stop
 
-An event-driven **finite-state machine** coordinates INITIALIZING, NORMAL, SYSID, ESTOP, RECOVERING, SOFT_FAULT and FAULT modes, alongside separate motion phases. Session IDs and guarded events correlate identification and recovery operations. Controller acknowledgements and physical feedback govern transitions; accepting a service request does not mean the physical transition has completed.
+An event-driven **finite-state machine** coordinates INITIALIZING, NORMAL, SYSID, ESTOP, RECOVERING and SOFT_FAULT modes, alongside separate motion phases. FAULT is a reserved interface value with no current entry transition. Session IDs and guarded events correlate identification and recovery operations. Controller acknowledgements and physical feedback govern transitions; accepting a service request does not mean the physical transition has completed.
 
 * **Before execution:** Input validation, IK feasibility, collision checks, kinematic limits, mode authorization and fresh feedback are required.
 * **During execution:** The CTC checks position/velocity path errors, persistent torque saturation, invalid numerical values and controller-mode changes.
@@ -233,7 +241,7 @@ The `/simulation/sysid_samples` stream records physical step numbers, simulation
 
 Repeated physical steps are removed before differentiation. A 0.1 s Savitzky–Golay derivative estimates acceleration; the first and last second are excluded from fitting. Useful samples require `|velocity| >= 0.05 rad/s`, with at least 200 samples and sufficient velocity variation per axis. Timing discontinuities, telemetry gaps and poor data quality are reported instead of silently producing parameters.
 
-Raw experiments are saved as pickle-free `.npz` archives in `${ROS_HOME:-~/.ros}/lite6_sysid/`, together with a `.txt` result or failure report. Output includes residuals, timing diagnostics and the YAML arrays `friction_v_nominal` (Nm·s/rad) and `friction_c_nominal` (Nm). Copy accepted results into the controller configuration and restart/reconfigure; estimation does not automatically retune the controller.
+Raw experiments are saved as pickle-free `.npz` archives in a project-specific subdirectory of `ROS_HOME` (default `~/.ros`), together with a `.txt` result or failure report. The reported archive path identifies each recording. Output includes residuals, timing diagnostics and the YAML arrays `friction_v_nominal` (Nm·s/rad) and `friction_c_nominal` (Nm). Copy accepted results into the controller configuration and restart/reconfigure; estimation does not automatically retune the controller.
 
 An estimation-quality failure follows a supervised return to NORMAL while retaining its diagnostic. Motion failures, missing feedback and transition timeouts follow the protective state-machine handling.
 
@@ -253,7 +261,7 @@ Mouse spring forces and torques make disturbance rejection visible. The viewer r
   <img src="media/demo_shadow_robot.gif" width="1080" alt="CTC target shadow robot and physical trajectory tracking"/>
 </p>
 
-### 6. Independent Lite6 Wide Gripper
+### 6. Independent Simulated Wide Gripper
 
 
 The Gripper tab and `/gripper/command` provide `OPEN=1`, `CLOSE=2`, and `STOP=3`.
@@ -264,11 +272,9 @@ feedback. Hardware deactivation still makes the gripper unavailable.
 
 `STOP` removes motor drive. Passive friction stops the jaws; there is no ideal
 position brake and no promise of retaining an object after stopping. A held
-`CLOSE` continues finite-force clamping during arm motion. This models the
-[Lite6 open/close/stop interface](https://docs.lite6.ufactory.cc/5.End-Effector.html),
-not the robot's physical power-cut emergency-stop circuit.
+`CLOSE` continues finite-force clamping during arm motion. These are simulated actuator behaviors based on the project's assumed drive model.
 
-Calibration lives in `src/lite6_hardware/config/gripper.yaml`, loaded at hardware
+Calibration lives in `gripper.yaml` in the simulation backend package, loaded at hardware
 initialization; restart after editing. The GUI cannot change these parameters.
 The defaults limit each finger's reference to 0.05 m/s and 0.5 m/s², with a
 10 N coupled motor force limit (approximately 5 N per jaw before losses).
@@ -277,8 +283,7 @@ limit and brakes overspeed with bounded force. Positions and velocities are
 never overwritten to enforce limits; sufficiently large external forces can
 still backdrive a physical force-limited actuator.
 
-`GRASPED` is a **simulation estimate**, not a sensor supplied by the Lite6 I/O
-gripper. It requires sustained inward normal force on both fingertips against
+`GRASPED` is a **simulation estimate** derived from contact and motion feedback. It requires sustained inward normal force on both fingertips against
 the same movable rigid object, stationary jaws, and a gap above the closed
 endpoint. Robot self-contact, finger bases, fixed obstacles and single-sided
 contact do not qualify. Contact loss is debounced and returns the state to
@@ -311,28 +316,20 @@ The viewer never steps or edits the live physics model. Mouse targets cross a se
 The intended environment is **Ubuntu 24.04**, **ROS 2 Jazzy**, **C++17**, **Python 3.12**, and the bundled **MuJoCo 3.9.0** distribution. Install ROS 2 Jazzy and the `colcon` / `rosdep` tools before the following steps. A graphical desktop with OpenGL support is needed for the native viewer and PyQt5 GUI.
 
 ```text
-~/lite6_ws_jazzy/
+<repository-root>/
 ├── mujoco-3.9.0/           # MuJoCo headers and native libraries
-├── src/
-│   ├── lite6_bringup/     # Launch orchestration
-│   ├── lite6_controllers/ # CTC, integral anti-windup, trajectory monitoring
-│   ├── lite6_description/ # URDF, meshes, MuJoCo scene
-│   ├── lite6_hardware/    # Effort backend, LuGre, gripper, native viewer
-│   ├── lite6_hmi/         # PyQt5 GUI and SysID
-│   ├── lite6_interfaces/  # Actions, services and telemetry messages
-│   └── lite6_planner/     # Supervisor, analytical IK, Coal and Ruckig
+├── src/                   # Seven ROS packages listed in the component map
+├── docs/
+│   └── robot_simulation_technical_report.tex
 ├── media/                 # Demonstrations
-├── Kinematics.pdf
-├── Theory.pdf
 └── README.md
 ```
 
 **1. Configure the environment:**
 
-Run these commands from the repository root; adjust the workspace path if needed. Use the system Python environment associated with ROS 2 so that the GUI and robotics bindings resolve consistently.
+Open a terminal in the repository root before running these commands. Use the system Python environment associated with ROS 2 so that the GUI and robotics bindings resolve consistently.
 
 ```bash
-cd ~/lite6_ws_jazzy
 source /opt/ros/jazzy/setup.bash
 export MUJOCO_DIR="$PWD/mujoco-3.9.0"
 export LD_LIBRARY_PATH="$MUJOCO_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -360,21 +357,23 @@ Start from a fresh shell with the ROS environment configured above, without sour
 rm -rf build install log
 colcon build --symlink-install
 source install/setup.bash
-ros2 launch lite6_bringup system_bringup.launch.py
+ros2 launch "$PWD"/src/*_bringup/launch/system_bringup.launch.py
 ```
 
-Bringup starts the controller manager, state publisher, controllers, native viewer, planner/Supervisor and HMI. Wait for fresh feedback and the ready state before sending motion. If a scheduling warning appears, inspect diagnostics and host permissions rather than assuming the nominal loop rates are being achieved.
+The launch command resolves the existing bringup file from the repository root. Bringup starts the controller manager, state publisher, controllers, native viewer, planner/Supervisor and HMI. Wait for fresh feedback and the ready state before sending motion. If a scheduling warning appears, inspect diagnostics and host permissions rather than assuming the nominal loop rates are being achieved.
 
 ### Configuration & ROS Interfaces
 
+Configuration entries below use actual basenames where applicable; the robot XML and SRDF are identified by their roles in the description and planning packages.
+
 | Configuration | Purpose |
 | --- | --- |
-| [ros2_controllers.yaml](src/lite6_hardware/config/ros2_controllers.yaml) | Control rate, PD/integral gains, friction/armature compensation, anti-windup, torque limits and execution tolerances |
-| [kinematic_limits.yaml](src/lite6_planner/config/kinematic_limits.yaml) | Joint position/velocity/acceleration/jerk and Cartesian motion limits |
-| [ik_config.yaml](src/lite6_planner/config/ik_config.yaml) and [lite6.srdf](src/lite6_planner/config/lite6.srdf) | IK configuration, ground obstacle and collision-pair exclusions |
-| [gripper.yaml](src/lite6_hardware/config/gripper.yaml) | Gripper motion, effort and grasp-detection parameters |
-| [lugre_friction.hpp](src/lite6_hardware/include/lite6_hardware/lugre_friction.hpp) | Simulated arm friction model and parameters |
-| [lite6.xml](src/lite6_description/mujoco/lite6.xml) | MuJoCo timestep, actuators and physical robot model |
+| `ros2_controllers.yaml` | Control rate, PD/integral gains, friction/armature compensation, anti-windup, torque limits and execution tolerances |
+| `kinematic_limits.yaml` | Joint position/velocity/acceleration/jerk and Cartesian motion limits |
+| `ik_config.yaml` and planning SRDF | IK configuration, ground obstacle and collision-pair exclusions |
+| `gripper.yaml` | Gripper motion, effort and grasp-detection parameters |
+| `lugre_friction.hpp` | Simulated arm friction model and parameters |
+| MuJoCo robot XML | MuJoCo timestep, actuators and simulated robot model |
 
 | Interface | Role |
 | --- | --- |
@@ -408,17 +407,19 @@ The native MuJoCo/GLFW viewer uses MuJoCo's `mjv` / `mjr` renderer and perturbat
 | Esc | Close the viewer; physics and HMI continue running |
 
 ```bash
+# Run from the repository root with the workspace environment sourced.
 # Start with the target overlay visible.
-ros2 launch lite6_bringup system_bringup.launch.py viewer_shadow:=true
+ros2 launch "$PWD"/src/*_bringup/launch/system_bringup.launch.py viewer_shadow:=true
 # Optional cast shadows.
-ros2 launch lite6_bringup system_bringup.launch.py viewer_shadows:=true
+ros2 launch "$PWD"/src/*_bringup/launch/system_bringup.launch.py viewer_shadows:=true
 # Disable the 3D viewer; the PyQt5 HMI still launches.
-ros2 launch lite6_bringup system_bringup.launch.py viewer:=false
+ros2 launch "$PWD"/src/*_bringup/launch/system_bringup.launch.py viewer:=false
 # Reopen only the display while the system is running.
-ros2 run lite6_hardware mujoco_viewer
+viewer_package=$(ros2 pkg executables | awk '$2 == "mujoco_viewer" {print $1; exit}')
+ros2 run "$viewer_package" mujoco_viewer
 ```
 
-`viewer_fps` accepts 15–240 (default 60). The initial window is 1920 × 1080, clamped to the desktop work area. Achieved FPS depends on the GPU and system load. Cast shadows are disabled by default; 8× MSAA is requested subject to GPU support. Visual OBJ meshes preserve the original STL triangles and face normals. After changing source visual meshes, regenerate them with `python3 src/lite6_description/tools/generate_visual_meshes.py`. Collision meshes remain separate and hidden.
+`viewer_fps` accepts 15–240 (default 60). The initial window is 1920 × 1080, clamped to the desktop work area. Achieved FPS depends on the GPU and system load. Cast shadows are disabled by default; 8× MSAA is requested subject to GPU support. Visual OBJ meshes preserve the original STL triangles and face normals. After changing source visual meshes, regenerate them with `python3 src/*_description/tools/generate_visual_meshes.py`. Collision meshes remain separate and hidden.
 
 Stale feedback is labelled CONNECTING and disables dragging; the shadow overlay expires when its data becomes stale. Mouse interaction applies forces and torques without teleporting joints or pausing physics.
 
@@ -440,7 +441,7 @@ Use readable 1080p footage and short captions. Keep one compact preview near the
 
 ## 🔎 Keywords & GitHub Topics
 
-**Suggested repository name:** `lite6-robotics-framework`
+**Suggested repository name:** `six-axis-robot-simulation`
 
 **Suggested GitHub description:**
 
@@ -449,7 +450,7 @@ Use readable 1080p footage and short captions. Keep one compact preview near the
 **Suggested GitHub topics** (copy as individual topics):
 
 ```text
-robotics ros2 ros2-control robot-arm lite6 mujoco motion-planning
+robotics ros2 ros2-control robot-arm mujoco motion-planning
 trajectory-generation ruckig inverse-kinematics collision-detection
 pinocchio computed-torque-control friction-compensation system-identification
 robot-simulation gripper pyqt5 real-time-control robotics-software
@@ -457,14 +458,12 @@ robot-simulation gripper pyqt5 real-time-control robotics-software
 
 **Technical keywords:** ROS 2 Jazzy; six-axis robotic manipulator; robot software architecture; model-based control; inverse dynamics; analytical inverse kinematics; joint-space planning; Cartesian path planning; MoveJ; MoveP; MoveL; MoveC; jerk-limited trajectory generation; Coal / HPP-FCL; singularity detection; trajectory tracking; torque control; integral control; anti-windup; LuGre friction; Fourier excitation; least-squares parameter estimation; finite-state machine; software emergency stop; recovery; human-machine interface; lock-free state exchange; simulation diagnostics.
 
-**中文关键词：** ROS 2 机器人软件架构、六轴机械臂、运动规划、解析逆运动学、碰撞检测、关节空间规划、笛卡尔轨迹规划、加加速度约束、计算力矩控制、逆动力学、摩擦力补偿、积分控制、抗积分饱和、系统辨识、机械臂仿真、夹爪控制、图形界面、状态机、软件急停与恢复、实时控制。
-
 ## 🔮 Future Work
 
 Potential extensions to the current architecture include:
 
 * **Manipulation workflows:** Reproducible object scenes and pick-and-place sequences using the existing wide gripper.
-* **Planning-scene coverage:** Gripper, carried-object and scene-obstacle geometry synchronized with the planner.
+* **Planning-scene coverage:** Carried-object and scene-obstacle geometry synchronized with the planner, extending the existing gripper envelopes.
 * **Advanced control:** Impedance and admittance control, with comparisons against the CTC baseline.
 * **Identification and evaluation:** Richer friction parameter estimation and reproducible tracking/timing benchmarks.
 * **Physical hardware integration:** A real-arm backend with hardware-specific limits, feedback and validation.
