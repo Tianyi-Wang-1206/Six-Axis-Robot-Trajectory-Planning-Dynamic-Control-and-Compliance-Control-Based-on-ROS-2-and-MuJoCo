@@ -218,27 +218,12 @@ flowchart TD
 
 ### 2. Automated System Identification
 The identification engine records actual joint position, velocity and actuator
-effort during one trajectory containing two experiments:
-
-1. The existing bounded Fourier excitation identifies viscous `Fv` and Coulomb
-   `Fc` friction with nonnegative linear least squares and the existing
-   `|velocity| >= 0.05 rad/s` cutoff.
-2. Six low speeds (0.004–0.048 rad/s), each in both directions, identify the
-   Stribeck peak `Fs` and characteristic speed `vs`, keeping `Fv` and `Fc` fixed.
-   Each plateau is preceded by a short same-direction sliding preparation at
-   0.08 rad/s, then a smooth deceleration to measurement speed. This overcomes
-   reversal stiction while friction compensation is disabled. Only settled, measured
-   velocities near each requested speed enter the second fit; each plateau has
-   equal weight. Missing data, poor speed coverage and excessive fit residuals
-   produce an explicit failure instead of nominal parameter output.
-
-Both stages respect the entered excursion bounds, joint motion limits and
-collision checks. The default low-speed experiment adds 63.4 seconds and needs
-0.2432 rad of excursion per joint within the existing 10% margin. Each speed pair
-returns to the workspace center. The Supervisor session and controller mode
-sequence remain the same. Rigid-body torque and the known rotor inertia are
-subtracted before fitting; rotor inertia and LuGre dynamic parameters are not
-identified.
+effort during bounded Fourier excitation. Nonnegative linear least squares
+identifies viscous `Fv` and Coulomb `Fc` friction using samples with
+`|velocity| >= 0.05 rad/s`. The trajectory respects the entered excursion bounds,
+joint motion limits and collision checks. Rigid-body torque and the known rotor
+inertia are subtracted before fitting; rotor inertia and LuGre dynamic parameters
+are not identified. LuGre friction simulation remains unchanged.
 
 Identification uses `/simulation/sysid_samples`, a separate observational stream
 containing the physical step number, simulation time, ROS-mapped step time,
@@ -249,16 +234,9 @@ jumps over 5 ms and telemetry gaps fail validation. The existing `/joint_states`
 stream and motion control remain unchanged. The extra stream is published only
 while subscribed; the HMI subscribes during SysID.
 
-Low-speed cruises last 3 s, leaving 1.7 s after the settling/end guards. Only
-continuous accepted runs of at least 0.3 s enter the fit. Low-speed acceleration
-uses a centered 0.2 s Savitzky–Golay derivative; the Fourier stage retains its
-0.1 s derivative. Samples must satisfy the existing velocity tolerance, an
-acceleration cap of `max(0.01, 0.5*abs(reference_speed))` rad/s², and a full coupled
-inertia-torque budget of `max(0.002, 0.01*Fc)` Nm. These engineering tolerances
-permit small velocity ripple while bounding dynamics relative to the friction
-fit's residual budget; they are not the robot's physical acceleration limits.
-Fit residual and speed-coverage checks still apply. Output includes rejection
-rates, longest steady runs, acceleration/torque percentiles and timing diagnostics.
+Acceleration uses a 0.1 s Savitzky–Golay derivative. The first and last second
+are excluded from fitting. Each axis requires at least 200 useful samples and
+sufficient velocity variation. Output includes per-axis residuals and timing diagnostics.
 
 Before estimation, raw experiments are saved as pickle-free `.npz` files in
 `${ROS_HOME:-~/.ros}/lite6_sysid/`, with trajectory-window metadata and a companion
@@ -271,25 +249,20 @@ restoration guards (0.05 rad and 0.01 rad/s). Configuration rejects incompatible
 SYS_ID tolerances. NORMAL endpoint tolerances, path protection, emergency stop,
 reference playback and the Supervisor mode sequence retain their existing behavior.
 
-The steady-sliding curve is
-`Fv*v + [Fc + (Fs-Fc)*exp(-(v/vs)^2)]*sign(v)` (fixed exponent 2).
-CTC uses this envelope evaluated at measured velocity, retaining its existing
-`tanh(tanh_slope*(dq_target + 5*position_error))` direction smoothing. SYS_ID
-mode still disables friction compensation. This is a static Stribeck fit, not
-an identification of LuGre bristle memory or a guarantee of zero static error.
+CTC friction feedforward is
+`Fv*dq + Fc*tanh(tanh_slope*(dq_target + friction_error_gain*position_error))`.
+The existing direction smoothing and integral control remain unchanged; SYS_ID
+mode still disables friction compensation.
 
-The GUI output includes per-axis fit residuals and four YAML arrays:
-`friction_v_nominal`, `friction_c_nominal`, `friction_s_nominal` (Nm), and
-`friction_vs_nominal` (rad/s); `Fv` has units Nm·s/rad. Copy the arrays into the
-CTC configuration and restart/reconfigure to apply them; identification does not
-automatically change controller parameters. The checked-in `Fs/vs` values are
-initial simulation nominals. Omitting `friction_s_nominal` preserves the previous
-Coulomb-only behavior (`Fs=Fc`).
+The GUI output includes per-axis fit residuals and two YAML arrays:
+`friction_v_nominal` (Nm·s/rad) and `friction_c_nominal` (Nm). Copy the arrays into
+the CTC configuration and restart/reconfigure to apply them; identification does
+not automatically change controller parameters.
 
 SysID references use an exact 1 ms grid, matching the 1000 Hz CTC loop and
 joint feedback. Trajectory generation and message construction run in the
 background. The HMI immediately displays preparation progress (model loading,
-Fourier/low-speed collision checks, message construction and Supervisor acceptance)
+Fourier collision checks, message construction and Supervisor acceptance)
 and blocks duplicate starts and local manual motion requests during preparation.
 This feedback does not change the robot mode: the Supervisor still authorizes
 SysID after preflight. Dense-path checks deduplicate only exactly identical poses;

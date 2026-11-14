@@ -32,15 +32,10 @@ ctc_controller:
     armature: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
 
     # Identified high-speed viscous [Nm s/rad] and Coulomb [Nm] friction.
-    friction_v_nominal: [1.0001, 1.0093, 0.5054, 0.2006, 0.1004, 0.0510]
-    friction_c_nominal: [1.4999, 1.4990, 0.9994, 0.4996, 0.1998, 0.0986]
+    friction_v_nominal: [1.002, 1.009, 0.506, 0.201, 0.101, 0.051]
+    friction_c_nominal: [1.499, 1.498, 0.999, 0.499, 0.200, 0.099]
 
-    # Identified Stribeck peak [Nm] and characteristic speed [rad/s].
-    friction_s_nominal: [1.7250, 1.7248, 1.1499, 0.5749, 0.2300, 0.1147]
-    friction_vs_nominal: [0.0200, 0.0201, 0.0200, 0.0201, 0.0201, 0.0223]
-
-    # Smooth compensation direction; low-speed identification uses steady sliding,
-    # not this smoothing function. Keep in sync with the high-speed fit if changed.
+    # Smooth compensation direction; keep in sync with the Fourier fit if changed.
     tanh_slope: 300.0
     # Position-error injection into reference velocity [1/s], unchanged from 5*e.
     friction_error_gain: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0]

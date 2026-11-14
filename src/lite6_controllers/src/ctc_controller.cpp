@@ -21,9 +21,6 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
   auto_declare<std::vector<double>>("integral_max_effort", {2.5, 2.5, 1.7, 0.85, 0.35, 0.18});
   auto_declare<std::vector<double>>("friction_v_nominal", {1.0, 1.0, 0.5, 0.2, 0.1, 0.05});
   auto_declare<std::vector<double>>("friction_c_nominal", {1.5, 1.5, 1.0, 0.5, 0.2, 0.1});
-  // An omitted Fs array retains the previous Coulomb model (Fs == Fc).
-  auto_declare<std::vector<double>>("friction_s_nominal", std::vector<double>{});
-  auto_declare<std::vector<double>>("friction_vs_nominal", {0.02, 0.02, 0.02, 0.02, 0.02, 0.02});
   auto_declare<std::vector<double>>("armature", {0.1, 0.1, 0.1, 0.1, 0.1, 0.1});
   
   auto_declare<std::vector<double>>("max_effort", {50.0, 50.0, 32.0, 32.0, 32.0, 20.0}); 
@@ -132,18 +129,15 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   auto error_gain_v = get_node()->get_parameter("friction_error_gain").as_double_array();
   auto fv_v = get_node()->get_parameter("friction_v_nominal").as_double_array();
   auto fc_v = get_node()->get_parameter("friction_c_nominal").as_double_array();
-  auto fs_v = get_node()->get_parameter("friction_s_nominal").as_double_array();
-  auto vs_v = get_node()->get_parameter("friction_vs_nominal").as_double_array();
-  if(fs_v.empty()) fs_v=fc_v;
-  if(fv_v.size()!=n||fc_v.size()!=n||fs_v.size()!=n||vs_v.size()!=n) {
+  if(fv_v.size()!=n||fc_v.size()!=n) {
     RCLCPP_ERROR(get_node()->get_logger(),"Friction parameter arrays must contain six values");
     return controller_interface::CallbackReturn::ERROR;
   }
   for(size_t i=0;i<n;++i) {
-    if(!std::isfinite(fv_v[i])||!std::isfinite(fc_v[i])||!std::isfinite(fs_v[i])||
-       !std::isfinite(vs_v[i])||fv_v[i]<0.0||fc_v[i]<0.0||fs_v[i]<fc_v[i]||vs_v[i]<=0.0) {
+    if(!std::isfinite(fv_v[i])||!std::isfinite(fc_v[i])||
+       fv_v[i]<0.0||fc_v[i]<0.0) {
       RCLCPP_ERROR(get_node()->get_logger(),
-          "Invalid joint%zu friction parameters: require finite Fv >= 0, Fs >= Fc >= 0, vs > 0",i+1);
+          "Invalid joint%zu friction parameters: require finite Fv >= 0, Fc >= 0",i+1);
       return controller_interface::CallbackReturn::ERROR;
     }
   }
@@ -183,7 +177,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
 
   Kp_ = Eigen::MatrixXd::Zero(n, n);
   Kv_ = Eigen::MatrixXd::Zero(n, n);
-  friction_v_.resize(n); friction_c_.resize(n); friction_s_.resize(n); friction_vs_.resize(n);
+  friction_v_.resize(n); friction_c_.resize(n);
   armature_.resize(n); max_effort_.resize(n); estop_decel_.resize(n);
   ki_.resize(n); antiwindup_gain_.resize(n); integral_max_effort_.resize(n);
   friction_error_gain_.resize(n);
@@ -191,7 +185,6 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   for(size_t i=0; i<n; ++i) {
       Kp_(i, i) = kp_v[i]; Kv_(i, i) = kv_v[i]; 
       friction_v_[i] = fv_v[i]; friction_c_[i] = fc_v[i]; armature_[i] = arm_v[i];
-      friction_s_[i] = fs_v[i]; friction_vs_[i] = vs_v[i];
       max_effort_[i] = effort_limit_v[i];
       estop_decel_[i] = estop_decel_v[i];
       ki_[i] = ki_v[i];
@@ -419,12 +412,8 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       dynamics_ddq_.head(6) = a_d_;
       pinocchio::rnea(pin_model_, pin_data_, dynamics_q_, dynamics_dq_, dynamics_ddq_);
       for(size_t i = 0; i < n; ++i) {
-          // Steady-sliding Stribeck envelope; retain the existing smooth
-          // reference/error-based direction policy and measured viscous term.
-          const double ratio = dq_[i] / friction_vs_[i];
-          const double magnitude = friction_c_[i] +
-              (friction_s_[i] - friction_c_[i]) * std::exp(-ratio * ratio);
-          tau_fric_[i] = friction_v_[i] * dq_[i] + magnitude *
+          // Viscous friction and Coulomb friction with smooth reference/error direction.
+          tau_fric_[i] = friction_v_[i] * dq_[i] + friction_c_[i] *
               std::tanh(tanh_slope_ * (dq_target_[i] + friction_error_gain_[i] * e_[i]));
           // ki == 0 disables both integration and back-calculation for this joint.
           if (ki_[i] == 0.0) integral_effort_[i] = 0.0;

@@ -9,12 +9,12 @@ import pinocchio as pin
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from scipy.interpolate import interp1d
-from scipy.optimize import least_squares, lsq_linear
+from scipy.optimize import lsq_linear
 from scipy.signal import savgol_filter
 
 
 class SysIdEngine:
-    """Fourier Fv/Fc identification followed by steady-sliding Stribeck fitting."""
+    """Fourier identification of viscous and Coulomb friction."""
 
     ARMATURE = 0.1  # Known factory inertia [kg m^2], identical on all six axes.
     SAMPLE_PERIOD = 0.001  # Same 1 ms grid as the CTC control loop and planner.
@@ -22,17 +22,7 @@ class SysIdEngine:
     TANH_SLOPE = 300.0
     LIMIT_MARGIN = 0.90
     MIN_DURATION = 6.0  # Keep useful recording time after the 1 s end trims.
-    MAX_DURATION = 120.0  # Fourier stage; low-speed experiments are appended.
-    LOW_SPEEDS = (0.004, 0.008, 0.014, 0.022, 0.034, 0.048)  # rad/s, both signs
-    LOW_CRUISE = 3.0
-    LOW_SETTLE = 1.0
-    LOW_END_GUARD = 0.3
-    LOW_DWELL = 0.4
-    LOW_PRE_SPEED = 0.08
-    LOW_PRE_CRUISE = 0.6
-    STAGE_DWELL = 1.0
-    LOW_DERIVATIVE_WINDOW = 0.2  # s; centered, inside the guarded plateau.
-    MIN_STEADY_DURATION = 0.3  # Continuous accepted data, not scattered samples.
+    MAX_DURATION = 120.0
 
     def __init__(self):
         desc = get_package_share_directory('lite6_description')
@@ -81,9 +71,6 @@ class SysIdEngine:
         self.b = np.zeros((6, self.N_f))
         self.record_data = []
         self.trajectory_summary = ''
-        self.high_speed_duration = None
-        self.low_segments = []
-        self.low_fit_windows = []
         self.fit_diagnostics = []
 
     @staticmethod
@@ -131,9 +118,6 @@ class SysIdEngine:
         zero velocity/acceleration endpoint constraints. Sampled extrema are
         padded with analytic derivative bounds before applying a 10% margin.
         """
-        self.high_speed_duration = None
-        self.low_segments = []
-        self.low_fit_windows = []
         q0 = np.asarray(q0, dtype=float)
         amplitudes = np.asarray(max_pos_limits, dtype=float)
         if (q0.shape != (6,) or amplitudes.shape != (6,) or
@@ -233,94 +217,14 @@ class SysIdEngine:
                          'choose a different center or larger excitation bounds')
 
     def generate_identification_trajectory(self, q0, max_pos_limits, progress=None):
-        """Keep Fourier excitation intact; append smooth, paired low-speed sweeps.
-
-        One Supervisor-owned trajectory preserves the existing session/mode flow.
-        All six axes move together; every speed is visited in both directions and
-        each pair returns to the center. No plant friction parameters are read.
-        """
+        """Generate the bounded Fourier experiment for Fv/Fc identification."""
         if progress is not None:
             progress('Checking Fourier trajectory collisions...')
         self.generate_fourier_coefficients(q0, max_pos_limits)
-        if progress is not None:
-            progress('Checking low-speed trajectory collisions...')
-        self.high_speed_duration = self.T_total
-        q0 = np.asarray(q0, dtype=float)
-        room = np.minimum(q0 - self.limits[:, 0], self.limits[:, 1] - q0)
-        allowed = self.LIMIT_MARGIN * np.minimum(np.asarray(max_pos_limits), room)
-        cursor = self.high_speed_duration + self.STAGE_DWELL
-        offset = 0.0
-        for speed in self.LOW_SPEEDS:
-            peak_speed = max(speed, self.LOW_PRE_SPEED)
-            if peak_speed > self.LIMIT_MARGIN * self.limits[:, 2].min():
-                raise ValueError('Joint velocity limits do not permit the low-speed experiment')
-            # Quintic velocity blend: max first derivative=1.875, second <5.774.
-            ramp = max(0.4, 1.875 * peak_speed / (self.LIMIT_MARGIN * self.limits[:, 3].min()),
-                       np.sqrt(5.774 * peak_speed / (self.LIMIT_MARGIN * self.limits[:, 4].min())))
-            ramp = np.ceil(ramp / self.SAMPLE_PERIOD) * self.SAMPLE_PERIOD
-            excursion = (self.LOW_PRE_SPEED * (self.LOW_PRE_CRUISE + ramp) +
-                         speed * (self.LOW_CRUISE + ramp))
-            if np.any(excursion > allowed):
-                raise ValueError(f'Low-speed SysID needs at least {excursion:.4f} rad of '
-                                 'per-axis excursion after the 10% margin; '
-                                 'increase bounds or move the center')
-            for direction in (1.0, -1.0):
-                velocity = direction * speed
-                preslide = direction * self.LOW_PRE_SPEED
-                # With friction compensation disabled, slow reversal alone may
-                # never overcome the PD tracking offset within a short plateau.
-                # Establish sliding first, then decelerate in the same direction.
-                for duration, v0, v1 in ((ramp, 0., preslide),
-                                         (self.LOW_PRE_CRUISE, preslide, preslide),
-                                         (ramp, preslide, velocity),
-                                         (self.LOW_CRUISE, velocity, velocity),
-                                         (ramp, velocity, 0.), (self.LOW_DWELL, 0., 0.)):
-                    self.low_segments.append((cursor, duration, offset, v0, v1))
-                    if v0 == v1 and v0 == velocity:
-                        self.low_fit_windows.append((cursor + self.LOW_SETTLE,
-                                                     cursor + duration - self.LOW_END_GUARD,
-                                                     velocity))
-                    offset += 0.5 * (v0 + v1) * duration
-                    cursor += duration
-            offset = 0.0  # Paired sweeps return analytically to the center.
-        self.T_total = cursor
-        self._low_starts = np.array([segment[0] for segment in self.low_segments])
-        rng = np.random.RandomState(73)
-        patterns = [np.ones(6), -np.ones(6)]
-        patterns.extend(rng.choice([-1., 1.], size=(14, 6)))
-        low_times = self.trajectory_times()
-        low_times = low_times[low_times >= self.high_speed_duration]
-        scalar = self._low_points(low_times)[0]
-        # Positions are monotone within each ramp/cruise: extrema occur at stops.
-        for pattern in patterns:
-            if self._path_is_clear(q0 + scalar[:, None] * pattern):
-                self.low_directions = pattern
-                self.trajectory_summary += (
-                    f'; low-speed stage {self.T_total - self.high_speed_duration:.2f} s, '
-                    f'{len(self.LOW_SPEEDS)} speeds in both directions; total {self.T_total:.2f} s')
-                return
-        raise ValueError('No collision-free low-speed SysID sweeps at this center')
-
-    def _low_point(self, t):
-        if not self.low_segments or t < self.low_segments[0][0]:
-            return 0., 0., 0.
-        index = min(int(np.searchsorted(self._low_starts, t, side='right')) - 1,
-                    len(self.low_segments) - 1)
-        start, duration, q0, v0, v1 = self.low_segments[index]
-        u = np.clip((t - start) / duration, 0., 1.)
-        blend = u**3 * (10. - 15. * u + 6. * u**2)
-        integral = u**4 * (2.5 - 3. * u + u**2)
-        derivative = 30. * u**2 * (1. - u)**2
-        return (q0 + duration * (v0 * u + (v1 - v0) * integral),
-                v0 + (v1 - v0) * blend, (v1 - v0) * derivative / duration)
 
     def get_trajectory_point(self, t, q0):
-        if self.high_speed_duration is None or t < self.high_speed_duration:
-            return tuple(np.array(x) for x in zip(*[
-                self.get_fourier_point(i, t, q0) for i in range(6)]))
-        q, v, a = self._low_point(t)
-        return (np.asarray(q0) + q * self.low_directions,
-                v * self.low_directions, a * self.low_directions)
+        return tuple(np.array(x) for x in zip(*[
+            self.get_fourier_point(i, t, q0) for i in range(6)]))
 
     @classmethod
     def _sample_times(cls, duration):
@@ -332,31 +236,11 @@ class SysIdEngine:
     def trajectory_times(self):
         return self._sample_times(self.T_total)
 
-    def _low_points(self, times):
-        """Vectorized low-speed references, including the inter-stage dwell."""
-        indices = np.searchsorted(self._low_starts, times, side='right') - 1
-        segments = np.asarray(self.low_segments)[np.clip(indices, 0, len(self.low_segments) - 1)]
-        start, duration, q0, v0, v1 = segments.T
-        u = np.clip((times - start) / duration, 0., 1.)
-        blend = u**3 * (10. - 15. * u + 6. * u**2)
-        integral = u**4 * (2.5 - 3. * u + u**2)
-        derivative = 30. * u**2 * (1. - u)**2
-        return tuple(np.where(indices < 0, 0., value) for value in (
-            q0 + duration * (v0 * u + (v1 - v0) * integral),
-            v0 + (v1 - v0) * blend, (v1 - v0) * derivative / duration))
-
     def trajectory_samples(self, q0):
         """Generate all 1 ms references without a Python loop over Fourier harmonics."""
         times = self.trajectory_times()
-        high = times < self.high_speed_duration
-        q, v, a = (np.empty((len(times), 6)) for _ in range(3))
-        offsets, v[high], a[high], _ = self._wave(self.a, self.b, self.w, times[high])
-        q[high] = np.asarray(q0) + offsets
-        low_q, low_v, low_a = self._low_points(times[~high])
-        q[~high] = np.asarray(q0) + low_q[:, None] * self.low_directions
-        v[~high] = low_v[:, None] * self.low_directions
-        a[~high] = low_a[:, None] * self.low_directions
-        return times, q, v, a
+        offsets, velocity, acceleration, _ = self._wave(self.a, self.b, self.w, times)
+        return times, np.asarray(q0) + offsets, velocity, acceleration
 
     def get_fourier_point(self, i, t, q0):
         wl = self.w * np.arange(1, self.N_f + 1)
@@ -379,13 +263,9 @@ class SysIdEngine:
         arrays = {key: np.asarray([sample[key] for sample in self.record_data],
                                   dtype=np.int64 if key in ('step', 'command_sequence') else float)
                   for key in keys}
-        metadata = dict(schema=2, session=str(session), excitation_start_ros=origin,
-                        t_is_relative=origin is not None,
-                        duration=self.T_total, high_speed_duration=self.high_speed_duration,
-                        low_fit_windows=self.low_fit_windows,
-                        low_directions=np.asarray(self.low_directions).tolist(),
-                        derivative_window=self.LOW_DERIVATIVE_WINDOW,
-                        min_steady_duration=self.MIN_STEADY_DURATION)
+        metadata = dict(schema=3, session=str(session), excitation_start_ros=origin,
+                        t_is_relative=origin is not None, duration=self.T_total,
+                        friction_model='viscous_coulomb', trajectory='fourier')
         # Exclusive creation protects existing experiments even on a repeated ID.
         with path.open('xb') as stream:
             np.savez_compressed(stream, **arrays, metadata=json.dumps(metadata))
@@ -424,13 +304,7 @@ class SysIdEngine:
             for key in ('q', 'dq', 'tau_cmd', 'gripper_q', 'gripper_dq', 'gripper_ddq')))
 
     def calculate_least_squares(self) -> str:
-        """Fit Fv/Fc first; freeze them while estimating Fs-Fc and vs.
-
-        Low-speed plateaus use the physical steady-sliding sign, not tanh(300*v).
-        The controller's tanh is a direction regularizer, not a plant parameter.
-        """
-        if self.high_speed_duration is None or not self.low_fit_windows:
-            raise ValueError('Generate the two-stage SysID trajectory before fitting')
+        """Fit nonnegative Fv/Fc from measured Fourier excitation data."""
         self.fit_diagnostics = []
         t_seq, q_seq, dq_seq, tau_seq, gq_seq, gv_seq, ga_seq = self._physical_samples()
         if len(t_seq) < 5:
@@ -455,12 +329,6 @@ class SysIdEngine:
         if len(t_uniform) < window:
             raise ValueError('Recording is too short for acceleration estimation')
         ddq = savgol_filter(dq, window, polyorder=3, deriv=1, delta=dt, axis=0)
-        low_window = max(5, int(self.LOW_DERIVATIVE_WINDOW / dt) | 1)
-        if len(t_uniform) < low_window:
-            raise ValueError('Recording is too short for low-speed acceleration estimation')
-        low = t_uniform >= self.high_speed_duration
-        ddq[low] = savgol_filter(dq, low_window, polyorder=3, deriv=1,
-                                delta=dt, axis=0)[low]
         gq, gv, ga = [interp1d(t_seq, values, axis=0)(t_uniform)
                       for values in (gq_seq, gv_seq, ga_seq)]
         full_q = np.column_stack((q, gq))
@@ -469,22 +337,14 @@ class SysIdEngine:
         rigid_torque = np.array([
             pin.rnea(self.dynamics_model, self.dynamics_data, qi, vi, ai)[:6].copy()
             for qi, vi, ai in zip(full_q, full_v, full_a)])
-        # Full coupled inertia torque M(q)*ddq + rotor inertia, not a per-axis
-        # scalar approximation. This bounds the dynamic term in a static fit.
-        inertia_torque = np.zeros_like(rigid_torque)
-        bias = np.array([
-            pin.rnea(self.dynamics_model, self.dynamics_data, qi, vi, np.zeros(8))[:6].copy()
-            for qi, vi in zip(full_q[low], full_v[low])])
-        inertia_torque[low] = rigid_torque[low] - bias + self.ARMATURE * ddq[low]
         residual = tau - rigid_torque - self.ARMATURE * ddq
         friction = np.zeros((6, 2))
-        stribeck = np.zeros((6, 2))
         report = []
         failures = []
         for i in range(6):
             try:
                 # Retain the original Fourier-stage speed cutoff and linear solver.
-                valid = ((t_uniform > 1.0) & (t_uniform < self.high_speed_duration - 1.0) &
+                valid = ((t_uniform > 1.0) & (t_uniform < self.T_total - 1.0) &
                          (np.abs(dq[:, i]) >= self.MIN_FIT_SPEED))
                 if np.count_nonzero(valid) < 200:
                     raise ValueError(f'Joint {i+1}: fewer than 200 useful high-speed friction samples')
@@ -498,106 +358,21 @@ class SysIdEngine:
                     raise ValueError(f'Joint {i+1}: friction fit failed')
                 friction[i] = result.x
                 high_rmse = np.sqrt(np.mean((design @ result.x - residual[valid, i])**2))
-                fs, vs, low_rmse, count = self._fit_stribeck(
-                    i, t_uniform, dq[:, i], ddq[:, i], residual[:, i], dt, *result.x,
-                    inertia_torque[:, i])
-                stribeck[i] = (fs, vs)
-                report.append(f'# joint{i+1}: high-speed RMSE={high_rmse:.6g} Nm '
-                              f'({valid.sum()} samples); low-speed RMSE={low_rmse:.6g} Nm '
-                              f'({count} stable samples, {len(self.low_fit_windows)} plateaus)')
+                report.append(f'# joint{i+1}: RMSE={high_rmse:.6g} Nm '
+                              f'({valid.sum()} samples)')
             except ValueError as exc:
                 failures.append(str(exc))
         if failures:
             raise ValueError('Identification quality checks failed:\n' + '\n'.join(failures) +
-                             '\nPlateau diagnostics:\n' + '\n'.join(self.fit_diagnostics))
+                             '\nTiming diagnostics:\n' + '\n'.join(self.fit_diagnostics))
 
         def format_list(values):
             return '[' + ', '.join(f'{value:.8g}' for value in values) + ']'
 
-        return ('# --- Two-stage identified friction parameters (not automatically applied) ---\n'
-                '# Stage 1: Fourier Fv/Fc. Stage 2: fixed Fv/Fc, fit Fs/vs; exponent=2.\n'
+        return ('# --- Identified friction parameters (not automatically applied) ---\n'
+                '# Fourier excitation: viscous Fv and Coulomb Fc.\n'
                 f'friction_v_nominal: {format_list(friction[:, 0])}\n'
                 f'friction_c_nominal: {format_list(friction[:, 1])}\n'
-                f'friction_s_nominal: {format_list(stribeck[:, 0])}\n'
-                f'friction_vs_nominal: {format_list(stribeck[:, 1])}\n'
                 + '\n'.join(report) + '\n'
                 + '\n'.join('# ' + line for line in self.fit_diagnostics) + '\n'
                 )
-
-    def _fit_stribeck(self, joint, times, velocity, acceleration, torque, dt, fv, fc,
-                      inertia_torque):
-        speeds, excesses = [], []
-        count = 0
-        failures = []
-        for start, end, scalar_velocity in self.low_fit_windows:
-            reference = scalar_velocity * self.low_directions[joint]
-            in_window = (times >= start) & (times <= end)
-            speed_ok = np.abs(velocity - reference) <= max(0.0005, 0.15 * abs(reference))
-            # Reject material dynamics, while tolerating small measured ripple
-            # whose inertia torque is below the fit's absolute/relative budget.
-            # The independent acceleration cap still rejects rapid speed drift.
-            torque_budget = max(0.002, 0.01 * fc)  # Nm, same floor as residual QC.
-            acceleration_limit = max(0.01, 0.5 * abs(reference))  # rad/s^2
-            acceleration_ok = ((np.abs(acceleration) <= acceleration_limit) &
-                               (np.abs(inertia_torque) <= torque_budget))
-            mask = in_window & speed_ok & acceleration_ok
-            available = np.count_nonzero(in_window)
-            # Retain only runs that actually remain steady for 0.3 s. Counting
-            # scattered accepted points used to overstate the stable duration.
-            edges = np.diff(np.r_[False, mask, False].astype(np.int8))
-            runs = list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)))
-            longest = max(((end_i - start_i - 1) * dt for start_i, end_i in runs), default=0.)
-            mask[:] = False
-            for start_i, end_i in runs:
-                if (end_i - start_i - 1) * dt >= self.MIN_STEADY_DURATION - 1e-9:
-                    mask[start_i:end_i] = True
-            samples = np.count_nonzero(mask)
-            duration = samples * dt
-            speed_rejected = np.count_nonzero(in_window & ~speed_ok) / max(available, 1)
-            acceleration_rejected = np.count_nonzero(in_window & ~acceleration_ok) / max(available, 1)
-            diagnostic = (f'Joint {joint+1}, {reference:+.4f} rad/s, [{start:.3f}, {end:.3f}] s: '
-                          f'{samples}/{available} samples in steady runs, {duration:.4f} s total; '
-                          f'longest run {longest:.4f} s (need {self.MIN_STEADY_DURATION:.4f} s); '
-                          f'velocity rejected {speed_rejected:.1%}, '
-                          f'acceleration/dynamics rejected {acceleration_rejected:.1%}; '
-                          f'acceleration cap={acceleration_limit:.5g} rad/s^2, '
-                          f'inertia torque budget={torque_budget:.5g} Nm; '
-                          f'|acceleration| p95={np.percentile(np.abs(acceleration[in_window]), 95) if available else float("nan"):.5g} rad/s^2, '
-                          f'|inertia torque| p95={np.percentile(np.abs(inertia_torque[in_window]), 95) if available else float("nan"):.5g} Nm')
-            self.fit_diagnostics.append(diagnostic)
-            if samples < 20:
-                failures.append(diagnostic)
-                continue
-            v = velocity[mask]
-            # One robust observation per speed/direction gives equal plateau weight.
-            speeds.append(float(np.median(np.abs(v))))
-            excesses.append(float(np.median(np.sign(v) * torque[mask] - fv * np.abs(v) - fc)))
-            count += samples
-        if failures:
-            raise ValueError('Insufficient steady low-speed data: ' + '; '.join(failures))
-        speeds, excesses = np.asarray(speeds), np.asarray(excesses)
-        scale = max(fc, 0.01)
-        vs_bounds = (min(self.LOW_SPEEDS) / 4., max(self.LOW_SPEEDS) * 2.)
-
-        def residual(parameters):
-            delta, vs = parameters
-            return (delta * np.exp(-(speeds / vs)**2) - excesses) / scale
-        results = [least_squares(
-            residual, [max(float(excesses.max()), 0.01 * scale), initial_vs],
-            bounds=([0., vs_bounds[0]], [np.inf, vs_bounds[1]]),
-            x_scale=[scale, 0.02], loss='soft_l1', f_scale=0.01, max_nfev=500)
-            for initial_vs in (0.006, 0.015, 0.03, 0.06)]
-        results = [r for r in results if r.success and np.isfinite(r.x).all()]
-        if not results:
-            raise ValueError(f'Joint {joint+1}: Stribeck fit did not converge')
-        best = min(results, key=lambda r: r.cost)
-        delta, vs = best.x
-        rmse = float(np.sqrt(np.mean((residual(best.x) * scale)**2)))
-        # An apparently successful solver must not manufacture an unobserved curve.
-        if delta <= max(1e-4, 3. * rmse):
-            raise ValueError(f'Joint {joint+1}: Stribeck excess is not identifiable above residual noise')
-        if speeds.min() > 0.8 * vs or speeds.max() < 1.5 * vs:
-            raise ValueError(f'Joint {joint+1}: low-speed samples do not bracket fitted vs={vs:.6g} rad/s')
-        if rmse > max(0.002, 0.01 * fc, 0.15 * delta):
-            raise ValueError(f'Joint {joint+1}: low-speed Stribeck residual too large ({rmse:.6g} Nm)')
-        return fc + delta, vs, rmse, count
