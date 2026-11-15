@@ -380,7 +380,8 @@ private:
 
   double parse_optional_angle_unit(int stmt_idx)
   {
-    if (peek().kind == TokenKind::IDENT) {
+    const int prev_line = pos_ > 0 ? tokens_[pos_ - 1].line : peek().line;
+    if (peek().kind == TokenKind::IDENT && peek().line == prev_line) {
       if (peek().lexeme == "rad") {
         advance();
         return 1.0;

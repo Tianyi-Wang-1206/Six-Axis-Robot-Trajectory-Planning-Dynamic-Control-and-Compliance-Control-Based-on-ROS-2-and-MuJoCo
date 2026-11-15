@@ -70,4 +70,37 @@ ament_export_dependencies(
   yaml-cpp
 )
 
+add_executable(lite6_studio_planner_node
+  src/studio_supervisor.cpp
+  src/studio_planner_node.cpp
+)
+
+target_include_directories(lite6_studio_planner_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(lite6_studio_planner_node
+  studio_planner_core
+)
+
+ament_target_dependencies(lite6_studio_planner_node
+  rclcpp
+  rclcpp_action
+  sensor_msgs
+  std_msgs
+  trajectory_msgs
+  control_msgs
+  ament_index_cpp
+  lite6_interfaces
+  lite6_planner
+  pinocchio
+  coal
+  yaml-cpp
+)
+
+install(TARGETS lite6_studio_planner_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()
