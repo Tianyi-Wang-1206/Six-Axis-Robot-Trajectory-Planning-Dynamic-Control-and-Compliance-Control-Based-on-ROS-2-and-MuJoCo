@@ -25,7 +25,7 @@ class PyQtHMI(QMainWindow):
     def __init__(self, worker):
         super().__init__()
         self.worker = worker
-        self.setWindowTitle("UFactory Lite6 - Industrial HMI Interface")
+        self.setWindowTitle("Robot - Industrial HMI Interface")
         self.resize(800, 700)
 
         # Style definition via QSS (Modern Slate Industrial Theme)

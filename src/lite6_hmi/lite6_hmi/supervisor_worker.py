@@ -1,4 +1,4 @@
-"""ROS 2 transport adapter for the Lite6 GUI.
+"""ROS 2 transport adapter for the Robot GUI.
 
 The planner's Supervisor is the *only* owner of the global discrete state.
 This module never transitions the global machine: it translates state snapshots

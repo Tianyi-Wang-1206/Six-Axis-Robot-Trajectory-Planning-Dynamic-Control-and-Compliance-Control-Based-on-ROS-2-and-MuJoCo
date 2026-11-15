@@ -13,8 +13,8 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='tianyi',
-    maintainer_email='tianyi@todo.todo',
+    maintainer='developer',
+    maintainer_email='developer@robot.local',
     description='TODO: Package description',
     license='TODO: License declaration',
     extras_require={

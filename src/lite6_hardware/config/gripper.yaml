@@ -1,6 +1,6 @@
-# Lite6 wide gripper drive approximation. Loaded once at hardware initialization.
+# Robot wide gripper drive approximation. Loaded once at hardware initialization.
 # OPEN/CLOSE/STOP are the public commands; these are simulation calibration values,
-# not settings exposed by the original Lite6 I/O gripper. Restart after editing.
+# not settings exposed by physical I/O grippers. Restart after editing.
 gripper:
   stiffness: 4000.0                 # N/m, position tracking / finite holding force
   damping: 40.0                     # N*s/m

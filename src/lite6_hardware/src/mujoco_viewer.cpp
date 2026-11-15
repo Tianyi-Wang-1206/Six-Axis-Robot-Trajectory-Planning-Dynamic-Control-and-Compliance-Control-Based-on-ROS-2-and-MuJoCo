@@ -140,7 +140,7 @@ public:
 
     glfwWindowHint(GLFW_SAMPLES, 8);
     glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
-    int width = 1920, height = 1080;
+    int width = 1400, height = 1400;
     if (auto * monitor = glfwGetPrimaryMonitor()) {
       int work_x, work_y, work_width, work_height;
       glfwGetMonitorWorkarea(monitor, &work_x, &work_y, &work_width, &work_height);
@@ -150,7 +150,7 @@ public:
         height = std::min(height, work_height - 100);
       }
     }
-    window_.reset(glfwCreateWindow(width, height, "Lite6 | MuJoCo Studio", nullptr, nullptr));
+    window_.reset(glfwCreateWindow(width, height, "Robot | MuJoCo Studio", nullptr, nullptr));
     if (!window_) {throw std::runtime_error("Cannot create an OpenGL window (check DISPLAY)");}
     glfwMakeContextCurrent(window_.get());
     glfwSwapInterval(1);
@@ -234,7 +234,7 @@ public:
           !fresh ? "CONNECTING" : (active_ ? "LIVE" : "PHYSICS STOPPED"),
           fps, data_->time, perturb_.active ? "  |  MOUSE FORCE" : "");
         mjr_overlay(mjFONT_NORMAL, mjGRID_TOPLEFT, viewport,
-          "LITE6 / MUJOCO STUDIO", status, &context_);
+          "ROBOT / MUJOCO STUDIO", status, &context_);
         if (help_) {
           mjr_overlay(mjFONT_NORMAL, mjGRID_BOTTOMLEFT, viewport,
             "Orbit / pan / zoom\nSelect body\nApply force / torque\nView / shadow / help",

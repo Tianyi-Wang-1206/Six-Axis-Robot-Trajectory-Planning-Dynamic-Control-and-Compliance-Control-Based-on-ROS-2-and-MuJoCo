@@ -1,4 +1,4 @@
-# Compile a Lite6Script trajectory program through the 5-stage verification pipeline.
+# Compile a RobotScript trajectory program through the 5-stage verification pipeline.
 string source_code
 bool use_current_robot_start
 float64[6] custom_start_joints

@@ -1,1 +1,1 @@
-"""Lite6 Studio HMI package."""
+"""Robot Studio HMI package."""

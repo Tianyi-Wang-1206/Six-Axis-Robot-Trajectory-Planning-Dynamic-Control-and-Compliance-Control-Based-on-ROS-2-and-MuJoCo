@@ -1,4 +1,4 @@
-"""Main PyQt5 IDE & Execution Monitoring Window for Lite6 Studio (Light Theme)."""
+"""Main PyQt5 IDE & Execution Monitoring Window for Robot Studio (Light Theme)."""
 
 from datetime import datetime
 import math
@@ -339,8 +339,8 @@ class StudioMainWindow(QMainWindow):
     def __init__(self, ros_worker, parent=None):
         super().__init__(parent)
         self.worker = ros_worker
-        self.setWindowTitle("Lite6 Industrial Trajectory Studio")
-        self.resize(1460, 920)
+        self.setWindowTitle("Robot Industrial Trajectory Studio")
+        self.resize(1800, 1400)
         self.setStyleSheet(_STYLESHEET)
 
         self._latest_studio_state = None
@@ -370,7 +370,7 @@ class StudioMainWindow(QMainWindow):
         h_splitter.addWidget(self._build_right_monitor_pane())
         h_splitter.setStretchFactor(0, 58)
         h_splitter.setStretchFactor(1, 42)
-        h_splitter.setSizes([830, 610])
+        h_splitter.setSizes([1050, 730])
         main_layout.addWidget(h_splitter, 1)
 
         # Load default industrial sample cleanly
@@ -392,7 +392,7 @@ class StudioMainWindow(QMainWindow):
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(8)
 
-        title = QLabel("LITE6 STUDIO")
+        title = QLabel("ROBOT STUDIO")
         title.setFont(QFont(_UI_FONT_FAMILY, 12, QFont.Bold))
         title.setStyleSheet("color: #1D4ED8;")
         layout.addWidget(title)
@@ -859,7 +859,7 @@ class StudioMainWindow(QMainWindow):
             self._mark_source_dirty(True)
 
     def _on_new_script(self):
-        self.editor.setPlainText("# New Lite6Script program\nMoveJ([0.0, 0.35, 1.0, 0.0, 0.65, 0.0], vel=0.4, acc=0.4)\n")
+        self.editor.setPlainText("# New RobotScript program\nMoveJ([0.0, 0.35, 1.0, 0.0, 0.65, 0.0], vel=0.4, acc=0.4)\n")
         self._current_file_path = None
         self.editor.set_diagnostic_markers([], [])
         self.diag_table.setRowCount(0)
@@ -867,7 +867,7 @@ class StudioMainWindow(QMainWindow):
 
     def _on_open_script(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Lite6Script Program", "", "Lite6Script (*.l6 *.txt);;All Files (*)"
+            self, "Open RobotScript Program", "", "RobotScript (*.l6 *.txt);;All Files (*)"
         )
         if not path:
             return
@@ -880,7 +880,7 @@ class StudioMainWindow(QMainWindow):
         path = self._current_file_path
         if not path:
             path, _ = QFileDialog.getSaveFileName(
-                self, "Save Lite6Script Program", "program.l6", "Lite6Script (*.l6);;All Files (*)"
+                self, "Save RobotScript Program", "program.l6", "RobotScript (*.l6);;All Files (*)"
             )
             if not path:
                 return

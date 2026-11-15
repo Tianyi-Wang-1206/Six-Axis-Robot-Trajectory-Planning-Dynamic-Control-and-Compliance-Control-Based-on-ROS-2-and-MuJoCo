@@ -1,4 +1,4 @@
-"""Entry point for Lite6 Studio HMI Qt5 application."""
+"""Entry point for Robot Studio HMI Qt5 application."""
 
 import signal
 import sys
@@ -38,7 +38,7 @@ def _apply_light_palette(app):
 def main(args=None):
     rclpy.init(args=args)
     app = QApplication(sys.argv)
-    app.setApplicationName("Lite6 Industrial Studio")
+    app.setApplicationName("Robot Industrial Studio")
     _apply_light_palette(app)
 
     worker = StudioRosWorker()

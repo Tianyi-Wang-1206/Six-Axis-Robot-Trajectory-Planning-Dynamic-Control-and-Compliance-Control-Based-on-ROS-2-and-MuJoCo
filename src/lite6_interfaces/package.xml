@@ -3,8 +3,8 @@
 <package format="3">
   <name>lite6_interfaces</name>
   <version>0.0.0</version>
-  <description>ROS 2 action, state and supervisor interfaces for Lite6.</description>
-  <maintainer email="2159593747@qq.com">tianyi</maintainer>
+  <description>ROS 2 action, state and supervisor interfaces for Robot.</description>
+  <maintainer email="developer@robot.local">developer</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>

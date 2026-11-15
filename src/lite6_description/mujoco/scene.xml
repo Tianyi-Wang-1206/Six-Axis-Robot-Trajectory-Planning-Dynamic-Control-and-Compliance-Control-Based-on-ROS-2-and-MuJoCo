@@ -1,4 +1,4 @@
-<mujoco model="Lite6 | Warm Studio">
+<mujoco model="Robot | Warm Studio">
   <!-- The robot model is included unchanged. -->
   <include file="lite6.xml"/>
 

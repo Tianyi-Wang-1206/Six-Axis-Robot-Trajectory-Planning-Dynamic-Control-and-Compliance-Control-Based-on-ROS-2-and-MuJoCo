@@ -78,7 +78,7 @@ public:
           desc_pkg + "/urdf/lite6_arm.urdf", planner_pkg + "/config/lite6.srdf") ||
         !kinematics_.load_limits(planner_pkg + "/config/kinematic_limits.yaml"))
     {
-      throw std::runtime_error("Lite6 planning model or YAML configuration failed to initialize");
+      throw std::runtime_error("Robot planning model or YAML configuration failed to initialize");
     }
     compiler_ = std::make_unique<ProgramCompiler>(kinematics_);
 
@@ -140,7 +140,7 @@ public:
 
     worker_thread_ = std::thread([this]() { worker_loop(); });
     publish_snapshot(supervisor_->snapshot());
-    RCLCPP_INFO(get_logger(), "Lite6 Studio Planner node started");
+    RCLCPP_INFO(get_logger(), "Robot Studio Planner node started");
   }
 
   ~StudioPlannerNode() override

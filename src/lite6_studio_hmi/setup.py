@@ -13,9 +13,9 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='tianyi',
-    maintainer_email='tianyi@todo.todo',
-    description='Industrial trajectory programming Studio HMI for UFactory Lite6',
+    maintainer='developer',
+    maintainer_email='developer@robot.local',
+    description='Industrial trajectory programming Studio HMI for 6-DOF Robot',
     license='BSD-3-Clause',
     entry_points={
         'console_scripts': [

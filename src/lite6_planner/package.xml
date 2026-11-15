@@ -2,8 +2,8 @@
 <package format="3">
   <name>lite6_planner</name>
   <version>0.0.0</version>
-  <description>Analytical Lite6 motion planning with event-supervised execution.</description>
-  <maintainer email="2159593747@qq.com">tianyi</maintainer>
+  <description>Analytical Robot motion planning with event-supervised execution.</description>
+  <maintainer email="developer@robot.local">developer</maintainer>
   <license>MIT</license>
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>rclcpp</depend>

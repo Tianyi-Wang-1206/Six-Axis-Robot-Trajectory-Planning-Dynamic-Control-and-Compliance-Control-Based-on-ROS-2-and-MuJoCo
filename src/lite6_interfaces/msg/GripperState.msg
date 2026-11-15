@@ -1,5 +1,5 @@
 # Independent gripper observation, not gated by the arm Supervisor.
-# GRASPED is a simulated contact estimate, not an original Lite6 sensor signal.
+# GRASPED is a simulated contact estimate, not a hardware gripper sensor signal.
 builtin_interfaces/Time stamp
 uint8 BLOCKED=0
 uint8 STOPPED=1

@@ -58,7 +58,7 @@ public:
     if(!kinematics_.load_ik_config(pkg+"/config/ik_config.yaml")||
        !kinematics_.init_robot_model(desc+"/urdf/lite6_arm.urdf",pkg+"/config/lite6.srdf")||
        !kinematics_.load_limits(pkg+"/config/kinematic_limits.yaml"))
-      throw std::runtime_error("Lite6 planning model / YAML initialization failed");
+      throw std::runtime_error("Robot planning model / YAML initialization failed");
     io_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     validation_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     const auto state_qos=rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
@@ -124,7 +124,7 @@ public:
         on_sysid_trajectory(*req,*resp);
       },rmw_qos_profile_services_default,validation_group_);
     heartbeat_=create_wall_timer(100ms,[this]{on_heartbeat();},io_group_);
-    RCLCPP_INFO(get_logger(),"Supervisor-owned Lite6 planner created (awaiting CTC status)");
+    RCLCPP_INFO(get_logger(),"Supervisor-owned Robot planner created (awaiting CTC status)");
   }
   ~IndustrialPlannerNode() override {
     shutdown_.store(true);

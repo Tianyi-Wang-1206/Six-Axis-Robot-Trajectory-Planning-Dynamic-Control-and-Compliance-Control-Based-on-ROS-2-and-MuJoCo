@@ -1,4 +1,4 @@
-"""Built-in Lite6Script example programs for Lite6 Studio HMI."""
+"""Built-in RobotScript example programs for Robot Studio HMI."""
 
 PRESET_PROGRAMS = {
     "1. Pick & Place + Impedance (Full Demo)": """# Complete industrial cycle demonstrating MoveJ, blended MoveL/MoveC,

@@ -3,7 +3,7 @@
          type="lite6_controllers::Lite6CTCController"
          base_class_type="controller_interface::ControllerInterface">
     <description>
-      Computed Torque Controller using Pinocchio for Lite6.
+      Computed Torque Controller using Pinocchio for 6-DOF Robot.
     </description>
   </class>
 </library>

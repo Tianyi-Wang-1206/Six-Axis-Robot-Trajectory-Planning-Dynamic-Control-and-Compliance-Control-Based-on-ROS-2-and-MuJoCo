@@ -10,7 +10,7 @@ uint8 STAGE_KINEMATIC_LIMIT=4
 uint8 STAGE_COLLISION=5
 uint8 stage
 
-# 1-based line and column numbers in the user's Lite6Script source code.
+# 1-based line and column numbers in the user's RobotScript source code.
 int32 line_number
 int32 column_number
 

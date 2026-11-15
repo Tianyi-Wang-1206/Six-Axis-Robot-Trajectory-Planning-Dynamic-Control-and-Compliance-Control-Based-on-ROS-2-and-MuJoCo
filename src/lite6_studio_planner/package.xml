@@ -3,8 +3,8 @@
 <package format="3">
   <name>lite6_studio_planner</name>
   <version>0.1.0</version>
-  <description>Industrial trajectory programming DSL compiler, self-developed time-optimal planner, and execution supervisor for Lite6.</description>
-  <maintainer email="developer@lite6.local">Lite6 Studio Team</maintainer>
+  <description>Industrial trajectory programming DSL compiler, self-developed time-optimal planner, and execution supervisor for Robot.</description>
+  <maintainer email="developer@robot.local">developer</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>

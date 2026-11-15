@@ -3,8 +3,8 @@
 <package format="3">
   <name>lite6_bringup</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="tianyi@todo.todo">tianyi</maintainer>
+  <description>Bringup launch configurations for the Robot simulation and control stack.</description>
+  <maintainer email="developer@robot.local">developer</maintainer>
   <license>TODO: License declaration</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>

@@ -3,8 +3,8 @@
 <package format="3">
   <name>lite6_controllers</name>
   <version>0.0.0</version>
-  <description>Computed Torque Controller for Lite6</description>
-  <maintainer email="your_email@example.com">tianyi</maintainer>
+  <description>Computed Torque Controller for 6-DOF Robot</description>
+  <maintainer email="developer@robot.local">developer</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
