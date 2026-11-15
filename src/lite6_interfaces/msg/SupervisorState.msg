@@ -64,6 +64,16 @@ bool motion_allowed
 bool estop_latched
 
 # Informational diagnostics, not authoritative transition triggers.
+uint8 ESTOP_NONE=0
+uint8 ESTOP_MANUAL=1
+uint8 ESTOP_COMPLIANCE_POSITION_LIMIT=2
+uint8 ESTOP_COMPLIANCE_VELOCITY_LIMIT=3
+uint8 ESTOP_COMPLIANCE_SATURATION=4
+uint8 ESTOP_TRAJECTORY=5
+uint8 ESTOP_CONTROLLER_FAULT=6
+uint8 ESTOP_SUPERVISOR=7
+uint8 estop_reason
+
 int32 ERROR_SYSID_ESTIMATION=-14
 int32 last_error_code
 string detail

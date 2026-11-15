@@ -81,6 +81,8 @@ private:
     double value = 0.0, double limit = 0.0);
   controller_interface::return_type fail_controller(TrajectoryResult reason, int joint = -1);
   void request_execution_stop();
+  void latch_estop_reason(uint8_t reason, int joint = -1, double value = 0.0, double limit = 0.0);
+  void clear_estop_reason();
   // Borrowed from the RT buffer once per update; valid until the next RT read.
   TrajectoryExecution * current_execution_ = nullptr;
   std::vector<double> path_position_tolerance_, path_velocity_tolerance_;
@@ -168,6 +170,16 @@ private:
   int status_publish_counter_ = 0;
   SystemState last_reported_state_ = SystemState::NORMAL;
   bool status_publish_pending_ = true;
+
+  // RT-only latched diagnostics for the current ESTOP episode.
+  uint8_t estop_reason_ = lite6_interfaces::msg::ControllerStatus::ESTOP_NONE;
+  int8_t estop_joint_ = -1;
+  double estop_value_ = 0.0;
+  double estop_limit_ = 0.0;
+  bool compliance_saturation_estop_pending_ = false;
+  int8_t pending_estop_joint_ = -1;
+  double pending_estop_value_ = 0.0;
+  double pending_estop_limit_ = 0.0;
 
 };
 

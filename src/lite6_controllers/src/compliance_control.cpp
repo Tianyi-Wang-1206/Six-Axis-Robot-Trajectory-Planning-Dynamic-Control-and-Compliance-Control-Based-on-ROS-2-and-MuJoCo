@@ -48,6 +48,7 @@ void Lite6CTCController::process_compliance_command(int32_t command,
         compliance_filtered_=settings;
         compliance_last_tau_=tau_cmd_;
         compliance_saturation_time_=0.0;
+        compliance_saturation_estop_pending_=false;
         integral_effort_.setZero();
       }
       system_state_=desired;
@@ -64,12 +65,22 @@ void Lite6CTCController::process_compliance_command(int32_t command,
       reference_interfaces_[i]=q_[i];
       reference_interfaces_[6+i]=0.0;reference_interfaces_[12+i]=0.0;
     }
+    clear_estop_reason();
     system_state_=SystemState::NORMAL;
   }
   if(compliance_active()) {
+    using CS=lite6_interfaces::msg::ControllerStatus;
     for(int i=0;i<6;++i) {
-      if(q_[i]<pin_model_.lowerPositionLimit[i]-0.01||q_[i]>pin_model_.upperPositionLimit[i]+0.01||
-         std::abs(dq_[i])>1.5) {
+      if(q_[i]<pin_model_.lowerPositionLimit[i]-0.01) {
+        latch_estop_reason(CS::ESTOP_COMPLIANCE_POSITION_LIMIT,i,q_[i],pin_model_.lowerPositionLimit[i]);
+        request_execution_stop();break;
+      }
+      if(q_[i]>pin_model_.upperPositionLimit[i]+0.01) {
+        latch_estop_reason(CS::ESTOP_COMPLIANCE_POSITION_LIMIT,i,q_[i],pin_model_.upperPositionLimit[i]);
+        request_execution_stop();break;
+      }
+      if(std::abs(dq_[i])>1.5) {
+        latch_estop_reason(CS::ESTOP_COMPLIANCE_VELOCITY_LIMIT,i,dq_[i],1.5);
         request_execution_stop();break;
       }
     }
@@ -109,17 +120,28 @@ void Lite6CTCController::compute_compliance(double dt) {
     // Small joint damping also damps task-null directions near singularities.
     tau_cmd_-=0.15*dq_;
   } else {
-    const double light=(s.sensitivity-1.0)/4.0;
-    const double damping=4.0-3.0*light;
-    const double assistance=0.35+0.5*light;
+    // Keep damping and friction assistance conservative across sensitivity
+    // levels 1..5, and fade out Coulomb assistance near rest everywhere so
+    // low-speed bristle dynamics cannot self-excite jitter at any level.
+    const double light=(std::min(s.sensitivity,3.0)-1.0)/4.0;
+    const double high=std::clamp((s.sensitivity-3.0)/2.0,0.0,1.0);
+    const double damping=4.0-3.0*light-0.5*high;
+    const double assistance=0.35+0.5*light+0.05*high;
+    const double friction_transition=0.06;
+    const double quiet_speed=0.06;
     for(int i=0;i<6;++i) {
       // Deliberately bounded below full compensation. At rest there is no
       // guessed force direction; the user still overcomes static friction.
+      // Fade out Coulomb assistance near rest while preserving viscous
+      // compensation and positive damping across all sensitivity levels.
+      const double ramp=std::clamp((std::abs(dq_[i])-quiet_speed)/quiet_speed,0.0,1.0);
+      const double coulomb_gate=ramp*ramp*(3.0-2.0*ramp);
       tau_cmd_[i]+=-damping*dq_[i]+assistance*(friction_v_[i]*dq_[i]+
-        friction_c_[i]*std::tanh(dq_[i]/0.03));
+        coulomb_gate*friction_c_[i]*std::tanh(dq_[i]/friction_transition));
     }
   }
   bool saturated=false;
+  int saturated_joint=-1;
   for(int i=0;i<6;++i) {
     // Preserve an equilibrium captured inside the margin (home is on joint3's
     // lower boundary). Do not push the arm simply because a mode was entered.
@@ -128,13 +150,22 @@ void Lite6CTCController::compute_compliance(double dt) {
     const double hi=std::max(pin_model_.upperPositionLimit[i]-0.15,compliance_q_[i]);
     if(q_[i]<lo) tau_cmd_[i]+=80.0*(lo-q_[i])-5.0*std::min(0.0,dq_[i]);
     if(q_[i]>hi) tau_cmd_[i]-=80.0*(q_[i]-hi)+5.0*std::max(0.0,dq_[i]);
-    saturated=saturated||std::abs(tau_cmd_[i])>max_effort_[i];
+    if(std::abs(tau_cmd_[i])>max_effort_[i]) {
+      saturated=true;
+      if(saturated_joint<0) saturated_joint=i;
+    }
     tau_cmd_[i]=std::clamp(tau_cmd_[i],compliance_last_tau_[i]-100.0*dt,
       compliance_last_tau_[i]+100.0*dt);
     compliance_last_tau_[i]=std::clamp(tau_cmd_[i],-max_effort_[i],max_effort_[i]);
   }
   compliance_saturation_time_=saturated?compliance_saturation_time_+dt:0.0;
   // Apply braking on the next cycle, so this cycle retains force-mode semantics.
-  if(compliance_saturation_time_>saturation_timeout_) emergency_pending_.store(true);
+  if(compliance_saturation_time_>saturation_timeout_) {
+    compliance_saturation_estop_pending_=true;
+    pending_estop_joint_=static_cast<int8_t>(saturated_joint);
+    pending_estop_value_=compliance_saturation_time_;
+    pending_estop_limit_=saturation_timeout_;
+    emergency_pending_.store(true);
+  }
 }
 }

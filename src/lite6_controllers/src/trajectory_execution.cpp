@@ -12,6 +12,24 @@ double seconds(const builtin_interfaces::msg::Duration & duration)
 {
   return duration.sec + 1e-9 * duration.nanosec;
 }
+
+template <typename ResultEnum>
+uint8_t map_trajectory_estop_reason(ResultEnum reason)
+{
+  using CS = lite6_interfaces::msg::ControllerStatus;
+  switch (reason) {
+    case ResultEnum::PATH_POSITION: return CS::ESTOP_TRAJECTORY_PATH_POSITION;
+    case ResultEnum::PATH_VELOCITY: return CS::ESTOP_TRAJECTORY_PATH_VELOCITY;
+    case ResultEnum::GOAL_TIMEOUT: return CS::ESTOP_TRAJECTORY_GOAL_TIMEOUT;
+    case ResultEnum::SATURATION: return CS::ESTOP_TRAJECTORY_SATURATION;
+    case ResultEnum::MODE_CHANGED: return CS::ESTOP_TRAJECTORY_MODE_CHANGED;
+    case ResultEnum::INVALID_STATE: return CS::ESTOP_INVALID_STATE;
+    case ResultEnum::INVALID_COMMAND: return CS::ESTOP_INVALID_COMMAND;
+    case ResultEnum::COMMAND_WRITE: return CS::ESTOP_COMMAND_WRITE;
+    case ResultEnum::CONTROL_EXCEPTION: return CS::ESTOP_CONTROL_EXCEPTION;
+    default: return CS::ESTOP_EXTERNAL;
+  }
+}
 }  // namespace
 
 bool Lite6CTCController::valid_trajectory_goal(const FollowTrajectory::Goal & goal) const
@@ -122,6 +140,29 @@ void Lite6CTCController::update_trajectory_reference(
   execution->endpoint_applied = index + 1 == points.size();
 }
 
+void Lite6CTCController::latch_estop_reason(
+  uint8_t reason, int joint, double value, double limit)
+{
+  // Keep the first latched cause until the controller leaves ESTOP.
+  if (estop_reason_ != lite6_interfaces::msg::ControllerStatus::ESTOP_NONE) return;
+  estop_reason_ = reason;
+  estop_joint_ = static_cast<int8_t>(joint);
+  estop_value_ = value;
+  estop_limit_ = limit;
+}
+
+void Lite6CTCController::clear_estop_reason()
+{
+  estop_reason_ = lite6_interfaces::msg::ControllerStatus::ESTOP_NONE;
+  estop_joint_ = -1;
+  estop_value_ = 0.0;
+  estop_limit_ = 0.0;
+  compliance_saturation_estop_pending_ = false;
+  pending_estop_joint_ = -1;
+  pending_estop_value_ = 0.0;
+  pending_estop_limit_ = 0.0;
+}
+
 void Lite6CTCController::request_execution_stop()
 {
   if (!execution_stop_latched_) {
@@ -142,6 +183,7 @@ void Lite6CTCController::request_execution_stop()
 void Lite6CTCController::fail_trajectory(
   TrajectoryResult reason, int joint, double value, double limit)
 {
+  latch_estop_reason(map_trajectory_estop_reason(reason), joint, value, limit);
   request_execution_stop();
   auto * execution = current_execution_;
   if (!execution || execution->result.load() != TrajectoryResult::RUNNING) return;

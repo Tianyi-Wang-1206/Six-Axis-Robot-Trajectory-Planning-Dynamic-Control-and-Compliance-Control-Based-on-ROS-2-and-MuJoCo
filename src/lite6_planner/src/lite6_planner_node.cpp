@@ -78,7 +78,7 @@ public:
         last_controller_stamp_=stamp;
         {
           std::lock_guard<std::mutex> transition(transition_mutex_);
-          do_effects(supervisor_.observe_controller(msg->mode));
+          do_effects(supervisor_.observe_controller(*msg));
         }
         {
           std::lock_guard<std::mutex> lock(ctc_mutex_);

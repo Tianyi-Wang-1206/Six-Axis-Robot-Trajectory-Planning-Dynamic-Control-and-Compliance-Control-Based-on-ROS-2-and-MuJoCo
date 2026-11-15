@@ -245,6 +245,10 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   rt_status_pub_ = std::make_shared<
     realtime_tools::RealtimePublisher<lite6_interfaces::msg::ControllerStatus>>(status_pub_);
   rt_status_pub_->msg_.mode = lite6_interfaces::msg::ControllerStatus::MODE_UNKNOWN;
+  rt_status_pub_->msg_.estop_reason = lite6_interfaces::msg::ControllerStatus::ESTOP_NONE;
+  rt_status_pub_->msg_.estop_joint = -1;
+  rt_status_pub_->msg_.estop_value = 0.0;
+  rt_status_pub_->msg_.estop_limit = 0.0;
   status_publish_counter_ = 0;
   status_publish_pending_ = true;
 
@@ -261,6 +265,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   execution_stop_latched_ = false;
   compliance_blocks_trajectory_.store(false);
   emergency_pending_.store(false);
+  clear_estop_reason();
 
   for (size_t i = 0; i < n; ++i) {
     double initial_pos = state_interfaces_[i].get_value();
@@ -340,9 +345,18 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   current_command_sequence_ = cmd_ptr->sequence;
 
   if (current_cmd == 1 && system_state_ != SystemState::ESTOP) {
+      if (compliance_saturation_estop_pending_) {
+          latch_estop_reason(
+              lite6_interfaces::msg::ControllerStatus::ESTOP_COMPLIANCE_SATURATION,
+              pending_estop_joint_, pending_estop_value_, pending_estop_limit_);
+          compliance_saturation_estop_pending_ = false;
+      } else {
+          latch_estop_reason(lite6_interfaces::msg::ControllerStatus::ESTOP_EXTERNAL);
+      }
       system_state_ = SystemState::ESTOP;
       estop_q_ = q_; 
       estop_dq_ = dq_;
+      status_publish_pending_ = true;
   } else if (current_cmd == 2 && system_state_ == SystemState::NORMAL) {
       system_state_ = SystemState::SYS_ID;
   } else if (current_cmd == 0 && system_state_ != SystemState::NORMAL &&
@@ -352,6 +366,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
           dq_.cwiseAbs().maxCoeff() < 0.01) {
           system_state_ = SystemState::NORMAL;
           execution_stop_latched_ = false;
+          clear_estop_reason();
           for(size_t i=0; i<n; ++i) {
               reference_interfaces_[i] = q_[i];
               reference_interfaces_[n+i] = 0.0;
@@ -510,6 +525,10 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
           status.mode = lite6_interfaces::msg::ControllerStatus::MODE_SYSID;
           break;
       }
+      status.estop_reason = estop_reason_;
+      status.estop_joint = estop_joint_;
+      status.estop_value = estop_value_;
+      status.estop_limit = estop_limit_;
       rt_status_pub_->unlockAndPublish();
       last_reported_state_ = system_state_;
       status_publish_counter_ = 0;

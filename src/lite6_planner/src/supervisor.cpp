@@ -1,8 +1,10 @@
 #include "lite6_planner/supervisor.hpp"
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <limits>
 #include <random>
+#include <sstream>
 
 namespace lite6_planner {
 namespace {
@@ -17,6 +19,107 @@ constexpr auto kDispatchTimeout=std::chrono::seconds(15);
 constexpr auto kValidationTimeout=std::chrono::seconds(120);
 constexpr auto kCalculationTimeout=std::chrono::seconds(60);
 constexpr double kSettleSpeed=0.01; // Stricter than the planner's 0.02 rad/s admission guard.
+constexpr double kRadToDeg=57.29577951308232;
+
+std::string format_fixed(double value,int precision=3) {
+  std::ostringstream out;
+  out<<std::fixed<<std::setprecision(precision)<<value;
+  return out.str();
+}
+
+std::string joint_label(int8_t joint) {
+  return (joint>=0&&joint<6)?("joint"+std::to_string(joint+1)):"arm joint";
+}
+
+std::string mode_label(uint8_t mode) {
+  switch(mode) {
+    case S::MODE_JOINT_IMPEDANCE: return "Joint-space impedance";
+    case S::MODE_CARTESIAN_IMPEDANCE: return "Cartesian-space impedance";
+    case S::MODE_TEACH: return "Drag teaching";
+    case S::MODE_COMPLIANCE_SWITCHING: return "Compliance mode transition";
+    case S::MODE_SYSID: return "System Identification";
+    case S::MODE_NORMAL: return "NORMAL";
+    default: return "Active control mode";
+  }
+}
+
+uint8_t map_supervisor_estop_reason(uint8_t ctc_reason) {
+  switch(ctc_reason) {
+    case CS::ESTOP_COMPLIANCE_POSITION_LIMIT: return S::ESTOP_COMPLIANCE_POSITION_LIMIT;
+    case CS::ESTOP_COMPLIANCE_VELOCITY_LIMIT: return S::ESTOP_COMPLIANCE_VELOCITY_LIMIT;
+    case CS::ESTOP_COMPLIANCE_SATURATION: return S::ESTOP_COMPLIANCE_SATURATION;
+    case CS::ESTOP_TRAJECTORY_PATH_POSITION:
+    case CS::ESTOP_TRAJECTORY_PATH_VELOCITY:
+    case CS::ESTOP_TRAJECTORY_GOAL_TIMEOUT:
+    case CS::ESTOP_TRAJECTORY_SATURATION:
+    case CS::ESTOP_TRAJECTORY_MODE_CHANGED: return S::ESTOP_TRAJECTORY;
+    default: return S::ESTOP_CONTROLLER_FAULT;
+  }
+}
+
+std::string describe_controller_estop(const CS& status,uint8_t previous_mode) {
+  const std::string joint=joint_label(status.estop_joint);
+  const std::string mode_name=mode_label(previous_mode);
+  switch(status.estop_reason) {
+    case CS::ESTOP_COMPLIANCE_VELOCITY_LIMIT: {
+      const double speed=std::abs(status.estop_value);
+      return "Compliance E-STOP: "+joint+" velocity limit exceeded ("+
+        format_fixed(speed,2)+" rad/s > "+format_fixed(status.estop_limit,2)+" rad/s)\n"+
+        "Active mode: "+mode_name+"\n"+
+        "Cause: "+joint+" speed reached "+format_fixed(status.estop_value,3)+" rad/s ("+
+        format_fixed(status.estop_value*kRadToDeg,1)+" deg/s), exceeding the compliance safety limit of "+
+        format_fixed(status.estop_limit,2)+" rad/s ("+format_fixed(status.estop_limit*kRadToDeg,1)+" deg/s).\n"+
+        "Improper operation: The applied MuJoCo mouse drag force or torque accelerated the arm too abruptly. "
+        "Drag more gently and smoothly, then press RESET FAULT to recover.";
+    }
+    case CS::ESTOP_COMPLIANCE_POSITION_LIMIT:
+      return "Compliance E-STOP: "+joint+" position limit exceeded ("+
+        format_fixed(status.estop_value,3)+" rad vs limit "+format_fixed(status.estop_limit,3)+" rad)\n"+
+        "Active mode: "+mode_name+"\n"+
+        "Cause: "+joint+" reached "+format_fixed(status.estop_value,3)+" rad ("+
+        format_fixed(status.estop_value*kRadToDeg,1)+" deg), exceeding its mechanical travel limit of "+
+        format_fixed(status.estop_limit,3)+" rad ("+format_fixed(status.estop_limit*kRadToDeg,1)+" deg).\n"+
+        "Improper operation: The applied MuJoCo mouse drag force pushed the joint beyond its physical boundary. "
+        "Avoid pulling joints hard against their travel limits, then press RESET FAULT to recover.";
+    case CS::ESTOP_COMPLIANCE_SATURATION:
+      return "Compliance E-STOP: "+joint+" sustained torque saturation ("+
+        format_fixed(status.estop_value,2)+" s > "+format_fixed(status.estop_limit,2)+" s)\n"+
+        "Active mode: "+mode_name+"\n"+
+        "Cause: "+joint+" commanded motor torque stayed saturated for "+
+        format_fixed(status.estop_value,2)+" s, exceeding the "+format_fixed(status.estop_limit,2)+" s timeout.\n"+
+        "Improper operation: The applied MuJoCo mouse drag force pulled too strongly against the compliance "
+        "resistance or joint-limit wall for too long. Reduce the drag force or displacement (or lower stiffness), "
+        "then press RESET FAULT to recover.";
+    case CS::ESTOP_TRAJECTORY_PATH_POSITION:
+      return "CTC E-STOP: "+joint+" path position error exceeded ("+
+        format_fixed(status.estop_value,3)+" rad > "+format_fixed(status.estop_limit,3)+" rad)\n"+
+        "Active mode: "+mode_name+"\nPress RESET FAULT to recover.";
+    case CS::ESTOP_TRAJECTORY_PATH_VELOCITY:
+      return "CTC E-STOP: "+joint+" path velocity error exceeded ("+
+        format_fixed(status.estop_value,3)+" rad/s > "+format_fixed(status.estop_limit,3)+" rad/s)\n"+
+        "Active mode: "+mode_name+"\nPress RESET FAULT to recover.";
+    case CS::ESTOP_TRAJECTORY_SATURATION:
+      return "CTC E-STOP: "+joint+" continuous effort saturation ("+
+        format_fixed(status.estop_value,2)+" s >= "+format_fixed(status.estop_limit,2)+" s)\n"+
+        "Active mode: "+mode_name+"\nPress RESET FAULT to recover.";
+    case CS::ESTOP_TRAJECTORY_GOAL_TIMEOUT:
+      return "CTC E-STOP: goal settling deadline exceeded\nActive mode: "+mode_name+"\nPress RESET FAULT to recover.";
+    case CS::ESTOP_TRAJECTORY_MODE_CHANGED:
+      return "CTC E-STOP: controller mode changed during trajectory execution\nActive mode: "+mode_name+"\nPress RESET FAULT to recover.";
+    case CS::ESTOP_INVALID_STATE:
+      return "CTC E-STOP: non-finite joint state feedback\nActive mode: "+mode_name+"\nPress RESET FAULT to recover.";
+    case CS::ESTOP_INVALID_COMMAND:
+      return "CTC E-STOP: non-finite torque command\nActive mode: "+mode_name+"\nPress RESET FAULT to recover.";
+    case CS::ESTOP_COMMAND_WRITE:
+      return "CTC E-STOP: hardware effort command write failed\nActive mode: "+mode_name+"\nPress RESET FAULT to recover.";
+    case CS::ESTOP_CONTROL_EXCEPTION:
+      return "CTC E-STOP: exception in real-time control update\nActive mode: "+mode_name+"\nPress RESET FAULT to recover.";
+    default:
+      return "CTC reported E-STOP\nActive mode: "+mode_name+
+        "\nCause: Controller entered emergency stop externally or without a specific safety code.\n"
+        "Press RESET FAULT to recover.";
+  }
+}
 }
 
 Supervisor::Supervisor() {
@@ -84,7 +187,8 @@ void Supervisor::clear_motion_unlocked() {
   active_key_.clear();cancel_requested_=false;
   state_.motion_phase=S::MOTION_IDLE;
 }
-void Supervisor::fault_unlocked(const std::string& reason,bool estop,Effects& effect) {
+void Supervisor::fault_unlocked(const std::string& reason,bool estop,Effects& effect,
+    uint8_t estop_reason) {
   if(!active_key_.empty()) {
     effect.cancel_active=true;effect.cancel_key=active_key_;
     cancel_requested_=true;
@@ -93,6 +197,7 @@ void Supervisor::fault_unlocked(const std::string& reason,bool estop,Effects& ef
   if(estop) {
     state_.mode=S::MODE_ESTOP;
     state_.estop_latched=true;
+    state_.estop_reason=estop_reason!=S::ESTOP_NONE?estop_reason:S::ESTOP_SUPERVISOR;
     effect.ctc_command=1;
   } else state_.mode=S::MODE_SOFT_FAULT;
   state_.sysid_phase=S::SYSID_NONE;
@@ -103,9 +208,10 @@ void Supervisor::fault_unlocked(const std::string& reason,bool estop,Effects& ef
   state_.last_error_code=-7;
   changed_unlocked(reason);
 }
-Supervisor::Effects Supervisor::observe_controller(uint8_t mode) {
+Supervisor::Effects Supervisor::observe_controller(const CS& status) {
   std::lock_guard<std::mutex> guard(mutex_);
   Effects fx;
+  const uint8_t mode=status.mode;
   if(mode<CS::MODE_NORMAL||mode>CS::MODE_COMPLIANCE_STOPPING) return fx;
   const auto previous=state_.controller_mode;
   seen_controller_=true;controller_time_=Clock::now();
@@ -122,10 +228,11 @@ Supervisor::Effects Supervisor::observe_controller(uint8_t mode) {
     return fx;
   }
   if(mode==CS::MODE_ESTOP&&state_.mode!=S::MODE_ESTOP&&state_.mode!=S::MODE_RECOVERING) {
-    fault_unlocked("CTC reports ESTOP",true,fx);
+    fault_unlocked(describe_controller_estop(status,state_.mode),true,fx,
+      map_supervisor_estop_reason(status.estop_reason));
     fx.ctc_command=-1; // already in ESTOP; do not echo a redundant command
   } else if(mode==CS::MODE_SYSID&&state_.mode!=S::MODE_SYSID) {
-    fault_unlocked("CTC entered SYS_ID without supervisor authorization",true,fx);
+    fault_unlocked("CTC entered SYS_ID without supervisor authorization",true,fx,S::ESTOP_CONTROLLER_FAULT);
   } else if(state_.mode==S::MODE_INITIALIZING&&mode==CS::MODE_NORMAL&&fresh_joint_unlocked()) {
     state_.mode=S::MODE_NORMAL;changed_unlocked("Ready");
   } else if(state_.mode==S::MODE_SYSID&&state_.sysid_phase==S::SYSID_WAIT_CONTROLLER_MODE&&
@@ -221,6 +328,7 @@ Supervisor::Effects Supervisor::watchdog() {
         state_.mode=S::MODE_NORMAL;
         state_.recovery_phase=S::RECOVERY_NONE;
         state_.estop_latched=false;
+        state_.estop_reason=S::ESTOP_NONE;
         state_.session_id=0;
         phase_deadline_=Clock::time_point{};
       }
@@ -397,7 +505,7 @@ Supervisor::Effects Supervisor::finish_motion(const std::string& key,bool succes
     if(state_.mode==S::MODE_ESTOP) {
       changed_unlocked(); // Cancellation acknowledgement must not hide the fault.
     } else if(state_.mode==S::MODE_SYSID||state_.mode==S::MODE_RECOVERING) {
-      fault_unlocked("Sequence motion failed: "+message,true,fx);
+      fault_unlocked("Sequence motion failed: "+message,true,fx,S::ESTOP_TRAJECTORY);
     } else if(state_.mode==S::MODE_NORMAL) {
       if(was_cancel_requested||code==-8) changed_unlocked("Normal motion cancelled");
       else {
@@ -415,7 +523,8 @@ Supervisor::Reply Supervisor::command(uint8_t event,uint64_t session,const std::
   switch(event) {
   case C::Request::CMD_ESTOP:
     r.accepted=true;
-    fault_unlocked("ESTOP: "+reason,true,r.effects);
+    fault_unlocked("ESTOP: "+reason,true,r.effects,
+      reason=="SOFTWARE E-STOP PRESSED"?S::ESTOP_MANUAL:S::ESTOP_SUPERVISOR);
     break;
   case C::Request::CMD_JOINT_IMPEDANCE:
   case C::Request::CMD_CARTESIAN_IMPEDANCE:

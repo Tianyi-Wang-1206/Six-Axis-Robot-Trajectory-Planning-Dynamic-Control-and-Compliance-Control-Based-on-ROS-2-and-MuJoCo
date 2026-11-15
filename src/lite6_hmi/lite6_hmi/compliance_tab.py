@@ -76,7 +76,7 @@ class ComplianceTab(QWidget):
         capture.addLayout(row)
         self.record_status = QLabel()
         capture.addWidget(self.record_status)
-        note = QLabel("Release the arm before switching modes. Higher sensitivity reduces damping and increases bounded friction assistance.\n"
+        note = QLabel("Release the arm before switching modes. Higher sensitivity reduces damping; levels 1-5 fade out Coulomb assistance near rest.\n"
                       "Static friction remains; zero-stiffness teaching does not actively hold position. Use Stop to hold.\n"
                       "Captured paths require smoothing, retiming and validation before any future playback.")
         note.setWordWrap(True)
@@ -138,7 +138,9 @@ class ComplianceTab(QWidget):
             labels = {S.MODE_JOINT_IMPEDANCE: "Joint impedance", S.MODE_CARTESIAN_IMPEDANCE: "Cartesian impedance",
                       S.MODE_TEACH: "Drag teaching", S.MODE_COMPLIANCE_SWITCHING: "Switching / stopping",
                       S.MODE_NORMAL: "NORMAL", S.MODE_ESTOP: "E-STOP"}
-            self.status.setText((f"Observed mode: {labels.get(state.mode, str(state.mode))} | {state.detail}"
+            detail_summary = state.detail.splitlines()[0] if (fresh and state.detail) else ""
+            self.status.setToolTip(state.detail if fresh else "")
+            self.status.setText((f"Observed mode: {labels.get(state.mode, str(state.mode))} | {detail_summary}"
                                  if fresh else "Waiting for fresh Supervisor / encoder feedback"))
 
     def capture_point(self):

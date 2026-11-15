@@ -140,6 +140,7 @@ class PyQtHMI(QMainWindow):
         # Build HMI Layout
         self.setup_ui()
         self._command_notice = None
+        self._estop_notice = None
 
         # Connect ROS worker signals to GUI Main Thread slots
         self.worker.telemetry_signal.connect(self.on_telemetry_updated)
@@ -149,6 +150,7 @@ class PyQtHMI(QMainWindow):
         # A GUI command can report rejection while holding the worker's state
         # lock. Always deliver the notice after that command has unwound.
         self.worker.command_error_signal.connect(self.on_command_error, Qt.QueuedConnection)
+        self.worker.estop_fault_signal.connect(self.on_estop_fault, Qt.QueuedConnection)
         self.worker.recovery_complete_signal.connect(self.on_recovery_completed)
         self.worker.gripper_signal.connect(self.on_gripper_updated)
         self._supervisor_offline_displayed = False
@@ -769,6 +771,21 @@ class PyQtHMI(QMainWindow):
         self._command_notice.setText(summary)
         self._command_notice.setDetailedText(detail)
         self._command_notice.show()
+
+    def on_estop_fault(self, message):
+        # Use a dedicated non-modal dialog so the Qt event loop and ROS
+        # watchdog continue running while clearly displaying the full cause.
+        summary, _, detail = message.partition("\n")
+        if self._estop_notice is None:
+            self._estop_notice = QMessageBox(
+                QMessageBox.Critical, "Emergency Stop (E-STOP) Triggered", "", QMessageBox.Ok, self)
+            self._estop_notice.setTextFormat(Qt.PlainText)
+            self._estop_notice.setWindowModality(Qt.NonModal)
+        self._estop_notice.setText(summary)
+        self._estop_notice.setInformativeText(detail)
+        self._estop_notice.show()
+        self._estop_notice.raise_()
+        self._estop_notice.activateWindow()
 
     def on_recovery_completed(self):
         # Reproduce the original recovery UI synchronization, but only once

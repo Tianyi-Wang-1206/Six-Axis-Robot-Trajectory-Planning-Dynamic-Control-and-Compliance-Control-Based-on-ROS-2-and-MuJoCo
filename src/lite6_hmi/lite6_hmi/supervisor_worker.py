@@ -105,6 +105,7 @@ class ROS2Worker(QThread):
     sysid_yaml_signal = pyqtSignal(str)
     sysid_preparation_signal = pyqtSignal()
     command_error_signal = pyqtSignal(str)
+    estop_fault_signal = pyqtSignal(str)
     recovery_complete_signal = pyqtSignal()
     gripper_signal = pyqtSignal(object)
 
@@ -344,6 +345,23 @@ class ROS2Worker(QThread):
             display = (self.state, self.error_msg)
             changed = display != self._last_view
             self._last_view = display
+            entered_estop = (
+                msg.mode in (SupervisorState.MODE_ESTOP, SupervisorState.MODE_FAULT)
+                and (previous is None or previous.mode not in (
+                    SupervisorState.MODE_ESTOP, SupervisorState.MODE_FAULT))
+            )
+            # Suppress the fault popup for intentional manual E-STOP presses and
+            # for trajectory failures that already report through _goal_result.
+            trajectory_reports_via_action = (
+                msg.estop_reason == SupervisorState.ESTOP_TRAJECTORY
+                and previous is not None
+                and previous.motion_phase != SupervisorState.MOTION_IDLE
+            )
+            estop_popup = None
+            if (entered_estop
+                    and msg.estop_reason != SupervisorState.ESTOP_MANUAL
+                    and not trajectory_reports_via_action):
+                estop_popup = msg.detail or "Controller entered emergency stop mode."
             if msg.mode == SupervisorState.MODE_ESTOP:
                 self._estop_requested_at = 0.0
             # After an observed, completed recovery, another independent
@@ -372,6 +390,8 @@ class ROS2Worker(QThread):
                 self.node.get_logger().info(msg.detail)
         if changed:
             self.state_signal.emit(display[0], display[1])
+        if estop_popup is not None:
+            self.estop_fault_signal.emit(estop_popup)
         self._drive_supervisor_phase(msg)
         self._drive_recovery_phase(msg)
 

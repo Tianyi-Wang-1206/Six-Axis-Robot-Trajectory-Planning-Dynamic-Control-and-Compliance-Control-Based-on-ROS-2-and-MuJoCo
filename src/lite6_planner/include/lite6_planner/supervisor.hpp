@@ -23,7 +23,7 @@ public:
   Supervisor();
   void observe_joint_state(double max_speed);
   void observe_excitation_start(const std::string& key, const builtin_interfaces::msg::Time& start);
-  Effects observe_controller(uint8_t mode);
+  Effects observe_controller(const lite6_interfaces::msg::ControllerStatus& status);
   Effects watchdog();
   State snapshot() const;
   Reply command(uint8_t event,uint64_t session,const std::string& reason);
@@ -46,7 +46,8 @@ private:
   bool fresh_controller_unlocked() const;
   bool fresh_joint_unlocked() const;
   bool can_start_motion_unlocked(uint8_t context,uint64_t session,std::string& reason) const;
-  void fault_unlocked(const std::string& reason,bool estop,Effects& effects);
+  void fault_unlocked(const std::string& reason,bool estop,Effects& effects,
+    uint8_t estop_reason=State::ESTOP_NONE);
   void clear_motion_unlocked();
   void settle_unlocked();
   void complete_sysid_unlocked();
