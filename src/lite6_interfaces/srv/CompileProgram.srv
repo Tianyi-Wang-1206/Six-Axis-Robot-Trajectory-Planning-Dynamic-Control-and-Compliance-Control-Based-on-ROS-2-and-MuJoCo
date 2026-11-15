@@ -1,0 +1,12 @@
+# Compile a Lite6Script trajectory program through the 5-stage verification pipeline.
+string source_code
+bool use_current_robot_start
+float64[6] custom_start_joints
+---
+bool success
+string program_id
+uint32 total_statements
+uint32 total_blocks
+float64 estimated_duration_sec
+uint32 total_samples_1khz
+CompileDiagnostic[] diagnostics

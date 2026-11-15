@@ -16,6 +16,7 @@
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "lite6_interfaces/msg/controller_status.hpp"
 #include "lite6_interfaces/msg/compliance_command.hpp"
+#include "lite6_interfaces/action/follow_impedance_trajectory.hpp"
 #include "realtime_tools/realtime_publisher.hpp"
 
 #include "pinocchio/multibody/model.hpp"
@@ -124,11 +125,112 @@ private:
   Eigen::VectorXd max_effort_;
   double tanh_slope_;
 
-  enum class SystemState { NORMAL, ESTOP, SYS_ID, JOINT_IMPEDANCE, CARTESIAN_IMPEDANCE, TEACH, COMPLIANCE_STOPPING };
+  enum class SystemState {
+    NORMAL,
+    ESTOP,
+    SYS_ID,
+    JOINT_IMPEDANCE,
+    CARTESIAN_IMPEDANCE,
+    TEACH,
+    COMPLIANCE_STOPPING,
+    CARTESIAN_IMPEDANCE_TRAJECTORY
+  };
   bool compliance_active() const;
+  bool impedance_trajectory_active() const;
   bool configure_compliance();
   void process_compliance_command(int32_t command, const lite6_interfaces::msg::ComplianceSettings& settings);
   void compute_compliance(double dt);
+
+  using FollowImpedance = lite6_interfaces::action::FollowImpedanceTrajectory;
+  using ImpedanceGoal = rclcpp_action::ServerGoalHandle<FollowImpedance>;
+  enum class ImpedanceTrajectoryResult {
+    RUNNING,
+    SUCCEEDED,
+    CANCELED,
+    DEACTIVATED,
+    DEVIATION_LIMIT,
+    VELOCITY_LIMIT,
+    POSITION_LIMIT,
+    SATURATION,
+    GOAL_TIMEOUT,
+    MODE_CHANGED,
+    INVALID_STATE,
+    INVALID_COMMAND,
+    COMMAND_WRITE,
+    CONTROL_EXCEPTION
+  };
+  struct ImpedanceTrajectoryExecution {
+    explicit ImpedanceTrajectoryExecution(std::shared_ptr<ImpedanceGoal> handle) : goal(std::move(handle)) {}
+    const std::shared_ptr<ImpedanceGoal> goal;
+    std::atomic<bool> cancel{false};
+    std::atomic<ImpedanceTrajectoryResult> result{ImpedanceTrajectoryResult::RUNNING};
+    std::atomic<size_t> sample{0};
+    std::array<std::atomic<double>, 3> pos_error{{0.0, 0.0, 0.0}};
+    std::array<std::atomic<double>, 3> rot_error{{0.0, 0.0, 0.0}};
+    // Control thread only fields.
+    double elapsed = 0.0;
+    int64_t start_time_ns = 0;
+    bool started = false;
+    bool endpoint_applied = false;
+    bool cancel_applied = false;
+    double settled_duration = 0.0;
+    bool was_settled = false;
+    double saturation_duration = 0.0;
+    int failure_joint = -1;
+    double failure_value = 0.0;
+    double failure_limit = 0.0;
+    std::string failure_detail;
+  };
+  bool configure_impedance_trajectory();
+  bool valid_impedance_trajectory_goal(const FollowImpedance::Goal & goal) const;
+  void update_impedance_trajectory_reference(const rclcpp::Time & time, const rclcpp::Duration & period);
+  void compute_impedance_trajectory(double dt);
+  void check_impedance_trajectory_path();
+  void finish_impedance_trajectory_cycle(double dt);
+  void fail_impedance_trajectory(ImpedanceTrajectoryResult reason, int joint = -1,
+    double value = 0.0, double limit = 0.0, const std::string & detail = "");
+  void monitor_impedance_trajectory();
+
+  ImpedanceTrajectoryExecution * current_impedance_execution_ = nullptr;
+  bool impedance_trajectory_reserved_ = false;
+  std::shared_ptr<ImpedanceTrajectoryExecution> active_impedance_trajectory_;
+  realtime_tools::RealtimeBuffer<std::shared_ptr<ImpedanceTrajectoryExecution>> impedance_trajectory_buffer_;
+  rclcpp_action::Server<FollowImpedance>::SharedPtr impedance_trajectory_server_;
+
+  pinocchio::Data pin_data_ref_;
+  Eigen::VectorXd dynamics_q_ref_;
+  Eigen::VectorXd dynamics_dq_ref_;
+  Eigen::Matrix<double, 6, Eigen::Dynamic> imp_ref_jacobian_;
+  Eigen::Matrix<double, 6, 1> q_imp_ref_ = Eigen::Matrix<double, 6, 1>::Zero();
+  Eigen::Matrix<double, 6, 1> dq_imp_ref_ = Eigen::Matrix<double, 6, 1>::Zero();
+  Eigen::Matrix<double, 6, 1> ddq_imp_ref_ = Eigen::Matrix<double, 6, 1>::Zero();
+  Eigen::Vector3d imp_kt_target_ = Eigen::Vector3d::Constant(200.0);
+  Eigen::Vector3d imp_dt_target_ = Eigen::Vector3d::Constant(25.0);
+  Eigen::Vector3d imp_kr_target_ = Eigen::Vector3d::Constant(8.0);
+  Eigen::Vector3d imp_dr_target_ = Eigen::Vector3d::Constant(1.5);
+  double imp_null_damping_target_ = 0.15;
+  Eigen::Vector3d imp_kt_filtered_ = Eigen::Vector3d::Constant(200.0);
+  Eigen::Vector3d imp_dt_filtered_ = Eigen::Vector3d::Constant(25.0);
+  Eigen::Vector3d imp_kr_filtered_ = Eigen::Vector3d::Constant(8.0);
+  Eigen::Vector3d imp_dr_filtered_ = Eigen::Vector3d::Constant(1.5);
+  double imp_null_damping_filtered_ = 0.15;
+  Eigen::Vector3d imp_current_pos_error_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d imp_current_rot_error_ = Eigen::Vector3d::Zero();
+  std::array<bool, 6> imp_effort_saturated_{};
+
+  double imp_max_trans_deviation_ = 0.12;
+  double imp_max_rot_deviation_ = 0.60;
+  double imp_max_joint_deviation_ = 0.80;
+  double imp_max_joint_velocity_ = 3.0;
+  double imp_hard_limit_tolerance_ = 0.01;
+  double imp_saturation_timeout_ = 1.0;
+  double imp_goal_trans_tolerance_ = 0.05;
+  double imp_goal_rot_tolerance_ = 0.25;
+  double imp_goal_velocity_tolerance_ = 0.01;
+  double imp_goal_settle_duration_ = 0.3;
+  double imp_goal_time_tolerance_ = 5.0;
+  double imp_entry_max_speed_ = 0.02;
+  double imp_entry_position_tolerance_ = 0.15;
   double compliance_max_joint_velocity_ = 1.5;
   double compliance_hard_limit_tolerance_ = 0.01;
   double compliance_saturation_timeout_ = 1.0;

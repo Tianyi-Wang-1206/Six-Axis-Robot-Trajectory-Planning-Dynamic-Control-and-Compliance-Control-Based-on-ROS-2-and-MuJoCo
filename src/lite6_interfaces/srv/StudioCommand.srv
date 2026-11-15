@@ -1,0 +1,17 @@
+# Industrial execution state machine event request for lite6_studio_planner.
+uint8 CMD_RUN=1
+uint8 CMD_PAUSE=2
+uint8 CMD_RESUME=3
+uint8 CMD_STEP=4
+uint8 CMD_STOP=5
+uint8 CMD_ESTOP=6
+uint8 CMD_RESET_FAULT=7
+uint8 CMD_RECOVER=8
+uint8 CMD_CLEAR_PROGRAM=9
+
+uint8 command
+string reason
+---
+bool accepted
+uint64 revision
+string message

@@ -1,0 +1,21 @@
+# Goal: 1 kHz time-varying equilibrium trajectory for Cartesian impedance tracking.
+string[] joint_names
+ImpedanceTrajectoryPoint[] points
+---
+int32 SUCCESSFUL=0
+int32 INVALID_GOAL=-1
+int32 DEVIATION_LIMIT_VIOLATED=-2
+int32 VELOCITY_LIMIT_VIOLATED=-3
+int32 POSITION_LIMIT_VIOLATED=-4
+int32 SATURATION_TIMEOUT=-5
+int32 GOAL_TIMEOUT=-6
+int32 MODE_CHANGED=-7
+int32 CONTROLLER_FAULT=-8
+
+int32 error_code
+string error_string
+---
+builtin_interfaces/Time stamp
+uint32 current_sample
+float64[3] position_error_m
+float64[3] rotation_error_rad

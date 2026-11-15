@@ -91,7 +91,9 @@ void Lite6CTCController::process_compliance_command(int32_t command,
     compliance_sequence_=current_command_sequence_;
     if(command>=3&&command<=5&&(system_state_==SystemState::NORMAL||compliance_active())&&
        !execution_stop_latched_&&(!current_execution_||
-       current_execution_->result.load()!=TrajectoryResult::RUNNING)) {
+       current_execution_->result.load()!=TrajectoryResult::RUNNING)&&
+       (!current_impedance_execution_||
+       current_impedance_execution_->result.load()!=ImpedanceTrajectoryResult::RUNNING)) {
       const auto desired=command==3?SystemState::JOINT_IMPEDANCE:
         (command==4?SystemState::CARTESIAN_IMPEDANCE:SystemState::TEACH);
       const bool entering=desired!=system_state_;

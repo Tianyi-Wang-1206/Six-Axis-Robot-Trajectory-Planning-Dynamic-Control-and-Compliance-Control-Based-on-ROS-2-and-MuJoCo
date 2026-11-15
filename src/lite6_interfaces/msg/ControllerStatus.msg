@@ -12,6 +12,7 @@ uint8 MODE_JOINT_IMPEDANCE=4
 uint8 MODE_CARTESIAN_IMPEDANCE=5
 uint8 MODE_TEACH=6
 uint8 MODE_COMPLIANCE_STOPPING=7
+uint8 MODE_CARTESIAN_IMPEDANCE_TRAJECTORY=8
 uint8 mode
 
 # Actual first control-cycle timestamp of the most recent trajectory.
@@ -34,6 +35,8 @@ uint8 ESTOP_INVALID_STATE=10
 uint8 ESTOP_INVALID_COMMAND=11
 uint8 ESTOP_COMMAND_WRITE=12
 uint8 ESTOP_CONTROL_EXCEPTION=13
+uint8 ESTOP_IMPEDANCE_TRAJECTORY_DEVIATION=14
+uint8 ESTOP_IMPEDANCE_TRAJECTORY_GOAL_TIMEOUT=15
 uint8 estop_reason
 # Zero-based joint index when applicable, or -1 if not joint-specific.
 int8 estop_joint

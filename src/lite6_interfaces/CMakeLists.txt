@@ -10,6 +10,7 @@ find_package(trajectory_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/IndustrialMotion.action"
+  "action/FollowImpedanceTrajectory.action"
   "msg/ComplianceSettings.msg"
   "msg/ComplianceCommand.msg"
   "msg/ControllerStatus.msg"
@@ -19,9 +20,14 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MousePerturbation.msg"
   "msg/SupervisorState.msg"
   "msg/MotionRejection.msg"
+  "msg/CompileDiagnostic.msg"
+  "msg/ImpedanceTrajectoryPoint.msg"
+  "msg/StudioState.msg"
   "srv/SupervisorCommand.srv"
   "srv/GripperCommand.srv"
   "srv/SubmitSysIdTrajectory.srv"
+  "srv/CompileProgram.srv"
+  "srv/StudioCommand.srv"
   DEPENDENCIES
     action_msgs
     builtin_interfaces

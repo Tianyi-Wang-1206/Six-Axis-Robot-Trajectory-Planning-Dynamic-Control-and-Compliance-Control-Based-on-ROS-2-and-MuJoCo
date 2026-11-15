@@ -73,7 +73,8 @@ void Lite6CTCController::configure_trajectory_action()
     get_node(), "~/follow_joint_trajectory",
     [this](const rclcpp_action::GoalUUID &, std::shared_ptr<const FollowTrajectory::Goal> goal) {
       std::lock_guard<std::mutex> lock(trajectory_mutex_);
-      if (!trajectory_enabled_.load() || compliance_blocks_trajectory_.load() || trajectory_reserved_ || !valid_trajectory_goal(*goal))
+      if (!trajectory_enabled_.load() || compliance_blocks_trajectory_.load() ||
+          trajectory_reserved_ || impedance_trajectory_reserved_ || !valid_trajectory_goal(*goal))
         return rclcpp_action::GoalResponse::REJECT;
       trajectory_reserved_ = true;
       return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
@@ -95,7 +96,10 @@ void Lite6CTCController::configure_trajectory_action()
       trajectory_buffer_.writeFromNonRT(active_trajectory_);
     });
   trajectory_monitor_ = get_node()->create_wall_timer(
-    std::chrono::milliseconds(20), [this] {monitor_trajectory();});
+    std::chrono::milliseconds(20), [this] {
+      monitor_trajectory();
+      monitor_impedance_trajectory();
+    });
 }
 
 void Lite6CTCController::update_trajectory_reference(
@@ -198,6 +202,15 @@ controller_interface::return_type Lite6CTCController::fail_controller(
 {
   trajectory_enabled_.store(false);
   fail_trajectory(reason, joint);
+  ImpedanceTrajectoryResult imp_reason = ImpedanceTrajectoryResult::CONTROL_EXCEPTION;
+  if (reason == TrajectoryResult::INVALID_STATE) {
+    imp_reason = ImpedanceTrajectoryResult::INVALID_STATE;
+  } else if (reason == TrajectoryResult::INVALID_COMMAND) {
+    imp_reason = ImpedanceTrajectoryResult::INVALID_COMMAND;
+  } else if (reason == TrajectoryResult::COMMAND_WRITE) {
+    imp_reason = ImpedanceTrajectoryResult::COMMAND_WRITE;
+  }
+  fail_impedance_trajectory(imp_reason, joint);
   integral_effort_.setZero();
   tau_cmd_.setZero();
   // Best effort only: an inaccessible interface cannot be made writable here.

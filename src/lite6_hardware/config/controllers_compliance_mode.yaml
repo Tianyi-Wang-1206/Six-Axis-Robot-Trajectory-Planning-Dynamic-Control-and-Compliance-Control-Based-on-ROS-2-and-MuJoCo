@@ -30,3 +30,21 @@ ctc_controller:
         assistance_levels: [0.35, 0.475, 0.60, 0.625, 0.65]         # bounded friction share [0..1]
         friction_transition_levels: [0.06, 0.06, 0.06, 0.06, 0.06]  # rad/s; tanh transition width
         quiet_speed_levels: [0.06, 0.06, 0.06, 0.06, 0.06]          # rad/s; Coulomb gate threshold
+
+    # Isolated tolerances and safety envelope for time-varying Cartesian impedance
+    # trajectory tracking (MODE_CARTESIAN_IMPEDANCE_TRAJECTORY).
+    # Rigid trajectory execution.* parameters in ros2_controllers.yaml remain untouched.
+    impedance_execution:
+      max_translation_deviation: 0.12     # m; max allowed TCP position deflection under external force
+      max_rotation_deviation: 0.60        # rad; max allowed TCP orientation deflection under external force
+      max_joint_deviation: 0.80           # rad; max allowed single-joint deflection from reference q_d(t)
+      max_joint_velocity: 3.0             # rad/s; exceeding this triggers E-STOP
+      hard_limit_tolerance: 0.01          # rad; allowance past URDF joint limits before E-STOP
+      saturation_timeout: 1.0             # s; continuous effort saturation before E-STOP
+      goal_translation_tolerance: 0.05    # m; endpoint compliant equilibrium position envelope
+      goal_rotation_tolerance: 0.25       # rad; endpoint compliant equilibrium orientation envelope
+      goal_velocity_tolerance: 0.01       # rad/s; endpoint stationary velocity requirement
+      goal_settle_duration: 0.3           # s; continuous stationary settling duration at endpoint
+      goal_time_tolerance: 5.0            # s; endpoint settling deadline allowance
+      entry_max_speed: 0.02               # rad/s; max joint speed allowed when starting impedance trajectory
+      entry_position_tolerance: 0.15      # rad; max initial joint offset |q_d(0) - q(0)| allowed on entry

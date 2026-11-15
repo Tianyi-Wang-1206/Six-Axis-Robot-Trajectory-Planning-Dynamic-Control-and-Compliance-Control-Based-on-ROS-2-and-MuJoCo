@@ -52,6 +52,20 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
   auto_declare<std::vector<double>>("compliance.teach.assistance_levels", {0.35, 0.475, 0.60, 0.625, 0.65});
   auto_declare<std::vector<double>>("compliance.teach.friction_transition_levels", {0.06, 0.06, 0.06, 0.06, 0.06});
   auto_declare<std::vector<double>>("compliance.teach.quiet_speed_levels", {0.06, 0.06, 0.06, 0.06, 0.06});
+
+  auto_declare<double>("impedance_execution.max_translation_deviation", 0.12);
+  auto_declare<double>("impedance_execution.max_rotation_deviation", 0.60);
+  auto_declare<double>("impedance_execution.max_joint_deviation", 0.80);
+  auto_declare<double>("impedance_execution.max_joint_velocity", 3.0);
+  auto_declare<double>("impedance_execution.hard_limit_tolerance", 0.01);
+  auto_declare<double>("impedance_execution.saturation_timeout", 1.0);
+  auto_declare<double>("impedance_execution.goal_translation_tolerance", 0.05);
+  auto_declare<double>("impedance_execution.goal_rotation_tolerance", 0.25);
+  auto_declare<double>("impedance_execution.goal_velocity_tolerance", 0.01);
+  auto_declare<double>("impedance_execution.goal_settle_duration", 0.3);
+  auto_declare<double>("impedance_execution.goal_time_tolerance", 5.0);
+  auto_declare<double>("impedance_execution.entry_max_speed", 0.02);
+  auto_declare<double>("impedance_execution.entry_position_tolerance", 0.15);
   
   return controller_interface::CallbackReturn::SUCCESS;
 }
@@ -91,6 +105,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   integral_effort_.setZero(n);
   q_target_.setZero(n); dq_target_.setZero(n); ddq_target_.setZero(n);
   current_execution_ = nullptr;
+  current_impedance_execution_ = nullptr;
 
   path_position_tolerance_ = get_node()->get_parameter("execution.path_position_tolerance").as_double_array();
   path_velocity_tolerance_ = get_node()->get_parameter("execution.path_velocity_tolerance").as_double_array();
@@ -232,9 +247,12 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
       }
     }
     pin_data_ = pinocchio::Data(pin_model_);
+    pin_data_ref_ = pinocchio::Data(pin_model_);
     dynamics_q_ = Eigen::VectorXd::Zero(8);
     dynamics_dq_ = Eigen::VectorXd::Zero(8);
     dynamics_ddq_ = Eigen::VectorXd::Zero(8);
+    dynamics_q_ref_ = Eigen::VectorXd::Zero(8);
+    dynamics_dq_ref_ = Eigen::VectorXd::Zero(8);
   } catch (const std::exception& e) {
     RCLCPP_ERROR(get_node()->get_logger(), "Failed to load URDF");
     return controller_interface::CallbackReturn::ERROR;
@@ -267,7 +285,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   status_publish_counter_ = 0;
   status_publish_pending_ = true;
 
-  if (!configure_compliance()) {
+  if (!configure_compliance() || !configure_impedance_trajectory()) {
     return controller_interface::CallbackReturn::ERROR;
   }
   configure_trajectory_action();
@@ -295,6 +313,9 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
     reference_interfaces_[i] = initial_pos;
     reference_interfaces_[n + i] = 0.0;
     reference_interfaces_[2 * n + i] = 0.0;
+    q_imp_ref_[i] = initial_pos;
+    dq_imp_ref_[i] = 0.0;
+    ddq_imp_ref_[i] = 0.0;
   }
   
   system_state_ = SystemState::NORMAL;
@@ -315,6 +336,10 @@ controller_interface::CallbackReturn Lite6CTCController::on_deactivate(const rcl
     auto expected = TrajectoryResult::RUNNING;
     active_trajectory_->result.compare_exchange_strong(expected, TrajectoryResult::DEACTIVATED);
   }
+  if (active_impedance_trajectory_) {
+    auto expected = ImpedanceTrajectoryResult::RUNNING;
+    active_impedance_trajectory_->result.compare_exchange_strong(expected, ImpedanceTrajectoryResult::DEACTIVATED);
+  }
   return controller_interface::CallbackReturn::SUCCESS;
 }
 
@@ -322,6 +347,7 @@ controller_interface::return_type Lite6CTCController::update(
   const rclcpp::Time & time, const rclcpp::Duration & period)
 {
   current_execution_ = trajectory_buffer_.readFromRT()->get();
+  current_impedance_execution_ = impedance_trajectory_buffer_.readFromRT()->get();
   try {
     return update_and_write_commands(time, period);
   } catch (const std::exception &) {
@@ -355,6 +381,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
     return fail_controller(TrajectoryResult::INVALID_STATE);
 
   update_trajectory_reference(time, period);
+  update_impedance_trajectory_reference(time, period);
 
   // 2. State Machine & Kinematic Deceleration Trajectory Generation
   const auto * cmd_ptr = cmd_buffer_.readFromRT();
@@ -377,6 +404,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   } else if (current_cmd == 2 && system_state_ == SystemState::NORMAL) {
       system_state_ = SystemState::SYS_ID;
   } else if (current_cmd == 0 && system_state_ != SystemState::NORMAL &&
+      !impedance_trajectory_active() &&
       (!execution_stop_latched_ || current_command_sequence_ > execution_stop_sequence_)) {
       Eigen::Map<Eigen::VectorXd> map_q_d(reference_interfaces_.data(), n);
       if ((map_q_d - q_).cwiseAbs().maxCoeff() < 0.05 &&
@@ -393,8 +421,12 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   }
 
   process_compliance_command(current_cmd, cmd_ptr->settings);
-  compliance_blocks_trajectory_.store(compliance_active()||system_state_==SystemState::COMPLIANCE_STOPPING);
+  compliance_blocks_trajectory_.store(
+    compliance_active() ||
+    system_state_ == SystemState::COMPLIANCE_STOPPING ||
+    impedance_trajectory_active());
   check_trajectory_path();
+  check_impedance_trajectory_path();
 
   Eigen::Map<Eigen::VectorXd> map_q_d(reference_interfaces_.data(), n);
   Eigen::Map<Eigen::VectorXd> map_dq_d(reference_interfaces_.data() + n, n);
@@ -402,6 +434,8 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
 
   if (system_state_ == SystemState::NORMAL || system_state_ == SystemState::SYS_ID) {
       q_target_ = map_q_d; dq_target_ = map_dq_d; ddq_target_ = map_ddq_d;
+  } else if (impedance_trajectory_active()) {
+      q_target_ = q_imp_ref_; dq_target_ = dq_imp_ref_; ddq_target_ = ddq_imp_ref_;
   } else if (compliance_active()) {
       q_target_=compliance_q_; dq_target_.setZero(); ddq_target_.setZero();
       if(system_state_==SystemState::TEACH) q_target_=q_;
@@ -438,7 +472,9 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
     return fail_controller(TrajectoryResult::INVALID_COMMAND);
 
   // 4. Branching Control Law
-  if (compliance_active()) {
+  if (impedance_trajectory_active()) {
+      compute_impedance_trajectory(dt);
+  } else if (compliance_active()) {
       compute_compliance(dt);
   } else if (system_state_ == SystemState::SYS_ID) {
       // Identification must contain neither friction nor learned bias compensation.
@@ -474,7 +510,8 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       const double raw_effort = tau_cmd_[i];
       effort_saturated_[i] = std::abs(raw_effort) > max_effort_[i];
       tau_cmd_[i] = std::clamp(raw_effort, -max_effort_[i], max_effort_[i]);
-      if (system_state_ != SystemState::SYS_ID && !compliance_active() && ki_[i] > 0.0) {
+      if (system_state_ != SystemState::SYS_ID && !compliance_active() &&
+          !impedance_trajectory_active() && ki_[i] > 0.0) {
           // During ESTOP retain the holding bias without integrating position
           // error. Back-calculation still unwinds bias if braking saturates.
           // NORMAL resumes from this state; trajectory completion never resets it.
@@ -495,6 +532,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   }
   // No success is published until this cycle's feedback and command writes pass.
   finish_trajectory_cycle(dt);
+  finish_impedance_trajectory_cycle(dt);
 
   // 6. Offer this cycle's actual reference to the display.
   if (rt_shadow_pub_->trylock()) {
@@ -517,11 +555,15 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       auto & status = rt_status_pub_->msg_;
       status.stamp = get_node()->now();
       const auto * execution = current_execution_;
+      const auto * imp_execution = current_impedance_execution_;
       status.trajectory_start = builtin_interfaces::msg::Time{};
       status.trajectory_id.fill(0);
       if (execution && execution->started) {
         status.trajectory_start = rclcpp::Time(execution->start_time_ns);
         status.trajectory_id = execution->goal->get_goal_id();
+      } else if (imp_execution && imp_execution->started) {
+        status.trajectory_start = rclcpp::Time(imp_execution->start_time_ns);
+        status.trajectory_id = imp_execution->goal->get_goal_id();
       }
       switch (system_state_) {
         case SystemState::NORMAL:
@@ -538,6 +580,8 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
           status.mode = lite6_interfaces::msg::ControllerStatus::MODE_TEACH; break;
         case SystemState::COMPLIANCE_STOPPING:
           status.mode = lite6_interfaces::msg::ControllerStatus::MODE_COMPLIANCE_STOPPING; break;
+        case SystemState::CARTESIAN_IMPEDANCE_TRAJECTORY:
+          status.mode = lite6_interfaces::msg::ControllerStatus::MODE_CARTESIAN_IMPEDANCE_TRAJECTORY; break;
         case SystemState::SYS_ID:
           status.mode = lite6_interfaces::msg::ControllerStatus::MODE_SYSID;
           break;
