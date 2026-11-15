@@ -37,6 +37,21 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
   auto_declare<double>("execution.goal_settle_duration", 0.3);
   auto_declare<double>("execution.goal_time_tolerance", 5.0);
   auto_declare<double>("execution.saturation_timeout", 1.0);
+
+  auto_declare<double>("compliance.max_joint_velocity", 1.5);
+  auto_declare<double>("compliance.hard_limit_tolerance", 0.01);
+  auto_declare<double>("compliance.saturation_timeout", 1.0);
+  auto_declare<double>("compliance.entry_max_speed", 0.01);
+  auto_declare<double>("compliance.filter_time_constant", 0.15);
+  auto_declare<double>("compliance.cartesian_null_damping", 0.15);
+  auto_declare<double>("compliance.soft_limit_margin", 0.15);
+  auto_declare<double>("compliance.soft_limit_stiffness", 80.0);
+  auto_declare<double>("compliance.soft_limit_damping", 5.0);
+  auto_declare<double>("compliance.torque_slew_rate", 100.0);
+  auto_declare<std::vector<double>>("compliance.teach.damping_levels", {4.0, 3.25, 2.5, 2.25, 2.0});
+  auto_declare<std::vector<double>>("compliance.teach.assistance_levels", {0.35, 0.475, 0.60, 0.625, 0.65});
+  auto_declare<std::vector<double>>("compliance.teach.friction_transition_levels", {0.06, 0.06, 0.06, 0.06, 0.06});
+  auto_declare<std::vector<double>>("compliance.teach.quiet_speed_levels", {0.06, 0.06, 0.06, 0.06, 0.06});
   
   return controller_interface::CallbackReturn::SUCCESS;
 }
@@ -252,7 +267,9 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   status_publish_counter_ = 0;
   status_publish_pending_ = true;
 
-  configure_compliance();
+  if (!configure_compliance()) {
+    return controller_interface::CallbackReturn::ERROR;
+  }
   configure_trajectory_action();
   return controller_interface::CallbackReturn::SUCCESS;
 }

@@ -126,9 +126,23 @@ private:
 
   enum class SystemState { NORMAL, ESTOP, SYS_ID, JOINT_IMPEDANCE, CARTESIAN_IMPEDANCE, TEACH, COMPLIANCE_STOPPING };
   bool compliance_active() const;
-  void configure_compliance();
+  bool configure_compliance();
   void process_compliance_command(int32_t command, const lite6_interfaces::msg::ComplianceSettings& settings);
   void compute_compliance(double dt);
+  double compliance_max_joint_velocity_ = 1.5;
+  double compliance_hard_limit_tolerance_ = 0.01;
+  double compliance_saturation_timeout_ = 1.0;
+  double compliance_entry_max_speed_ = 0.01;
+  double compliance_filter_time_constant_ = 0.15;
+  double compliance_cartesian_null_damping_ = 0.15;
+  double compliance_soft_limit_margin_ = 0.15;
+  double compliance_soft_limit_stiffness_ = 80.0;
+  double compliance_soft_limit_damping_ = 5.0;
+  double compliance_torque_slew_rate_ = 100.0;
+  std::array<double, 5> teach_damping_levels_{4.0, 3.25, 2.5, 2.25, 2.0};
+  std::array<double, 5> teach_assistance_levels_{0.35, 0.475, 0.60, 0.625, 0.65};
+  std::array<double, 5> teach_friction_transition_levels_{0.06, 0.06, 0.06, 0.06, 0.06};
+  std::array<double, 5> teach_quiet_speed_levels_{0.06, 0.06, 0.06, 0.06, 0.06};
   lite6_interfaces::msg::ComplianceSettings compliance_settings_, compliance_filtered_;
   Eigen::Matrix<double,6,1> compliance_q_=Eigen::Matrix<double,6,1>::Zero();
   Eigen::Matrix<double,6,1> compliance_last_tau_=Eigen::Matrix<double,6,1>::Zero();

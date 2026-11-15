@@ -1,0 +1,32 @@
+# Compliance and Drag Teaching Controller Configuration
+# Loaded alongside ros2_controllers.yaml for ctc_controller.
+
+ctc_controller:
+  ros__parameters:
+    compliance:
+      # Safety limits active during all three compliance modes
+      # (JOINT_IMPEDANCE, CARTESIAN_IMPEDANCE, and TEACH).
+      max_joint_velocity: 1.5         # rad/s; exceeding this triggers E-STOP
+      hard_limit_tolerance: 0.01      # rad; numerical allowance past URDF limits before E-STOP
+      saturation_timeout: 1.0         # s; continuous effort saturation before E-STOP
+      entry_max_speed: 0.01           # rad/s; max joint speed allowed when entering compliance
+
+      # Gain smoothing and Cartesian null-space damping
+      filter_time_constant: 0.15      # s; exponential smoothing time constant for mode gains
+      cartesian_null_damping: 0.15    # Nm s/rad; joint-space damping in Cartesian impedance
+
+      # Soft joint-limit wall inside mechanical travel limits
+      soft_limit_margin: 0.15         # rad; distance inward from joint limits where wall starts
+      soft_limit_stiffness: 80.0      # Nm/rad; soft wall spring gain
+      soft_limit_damping: 5.0         # Nm s/rad; one-sided soft wall damping
+
+      # Output torque rate limiting during compliance modes
+      torque_slew_rate: 100.0         # Nm/s; maximum commanded torque rate of change
+
+      # Drag teaching sensitivity profiles for levels 1 (firm) through 5 (light).
+      # Intermediate sensitivity values are interpolated piecewise-linearly.
+      teach:
+        damping_levels: [4.0, 3.25, 2.5, 2.25, 2.0]                 # Nm s/rad
+        assistance_levels: [0.35, 0.475, 0.60, 0.625, 0.65]         # bounded friction share [0..1]
+        friction_transition_levels: [0.06, 0.06, 0.06, 0.06, 0.06]  # rad/s; tanh transition width
+        quiet_speed_levels: [0.06, 0.06, 0.06, 0.06, 0.06]          # rad/s; Coulomb gate threshold

@@ -7,15 +7,73 @@
 #include <cmath>
 
 namespace lite6_controllers {
+namespace {
+double interpolate_teach_level(const std::array<double, 5>& levels, double sensitivity) {
+  const double pos=std::clamp(sensitivity,1.0,5.0)-1.0;
+  const size_t idx=std::min<size_t>(3,static_cast<size_t>(std::floor(pos)));
+  const double frac=pos-static_cast<double>(idx);
+  return levels[idx]+frac*(levels[idx+1]-levels[idx]);
+}
+
+bool load_teach_levels(const rclcpp_lifecycle::LifecycleNode::SharedPtr& node,
+    const std::string& name,double min_val,bool strict_positive,double max_val,
+    std::array<double,5>& out) {
+  const auto values=node->get_parameter(name).as_double_array();
+  if(values.size()!=5) {
+    RCLCPP_ERROR(node->get_logger(),"%s must contain exactly five values (levels 1..5)",name.c_str());
+    return false;
+  }
+  for(size_t i=0;i<5;++i) {
+    const bool ok=std::isfinite(values[i])&&
+      (strict_positive?values[i]>min_val:values[i]>=min_val)&&values[i]<=max_val;
+    if(!ok) {
+      RCLCPP_ERROR(node->get_logger(),"%s[%zu] out of valid range",name.c_str(),i);
+      return false;
+    }
+    out[i]=values[i];
+  }
+  return true;
+}
+}  // namespace
+
 bool Lite6CTCController::compliance_active() const {
   return system_state_==SystemState::JOINT_IMPEDANCE||
     system_state_==SystemState::CARTESIAN_IMPEDANCE||system_state_==SystemState::TEACH;
 }
-void Lite6CTCController::configure_compliance() {
+bool Lite6CTCController::configure_compliance() {
+  const auto node=get_node();
+  compliance_max_joint_velocity_=node->get_parameter("compliance.max_joint_velocity").as_double();
+  compliance_hard_limit_tolerance_=node->get_parameter("compliance.hard_limit_tolerance").as_double();
+  compliance_saturation_timeout_=node->get_parameter("compliance.saturation_timeout").as_double();
+  compliance_entry_max_speed_=node->get_parameter("compliance.entry_max_speed").as_double();
+  compliance_filter_time_constant_=node->get_parameter("compliance.filter_time_constant").as_double();
+  compliance_cartesian_null_damping_=node->get_parameter("compliance.cartesian_null_damping").as_double();
+  compliance_soft_limit_margin_=node->get_parameter("compliance.soft_limit_margin").as_double();
+  compliance_soft_limit_stiffness_=node->get_parameter("compliance.soft_limit_stiffness").as_double();
+  compliance_soft_limit_damping_=node->get_parameter("compliance.soft_limit_damping").as_double();
+  compliance_torque_slew_rate_=node->get_parameter("compliance.torque_slew_rate").as_double();
+
+  auto positive=[](double v){return std::isfinite(v)&&v>0.0;};
+  auto nonneg=[](double v){return std::isfinite(v)&&v>=0.0;};
+  if(!positive(compliance_max_joint_velocity_)||!nonneg(compliance_hard_limit_tolerance_)||
+     !positive(compliance_saturation_timeout_)||!positive(compliance_entry_max_speed_)||
+     !positive(compliance_filter_time_constant_)||!nonneg(compliance_cartesian_null_damping_)||
+     !nonneg(compliance_soft_limit_margin_)||!nonneg(compliance_soft_limit_stiffness_)||
+     !nonneg(compliance_soft_limit_damping_)||!positive(compliance_torque_slew_rate_)) {
+    RCLCPP_ERROR(node->get_logger(),"Invalid compliance safety or control parameter");
+    return false;
+  }
+  if(!load_teach_levels(node,"compliance.teach.damping_levels",0.0,false,100.0,teach_damping_levels_)||
+     !load_teach_levels(node,"compliance.teach.assistance_levels",0.0,false,1.0,teach_assistance_levels_)||
+     !load_teach_levels(node,"compliance.teach.friction_transition_levels",0.0,true,10.0,teach_friction_transition_levels_)||
+     !load_teach_levels(node,"compliance.teach.quiet_speed_levels",0.0,false,10.0,teach_quiet_speed_levels_)) {
+    return false;
+  }
+
   compliance_frame_=pin_model_.getFrameId("link_eef");
   if(compliance_frame_>=static_cast<pinocchio::FrameIndex>(pin_model_.nframes)) throw std::runtime_error("Missing compliance TCP frame");
   compliance_jacobian_.setZero(6,pin_model_.nv);
-  compliance_sub_=get_node()->create_subscription<lite6_interfaces::msg::ComplianceCommand>(
+  compliance_sub_=node->create_subscription<lite6_interfaces::msg::ComplianceCommand>(
     "~/compliance_cmd",rclcpp::QoS(10),
     [this](const lite6_interfaces::msg::ComplianceCommand::SharedPtr msg) {
       if(msg->command<3||msg->command>5||!lite6_interfaces::valid_compliance_settings(msg->settings)) return;
@@ -23,6 +81,7 @@ void Lite6CTCController::configure_compliance() {
       command.settings=msg->settings;
       cmd_buffer_.writeFromNonRT(command);
     });
+  return true;
 }
 void Lite6CTCController::process_compliance_command(int32_t command,
     const lite6_interfaces::msg::ComplianceSettings& settings) {
@@ -36,7 +95,7 @@ void Lite6CTCController::process_compliance_command(int32_t command,
       const auto desired=command==3?SystemState::JOINT_IMPEDANCE:
         (command==4?SystemState::CARTESIAN_IMPEDANCE:SystemState::TEACH);
       const bool entering=desired!=system_state_;
-      if(entering&&dq_.cwiseAbs().maxCoeff()>=0.01) return;
+      if(entering&&dq_.cwiseAbs().maxCoeff()>=compliance_entry_max_speed_) return;
       compliance_settings_=settings;
       if(entering||settings.recapture) {
         compliance_q_=q_;
@@ -71,16 +130,16 @@ void Lite6CTCController::process_compliance_command(int32_t command,
   if(compliance_active()) {
     using CS=lite6_interfaces::msg::ControllerStatus;
     for(int i=0;i<6;++i) {
-      if(q_[i]<pin_model_.lowerPositionLimit[i]-0.01) {
+      if(q_[i]<pin_model_.lowerPositionLimit[i]-compliance_hard_limit_tolerance_) {
         latch_estop_reason(CS::ESTOP_COMPLIANCE_POSITION_LIMIT,i,q_[i],pin_model_.lowerPositionLimit[i]);
         request_execution_stop();break;
       }
-      if(q_[i]>pin_model_.upperPositionLimit[i]+0.01) {
+      if(q_[i]>pin_model_.upperPositionLimit[i]+compliance_hard_limit_tolerance_) {
         latch_estop_reason(CS::ESTOP_COMPLIANCE_POSITION_LIMIT,i,q_[i],pin_model_.upperPositionLimit[i]);
         request_execution_stop();break;
       }
-      if(std::abs(dq_[i])>1.5) {
-        latch_estop_reason(CS::ESTOP_COMPLIANCE_VELOCITY_LIMIT,i,dq_[i],1.5);
+      if(std::abs(dq_[i])>compliance_max_joint_velocity_) {
+        latch_estop_reason(CS::ESTOP_COMPLIANCE_VELOCITY_LIMIT,i,dq_[i],compliance_max_joint_velocity_);
         request_execution_stop();break;
       }
     }
@@ -89,7 +148,7 @@ void Lite6CTCController::process_compliance_command(int32_t command,
 void Lite6CTCController::compute_compliance(double dt) {
   // Only encoder position/velocity and model gravity are used. No effort state,
   // MuJoCo contact force, applied force, or hidden friction state enters here.
-  const double alpha=1.0-std::exp(-dt/0.15);
+  const double alpha=1.0-std::exp(-dt/compliance_filter_time_constant_);
   auto smooth=[alpha](double& value,double target){value+=alpha*(target-value);};
   auto& s=compliance_filtered_;
   smooth(s.joint_stiffness,compliance_settings_.joint_stiffness);
@@ -118,24 +177,24 @@ void Lite6CTCController::compute_compliance(double dt) {
     wrench.tail<3>()=s.rotation_stiffness*error.tail<3>()-s.rotation_damping*velocity.tail<3>();
     tau_cmd_.noalias()+=compliance_jacobian_.leftCols(6).transpose()*wrench;
     // Small joint damping also damps task-null directions near singularities.
-    tau_cmd_-=0.15*dq_;
+    tau_cmd_-=compliance_cartesian_null_damping_*dq_;
   } else {
-    // Keep damping and friction assistance conservative across sensitivity
-    // levels 1..5, and fade out Coulomb assistance near rest everywhere so
-    // low-speed bristle dynamics cannot self-excite jitter at any level.
-    const double light=(std::min(s.sensitivity,3.0)-1.0)/4.0;
-    const double high=std::clamp((s.sensitivity-3.0)/2.0,0.0,1.0);
-    const double damping=4.0-3.0*light-0.5*high;
-    const double assistance=0.35+0.5*light+0.05*high;
-    const double friction_transition=0.06;
-    const double quiet_speed=0.06;
+    // Interpolate configured sensitivity 1..5 profiles and fade out Coulomb
+    // assistance near rest so low-speed bristle dynamics stay quiet.
+    const double damping=interpolate_teach_level(teach_damping_levels_,s.sensitivity);
+    const double assistance=interpolate_teach_level(teach_assistance_levels_,s.sensitivity);
+    const double friction_transition=interpolate_teach_level(teach_friction_transition_levels_,s.sensitivity);
+    const double quiet_speed=interpolate_teach_level(teach_quiet_speed_levels_,s.sensitivity);
     for(int i=0;i<6;++i) {
       // Deliberately bounded below full compensation. At rest there is no
       // guessed force direction; the user still overcomes static friction.
       // Fade out Coulomb assistance near rest while preserving viscous
       // compensation and positive damping across all sensitivity levels.
-      const double ramp=std::clamp((std::abs(dq_[i])-quiet_speed)/quiet_speed,0.0,1.0);
-      const double coulomb_gate=ramp*ramp*(3.0-2.0*ramp);
+      double coulomb_gate=1.0;
+      if(quiet_speed>0.0) {
+        const double ramp=std::clamp((std::abs(dq_[i])-quiet_speed)/quiet_speed,0.0,1.0);
+        coulomb_gate=ramp*ramp*(3.0-2.0*ramp);
+      }
       tau_cmd_[i]+=-damping*dq_[i]+assistance*(friction_v_[i]*dq_[i]+
         coulomb_gate*friction_c_[i]*std::tanh(dq_[i]/friction_transition));
     }
@@ -145,26 +204,27 @@ void Lite6CTCController::compute_compliance(double dt) {
   for(int i=0;i<6;++i) {
     // Preserve an equilibrium captured inside the margin (home is on joint3's
     // lower boundary). Do not push the arm simply because a mode was entered.
-    // Hard-limit checks tolerate 0.01 rad for solver compliance/encoder noise.
-    const double lo=std::min(pin_model_.lowerPositionLimit[i]+0.15,compliance_q_[i]);
-    const double hi=std::max(pin_model_.upperPositionLimit[i]-0.15,compliance_q_[i]);
-    if(q_[i]<lo) tau_cmd_[i]+=80.0*(lo-q_[i])-5.0*std::min(0.0,dq_[i]);
-    if(q_[i]>hi) tau_cmd_[i]-=80.0*(q_[i]-hi)+5.0*std::max(0.0,dq_[i]);
+    // Hard-limit checks tolerate the configured allowance for solver/encoder noise.
+    const double lo=std::min(pin_model_.lowerPositionLimit[i]+compliance_soft_limit_margin_,compliance_q_[i]);
+    const double hi=std::max(pin_model_.upperPositionLimit[i]-compliance_soft_limit_margin_,compliance_q_[i]);
+    if(q_[i]<lo) tau_cmd_[i]+=compliance_soft_limit_stiffness_*(lo-q_[i])-compliance_soft_limit_damping_*std::min(0.0,dq_[i]);
+    if(q_[i]>hi) tau_cmd_[i]-=compliance_soft_limit_stiffness_*(q_[i]-hi)+compliance_soft_limit_damping_*std::max(0.0,dq_[i]);
     if(std::abs(tau_cmd_[i])>max_effort_[i]) {
       saturated=true;
       if(saturated_joint<0) saturated_joint=i;
     }
-    tau_cmd_[i]=std::clamp(tau_cmd_[i],compliance_last_tau_[i]-100.0*dt,
-      compliance_last_tau_[i]+100.0*dt);
+    const double max_step=compliance_torque_slew_rate_*dt;
+    tau_cmd_[i]=std::clamp(tau_cmd_[i],compliance_last_tau_[i]-max_step,
+      compliance_last_tau_[i]+max_step);
     compliance_last_tau_[i]=std::clamp(tau_cmd_[i],-max_effort_[i],max_effort_[i]);
   }
   compliance_saturation_time_=saturated?compliance_saturation_time_+dt:0.0;
   // Apply braking on the next cycle, so this cycle retains force-mode semantics.
-  if(compliance_saturation_time_>saturation_timeout_) {
+  if(compliance_saturation_time_>compliance_saturation_timeout_) {
     compliance_saturation_estop_pending_=true;
     pending_estop_joint_=static_cast<int8_t>(saturated_joint);
     pending_estop_value_=compliance_saturation_time_;
-    pending_estop_limit_=saturation_timeout_;
+    pending_estop_limit_=compliance_saturation_timeout_;
     emergency_pending_.store(true);
   }
 }

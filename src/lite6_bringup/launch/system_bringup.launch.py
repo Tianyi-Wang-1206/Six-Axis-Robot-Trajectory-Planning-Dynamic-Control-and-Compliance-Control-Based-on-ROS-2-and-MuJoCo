@@ -17,12 +17,15 @@ def generate_launch_description():
         robot_desc = infp.read()
     
     controller_config = os.path.join(hw_pkg, 'config', 'ros2_controllers.yaml')
+    compliance_controller_config = os.path.join(
+        hw_pkg, 'config', 'controllers_compliance_mode.yaml'
+    )
 
     # Core nodes for the robot system bringup
     control_node = Node(
         package="controller_manager", 
         executable="ros2_control_node", 
-        parameters=[{'robot_description': robot_desc}, controller_config], 
+        parameters=[{'robot_description': robot_desc}, controller_config, compliance_controller_config], 
         output="screen"
     )
     
