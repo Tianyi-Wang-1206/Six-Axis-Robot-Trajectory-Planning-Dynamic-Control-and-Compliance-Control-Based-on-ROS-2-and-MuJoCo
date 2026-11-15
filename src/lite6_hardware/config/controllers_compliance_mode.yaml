@@ -6,7 +6,7 @@ ctc_controller:
     compliance:
       # Safety limits active during all three compliance modes
       # (JOINT_IMPEDANCE, CARTESIAN_IMPEDANCE, and TEACH).
-      max_joint_velocity: 1.5         # rad/s; exceeding this triggers E-STOP
+      max_joint_velocity: 3.0         # rad/s; exceeding this triggers E-STOP
       hard_limit_tolerance: 0.01      # rad; numerical allowance past URDF limits before E-STOP
       saturation_timeout: 1.0         # s; continuous effort saturation before E-STOP
       entry_max_speed: 0.01           # rad/s; max joint speed allowed when entering compliance
