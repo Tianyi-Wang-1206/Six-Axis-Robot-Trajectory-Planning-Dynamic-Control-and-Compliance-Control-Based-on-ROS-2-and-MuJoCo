@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import QPlainTextEdit, QTextEdit, QWidget
 
 
 class Lite6ScriptHighlighter(QSyntaxHighlighter):
-    """Syntax highlighter for Lite6Script motion programming DSL."""
+    """Syntax highlighter for Lite6Script motion programming DSL (light theme)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -29,11 +29,13 @@ class Lite6ScriptHighlighter(QSyntaxHighlighter):
                 f.setFontItalic(True)
             return f
 
-        decl_fmt = fmt("#c678dd", bold=True)
+        # Declarations (joint, pose)
+        decl_fmt = fmt("#7C3AED", bold=True)
         for kw in ("joint", "pose"):
             self._rules.append((QRegularExpression(rf"\b{kw}\b"), decl_fmt))
 
-        cmd_fmt = fmt("#61afef", bold=True)
+        # Motion & structured control statements
+        cmd_fmt = fmt("#0369A1", bold=True)
         for kw in (
             "MoveJ",
             "MoveP",
@@ -48,7 +50,8 @@ class Lite6ScriptHighlighter(QSyntaxHighlighter):
         ):
             self._rules.append((QRegularExpression(rf"\b{kw}\b"), cmd_fmt))
 
-        param_fmt = fmt("#e5c07b")
+        # Parameter names
+        param_fmt = fmt("#9A3412")
         for kw in (
             "vel",
             "acc",
@@ -80,7 +83,8 @@ class Lite6ScriptHighlighter(QSyntaxHighlighter):
         ):
             self._rules.append((QRegularExpression(rf"\b{kw}\b"), param_fmt))
 
-        enum_fmt = fmt("#56b6c2", bold=True)
+        # Enum constants, units, and booleans
+        enum_fmt = fmt("#0F766E", bold=True)
         for kw in (
             "JOINT",
             "CARTESIAN",
@@ -94,12 +98,14 @@ class Lite6ScriptHighlighter(QSyntaxHighlighter):
         ):
             self._rules.append((QRegularExpression(rf"\b{kw}\b"), enum_fmt))
 
-        num_fmt = fmt("#d19a66")
+        # Numeric literals
+        num_fmt = fmt("#047857")
         self._rules.append(
             (QRegularExpression(r"(?<![A-Za-z0-9_])[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"), num_fmt)
         )
 
-        comment_fmt = fmt("#7f848e", italic=True)
+        # Comments
+        comment_fmt = fmt("#64748B", italic=True)
         self._comment_rule = (QRegularExpression(r"#[^\n]*"), comment_fmt)
 
     def highlightBlock(self, text):
@@ -108,7 +114,7 @@ class Lite6ScriptHighlighter(QSyntaxHighlighter):
             while it.hasNext():
                 m = it.next()
                 self.setFormat(m.capturedStart(), m.capturedLength(), char_fmt)
-        # Apply comments last so words/numbers inside comments stay dimmed
+        # Apply comments last so tokens inside comments stay muted
         it = self._comment_rule[0].globalMatch(text)
         while it.hasNext():
             m = it.next()
@@ -134,11 +140,21 @@ class CodeEditor(QPlainTextEdit):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        font = QFont("JetBrains Mono, Ubuntu Mono, Consolas, Monospace", 10)
-        font.setStyleHint(QFont.Monospace)
+        font = QFont("Noto Sans Mono", 10)
+        font.setStyleHint(QFont.TypeWriter)
         self.setFont(font)
         self.setTabStopDistance(self.fontMetrics().horizontalAdvance(" ") * 2)
         self.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.setStyleSheet(
+            "QPlainTextEdit {"
+            "  background-color: #FFFFFF;"
+            "  color: #0F172A;"
+            "  border: 1px solid #DDE3EC;"
+            "  border-radius: 6px;"
+            "  selection-background-color: #DBEAFE;"
+            "  selection-color: #1E3A8A;"
+            "}"
+        )
 
         self._highlighter = Lite6ScriptHighlighter(self.document())
         self._line_area = _LineNumberArea(self)
@@ -155,7 +171,7 @@ class CodeEditor(QPlainTextEdit):
 
     def line_number_area_width(self):
         digits = max(3, len(str(max(1, self.blockCount()))))
-        return 22 + self.fontMetrics().horizontalAdvance("9") * digits
+        return 26 + self.fontMetrics().horizontalAdvance("9") * digits
 
     def _update_line_number_area_width(self, _):
         self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
@@ -177,7 +193,12 @@ class CodeEditor(QPlainTextEdit):
 
     def paint_line_number_area(self, event):
         painter = QPainter(self._line_area)
-        painter.fillRect(event.rect(), QColor("#1f2430"))
+        painter.fillRect(event.rect(), QColor("#F8FAFC"))
+
+        # Clean 1px separator between gutter and white editor surface
+        sep_x = self._line_area.width() - 1
+        painter.setPen(QColor("#E2E8F0"))
+        painter.drawLine(sep_x, event.rect().top(), sep_x, event.rect().bottom())
 
         block = self.firstVisibleBlock()
         block_number = block.blockNumber()
@@ -189,24 +210,24 @@ class CodeEditor(QPlainTextEdit):
             if block.isVisible() and bottom >= event.rect().top():
                 ln = block_number + 1
                 if ln in self._error_lines:
-                    painter.fillRect(2, top + 3, 5, max(4, line_h - 6), QColor("#e06c75"))
+                    painter.fillRect(2, top + 3, 4, max(4, line_h - 6), QColor("#DC2626"))
                 elif ln in self._warning_lines:
-                    painter.fillRect(2, top + 3, 5, max(4, line_h - 6), QColor("#e5c07b"))
+                    painter.fillRect(2, top + 3, 4, max(4, line_h - 6), QColor("#D97706"))
                 if ln == self._active_line:
-                    painter.fillRect(9, top + 4, 5, max(4, line_h - 8), QColor("#4ec9b0"))
+                    painter.fillRect(8, top + 3, 4, max(4, line_h - 6), QColor("#0284C7"))
 
                 num_color = (
-                    QColor("#e06c75")
+                    QColor("#DC2626")
                     if ln in self._error_lines
-                    else QColor("#4ec9b0")
+                    else QColor("#0284C7")
                     if ln == self._active_line
-                    else QColor("#6b7280")
+                    else QColor("#94A3B8")
                 )
                 painter.setPen(num_color)
                 painter.drawText(
                     0,
                     top,
-                    self._line_area.width() - 6,
+                    self._line_area.width() - 8,
                     line_h,
                     Qt.AlignRight | Qt.AlignVCenter,
                     str(ln),
@@ -260,27 +281,26 @@ class CodeEditor(QPlainTextEdit):
 
     def _refresh_extra_selections(self):
         selections = []
-        # Subtle current cursor line
         if not self.isReadOnly():
             sel = QTextEdit.ExtraSelection()
-            sel.format.setBackground(QColor("#242a37"))
+            sel.format.setBackground(QColor("#F1F5F9"))
             sel.format.setProperty(QTextFormat.FullWidthSelection, True)
             sel.cursor = self.textCursor()
             sel.cursor.clearSelection()
             selections.append(sel)
 
         for ln in sorted(self._warning_lines):
-            s = self._line_selection(ln, QColor(229, 192, 123, 32))
+            s = self._line_selection(ln, QColor(245, 158, 11, 30))
             if s is not None:
                 selections.append(s)
 
         for ln in sorted(self._error_lines):
-            s = self._line_selection(ln, QColor(224, 108, 117, 45))
+            s = self._line_selection(ln, QColor(239, 68, 68, 34))
             if s is not None:
                 selections.append(s)
 
         if self._active_line > 0:
-            s = self._line_selection(self._active_line, QColor(78, 201, 176, 42))
+            s = self._line_selection(self._active_line, QColor(14, 165, 233, 36))
             if s is not None:
                 selections.append(s)
 

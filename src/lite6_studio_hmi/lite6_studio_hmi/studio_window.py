@@ -1,4 +1,4 @@
-"""Main PyQt5 IDE & Execution Monitoring Window for Lite6 Studio."""
+"""Main PyQt5 IDE & Execution Monitoring Window for Lite6 Studio (Light Theme)."""
 
 from datetime import datetime
 import math
@@ -13,7 +13,6 @@ from PyQt5.QtWidgets import (
     QFileDialog,
     QFrame,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -23,6 +22,7 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -36,17 +36,20 @@ from lite6_interfaces.srv import GripperCommand, StudioCommand
 from lite6_studio_hmi.code_editor import CodeEditor
 from lite6_studio_hmi.dsl_examples import PRESET_PROGRAMS
 
+_UI_FONT_FAMILY = "Noto Sans"
+_MONO_FONT_FAMILY = "Noto Sans Mono"
+
 _STATE_META = {
-    StudioState.STATE_BOOT_INIT: ("BOOT INIT", "#4b5563", "#ffffff"),
-    StudioState.STATE_IDLE: ("IDLE", "#334155", "#f8fafc"),
-    StudioState.STATE_COMPILED_READY: ("COMPILED READY", "#0284c7", "#ffffff"),
-    StudioState.STATE_RUNNING: ("RUNNING", "#16a34a", "#ffffff"),
-    StudioState.STATE_PAUSED: ("PAUSED", "#d97706", "#ffffff"),
-    StudioState.STATE_STEPPING: ("STEPPING", "#0d9488", "#ffffff"),
-    StudioState.STATE_STOPPING: ("STOPPING", "#b45309", "#ffffff"),
-    StudioState.STATE_ESTOP: ("E-STOP", "#dc2626", "#ffffff"),
-    StudioState.STATE_FAULT: ("FAULT", "#991b1b", "#ffffff"),
-    StudioState.STATE_RECOVERING: ("RECOVERING", "#7c3aed", "#ffffff"),
+    StudioState.STATE_BOOT_INIT: ("BOOT INIT", "#64748B", "#FFFFFF"),
+    StudioState.STATE_IDLE: ("IDLE", "#475569", "#FFFFFF"),
+    StudioState.STATE_COMPILED_READY: ("COMPILED READY", "#0284C7", "#FFFFFF"),
+    StudioState.STATE_RUNNING: ("RUNNING", "#16A34A", "#FFFFFF"),
+    StudioState.STATE_PAUSED: ("PAUSED", "#D97706", "#FFFFFF"),
+    StudioState.STATE_STEPPING: ("STEPPING", "#0D9488", "#FFFFFF"),
+    StudioState.STATE_STOPPING: ("STOPPING", "#C2410C", "#FFFFFF"),
+    StudioState.STATE_ESTOP: ("E-STOP", "#DC2626", "#FFFFFF"),
+    StudioState.STATE_FAULT: ("FAULT", "#B91C1C", "#FFFFFF"),
+    StudioState.STATE_RECOVERING: ("RECOVERING", "#7C3AED", "#FFFFFF"),
 }
 
 _CTRL_MODE_NAMES = {
@@ -81,14 +84,14 @@ _ESTOP_REASON_NAMES = {
 }
 
 _GRIPPER_STATE_NAMES = {
-    GripperState.BLOCKED: ("BLOCKED", "#991b1b"),
-    GripperState.STOPPED: ("STOPPED", "#475569"),
-    GripperState.OPENING: ("OPENING", "#0284c7"),
-    GripperState.CLOSING: ("CLOSING", "#0284c7"),
-    GripperState.OPEN: ("OPEN", "#16a34a"),
-    GripperState.CLOSED: ("CLOSED", "#0f766e"),
+    GripperState.BLOCKED: ("BLOCKED", "#991B1B"),
+    GripperState.STOPPED: ("STOPPED", "#64748B"),
+    GripperState.OPENING: ("OPENING", "#0284C7"),
+    GripperState.CLOSING: ("CLOSING", "#0284C7"),
+    GripperState.OPEN: ("OPEN", "#16A34A"),
+    GripperState.CLOSED: ("CLOSED", "#0F766E"),
     GripperState.GRASPED: ("GRASPED", "#059669"),
-    GripperState.FAULT: ("FAULT", "#dc2626"),
+    GripperState.FAULT: ("FAULT", "#DC2626"),
 }
 
 _DIAG_STAGE_NAMES = {
@@ -101,99 +104,233 @@ _DIAG_STAGE_NAMES = {
 
 _STYLESHEET = """
 QMainWindow, QWidget#StudioRoot {
-    background-color: #11161f;
-    color: #e2e8f0;
-    font-family: "Segoe UI", "Ubuntu", "Noto Sans", sans-serif;
-    font-size: 9.5pt;
+    background-color: #F3F5F8;
+    color: #0F172A;
+    font-family: "Noto Sans", "Liberation Sans", sans-serif;
+    font-size: 10pt;
 }
-QGroupBox {
-    background-color: #19202c;
-    border: 1px solid #2b3547;
+QScrollArea, QWidget#MonitorPanel {
+    background-color: #F3F5F8;
+    color: #0F172A;
+}
+QFrame#HeaderBar, QFrame#ToolbarRow, QFrame#StudioCard, QFrame#CompileBanner {
+    background-color: #FFFFFF;
+    border: 1px solid #DDE3EC;
+    border-radius: 8px;
+}
+QFrame#CompileBanner {
     border-radius: 6px;
-    margin-top: 10px;
-    padding: 8px;
+}
+QFrame#CardDivider, QFrame#ToolbarDivider {
+    background-color: #E2E8F0;
+    border: none;
+}
+QLabel {
+    color: #1E293B;
+    background-color: transparent;
+}
+QLabel#CardTitle {
+    color: #0F172A;
     font-weight: bold;
-    color: #cbd5e1;
+    font-size: 10pt;
 }
-QGroupBox::title {
-    subcontrol-origin: margin;
-    subcontrol-position: top left;
-    left: 10px;
-    padding: 0 5px;
-    color: #93c5fd;
+QLabel#FieldKey {
+    color: #64748B;
+    font-weight: 600;
 }
-QPlainTextEdit {
-    background-color: #151a24;
-    color: #e5e7eb;
-    border: 1px solid #2b3547;
-    border-radius: 4px;
-    selection-background-color: #264f78;
+QLabel#FieldVal {
+    color: #0F172A;
+    font-weight: 500;
+}
+QPlainTextEdit#EventLog {
+    background-color: #FFFFFF;
+    color: #1E293B;
+    border: 1px solid #E2E8F0;
+    border-radius: 6px;
+    selection-background-color: #DBEAFE;
+    selection-color: #1E3A8A;
 }
 QTableWidget {
-    background-color: #151a24;
-    alternate-background-color: #1a2130;
-    color: #e2e8f0;
-    border: 1px solid #2b3547;
-    gridline-color: #263042;
-    selection-background-color: #1e3a5f;
+    background-color: #FFFFFF;
+    alternate-background-color: #F8FAFC;
+    color: #0F172A;
+    border: 1px solid #E2E8F0;
+    border-radius: 6px;
+    gridline-color: #E2E8F0;
+    selection-background-color: #DBEAFE;
+    selection-color: #1E3A8A;
 }
 QHeaderView::section {
-    background-color: #1f2735;
-    color: #94a3b8;
-    border: 1px solid #2b3547;
-    padding: 4px 6px;
+    background-color: #F8FAFC;
+    color: #334155;
+    border: none;
+    border-bottom: 1px solid #DDE3EC;
+    border-right: 1px solid #E2E8F0;
+    padding: 6px 8px;
     font-weight: bold;
 }
 QPushButton {
-    background-color: #243042;
-    color: #f1f5f9;
-    border: 1px solid #38465c;
-    border-radius: 4px;
-    padding: 5px 11px;
+    background-color: #FFFFFF;
+    color: #1E293B;
+    border: 1px solid #CBD5E1;
+    border-radius: 6px;
+    padding: 5px 12px;
     font-weight: 600;
+    min-height: 20px;
 }
 QPushButton:hover:enabled {
-    background-color: #2f3e55;
-    border-color: #60a5fa;
+    background-color: #F8FAFC;
+    border-color: #94A3B8;
 }
 QPushButton:pressed:enabled {
-    background-color: #1d2838;
+    background-color: #EFF6FF;
 }
 QPushButton:disabled {
-    background-color: #181f2b;
-    color: #526075;
-    border-color: #222a38;
+    background-color: #F1F5F9;
+    color: #94A3B8;
+    border: 1px solid #E2E8F0;
+}
+QPushButton#BtnCompile:enabled {
+    background-color: #2563EB;
+    color: #FFFFFF;
+    border-color: #1D4ED8;
+}
+QPushButton#BtnCompile:hover:enabled {
+    background-color: #1D4ED8;
+}
+QPushButton#BtnRun:enabled {
+    background-color: #16A34A;
+    color: #FFFFFF;
+    border-color: #15803D;
+}
+QPushButton#BtnRun:hover:enabled {
+    background-color: #15803D;
+}
+QPushButton#BtnStop:enabled {
+    background-color: #D97706;
+    color: #FFFFFF;
+    border-color: #B45309;
+}
+QPushButton#BtnStop:hover:enabled {
+    background-color: #B45309;
+}
+QPushButton#BtnRecover:enabled {
+    background-color: #7C3AED;
+    color: #FFFFFF;
+    border-color: #6D28D9;
+}
+QPushButton#BtnRecover:hover:enabled {
+    background-color: #6D28D9;
+}
+QPushButton#BtnEstop {
+    background-color: #DC2626;
+    color: #FFFFFF;
+    border: 2px solid #B91C1C;
+    border-radius: 6px;
+    font-weight: bold;
+    font-size: 10pt;
+    padding: 6px 16px;
+}
+QPushButton#BtnEstop:hover {
+    background-color: #B91C1C;
+}
+QPushButton#BtnGripOpen:enabled {
+    background-color: #0284C7;
+    color: #FFFFFF;
+    border-color: #0369A1;
+}
+QPushButton#BtnGripOpen:hover:enabled {
+    background-color: #0369A1;
+}
+QPushButton#BtnGripClose:enabled {
+    background-color: #0F766E;
+    color: #FFFFFF;
+    border-color: #115E59;
+}
+QPushButton#BtnGripClose:hover:enabled {
+    background-color: #115E59;
 }
 QComboBox {
-    background-color: #1f2735;
-    color: #e2e8f0;
-    border: 1px solid #38465c;
-    border-radius: 4px;
-    padding: 4px 8px;
+    background-color: #FFFFFF;
+    color: #0F172A;
+    border: 1px solid #CBD5E1;
+    border-radius: 6px;
+    padding: 4px 10px;
+    min-height: 20px;
+}
+QComboBox QAbstractItemView {
+    background-color: #FFFFFF;
+    color: #0F172A;
+    border: 1px solid #CBD5E1;
+    selection-background-color: #DBEAFE;
+    selection-color: #1E3A8A;
+}
+QCheckBox {
+    color: #1E293B;
+    font-weight: 600;
+    spacing: 7px;
+    background-color: transparent;
 }
 QProgressBar {
-    background-color: #0f141c;
-    border: 1px solid #2b3547;
-    border-radius: 4px;
+    background-color: #F1F5F9;
+    border: 1px solid #DDE3EC;
+    border-radius: 5px;
     text-align: center;
-    color: #f8fafc;
+    color: #0F172A;
+    font-weight: bold;
     height: 18px;
 }
 QProgressBar::chunk {
-    background-color: #0284c7;
-    border-radius: 3px;
+    background-color: #60A5FA;
+    border-radius: 4px;
 }
 QSplitter::handle {
-    background-color: #273142;
+    background-color: #E2E8F0;
+}
+QSplitter::handle:horizontal {
+    width: 4px;
+}
+QSplitter::handle:vertical {
+    height: 4px;
 }
 """
 
 
-def _styled_pill(bg_hex, fg_hex="#ffffff"):
+def _styled_pill(bg_hex, fg_hex="#FFFFFF"):
     return (
-        f"background-color: {bg_hex}; color: {fg_hex}; border-radius: 4px; "
-        "padding: 3px 9px; font-weight: bold;"
+        f"background-color: {bg_hex}; color: {fg_hex}; border-radius: 5px; "
+        "padding: 3px 10px; font-weight: bold; font-size: 9pt;"
     )
+
+
+def _make_card(title_text):
+    """Create a white border card with a crisp header and return (frame, content_layout)."""
+    card = QFrame()
+    card.setObjectName("StudioCard")
+    vbox = QVBoxLayout(card)
+    vbox.setContentsMargins(11, 7, 11, 8)
+    vbox.setSpacing(5)
+
+    lbl_title = QLabel(title_text)
+    lbl_title.setObjectName("CardTitle")
+    vbox.addWidget(lbl_title)
+
+    divider = QFrame()
+    divider.setObjectName("CardDivider")
+    divider.setFixedHeight(1)
+    vbox.addWidget(divider)
+
+    content_layout = QVBoxLayout()
+    content_layout.setContentsMargins(0, 1, 0, 0)
+    content_layout.setSpacing(4)
+    vbox.addLayout(content_layout)
+    return card, content_layout
+
+
+def _key_label(text):
+    lbl = QLabel(text)
+    lbl.setObjectName("FieldKey")
+    return lbl
 
 
 class StudioMainWindow(QMainWindow):
@@ -203,7 +340,7 @@ class StudioMainWindow(QMainWindow):
         super().__init__(parent)
         self.worker = ros_worker
         self.setWindowTitle("Lite6 Industrial Trajectory Studio")
-        self.resize(1380, 860)
+        self.resize(1460, 920)
         self.setStyleSheet(_STYLESHEET)
 
         self._latest_studio_state = None
@@ -220,18 +357,20 @@ class StudioMainWindow(QMainWindow):
         root.setObjectName("StudioRoot")
         self.setCentralWidget(root)
         main_layout = QVBoxLayout(root)
-        main_layout.setContentsMargins(8, 8, 8, 8)
-        main_layout.setSpacing(6)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(8)
 
         main_layout.addWidget(self._build_header_bar())
-        main_layout.addWidget(self._build_action_toolbar())
+        main_layout.addWidget(self._build_authoring_toolbar())
+        main_layout.addWidget(self._build_execution_toolbar())
 
         # Main workspace splitter: Left IDE / Diagnostics, Right Live Telemetry & Gripper
         h_splitter = QSplitter(Qt.Horizontal)
         h_splitter.addWidget(self._build_left_ide_pane())
         h_splitter.addWidget(self._build_right_monitor_pane())
-        h_splitter.setStretchFactor(0, 62)
-        h_splitter.setStretchFactor(1, 38)
+        h_splitter.setStretchFactor(0, 58)
+        h_splitter.setStretchFactor(1, 42)
+        h_splitter.setSizes([830, 610])
         main_layout.addWidget(h_splitter, 1)
 
         # Load default industrial sample cleanly
@@ -239,6 +378,7 @@ class StudioMainWindow(QMainWindow):
         self.editor.setPlainText(PRESET_PROGRAMS[first_key])
         self._mark_source_dirty(False)
         self.lbl_compile_summary.setText("Not compiled - click Compile to plan & validate")
+        self.lbl_compile_summary.setStyleSheet("color: #475569; font-weight: 600;")
 
         self._connect_signals()
         self._refresh_button_states()
@@ -247,52 +387,49 @@ class StudioMainWindow(QMainWindow):
 
     def _build_header_bar(self):
         frame = QFrame()
-        frame.setStyleSheet("background-color: #19202c; border: 1px solid #2b3547; border-radius: 6px;")
+        frame.setObjectName("HeaderBar")
         layout = QHBoxLayout(frame)
-        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(8)
 
         title = QLabel("LITE6 STUDIO")
-        title.setFont(QFont("Segoe UI", 12, QFont.Bold))
-        title.setStyleSheet("color: #60a5fa; border: none;")
+        title.setFont(QFont(_UI_FONT_FAMILY, 12, QFont.Bold))
+        title.setStyleSheet("color: #1D4ED8;")
         layout.addWidget(title)
 
+        layout.addSpacing(4)
         self.lbl_state_badge = QLabel("BOOT INIT")
-        self.lbl_state_badge.setStyleSheet(_styled_pill("#4b5563"))
+        self.lbl_state_badge.setStyleSheet(_styled_pill("#64748B"))
         layout.addWidget(self.lbl_state_badge)
 
-        layout.addSpacing(8)
+        layout.addSpacing(6)
         self.lbl_joint_fresh = QLabel("JOINTS: STALE")
-        self.lbl_joint_fresh.setStyleSheet(_styled_pill("#475569"))
+        self.lbl_joint_fresh.setStyleSheet(_styled_pill("#64748B"))
         layout.addWidget(self.lbl_joint_fresh)
 
         self.lbl_ctrl_fresh = QLabel("CTRL: STALE")
-        self.lbl_ctrl_fresh.setStyleSheet(_styled_pill("#475569"))
+        self.lbl_ctrl_fresh.setStyleSheet(_styled_pill("#64748B"))
         layout.addWidget(self.lbl_ctrl_fresh)
 
         self.lbl_grip_fresh = QLabel("GRIPPER: OFFLINE")
-        self.lbl_grip_fresh.setStyleSheet(_styled_pill("#475569"))
+        self.lbl_grip_fresh.setStyleSheet(_styled_pill("#64748B"))
         layout.addWidget(self.lbl_grip_fresh)
 
         layout.addStretch(1)
 
         self.btn_estop = QPushButton("EMERGENCY STOP")
-        self.btn_estop.setMinimumWidth(160)
-        self.btn_estop.setStyleSheet(
-            "QPushButton { background-color: #dc2626; color: #ffffff; border: 2px solid #fca5a5; "
-            "font-weight: bold; font-size: 10.5pt; padding: 6px 14px; }"
-            "QPushButton:hover { background-color: #ef4444; }"
-        )
+        self.btn_estop.setObjectName("BtnEstop")
+        self.btn_estop.setMinimumWidth(165)
         layout.addWidget(self.btn_estop)
         return frame
 
-    def _build_action_toolbar(self):
+    def _build_authoring_toolbar(self):
         frame = QFrame()
-        frame.setStyleSheet("background-color: #161c27; border: 1px solid #263042; border-radius: 6px;")
+        frame.setObjectName("ToolbarRow")
         outer = QHBoxLayout(frame)
-        outer.setContentsMargins(8, 5, 8, 5)
-        outer.setSpacing(6)
+        outer.setContentsMargins(10, 6, 10, 6)
+        outer.setSpacing(8)
 
-        # File & snippet tools
         self.btn_new = QPushButton("New")
         self.btn_open = QPushButton("Open")
         self.btn_save = QPushButton("Save")
@@ -300,14 +437,24 @@ class StudioMainWindow(QMainWindow):
         outer.addWidget(self.btn_open)
         outer.addWidget(self.btn_save)
 
+        sep1 = QFrame()
+        sep1.setObjectName("ToolbarDivider")
+        sep1.setFixedWidth(1)
+        outer.addWidget(sep1)
+
         self.cmb_presets = QComboBox()
         for name in PRESET_PROGRAMS:
             self.cmb_presets.addItem(name)
-        self.cmb_presets.setMaximumWidth(250)
+        self.cmb_presets.setMinimumWidth(285)
         outer.addWidget(self.cmb_presets)
 
         self.btn_load_preset = QPushButton("Load Example")
         outer.addWidget(self.btn_load_preset)
+
+        sep2 = QFrame()
+        sep2.setObjectName("ToolbarDivider")
+        sep2.setFixedWidth(1)
+        outer.addWidget(sep2)
 
         self.btn_insert_joints = QPushButton("+ Joints")
         self.btn_insert_joints.setToolTip("Insert live measured joint vector into editor")
@@ -322,66 +469,75 @@ class StudioMainWindow(QMainWindow):
             "When checked, compiles starting at measured /joint_states; uncheck for zero-pose offline dry-run."
         )
         outer.addWidget(self.chk_use_current_start)
-
         outer.addStretch(1)
+        return frame
 
-        # Motion & state machine execution controls
+    def _build_execution_toolbar(self):
+        frame = QFrame()
+        frame.setObjectName("ToolbarRow")
+        outer = QHBoxLayout(frame)
+        outer.setContentsMargins(10, 6, 10, 6)
+        outer.setSpacing(8)
+
         self.btn_compile = QPushButton("Compile")
-        self.btn_compile.setStyleSheet(
-            "QPushButton { background-color: #1d4ed8; border-color: #3b82f6; }"
-            "QPushButton:hover:enabled { background-color: #2563eb; }"
-        )
+        self.btn_compile.setObjectName("BtnCompile")
+        self.btn_compile.setMinimumWidth(96)
+
         self.btn_run_resume = QPushButton("Run")
-        self.btn_run_resume.setStyleSheet(
-            "QPushButton { background-color: #15803d; border-color: #22c55e; }"
-            "QPushButton:hover:enabled { background-color: #16a34a; }"
-        )
+        self.btn_run_resume.setObjectName("BtnRun")
+        self.btn_run_resume.setMinimumWidth(88)
+
         self.btn_pause = QPushButton("Pause")
         self.btn_step = QPushButton("Step")
+
         self.btn_stop = QPushButton("Stop")
-        self.btn_stop.setStyleSheet(
-            "QPushButton { background-color: #b45309; border-color: #f59e0b; }"
-            "QPushButton:hover:enabled { background-color: #d97706; }"
-        )
+        self.btn_stop.setObjectName("BtnStop")
+
         self.btn_reset_fault = QPushButton("Reset Fault")
+
         self.btn_recover = QPushButton("Recover E-STOP")
-        self.btn_recover.setStyleSheet(
-            "QPushButton { background-color: #6d28d9; border-color: #a78bfa; }"
-            "QPushButton:hover:enabled { background-color: #7c3aed; }"
-        )
+        self.btn_recover.setObjectName("BtnRecover")
+
         self.btn_clear = QPushButton("Clear")
 
-        for btn in (
-            self.btn_compile,
-            self.btn_run_resume,
-            self.btn_pause,
-            self.btn_step,
-            self.btn_stop,
-            self.btn_reset_fault,
-            self.btn_recover,
-            self.btn_clear,
-        ):
+        outer.addWidget(self.btn_compile)
+
+        sep1 = QFrame()
+        sep1.setObjectName("ToolbarDivider")
+        sep1.setFixedWidth(1)
+        outer.addWidget(sep1)
+
+        for btn in (self.btn_run_resume, self.btn_pause, self.btn_step, self.btn_stop):
             outer.addWidget(btn)
 
+        sep2 = QFrame()
+        sep2.setObjectName("ToolbarDivider")
+        sep2.setFixedWidth(1)
+        outer.addWidget(sep2)
+
+        for btn in (self.btn_reset_fault, self.btn_recover, self.btn_clear):
+            outer.addWidget(btn)
+
+        outer.addStretch(1)
         return frame
 
     def _build_left_ide_pane(self):
         v_splitter = QSplitter(Qt.Vertical)
 
-        # Top: Editor card with compile summary strip
+        # Top: Editor with compile summary strip
         editor_container = QWidget()
         e_layout = QVBoxLayout(editor_container)
         e_layout.setContentsMargins(0, 0, 0, 0)
-        e_layout.setSpacing(4)
+        e_layout.setSpacing(6)
 
         banner = QFrame()
-        banner.setStyleSheet("background-color: #19202c; border: 1px solid #2b3547; border-radius: 4px;")
+        banner.setObjectName("CompileBanner")
         b_layout = QHBoxLayout(banner)
-        b_layout.setContentsMargins(8, 4, 8, 4)
+        b_layout.setContentsMargins(10, 6, 10, 6)
         self.lbl_compile_summary = QLabel("Ready")
-        self.lbl_compile_summary.setStyleSheet("border: none; color: #cbd5e1; font-weight: 600;")
+        self.lbl_compile_summary.setStyleSheet("color: #475569; font-weight: 600;")
         self.lbl_dirty_flag = QLabel("")
-        self.lbl_dirty_flag.setStyleSheet("border: none; color: #f59e0b; font-weight: bold;")
+        self.lbl_dirty_flag.setStyleSheet("color: #B45309; font-weight: bold;")
         b_layout.addWidget(self.lbl_compile_summary, 1)
         b_layout.addWidget(self.lbl_dirty_flag)
         e_layout.addWidget(banner)
@@ -390,11 +546,8 @@ class StudioMainWindow(QMainWindow):
         e_layout.addWidget(self.editor, 1)
         v_splitter.addWidget(editor_container)
 
-        # Bottom: Diagnostics panel
-        diag_group = QGroupBox("Compiler Diagnostics (click row to jump to line)")
-        d_layout = QVBoxLayout(diag_group)
-        d_layout.setContentsMargins(6, 12, 6, 6)
-
+        # Bottom: Diagnostics card
+        diag_card, d_layout = _make_card("Compiler Diagnostics (click row to jump to line)")
         self.diag_table = QTableWidget(0, 6)
         self.diag_table.setHorizontalHeaderLabels(
             ["Severity", "Stage", "Line", "Col", "Code", "Diagnostic Message"]
@@ -413,7 +566,7 @@ class StudioMainWindow(QMainWindow):
         hdr.setSectionResizeMode(5, QHeaderView.Stretch)
         d_layout.addWidget(self.diag_table)
 
-        v_splitter.addWidget(diag_group)
+        v_splitter.addWidget(diag_card)
         v_splitter.setStretchFactor(0, 72)
         v_splitter.setStretchFactor(1, 28)
         return v_splitter
@@ -422,18 +575,26 @@ class StudioMainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(470)
 
         panel = QWidget()
+        panel.setObjectName("MonitorPanel")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(4, 0, 2, 0)
         layout.setSpacing(6)
 
         # 1. Execution progress card
-        prog_box = QGroupBox("Program Execution & Progress")
-        p_grid = QGridLayout(prog_box)
-        p_grid.setSpacing(5)
+        prog_card, prog_v = _make_card("Program Execution & Progress")
+        p_grid = QGridLayout()
+        p_grid.setHorizontalSpacing(10)
+        p_grid.setVerticalSpacing(4)
+        p_grid.setColumnStretch(1, 1)
+        p_grid.setColumnStretch(3, 1)
 
         self.lbl_prog_id = QLabel("--")
+        self.lbl_prog_id.setFont(QFont(_MONO_FONT_FAMILY, 9))
+        self.lbl_prog_id.setWordWrap(True)
         self.lbl_block_idx = QLabel("0 / 0")
         self.lbl_active_line = QLabel("--")
         self.lbl_exec_detail = QLabel("--")
@@ -444,104 +605,119 @@ class StudioMainWindow(QMainWindow):
         self.bar_total_progress = QProgressBar()
         self.bar_total_progress.setRange(0, 100)
 
-        p_grid.addWidget(QLabel("Program ID:"), 0, 0)
-        p_grid.addWidget(self.lbl_prog_id, 0, 1)
-        p_grid.addWidget(QLabel("Block:"), 0, 2)
-        p_grid.addWidget(self.lbl_block_idx, 0, 3)
-        p_grid.addWidget(QLabel("Active Line:"), 1, 0)
-        p_grid.addWidget(self.lbl_active_line, 1, 1)
-        p_grid.addWidget(QLabel("Block %:"), 2, 0)
+        p_grid.addWidget(_key_label("Program ID:"), 0, 0)
+        p_grid.addWidget(self.lbl_prog_id, 0, 1, 1, 3)
+        p_grid.addWidget(_key_label("Block:"), 1, 0)
+        p_grid.addWidget(self.lbl_block_idx, 1, 1)
+        p_grid.addWidget(_key_label("Active Line:"), 1, 2)
+        p_grid.addWidget(self.lbl_active_line, 1, 3)
+        p_grid.addWidget(_key_label("Block %:"), 2, 0)
         p_grid.addWidget(self.bar_block_progress, 2, 1, 1, 3)
-        p_grid.addWidget(QLabel("Total %:"), 3, 0)
+        p_grid.addWidget(_key_label("Total %:"), 3, 0)
         p_grid.addWidget(self.bar_total_progress, 3, 1, 1, 3)
-        p_grid.addWidget(QLabel("Status:"), 4, 0)
+        p_grid.addWidget(_key_label("Status:"), 4, 0, Qt.AlignTop)
         p_grid.addWidget(self.lbl_exec_detail, 4, 1, 1, 3)
-        layout.addWidget(prog_box)
+        prog_v.addLayout(p_grid)
+        layout.addWidget(prog_card)
 
         # 2. Controller & Impedance Telemetry Card
-        ctrl_box = QGroupBox("Controller & Impedance Tracking")
-        c_grid = QGridLayout(ctrl_box)
-        c_grid.setSpacing(5)
+        ctrl_card, ctrl_v = _make_card("Controller & Impedance Tracking")
+        c_grid = QGridLayout()
+        c_grid.setHorizontalSpacing(10)
+        c_grid.setVerticalSpacing(6)
+        c_grid.setColumnStretch(1, 1)
 
         self.lbl_ctrl_mode = QLabel("UNKNOWN")
-        self.lbl_ctrl_mode.setStyleSheet("color: #93c5fd; font-weight: bold;")
+        self.lbl_ctrl_mode.setStyleSheet("color: #1D4ED8; font-weight: bold;")
+        self.lbl_ctrl_mode.setWordWrap(True)
         self.lbl_estop_reason = QLabel("None")
         self.lbl_estop_reason.setWordWrap(True)
-        self.lbl_pos_err = QLabel("0.00 mm  [0.00, 0.00, 0.00]")
-        self.lbl_rot_err = QLabel("0.00 deg [0.00, 0.00, 0.00]")
+        self.lbl_pos_err = QLabel("0.00 mm  [0.0, 0.0, 0.0]")
+        self.lbl_pos_err.setFont(QFont(_MONO_FONT_FAMILY, 9))
+        self.lbl_pos_err.setWordWrap(True)
+        self.lbl_rot_err = QLabel("0.00 deg [0.0, 0.0, 0.0]")
+        self.lbl_rot_err.setFont(QFont(_MONO_FONT_FAMILY, 9))
+        self.lbl_rot_err.setWordWrap(True)
 
-        c_grid.addWidget(QLabel("CTC Mode:"), 0, 0)
+        c_grid.addWidget(_key_label("CTC Mode:"), 0, 0)
         c_grid.addWidget(self.lbl_ctrl_mode, 0, 1)
-        c_grid.addWidget(QLabel("E-STOP / Fault:"), 1, 0)
+        c_grid.addWidget(_key_label("E-STOP / Fault:"), 1, 0, Qt.AlignTop)
         c_grid.addWidget(self.lbl_estop_reason, 1, 1)
-        c_grid.addWidget(QLabel("Impedance Pos Err:"), 2, 0)
+        c_grid.addWidget(_key_label("Impedance Pos Err:"), 2, 0)
         c_grid.addWidget(self.lbl_pos_err, 2, 1)
-        c_grid.addWidget(QLabel("Impedance Rot Err:"), 3, 0)
+        c_grid.addWidget(_key_label("Impedance Rot Err:"), 3, 0)
         c_grid.addWidget(self.lbl_rot_err, 3, 1)
-        layout.addWidget(ctrl_box)
+        ctrl_v.addLayout(c_grid)
+        layout.addWidget(ctrl_card)
 
         # 3. Live Robot Joint & TCP Telemetry Card
-        rob_box = QGroupBox("Live Robot Feedback")
-        r_layout = QVBoxLayout(rob_box)
-        r_layout.setSpacing(4)
+        rob_card, r_layout = _make_card("Live Robot Feedback")
 
         self.lbl_tcp_pose = QLabel("TCP: awaiting TF link_base -> link_eef...")
-        self.lbl_tcp_pose.setStyleSheet("font-family: Consolas, Monospace; color: #38bdf8;")
+        self.lbl_tcp_pose.setFont(QFont(_MONO_FONT_FAMILY, 9))
+        self.lbl_tcp_pose.setStyleSheet("color: #0369A1; font-weight: 600;")
+        self.lbl_tcp_pose.setWordWrap(True)
         r_layout.addWidget(self.lbl_tcp_pose)
 
         j_grid = QGridLayout()
-        j_grid.setSpacing(3)
+        j_grid.setHorizontalSpacing(8)
+        j_grid.setVerticalSpacing(4)
+        j_grid.setColumnStretch(1, 1)
+        j_grid.setColumnStretch(3, 1)
         self._joint_labels = []
+        mono_joint_font = QFont(_MONO_FONT_FAMILY, 9)
         for idx in range(6):
             row = idx // 2
             col_base = (idx % 2) * 2
-            name_lbl = QLabel(f"J{idx + 1}:")
-            name_lbl.setStyleSheet("color: #94a3b8; font-weight: bold;")
-            val_lbl = QLabel("  0.000 rad (  0.0 deg)")
-            val_lbl.setStyleSheet("font-family: Consolas, Monospace;")
+            name_lbl = _key_label(f"J{idx + 1}:")
+            val_lbl = QLabel("+0.000 rad (+0.0 deg)")
+            val_lbl.setFont(mono_joint_font)
             j_grid.addWidget(name_lbl, row, col_base)
             j_grid.addWidget(val_lbl, row, col_base + 1)
             self._joint_labels.append(val_lbl)
         r_layout.addLayout(j_grid)
-        layout.addWidget(rob_box)
+        layout.addWidget(rob_card)
 
         # 4. Standalone Decoupled Gripper Card
-        grip_box = QGroupBox("End-Effector (Decoupled Gripper Control)")
-        g_layout = QVBoxLayout(grip_box)
-        g_layout.setSpacing(5)
+        grip_card, g_layout = _make_card("End-Effector (Decoupled Gripper Control)")
 
         g_info = QHBoxLayout()
+        g_info.setSpacing(10)
         self.lbl_gripper_state = QLabel("OFFLINE")
-        self.lbl_gripper_state.setStyleSheet(_styled_pill("#475569"))
-        self.lbl_gripper_metrics = QLabel("Pos: -- mm | Effort: -- N")
-        self.lbl_gripper_metrics.setStyleSheet("font-family: Consolas, Monospace;")
+        self.lbl_gripper_state.setStyleSheet(_styled_pill("#64748B"))
+        self.lbl_gripper_metrics = QLabel("Opening: -- mm | Effort: -- N")
+        self.lbl_gripper_metrics.setFont(QFont(_MONO_FONT_FAMILY, 9))
         g_info.addWidget(self.lbl_gripper_state)
         g_info.addWidget(self.lbl_gripper_metrics, 1)
         g_layout.addLayout(g_info)
 
         g_btns = QHBoxLayout()
+        g_btns.setSpacing(8)
         self.btn_grip_open = QPushButton("Open Gripper")
+        self.btn_grip_open.setObjectName("BtnGripOpen")
+        self.btn_grip_open.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.btn_grip_close = QPushButton("Close Gripper")
-        self.btn_grip_stop = QPushButton("Stop Gripper")
-        self.btn_grip_open.setStyleSheet("QPushButton { background-color: #0369a1; }")
-        self.btn_grip_close.setStyleSheet("QPushButton { background-color: #0f766e; }")
-        g_btns.addWidget(self.btn_grip_open)
-        g_btns.addWidget(self.btn_grip_close)
-        g_btns.addWidget(self.btn_grip_stop)
+        self.btn_grip_close.setObjectName("BtnGripClose")
+        self.btn_grip_close.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.btn_grip_stop = QPushButton("Stop")
+        self.btn_grip_stop.setToolTip("Stop gripper actuation")
+        self.btn_grip_stop.setMinimumWidth(78)
+        g_btns.addWidget(self.btn_grip_open, 1)
+        g_btns.addWidget(self.btn_grip_close, 1)
+        g_btns.addWidget(self.btn_grip_stop, 0)
         g_layout.addLayout(g_btns)
-        layout.addWidget(grip_box)
+        layout.addWidget(grip_card)
 
-        # 5. Event Console Log
-        log_box = QGroupBox("Studio Event Log")
-        l_layout = QVBoxLayout(log_box)
-        l_layout.setContentsMargins(6, 12, 6, 6)
+        # 5. Event Console Log Card
+        log_card, l_layout = _make_card("Studio Event Log")
         self.txt_log = QPlainTextEdit()
+        self.txt_log.setObjectName("EventLog")
         self.txt_log.setReadOnly(True)
         self.txt_log.setMaximumBlockCount(300)
-        self.txt_log.setMinimumHeight(120)
-        self.txt_log.setFont(QFont("Consolas, Monospace", 9))
+        self.txt_log.setMinimumHeight(95)
+        self.txt_log.setFont(QFont(_MONO_FONT_FAMILY, 9))
         l_layout.addWidget(self.txt_log)
-        layout.addWidget(log_box, 1)
+        layout.addWidget(log_card, 1)
 
         scroll.setWidget(panel)
         return scroll
@@ -743,7 +919,7 @@ class StudioMainWindow(QMainWindow):
     def trigger_compile(self):
         self._compile_in_flight = True
         self.lbl_compile_summary.setText("Compiling & validating 1 kHz optimal trajectory...")
-        self.lbl_compile_summary.setStyleSheet("border: none; color: #60a5fa; font-weight: 600;")
+        self.lbl_compile_summary.setStyleSheet("color: #1D4ED8; font-weight: 600;")
         self._refresh_button_states()
         self.worker.request_compile(
             self.editor.toPlainText(),
@@ -782,7 +958,7 @@ class StudioMainWindow(QMainWindow):
                 warn_lines.add(int(d.line_number))
 
             sev_item = QTableWidgetItem("ERROR" if is_err else "WARN")
-            sev_item.setForeground(QColor("#f87171" if is_err else "#fbbf24"))
+            sev_item.setForeground(QColor("#DC2626" if is_err else "#B45309"))
             stage_item = QTableWidgetItem(_DIAG_STAGE_NAMES.get(d.stage, str(d.stage)))
             line_item = QTableWidgetItem(str(d.line_number))
             col_item = QTableWidgetItem(str(d.column_number))
@@ -805,13 +981,13 @@ class StudioMainWindow(QMainWindow):
                 f"1 kHz Samples: {resp.total_samples_1khz}"
             )
             self.lbl_compile_summary.setText(summary)
-            self.lbl_compile_summary.setStyleSheet("border: none; color: #4ade80; font-weight: 600;")
+            self.lbl_compile_summary.setStyleSheet("color: #15803D; font-weight: 600;")
             self.append_log(summary)
         else:
             err_count = sum(1 for d in self._diagnostics if d.severity == CompileDiagnostic.SEVERITY_ERROR)
             summary = f"Compile FAILED ({err_count} error(s)) - click diagnostic row to locate"
             self.lbl_compile_summary.setText(summary)
-            self.lbl_compile_summary.setStyleSheet("border: none; color: #f87171; font-weight: 600;")
+            self.lbl_compile_summary.setStyleSheet("color: #DC2626; font-weight: 600;")
             self.append_log(summary)
             if self._diagnostics:
                 self.diag_table.selectRow(0)
@@ -834,7 +1010,7 @@ class StudioMainWindow(QMainWindow):
     def on_studio_state(self, msg):
         self._latest_studio_state = msg
 
-        name, bg, fg = _STATE_META.get(msg.state, (f"STATE_{msg.state}", "#475569", "#ffffff"))
+        name, bg, fg = _STATE_META.get(msg.state, (f"STATE_{msg.state}", "#64748B", "#FFFFFF"))
         self.lbl_state_badge.setText(name)
         self.lbl_state_badge.setStyleSheet(_styled_pill(bg, fg))
 
@@ -842,15 +1018,15 @@ class StudioMainWindow(QMainWindow):
             "JOINTS: FRESH" if msg.joint_states_fresh else "JOINTS: STALE"
         )
         self.lbl_joint_fresh.setStyleSheet(
-            _styled_pill("#15803d" if msg.joint_states_fresh else "#b91c1c")
+            _styled_pill("#16A34A" if msg.joint_states_fresh else "#DC2626")
         )
         self.lbl_ctrl_fresh.setText("CTRL: FRESH" if msg.controller_fresh else "CTRL: STALE")
         self.lbl_ctrl_fresh.setStyleSheet(
-            _styled_pill("#15803d" if msg.controller_fresh else "#b91c1c")
+            _styled_pill("#16A34A" if msg.controller_fresh else "#DC2626")
         )
         self.lbl_grip_fresh.setText("GRIPPER: READY" if msg.gripper_ready else "GRIPPER: NOT READY")
         self.lbl_grip_fresh.setStyleSheet(
-            _styled_pill("#0f766e" if msg.gripper_ready else "#64748b")
+            _styled_pill("#0F766E" if msg.gripper_ready else "#64748B")
         )
 
         self.lbl_prog_id.setText(msg.loaded_program_id if msg.loaded_program_id else "--")
@@ -879,13 +1055,13 @@ class StudioMainWindow(QMainWindow):
         if msg.estop_latched:
             reason_str = _ESTOP_REASON_NAMES.get(msg.estop_reason, f"ESTOP_{msg.estop_reason}")
             self.lbl_estop_reason.setText(f"ESTOP LATCHED: {reason_str}")
-            self.lbl_estop_reason.setStyleSheet("color: #f87171; font-weight: bold;")
+            self.lbl_estop_reason.setStyleSheet("color: #DC2626; font-weight: bold;")
         elif msg.last_error_code != 0:
             self.lbl_estop_reason.setText(f"Fault code {msg.last_error_code}")
-            self.lbl_estop_reason.setStyleSheet("color: #fbbf24; font-weight: bold;")
+            self.lbl_estop_reason.setStyleSheet("color: #B45309; font-weight: bold;")
         else:
             self.lbl_estop_reason.setText("None")
-            self.lbl_estop_reason.setStyleSheet("color: #94a3b8;")
+            self.lbl_estop_reason.setStyleSheet("color: #64748B;")
 
         pe = msg.cartesian_pos_error_m
         re = msg.cartesian_rot_error_rad
@@ -910,12 +1086,12 @@ class StudioMainWindow(QMainWindow):
         ):
             self._compiled_program_id = ""
             self.lbl_compile_summary.setText("Program cleared - click Compile to build")
-            self.lbl_compile_summary.setStyleSheet("border: none; color: #cbd5e1; font-weight: 600;")
+            self.lbl_compile_summary.setStyleSheet("color: #475569; font-weight: 600;")
 
         self._refresh_button_states()
 
     def on_gripper_state(self, msg):
-        gname, gbg = _GRIPPER_STATE_NAMES.get(msg.state, (f"STATE_{msg.state}", "#475569"))
+        gname, gbg = _GRIPPER_STATE_NAMES.get(msg.state, (f"STATE_{msg.state}", "#64748B"))
         self.lbl_gripper_state.setText(gname)
         self.lbl_gripper_state.setStyleSheet(_styled_pill(gbg))
         pos_mm = (msg.position[0] - msg.position[1]) * 1000.0
@@ -925,10 +1101,11 @@ class StudioMainWindow(QMainWindow):
         if q_list is not None:
             self._latest_q = q_list
             for idx, val in enumerate(q_list):
-                self._joint_labels[idx].setText(f"{val:7.3f} rad ({math.degrees(val):6.1f} deg)")
+                self._joint_labels[idx].setText(f"{val:+6.3f} rad ({math.degrees(val):+5.1f} deg)")
         if tcp6 is not None:
             self._latest_tcp = tcp6
             x, y, z, r, p, w = tcp6
             self.lbl_tcp_pose.setText(
-                f"TCP xyz=[{x:6.4f}, {y:6.4f}, {z:6.4f}] m | rpy=[{r:6.3f}, {p:6.3f}, {w:6.3f}] rad"
+                f"XYZ: [{x:6.4f}, {y:6.4f}, {z:6.4f}] m\n"
+                f"RPY: [{r:6.3f}, {p:6.3f}, {w:6.3f}] rad"
             )
