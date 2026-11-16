@@ -453,6 +453,7 @@ private:
     paused_sample_idx_ = 0;
     paused_remaining_wait_sec_ = -1.0;
     paused_block_snapshot_ = ExecutionBlock();
+    post_impedance_offset_active_ = false;
   }
 
   template <typename ActionT>
@@ -716,6 +717,7 @@ private:
     bool resume_mid = false;
     size_t pause_sample = 0;
     double resume_wait_sec = -1.0;
+    bool post_imp_offset = false;
     ExecutionBlock paused_blk;
 
     {
@@ -725,6 +727,7 @@ private:
       resume_mid = paused_mid_block_;
       pause_sample = paused_sample_idx_;
       resume_wait_sec = paused_remaining_wait_sec_;
+      post_imp_offset = post_impedance_offset_active_;
       paused_blk = paused_block_snapshot_;
     }
 
@@ -775,6 +778,7 @@ private:
       }
 
       ExecutionBlock block_to_run;
+      bool used_mid_block_replan = false;
       if (resume_mid && paused_blk.type != ExecutionBlockType::WAIT_CMD) {
         std::array<double, 6> q_actual{};
         double max_dq = 0.0;
@@ -795,6 +799,7 @@ private:
           apply_effects(eff);
           return;
         }
+        used_mid_block_replan = true;
         resume_mid = false;
         pause_sample = 0;
       } else {
@@ -807,9 +812,10 @@ private:
         resume_wait_sec = -1.0;
       }
 
-      // Pre-execution joint alignment bridge for trajectory blocks
-      if (block_to_run.type == ExecutionBlockType::RIGID_TRAJECTORY ||
-          block_to_run.type == ExecutionBlockType::IMPEDANCE_TRAJECTORY)
+      // Pre-execution joint alignment bridge or post-impedance start-pose replanning
+      if (!used_mid_block_replan &&
+          (block_to_run.type == ExecutionBlockType::RIGID_TRAJECTORY ||
+           block_to_run.type == ExecutionBlockType::IMPEDANCE_TRAJECTORY))
       {
         std::array<double, 6> q_actual{};
         double max_dq = 0.0;
@@ -824,7 +830,38 @@ private:
         for (size_t i = 0; i < 6; ++i) {
           max_diff = std::max(max_diff, std::abs(q_actual[i] - block_to_run.start_joints[i]));
         }
-        if (max_diff > kAlignmentThresholdRad) {
+
+        if (post_imp_offset) {
+          if (max_diff > 5e-4 && block_to_run.source_kind != BlockSourceKind::NONE) {
+            const auto orig_end_joints = block_to_run.end_joints;
+            ExecutionBlock replanned_blk;
+            std::vector<Diagnostic> diags;
+            if (!compiler_->replan_block_from_start(
+                  block_to_run, q_actual, replanned_blk, diags))
+            {
+              const std::string reason = diags.empty() ?
+                "Unknown planning error" : diags.front().message;
+              StudioSupervisor::Effects eff;
+              supervisor_->on_execution_fault(
+                session, -5, "Post-impedance trajectory replanning failed: " + reason, false, eff);
+              apply_effects(eff);
+              return;
+            }
+            block_to_run = std::move(replanned_blk);
+            if (block_to_run.type == ExecutionBlockType::RIGID_TRAJECTORY) {
+              double end_diff = 0.0;
+              for (size_t i = 0; i < 6; ++i) {
+                end_diff = std::max(
+                  end_diff, std::abs(block_to_run.end_joints[i] - orig_end_joints[i]));
+              }
+              if (end_diff <= 1e-3) {
+                post_imp_offset = false;
+              }
+            }
+          } else if (block_to_run.type == ExecutionBlockType::RIGID_TRAJECTORY && max_diff <= 5e-4) {
+            post_imp_offset = false;
+          }
+        } else if (max_diff > kAlignmentThresholdRad) {
           trajectory_msgs::msg::JointTrajectory bridge_traj;
           std::string bridge_err;
           if (!compiler_->plan_alignment_bridge(
@@ -888,6 +925,7 @@ private:
         if (!execute_impedance_block(session, prog, block_to_run, block_idx, calc_total_pct)) {
           return;
         }
+        post_imp_offset = true;
       } else if (block_to_run.type == ExecutionBlockType::GRIPPER_CMD) {
         if (!execute_gripper_block(session, block_to_run, block_idx, calc_total_pct)) {
           return;
@@ -909,6 +947,7 @@ private:
         paused_mid_block_ = false;
         paused_sample_idx_ = 0;
         paused_remaining_wait_sec_ = -1.0;
+        post_impedance_offset_active_ = post_imp_offset;
       }
 
       if (supervisor_->stop_requested(session)) {
@@ -1297,6 +1336,7 @@ private:
   size_t paused_sample_idx_ = 0;
   double paused_remaining_wait_sec_ = -1.0;
   ExecutionBlock paused_block_snapshot_;
+  bool post_impedance_offset_active_ = false;
 
   std::mutex worker_wake_mutex_;
   std::condition_variable worker_cv_;

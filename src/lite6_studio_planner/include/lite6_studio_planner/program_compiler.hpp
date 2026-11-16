@@ -26,9 +26,18 @@ enum class ExecutionBlockType
   WAIT_CMD
 };
 
+enum class BlockSourceKind
+{
+  NONE,
+  CARTESIAN_GROUP,
+  JOINT_GROUP,
+  MOVE_PVA
+};
+
 struct ExecutionBlock
 {
   ExecutionBlockType type = ExecutionBlockType::RIGID_TRAJECTORY;
+  BlockSourceKind source_kind = BlockSourceKind::NONE;
   SourceLocation loc;
   std::array<double, 6> start_joints{};
   std::array<double, 6> end_joints{};
@@ -40,6 +49,10 @@ struct ExecutionBlock
   // Populated when type == IMPEDANCE_TRAJECTORY
   lite6_interfaces::action::FollowImpedanceTrajectory::Goal impedance_goal;
   ImpedanceParams impedance_params;
+
+  // Original AST source group retained for dynamic post-impedance start-pose replanning
+  std::vector<MotionStatement> source_motions;
+  MovePVAStatement source_pva;
 
   // Per-1kHz-sample source location mapping for live line highlighting and diagnostics
   std::vector<SourceLocation> sample_locations;
@@ -100,8 +113,44 @@ public:
     ExecutionBlock & out_resumed_block,
     std::string & out_error) const;
 
+  // Replans an entire trajectory block directly from q_actual (used when an earlier impedance
+  // block finished compliantly deflected against physical contact).
+  bool replan_block_from_start(
+    const ExecutionBlock & original_block,
+    const std::array<double, 6> & q_actual,
+    ExecutionBlock & out_replanned_block,
+    std::vector<Diagnostic> & out_diagnostics) const;
+
 private:
   const lite6_planner::KinematicsEngine & engine_;
+
+  bool validate_and_clamp_start_joints(
+    const std::array<double, 6> & q_in,
+    const SourceLocation & loc,
+    std::array<double, 6> & q_out,
+    std::vector<Diagnostic> & diags) const;
+
+  bool compile_cartesian_group(
+    const std::vector<MotionStatement> & group,
+    const std::array<double, 6> & start_q,
+    bool is_impedance,
+    const ImpedanceParams & imp_params,
+    ExecutionBlock & out_block,
+    std::vector<Diagnostic> & out_diagnostics) const;
+
+  bool compile_joint_group(
+    const std::vector<MotionStatement> & group,
+    const std::array<double, 6> & start_q,
+    ExecutionBlock & out_block,
+    std::vector<Diagnostic> & out_diagnostics) const;
+
+  bool compile_pva_statement(
+    const MovePVAStatement & pva,
+    const std::array<double, 6> & start_q,
+    bool is_impedance,
+    const ImpedanceParams & imp_params,
+    ExecutionBlock & out_block,
+    std::vector<Diagnostic> & out_diagnostics) const;
 
   bool verify_sampled_trajectory_1khz(
     const SampledTrajectory1kHz & sampled,
