@@ -118,17 +118,24 @@ controller_interface::InterfaceConfiguration Lite6CTCController::state_interface
 
 controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclcpp_lifecycle::State &)
 {
-  size_t n = joint_names_.size();
-  
-  q_.setZero(n); dq_.setZero(n); 
-  estop_q_.setZero(n); estop_dq_.setZero(n); 
-  
-  e_.setZero(n); de_.setZero(n); a_d_.setZero(n);
-  tau_fric_.setZero(n); tau_cmd_.setZero(n);
-  integral_effort_.setZero(n);
-  q_target_.setZero(n); dq_target_.setZero(n); ddq_target_.setZero(n);
+  const size_t n = joint_names_.size();
+  if (n != 6) {
+    RCLCPP_ERROR(get_node()->get_logger(), "Expected 6 arm joints, got %zu", n);
+    return controller_interface::CallbackReturn::ERROR;
+  }
+  node_clock_ = get_node()->get_clock();
+
+  q_.setZero(); dq_.setZero();
+  estop_q_.setZero(); estop_dq_.setZero();
+
+  e_.setZero(); de_.setZero(); a_d_.setZero();
+  tau_fric_.setZero(); tau_cmd_.setZero();
+  integral_effort_.setZero();
+  q_target_.setZero(); dq_target_.setZero(); ddq_target_.setZero();
   current_execution_ = nullptr;
   current_impedance_execution_ = nullptr;
+  rt_seen_execution_.store(nullptr, std::memory_order_release);
+  rt_seen_impedance_execution_.store(nullptr, std::memory_order_release);
 
   path_position_tolerance_ = get_node()->get_parameter("execution.path_position_tolerance").as_double_array();
   path_velocity_tolerance_ = get_node()->get_parameter("execution.path_velocity_tolerance").as_double_array();
@@ -228,30 +235,35 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
     }
   }
 
-  Kp_ = Eigen::MatrixXd::Zero(n, n);
-  Kv_ = Eigen::MatrixXd::Zero(n, n);
-  friction_v_.resize(n); friction_c_.resize(n);
-  armature_.resize(n); max_effort_.resize(n); estop_decel_.resize(n);
-  ki_.resize(n); antiwindup_gain_.resize(n); integral_max_effort_.resize(n);
-  friction_error_gain_.resize(n);
+  kp_.setZero();
+  kv_.setZero();
+  friction_v_.setZero(); friction_c_.setZero();
+  armature_.setZero(); max_effort_.setZero(); estop_decel_.setZero();
+  ki_.setZero(); antiwindup_gain_.setZero(); integral_max_effort_.setZero();
+  friction_error_gain_.setZero();
 
-  for(size_t i=0; i<n; ++i) {
-      Kp_(i, i) = kp_v[i]; Kv_(i, i) = kv_v[i]; 
-      friction_v_[i] = fv_v[i]; friction_c_[i] = fc_v[i]; armature_[i] = arm_v[i];
-      max_effort_[i] = effort_limit_v[i];
-      estop_decel_[i] = estop_decel_v[i];
-      ki_[i] = ki_v[i];
-      antiwindup_gain_[i] = aw_v[i];
-      integral_max_effort_[i] = integral_limit_v[i];
-      friction_error_gain_[i] = error_gain_v[i];
+  for (size_t i = 0; i < n; ++i) {
+      const Eigen::Index idx = static_cast<Eigen::Index>(i);
+      kp_[idx] = kp_v[i]; kv_[idx] = kv_v[i];
+      friction_v_[idx] = fv_v[i]; friction_c_[idx] = fc_v[i]; armature_[idx] = arm_v[i];
+      max_effort_[idx] = effort_limit_v[i];
+      estop_decel_[idx] = estop_decel_v[i];
+      ki_[idx] = ki_v[i];
+      antiwindup_gain_[idx] = aw_v[i];
+      integral_max_effort_[idx] = integral_limit_v[i];
+      friction_error_gain_[idx] = error_gain_v[i];
   }
 
-  cmd_buffer_.writeFromNonRT(ModeCommand{0, ++command_sequence_});
+  {
+    std::lock_guard<std::mutex> lock(cmd_write_mutex_);
+    cmd_buffer_.writeFromNonRT(ModeCommand{0, ++command_sequence_});
+  }
   cmd_sub_ = get_node()->create_subscription<std_msgs::msg::Int32>(
     "~/system_cmd", rclcpp::SystemDefaultsQoS(),
     [this](const std_msgs::msg::Int32::SharedPtr msg) {
-      if(msg->data<0||msg->data>6|| (msg->data>=3&&msg->data<=5)) return;
-      if(msg->data==1) emergency_pending_.store(true);
+      if (msg->data < 0 || msg->data > 6 || (msg->data >= 3 && msg->data <= 5)) return;
+      if (msg->data == 1) emergency_pending_.store(true);
+      std::lock_guard<std::mutex> lock(cmd_write_mutex_);
       cmd_buffer_.writeFromNonRT(ModeCommand{msg->data, ++command_sequence_});
     });
 
@@ -272,12 +284,12 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
     pin_data_ = pinocchio::Data(pin_model_);
     pin_data_ref_ = pinocchio::Data(pin_model_);
     pin_data_gmo_ = pinocchio::Data(pin_model_);
-    gmo_jacobian_.setZero(6, pin_model_.nv);
-    dynamics_q_ = Eigen::VectorXd::Zero(8);
-    dynamics_dq_ = Eigen::VectorXd::Zero(8);
-    dynamics_ddq_ = Eigen::VectorXd::Zero(8);
-    dynamics_q_ref_ = Eigen::VectorXd::Zero(8);
-    dynamics_dq_ref_ = Eigen::VectorXd::Zero(8);
+    gmo_jacobian_.setZero();
+    dynamics_q_.setZero();
+    dynamics_dq_.setZero();
+    dynamics_ddq_.setZero();
+    dynamics_q_ref_.setZero();
+    dynamics_dq_ref_.setZero();
   } catch (const std::exception& e) {
     RCLCPP_ERROR(get_node()->get_logger(), "Failed to load URDF");
     return controller_interface::CallbackReturn::ERROR;
@@ -342,7 +354,10 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   system_state_ = SystemState::NORMAL;
   tau_applied_prev_.setZero();
   reset_momentum_observer();
-  cmd_buffer_.writeFromNonRT(ModeCommand{0, ++command_sequence_});
+  {
+    std::lock_guard<std::mutex> lock(cmd_write_mutex_);
+    cmd_buffer_.writeFromNonRT(ModeCommand{0, ++command_sequence_});
+  }
   // Force a fresh NORMAL observation on the first successful update.
   // Never infer a mode from the last received system_cmd value.
   status_publish_counter_ = 0;
@@ -372,7 +387,9 @@ controller_interface::return_type Lite6CTCController::update(
   const rclcpp::Time & time, const rclcpp::Duration & period)
 {
   current_execution_ = trajectory_buffer_.readFromRT()->get();
+  rt_seen_execution_.store(current_execution_, std::memory_order_release);
   current_impedance_execution_ = impedance_trajectory_buffer_.readFromRT()->get();
+  rt_seen_impedance_execution_.store(current_impedance_execution_, std::memory_order_release);
   try {
     return update_and_write_commands(time, period);
   } catch (const std::exception &) {
@@ -407,6 +424,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
 
   // Update the sensorless Generalized Momentum Observer using the torque applied in the
   // previous cycle before generating this cycle's new reference or control command.
+  gmo_state_cached_this_cycle_ = false;
   update_momentum_observer(dt);
 
   update_trajectory_reference(time, period);
@@ -435,7 +453,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   } else if (current_cmd == 0 && system_state_ != SystemState::NORMAL &&
       !impedance_trajectory_active() &&
       (!execution_stop_latched_ || current_command_sequence_ > execution_stop_sequence_)) {
-      Eigen::Map<Eigen::VectorXd> map_q_d(reference_interfaces_.data(), n);
+      Eigen::Map<Vec6d> map_q_d(reference_interfaces_.data());
       if ((map_q_d - q_).cwiseAbs().maxCoeff() < 0.05 &&
           dq_.cwiseAbs().maxCoeff() < 0.01) {
           system_state_ = SystemState::NORMAL;
@@ -457,9 +475,9 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   check_trajectory_path();
   check_impedance_trajectory_path();
 
-  Eigen::Map<Eigen::VectorXd> map_q_d(reference_interfaces_.data(), n);
-  Eigen::Map<Eigen::VectorXd> map_dq_d(reference_interfaces_.data() + n, n);
-  Eigen::Map<Eigen::VectorXd> map_ddq_d(reference_interfaces_.data() + 2 * n, n);
+  Eigen::Map<Vec6d> map_q_d(reference_interfaces_.data());
+  Eigen::Map<Vec6d> map_dq_d(reference_interfaces_.data() + n);
+  Eigen::Map<Vec6d> map_ddq_d(reference_interfaces_.data() + 2 * n);
 
   if (system_state_ == SystemState::NORMAL || system_state_ == SystemState::SYS_ID) {
       q_target_ = map_q_d; dq_target_ = map_dq_d; ddq_target_ = map_ddq_d;
@@ -509,7 +527,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       // Identification must contain neither friction nor learned bias compensation.
       integral_effort_.setZero();
       // Rotor inertia is known in every mode; only friction is unidentified.
-      a_d_.noalias() = ddq_target_ + (Kp_ * e_) + (Kv_ * de_);
+      a_d_ = ddq_target_ + kp_.cwiseProduct(e_) + kv_.cwiseProduct(de_);
       dynamics_ddq_.head(6) = a_d_;
       pinocchio::rnea(pin_model_, pin_data_, dynamics_q_, dynamics_dq_, dynamics_ddq_);
       for(size_t i = 0; i < n; ++i) {
@@ -517,7 +535,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       }
   } 
   else {
-      a_d_.noalias() = ddq_target_ + (Kp_ * e_) + (Kv_ * de_);
+      a_d_ = ddq_target_ + kp_.cwiseProduct(e_) + kv_.cwiseProduct(de_);
       dynamics_ddq_.head(6) = a_d_;
       pinocchio::rnea(pin_model_, pin_data_, dynamics_q_, dynamics_dq_, dynamics_ddq_);
       for(size_t i = 0; i < n; ++i) {
@@ -576,7 +594,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       status_publish_counter_ >= status_publish_rate_divider_) {
     if (rt_status_pub_->trylock()) {
       auto & status = rt_status_pub_->msg_;
-      status.stamp = get_node()->now();
+      status.stamp = time;
       const auto * execution = current_execution_;
       const auto * imp_execution = current_impedance_execution_;
       status.trajectory_start = builtin_interfaces::msg::Time{};
@@ -628,11 +646,11 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   return controller_interface::return_type::OK;
 }
 
-void Lite6CTCController::publish_shadow_shm(const Eigen::VectorXd * target, bool valid)
+void Lite6CTCController::publish_shadow_shm(const Vec6d * target, bool valid)
 {
   if (!state_shm_.valid()) {return;}
   lite6_interfaces::shm::ShadowStatePod pod{};
-  if (target && target->size() >= static_cast<Eigen::Index>(joint_names_.size())) {
+  if (target) {
     for (size_t i = 0; i < joint_names_.size(); ++i) {
       pod.position[i] = (*target)[static_cast<Eigen::Index>(i)];
     }
@@ -734,7 +752,7 @@ void Lite6CTCController::update_momentum_observer(double dt)
   }
 
   pinocchio::computeJointJacobians(pin_model_, pin_data_gmo_, dynamics_q_);
-  pinocchio::updateFramePlacements(pin_model_, pin_data_gmo_);
+  pinocchio::updateFramePlacement(pin_model_, pin_data_gmo_, compliance_frame_);
   gmo_jacobian_.setZero();
   pinocchio::getFrameJacobian(
     pin_model_, pin_data_gmo_, compliance_frame_,
@@ -750,12 +768,31 @@ void Lite6CTCController::update_momentum_observer(double dt)
   }
   gmo_contact_detected_ =
     gmo_external_wrench_.head<3>().norm() >= gmo_contact_force_threshold_;
+  gmo_state_cached_this_cycle_ = true;
+}
+
+void Lite6CTCController::read_cached_tcp_kinematics(
+  const pinocchio::SE3 * & out_pose, const Mat6x8d * & out_jacobian)
+{
+  if (gmo_state_cached_this_cycle_) {
+    out_pose = &pin_data_gmo_.oMf[compliance_frame_];
+    out_jacobian = &gmo_jacobian_;
+    return;
+  }
+  pinocchio::computeJointJacobians(pin_model_, pin_data_, dynamics_q_);
+  pinocchio::updateFramePlacement(pin_model_, pin_data_, compliance_frame_);
+  compliance_jacobian_.setZero();
+  pinocchio::getFrameJacobian(
+    pin_model_, pin_data_, compliance_frame_,
+    pinocchio::LOCAL_WORLD_ALIGNED, compliance_jacobian_);
+  out_pose = &pin_data_.oMf[compliance_frame_];
+  out_jacobian = &compliance_jacobian_;
 }
 
 void Lite6CTCController::add_passive_friction_ff(
   double fv_scale, double fc_scale, double v_trans, double quiet_speed,
-  const Eigen::Ref<const Eigen::VectorXd> & dq_coulomb,
-  Eigen::VectorXd & tau_out) const
+  const Vec6d & dq_coulomb,
+  Vec6d & tau_out) const
 {
   const size_t n = joint_names_.size();
   for (size_t i = 0; i < n; ++i) {

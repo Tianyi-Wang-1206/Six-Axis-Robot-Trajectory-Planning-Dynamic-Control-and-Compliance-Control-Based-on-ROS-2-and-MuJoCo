@@ -8,6 +8,7 @@ GUI widgets, their layouts and the SysIdEngine numerical methods live elsewhere.
 """
 
 import math
+import queue
 import threading
 import time
 import uuid
@@ -152,7 +153,10 @@ class ROS2Worker(QThread):
         self._last_joint_seq = 0
         self._last_joint_steady_ns = 0
         self._sysid_shm_enabled = False
-        self.shm_timer = self.node.create_timer(0.005, self._poll_shm)
+        self.shm_timer = self.node.create_timer(0.01, self._poll_shm)
+        self._ros_tasks = queue.Queue()
+        self._executor_thread_id = None
+        self._ros_wake = self.node.create_guard_condition(self._drain_ros_tasks)
         self.gripper_state = None
         self.last_gripper_rx_time = 0.0
         self.gripper_client = self.node.create_client(GripperCommand, "/gripper/command")
@@ -213,20 +217,53 @@ class ROS2Worker(QThread):
             return bool(g is not None and g.ready and g.active
                         and time.monotonic() - self.last_gripper_rx_time < 0.25)
 
+    def _drain_ros_tasks(self):
+        while True:
+            try:
+                fn = self._ros_tasks.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception as exc:
+                if not self._stopping:
+                    self.node.get_logger().warn(f"Queued ROS task error: {exc}")
+
+    def _run_on_executor(self, fn):
+        if self._stopping:
+            return False
+        if self._executor_thread_id is not None and threading.get_ident() == self._executor_thread_id:
+            fn()
+            return True
+        self._ros_tasks.put(fn)
+        try:
+            self._ros_wake.trigger()
+        except Exception:
+            pass
+        return True
+
     def command_gripper(self, command):
         with self.state_lock:
             if not self.gripper_ready():
                 self._report_error("Gripper hardware is inactive or feedback is stale")
                 return
-            if not self.gripper_client.service_is_ready():
-                self._report_error("Gripper service unavailable")
+        if not self._run_on_executor(lambda cmd=command: self._send_gripper_on_executor(cmd)):
+            self._report_error("Gripper request canceled while stopping")
+
+    def _send_gripper_on_executor(self, command):
+        with self.state_lock:
+            if not self.gripper_ready():
+                self._report_error("Gripper hardware is inactive or feedback is stale")
                 return
-            request = GripperCommand.Request()
-            request.command = command
-            try:
-                self.gripper_client.call_async(request).add_done_callback(self._gripper_response)
-            except Exception as exc:
-                self._report_error(f"Gripper request failed: {exc}")
+        if not self.gripper_client.service_is_ready():
+            self._report_error("Gripper service unavailable")
+            return
+        request = GripperCommand.Request()
+        request.command = command
+        try:
+            self.gripper_client.call_async(request).add_done_callback(self._gripper_response)
+        except Exception as exc:
+            self._report_error(f"Gripper request failed: {exc}")
 
     def _gripper_response(self, future):
         try:
@@ -237,17 +274,28 @@ class ROS2Worker(QThread):
             self._report_error(f"Gripper request failed: {exc}")
 
     def run(self):
+        self._executor_thread_id = threading.get_ident()
+        self._drain_ros_tasks()
         try:
             self.executor.spin()
         finally:
+            self._drain_ros_tasks()
             self.executor.remove_node(self.node)
 
     def stop(self):
         self._stopping = True
+        try:
+            self._ros_wake.trigger()
+        except Exception:
+            pass
         self.executor.shutdown(timeout_sec=2.0)
         self.wait(2500)
         self._sysid_shm.close()
         self._state_shm.close()
+        try:
+            self.node.destroy_guard_condition(self._ros_wake)
+        except Exception:
+            pass
         self.node.destroy_node()
 
     def _report_error(self, message):
@@ -283,8 +331,16 @@ class ROS2Worker(QThread):
             self._report_error(message)
 
     def _send_command(self, event, session=0, reason="", done=None, compliance=None):
+        if self._executor_thread_id is not None and threading.get_ident() == self._executor_thread_id:
+            return self._send_command_on_executor(event, session, reason, done, compliance)
+        return self._run_on_executor(
+            lambda: self._send_command_on_executor(event, session, reason, done, compliance))
+
+    def _send_command_on_executor(self, event, session=0, reason="", done=None, compliance=None):
         if not self.command_client.service_is_ready():
             self._report_error("Supervisor command service is unavailable")
+            if done is not None:
+                done(None)
             return False
         req = SupervisorCommand.Request()
         req.command = event
@@ -298,6 +354,8 @@ class ROS2Worker(QThread):
             return True
         except Exception as exc:
             self._report_error(f"Supervisor command request failed: {exc}")
+            if done is not None:
+                done(None)
             return False
 
     def _command_response(self, future, done):
@@ -563,6 +621,11 @@ class ROS2Worker(QThread):
         return p
 
     def _dispatch_motion(self, goal):
+        if self._executor_thread_id is not None and threading.get_ident() == self._executor_thread_id:
+            return self._dispatch_motion_on_executor(goal)
+        return self._run_on_executor(lambda: self._dispatch_motion_on_executor(goal))
+
+    def _dispatch_motion_on_executor(self, goal):
         with self.state_lock:
             snap = self.supervisor_state
             if self._motion_pending:
@@ -700,6 +763,10 @@ class ROS2Worker(QThread):
         """Request supervisor ESTOP; use CTC direct path only if unavailable."""
         with self.state_lock:
             self._estop_requested_at = time.monotonic()
+        self._run_on_executor(lambda: self._trigger_estop_on_executor(reason, force_fallback))
+
+    def _trigger_estop_on_executor(self, reason, force_fallback=False):
+        with self.state_lock:
             h = self.current_goal_handle
         if h is not None:
             try:
@@ -707,18 +774,21 @@ class ROS2Worker(QThread):
             except Exception:
                 pass
         if force_fallback or not self.command_client.service_is_ready():
-            self._emergency_fallback(reason)
+            self._emergency_fallback_on_executor(reason)
             return
-        ok = self._send_command(SupervisorCommand.Request.CMD_ESTOP, reason=reason,
-                                done=self._estop_reply)
+        ok = self._send_command_on_executor(
+            SupervisorCommand.Request.CMD_ESTOP, reason=reason, done=self._estop_reply)
         if not ok:
-            self._emergency_fallback(reason)
+            self._emergency_fallback_on_executor(reason)
 
     def _estop_reply(self, resp):
         if resp is None or not resp.accepted:
             self._emergency_fallback("Supervisor did not accept emergency stop")
 
     def _emergency_fallback(self, reason):
+        self._run_on_executor(lambda: self._emergency_fallback_on_executor(reason))
+
+    def _emergency_fallback_on_executor(self, reason):
         with self.state_lock:
             if self._direct_estop_sent:
                 return
@@ -872,13 +942,23 @@ class ROS2Worker(QThread):
             if not self._sysid_phase_is(session, SupervisorState.SYSID_READY_FOR_EXCITATION):
                 return
             trajectory = self._prepared_trajectory
-        if trajectory is None or not self.sysid_client.service_is_ready():
-            self._report_error("Supervisor SysID trajectory service or prepared trajectory unavailable")
+        if trajectory is None:
+            self._report_error("Prepared SysID trajectory unavailable")
             self._abort_sysid(session, "Excitation submission unavailable")
             return
         req = SubmitSysIdTrajectory.Request()
         req.session_id = int(session)
         req.trajectory = trajectory
+        if not self._run_on_executor(lambda: self._submit_sysid_on_executor(session, req)):
+            self._abort_sysid(session, "Excitation submission canceled")
+
+    def _submit_sysid_on_executor(self, session, req):
+        if not self._sysid_phase_is(session, SupervisorState.SYSID_READY_FOR_EXCITATION):
+            return
+        if not self.sysid_client.service_is_ready():
+            self._report_error("Supervisor SysID trajectory service unavailable")
+            self._abort_sysid(session, "Excitation submission unavailable")
+            return
         try:
             self.sysid_client.call_async(req).add_done_callback(
                 lambda f: self._excitation_reply(f, session))

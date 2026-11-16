@@ -116,6 +116,7 @@ bool KinematicsEngine::init_robot_model(const std::string& urdf, const std::stri
     }
     flange_to_tcp_ = pin_model_.frames[flange].placement.actInv(
       pin_model_.frames[tcp].placement).toHomogeneousMatrix();
+    tcp_frame_id_ = tcp;
     std::vector<std::string> dirs;
     for(const auto& pkg:ament_index_cpp::get_packages_with_prefixes()) dirs.push_back(pkg.second+"/share");
     pinocchio::urdf::buildGeom(pin_model_,urdf,pinocchio::COLLISION,geom_model_,dirs);
@@ -145,11 +146,15 @@ bool KinematicsEngine::joint_valid(const std::array<double,6>& q,double eps) con
 }
 
 Eigen::Matrix4d KinematicsEngine::forward_pose(const std::array<double,6>& q) const {
-  pinocchio::Data data(pin_model_); // No model-lifetime-sensitive thread_local cache.
+  pinocchio::Data data(pin_model_);
+  return forward_pose(q,data);
+}
+
+Eigen::Matrix4d KinematicsEngine::forward_pose(
+    const std::array<double,6>& q,pinocchio::Data& data) const {
   const Eigen::Map<const Eigen::Matrix<double,6,1>> qe(q.data());
   pinocchio::forwardKinematics(pin_model_,data,qe);
-  pinocchio::updateFramePlacements(pin_model_,data);
-  const auto& frame=data.oMf[pin_model_.getFrameId("link_eef")];
+  const auto& frame=pinocchio::updateFramePlacement(pin_model_,data,tcp_frame_id_);
   Eigen::Matrix4d T=Eigen::Matrix4d::Identity();
   T.topLeftCorner<3,3>()=frame.rotation();
   T.topRightCorner<3,1>()=frame.translation();
@@ -190,11 +195,17 @@ bool KinematicsEngine::check_collision(const std::array<double,6>& q,
 double KinematicsEngine::check_singularity(const std::array<double,6>& q) const {
   if(!all_finite(q)) return 0;
   pinocchio::Data data(pin_model_);
+  return check_singularity(q,data);
+}
+
+double KinematicsEngine::check_singularity(
+    const std::array<double,6>& q,pinocchio::Data& data) const {
+  if(!all_finite(q)) return 0;
   const Eigen::Map<const Eigen::Matrix<double,6,1>> qe(q.data());
   pinocchio::Data::Matrix6x J(6,6);
   J.setZero();
   pinocchio::computeFrameJacobian(pin_model_,data,qe,
-    pin_model_.getFrameId("link_eef"),pinocchio::LOCAL_WORLD_ALIGNED,J);
+    tcp_frame_id_,pinocchio::LOCAL_WORLD_ALIGNED,J);
   // Pinocchio spatial order: [linear velocity; angular velocity].
   J.topRows(3)/=kJacobianLength;
   Eigen::JacobiSVD<Eigen::Matrix<double,6,6>> svd(J,Eigen::ComputeFullU|Eigen::ComputeFullV);
@@ -387,6 +398,14 @@ void KinematicsEngine::raw_inverse_kinematics(const Eigen::Matrix4d& T, double c
 IKResult KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
     const std::array<double,6>& q_ref,
     std::vector<std::array<double,6>>& sorted,bool continuous,IKDiagnostics* diagnostics) const {
+  auto workspace=collision_workspace();
+  return solve_optimal_ik(T,q_ref,sorted,continuous,workspace,diagnostics);
+}
+
+IKResult KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
+    const std::array<double,6>& q_ref,
+    std::vector<std::array<double,6>>& sorted,bool continuous,
+    CollisionWorkspace& workspace,IKDiagnostics* diagnostics) const {
   sorted.clear();
   if(diagnostics) *diagnostics=IKDiagnostics{};
   if(!T.allFinite()||!all_finite(q_ref)) {
@@ -464,18 +483,17 @@ IKResult KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
     // but correct finite symbolic/model mismatch using a normalized SVD-DLS step.
     // Only a small local correction is permitted; this is NOT a new global IK.
     for(int iteration=0;iteration<8;++iteration) {
-      const Eigen::Matrix4d fk=forward_pose(q);
+      const Eigen::Matrix4d fk=forward_pose(q,workspace.data);
       if((fk.topRightCorner<3,1>()-T.topRightCorner<3,1>()).norm()<kFKPositionTol*0.25&&
          rotation_error(fk.topLeftCorner<3,3>(),T.topLeftCorner<3,3>())<kFKRotationTol*0.25) break;
       const pinocchio::SE3 current(fk.topLeftCorner<3,3>(),fk.topRightCorner<3,1>());
       const pinocchio::SE3 desired(T.topLeftCorner<3,3>(),T.topRightCorner<3,1>());
       const auto pose_error=pinocchio::log6(current.actInv(desired)).toVector();
       if(!pose_error.allFinite()) break;
-      pinocchio::Data data(pin_model_);
       const Eigen::Map<const Eigen::Matrix<double,6,1>> qe(q.data());
       pinocchio::Data::Matrix6x jac(6,6);jac.setZero();
-      pinocchio::computeFrameJacobian(pin_model_,data,qe,
-          pin_model_.getFrameId("link_eef"),pinocchio::LOCAL,jac);
+      pinocchio::computeFrameJacobian(pin_model_,workspace.data,qe,
+          tcp_frame_id_,pinocchio::LOCAL,jac);
       jac.topRows(3)/=kJacobianLength;
       Eigen::Matrix<double,6,1> error=pose_error;
       error.head<3>()/=kJacobianLength;
@@ -495,7 +513,7 @@ IKResult KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
       if(!joint_valid(q)) break;
     }
     if(!joint_valid(q)) {reject_invalid(q);blocked=true;continue;}
-    const Eigen::Matrix4d fk=forward_pose(q);
+    const Eigen::Matrix4d fk=forward_pose(q,workspace.data);
     const double pos_error=(fk.topRightCorner<3,1>()-T.topRightCorner<3,1>()).norm();
     const double rot_error=rotation_error(fk.topLeftCorner<3,3>(),T.topLeftCorner<3,3>());
     if(pos_error>kFKPositionTol||rot_error>kFKRotationTol) {
@@ -507,7 +525,7 @@ IKResult KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
       continue; // Do not publish an unverified inverse-kinematics branch.
     }
     if(continuous) {
-      const double sigma=check_singularity(q),threshold=std::max(0.003,singularity_threshold_);
+      const double sigma=check_singularity(q,workspace.data),threshold=std::max(0.003,singularity_threshold_);
       if(sigma<threshold) {
         std::ostringstream out;
         out<<std::setprecision(10)<<"normalized Jacobian sigma_min="<<sigma<<", threshold="<<threshold;
@@ -515,7 +533,7 @@ IKResult KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
       }
     }
     std::string collision;
-    if(check_collision(q,diagnostics?&collision:nullptr)) {
+    if(check_collision(q,workspace,diagnostics?&collision:nullptr)) {
       reject("collision",collision);blocked=true;continue;
     }
     cost=0.0;

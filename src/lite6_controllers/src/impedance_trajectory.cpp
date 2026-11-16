@@ -121,7 +121,7 @@ bool Lite6CTCController::configure_impedance_trajectory()
     imp_max_external_torque_[i] = imp_ext_lim[i];
   }
 
-  imp_ref_jacobian_.setZero(6, pin_model_.nv);
+  imp_ref_jacobian_.setZero();
   impedance_trajectory_server_ = rclcpp_action::create_server<FollowImpedance>(
     node, "~/follow_impedance_trajectory",
     [this](const rclcpp_action::GoalUUID &, std::shared_ptr<const FollowImpedance::Goal> goal) {
@@ -145,6 +145,9 @@ bool Lite6CTCController::configure_impedance_trajectory()
     },
     [this](const std::shared_ptr<ImpedanceGoal> goal) {
       std::lock_guard<std::mutex> lock(trajectory_mutex_);
+      if (active_impedance_trajectory_) {
+        retired_impedance_trajectories_.push_back(std::move(active_impedance_trajectory_));
+      }
       active_impedance_trajectory_ = std::make_shared<ImpedanceTrajectoryExecution>(goal);
       if (!trajectory_enabled_.load()) {
         active_impedance_trajectory_->result.store(ImpedanceTrajectoryResult::DEACTIVATED);
@@ -195,7 +198,7 @@ bool Lite6CTCController::valid_impedance_trajectory_goal(
 
 void Lite6CTCController::fail_impedance_trajectory(
   ImpedanceTrajectoryResult reason, int joint, double value, double limit,
-  const std::string & detail)
+  const char * detail)
 {
   int code = 0;
   switch (reason) {
@@ -296,12 +299,15 @@ void Lite6CTCController::update_impedance_trajectory_reference(
     return;
   }
 
-  const auto next = std::upper_bound(
-    points.begin(), points.end(), execution->elapsed,
-    [](double t, const lite6_interfaces::msg::ImpedanceTrajectoryPoint & point) {
-      return t < to_seconds(point.time_from_start);
-    });
-  const size_t index = static_cast<size_t>(std::distance(points.begin(), next) - 1);
+  size_t index = execution->last_sample_index;
+  if (index >= points.size()) {
+    index = 0;
+  }
+  while (index + 1 < points.size() &&
+         to_seconds(points[index + 1].time_from_start) <= execution->elapsed) {
+    ++index;
+  }
+  execution->last_sample_index = index;
   const auto & point = points[index];
   for (size_t i = 0; i < joint_names_.size(); ++i) {
     q_imp_ref_[static_cast<int>(i)] = point.positions[i];
@@ -375,7 +381,9 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
   imp_null_damping_filtered_ += alpha * (imp_null_damping_target_ - imp_null_damping_filtered_);
 
   // Gravity compensation on the measured configuration.
-  tau_cmd_ = pinocchio::computeGeneralizedGravity(pin_model_, pin_data_, dynamics_q_).head(6);
+  tau_cmd_ = (gmo_state_cached_this_cycle_
+    ? pin_data_gmo_.g
+    : pinocchio::computeGeneralizedGravity(pin_model_, pin_data_, dynamics_q_)).head<6>();
   a_d_.setZero();
   integral_effort_.setZero();
 
@@ -386,23 +394,21 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
   dynamics_dq_ref_.tail(2).setZero();
 
   pinocchio::computeJointJacobians(pin_model_, pin_data_ref_, dynamics_q_ref_);
-  pinocchio::updateFramePlacements(pin_model_, pin_data_ref_);
+  pinocchio::updateFramePlacement(pin_model_, pin_data_ref_, compliance_frame_);
   imp_ref_jacobian_.setZero();
   pinocchio::getFrameJacobian(
     pin_model_, pin_data_ref_, compliance_frame_,
     pinocchio::LOCAL_WORLD_ALIGNED, imp_ref_jacobian_);
   const auto & ref_pose = pin_data_ref_.oMf[compliance_frame_];
-  const Eigen::Matrix<double, 6, 1> ref_velocity = imp_ref_jacobian_ * dynamics_dq_ref_;
+  const Vec6d ref_velocity = imp_ref_jacobian_ * dynamics_dq_ref_;
 
-  // 2. Evaluate measured pose T(q) and twist v(q, dq).
-  pinocchio::computeJointJacobians(pin_model_, pin_data_, dynamics_q_);
-  pinocchio::updateFramePlacements(pin_model_, pin_data_);
-  compliance_jacobian_.setZero();
-  pinocchio::getFrameJacobian(
-    pin_model_, pin_data_, compliance_frame_,
-    pinocchio::LOCAL_WORLD_ALIGNED, compliance_jacobian_);
-  const auto & meas_pose = pin_data_.oMf[compliance_frame_];
-  const Eigen::Matrix<double, 6, 1> meas_velocity = compliance_jacobian_ * dynamics_dq_;
+  // 2. Evaluate measured pose T(q) and twist v(q, dq), reusing GMO cache if valid this cycle.
+  const pinocchio::SE3 * meas_pose_ptr = nullptr;
+  const Mat6x8d * meas_jac_ptr = nullptr;
+  read_cached_tcp_kinematics(meas_pose_ptr, meas_jac_ptr);
+  const auto & meas_pose = *meas_pose_ptr;
+  const auto & meas_jac = *meas_jac_ptr;
+  const Vec6d meas_velocity = meas_jac * dynamics_dq_;
 
   // 3. Compute SE(3) pose & twist errors in LOCAL_WORLD_ALIGNED frame.
   imp_current_pos_error_ = ref_pose.translation() - meas_pose.translation();
@@ -411,13 +417,13 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
   const Eigen::Vector3d vel_trans_error = ref_velocity.head<3>() - meas_velocity.head<3>();
   const Eigen::Vector3d vel_rot_error = ref_velocity.tail<3>() - meas_velocity.tail<3>();
 
-  Eigen::Matrix<double, 6, 1> wrench;
+  Vec6d wrench;
   wrench.head<3>() = imp_kt_filtered_.cwiseProduct(imp_current_pos_error_) +
                      imp_dt_filtered_.cwiseProduct(vel_trans_error);
   wrench.tail<3>() = imp_kr_filtered_.cwiseProduct(imp_current_rot_error_) +
                      imp_dr_filtered_.cwiseProduct(vel_rot_error);
 
-  tau_cmd_.noalias() += compliance_jacobian_.leftCols(6).transpose() * wrench;
+  tau_cmd_.noalias() += meas_jac.leftCols<6>().transpose() * wrench;
   // Damping relative to reference joint velocity stabilizes null-space and near-singular motions.
   tau_cmd_ -= imp_null_damping_filtered_ * (dq_ - dq_imp_ref_);
   add_passive_friction_ff(
@@ -572,17 +578,34 @@ void Lite6CTCController::finish_impedance_trajectory_cycle(double dt)
 
 void Lite6CTCController::monitor_impedance_trajectory()
 {
-  std::lock_guard<std::mutex> lock(trajectory_mutex_);
-  if (!active_impedance_trajectory_) {
+  std::shared_ptr<ImpedanceTrajectoryExecution> execution;
+  {
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    if (!active_impedance_trajectory_ && !retired_impedance_trajectories_.empty() &&
+        rt_seen_impedance_execution_.load(std::memory_order_acquire) == nullptr)
+    {
+      impedance_trajectory_buffer_.writeFromNonRT(
+        std::shared_ptr<ImpedanceTrajectoryExecution>{});
+    }
+    const auto * rt_seen = rt_seen_impedance_execution_.load(std::memory_order_acquire);
+    retired_impedance_trajectories_.erase(
+      std::remove_if(
+        retired_impedance_trajectories_.begin(), retired_impedance_trajectories_.end(),
+        [rt_seen](const std::shared_ptr<ImpedanceTrajectoryExecution> & ptr) {
+          return ptr.use_count() == 1 && ptr.get() != rt_seen;
+        }),
+      retired_impedance_trajectories_.end());
+    execution = active_impedance_trajectory_;
+  }
+  if (!execution) {
     return;
   }
-  const auto & execution = active_impedance_trajectory_;
   const auto outcome = execution->result.load();
   const auto & goal = execution->goal;
   if (outcome == ImpedanceTrajectoryResult::RUNNING) {
     if (goal->is_executing()) {
       auto feedback = std::make_shared<FollowImpedance::Feedback>();
-      feedback->stamp = get_node()->now();
+      feedback->stamp = node_clock_ ? node_clock_->now() : get_node()->now();
       feedback->current_sample = static_cast<uint32_t>(execution->sample.load());
       for (size_t k = 0; k < 3; ++k) {
         feedback->position_error_m[k] = execution->pos_error[k].load(std::memory_order_relaxed);
@@ -640,8 +663,8 @@ void Lite6CTCController::monitor_impedance_trajectory()
         result->error_code = FollowImpedance::Result::CONTROLLER_FAULT;
         break;
     }
-    result->error_string = execution->failure_detail.empty() ?
-      "Impedance trajectory execution aborted" : execution->failure_detail;
+    result->error_string = (execution->failure_detail && execution->failure_detail[0] != '\0') ?
+      execution->failure_detail : "Impedance trajectory execution aborted";
     if (execution->failure_joint >= 0 &&
         static_cast<size_t>(execution->failure_joint) < joint_names_.size()) {
       result->error_string += "; " + joint_names_[execution->failure_joint];
@@ -652,8 +675,14 @@ void Lite6CTCController::monitor_impedance_trajectory()
     }
     goal->abort(result);
   }
-  active_impedance_trajectory_.reset();
-  impedance_trajectory_reserved_ = false;
+
+  std::lock_guard<std::mutex> lock(trajectory_mutex_);
+  if (active_impedance_trajectory_ == execution) {
+    retired_impedance_trajectories_.push_back(std::move(active_impedance_trajectory_));
+    impedance_trajectory_buffer_.writeFromNonRT(
+      std::shared_ptr<ImpedanceTrajectoryExecution>{});
+    impedance_trajectory_reserved_ = false;
+  }
 }
 
 }  // namespace lite6_controllers

@@ -19,6 +19,17 @@ inline int64_t steady_now_ns() noexcept
     std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+inline void cpu_relax() noexcept
+{
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+  asm volatile("yield" ::: "memory");
+#else
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+}
+
 constexpr uint32_t kShmMagic = 0x4C365348U;  // "L6SH"
 constexpr uint32_t kShmVersion = 1U;
 constexpr uint32_t kInitUninit = 0U;
@@ -61,7 +72,7 @@ struct alignas(64) ShmSeqRegister
       s += 1ULL;
     }
     seq.store(s, std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_acq_rel);
     for (size_t i = 0; i < kWords; ++i) {
       words[i].store(buf[i], std::memory_order_relaxed);
     }
@@ -73,7 +84,11 @@ struct alignas(64) ShmSeqRegister
     uint64_t buf[kWords];
     for (uint32_t attempt = 0; attempt < max_retries; ++attempt) {
       const uint64_t s1 = seq.load(std::memory_order_acquire);
-      if (s1 == 0ULL || (s1 & 1ULL) != 0ULL) {
+      if (s1 == 0ULL) {
+        return false;
+      }
+      if ((s1 & 1ULL) != 0ULL) {
+        cpu_relax();
         continue;
       }
       for (size_t i = 0; i < kWords; ++i) {
@@ -86,6 +101,7 @@ struct alignas(64) ShmSeqRegister
         out_seq = s1;
         return true;
       }
+      cpu_relax();
     }
     return false;
   }

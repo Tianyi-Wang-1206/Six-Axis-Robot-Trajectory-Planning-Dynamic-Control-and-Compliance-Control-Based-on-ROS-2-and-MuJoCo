@@ -45,6 +45,10 @@ protected:
   controller_interface::return_type update_and_write_commands(const rclcpp::Time & time, const rclcpp::Duration & period);
 
 private:
+  using Vec6d = Eigen::Matrix<double, 6, 1>;
+  using Vec8d = Eigen::Matrix<double, 8, 1>;
+  using Mat6x8d = Eigen::Matrix<double, 6, 8>;
+
   using FollowTrajectory = control_msgs::action::FollowJointTrajectory;
   using TrajectoryGoal = rclcpp_action::ServerGoalHandle<FollowTrajectory>;
   enum class TrajectoryResult {
@@ -59,6 +63,7 @@ private:
     std::atomic<TrajectoryResult> result{TrajectoryResult::RUNNING};
     std::atomic<size_t> sample{0};
     // Only the control thread accesses these playback fields.
+    size_t last_sample_index = 0;
     double elapsed = 0.0;
     int64_t start_time_ns = 0;
     bool started = false;
@@ -84,9 +89,10 @@ private:
   void request_execution_stop();
   void latch_estop_reason(uint8_t reason, int joint = -1, double value = 0.0, double limit = 0.0);
   void clear_estop_reason();
-  void publish_shadow_shm(const Eigen::VectorXd * target, bool valid);
+  void publish_shadow_shm(const Vec6d * target, bool valid);
   // Borrowed from the RT buffer once per update; valid until the next RT read.
   TrajectoryExecution * current_execution_ = nullptr;
+  std::atomic<const TrajectoryExecution *> rt_seen_execution_{nullptr};
   std::vector<double> path_position_tolerance_, path_velocity_tolerance_;
   std::vector<double> goal_position_tolerance_, goal_velocity_tolerance_;
   std::vector<double> sysid_goal_position_tolerance_, sysid_goal_velocity_tolerance_;
@@ -99,6 +105,7 @@ private:
   std::mutex trajectory_mutex_;  // Non-real-time callbacks only.
   bool trajectory_reserved_ = false;
   std::shared_ptr<TrajectoryExecution> active_trajectory_;
+  std::vector<std::shared_ptr<TrajectoryExecution>> retired_trajectories_;
   realtime_tools::RealtimeBuffer<std::shared_ptr<TrajectoryExecution>> trajectory_buffer_;
   rclcpp_action::Server<FollowTrajectory>::SharedPtr trajectory_server_;
   rclcpp::TimerBase::SharedPtr trajectory_monitor_;
@@ -108,22 +115,24 @@ private:
   pinocchio::Model pin_model_;
   pinocchio::Data pin_data_;
   // Full articulated dynamics; command/reference/estop vectors stay six-axis.
-  Eigen::VectorXd dynamics_q_, dynamics_dq_, dynamics_ddq_;
+  Vec8d dynamics_q_ = Vec8d::Zero(), dynamics_dq_ = Vec8d::Zero(), dynamics_ddq_ = Vec8d::Zero();
 
-  Eigen::VectorXd e_, de_, a_d_, tau_fric_, tau_cmd_;
-  Eigen::VectorXd q_target_, dq_target_, ddq_target_;
+  Vec6d e_ = Vec6d::Zero(), de_ = Vec6d::Zero(), a_d_ = Vec6d::Zero();
+  Vec6d tau_fric_ = Vec6d::Zero(), tau_cmd_ = Vec6d::Zero();
+  Vec6d q_target_ = Vec6d::Zero(), dq_target_ = Vec6d::Zero(), ddq_target_ = Vec6d::Zero();
 
-  Eigen::VectorXd q_, dq_;
+  Vec6d q_ = Vec6d::Zero(), dq_ = Vec6d::Zero();
 
-  // PD Control Matrices
-  Eigen::MatrixXd Kp_, Kv_;
+  // Diagonal PD control gains
+  Vec6d kp_ = Vec6d::Zero(), kv_ = Vec6d::Zero();
 
   // Torque-domain integral: gains in Nm/(rad s), back-calculation in 1/s,
   // and both the retained state and its limits in Nm.
-  Eigen::VectorXd ki_, antiwindup_gain_, integral_max_effort_, integral_effort_;
-  Eigen::VectorXd friction_v_, friction_c_, armature_;
-  Eigen::VectorXd friction_error_gain_;
-  Eigen::VectorXd max_effort_;
+  Vec6d ki_ = Vec6d::Zero(), antiwindup_gain_ = Vec6d::Zero();
+  Vec6d integral_max_effort_ = Vec6d::Zero(), integral_effort_ = Vec6d::Zero();
+  Vec6d friction_v_ = Vec6d::Zero(), friction_c_ = Vec6d::Zero(), armature_ = Vec6d::Zero();
+  Vec6d friction_error_gain_ = Vec6d::Zero();
+  Vec6d max_effort_ = Vec6d::Zero();
   double tanh_slope_;
 
   enum class SystemState {
@@ -173,6 +182,7 @@ private:
     std::array<std::atomic<double>, 6> external_wrench{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
     std::atomic<bool> contact_detected{false};
     // Control thread only fields.
+    size_t last_sample_index = 0;
     double elapsed = 0.0;
     int64_t start_time_ns = 0;
     bool started = false;
@@ -185,7 +195,7 @@ private:
     int failure_joint = -1;
     double failure_value = 0.0;
     double failure_limit = 0.0;
-    std::string failure_detail;
+    const char * failure_detail = nullptr;
   };
   bool configure_impedance_trajectory();
   bool valid_impedance_trajectory_goal(const FollowImpedance::Goal & goal) const;
@@ -194,19 +204,21 @@ private:
   void check_impedance_trajectory_path();
   void finish_impedance_trajectory_cycle(double dt);
   void fail_impedance_trajectory(ImpedanceTrajectoryResult reason, int joint = -1,
-    double value = 0.0, double limit = 0.0, const std::string & detail = "");
+    double value = 0.0, double limit = 0.0, const char * detail = nullptr);
   void monitor_impedance_trajectory();
 
   ImpedanceTrajectoryExecution * current_impedance_execution_ = nullptr;
+  std::atomic<const ImpedanceTrajectoryExecution *> rt_seen_impedance_execution_{nullptr};
   bool impedance_trajectory_reserved_ = false;
   std::shared_ptr<ImpedanceTrajectoryExecution> active_impedance_trajectory_;
+  std::vector<std::shared_ptr<ImpedanceTrajectoryExecution>> retired_impedance_trajectories_;
   realtime_tools::RealtimeBuffer<std::shared_ptr<ImpedanceTrajectoryExecution>> impedance_trajectory_buffer_;
   rclcpp_action::Server<FollowImpedance>::SharedPtr impedance_trajectory_server_;
 
   pinocchio::Data pin_data_ref_;
-  Eigen::VectorXd dynamics_q_ref_;
-  Eigen::VectorXd dynamics_dq_ref_;
-  Eigen::Matrix<double, 6, Eigen::Dynamic> imp_ref_jacobian_;
+  Vec8d dynamics_q_ref_ = Vec8d::Zero();
+  Vec8d dynamics_dq_ref_ = Vec8d::Zero();
+  Mat6x8d imp_ref_jacobian_ = Mat6x8d::Zero();
   Eigen::Matrix<double, 6, 1> q_imp_ref_ = Eigen::Matrix<double, 6, 1>::Zero();
   Eigen::Matrix<double, 6, 1> dq_imp_ref_ = Eigen::Matrix<double, 6, 1>::Zero();
   Eigen::Matrix<double, 6, 1> ddq_imp_ref_ = Eigen::Matrix<double, 6, 1>::Zero();
@@ -265,35 +277,38 @@ private:
   bool configure_momentum_observer();
   void reset_momentum_observer();
   void update_momentum_observer(double dt);
+  void read_cached_tcp_kinematics(
+    const pinocchio::SE3 * & out_pose, const Mat6x8d * & out_jacobian);
   void add_passive_friction_ff(
     double fv_scale, double fc_scale, double v_trans, double quiet_speed,
-    const Eigen::Ref<const Eigen::VectorXd> & dq_coulomb,
-    Eigen::VectorXd & tau_out) const;
+    const Vec6d & dq_coulomb,
+    Vec6d & tau_out) const;
   bool check_external_torque_limit(
     double dt, const std::array<double, 6> & limits, double timeout,
     double & accum_duration, int & out_joint, double & out_val, double & out_limit) const;
 
   bool gmo_enabled_ = true;
   bool gmo_initialized_ = false;
+  bool gmo_state_cached_this_cycle_ = false;
   std::array<double, 6> gmo_gains_{25.0, 25.0, 25.0, 30.0, 30.0, 30.0};
   double gmo_jacobian_damping_ = 0.04;
   double gmo_fric_trans_speed_ = 0.03;
   double gmo_contact_force_threshold_ = 2.5;
   pinocchio::Data pin_data_gmo_;
-  Eigen::Matrix<double, 6, Eigen::Dynamic> gmo_jacobian_;
-  Eigen::Matrix<double, 6, 1> gmo_p_integral_ = Eigen::Matrix<double, 6, 1>::Zero();
-  Eigen::Matrix<double, 6, 1> gmo_residual_tau_ = Eigen::Matrix<double, 6, 1>::Zero();
-  Eigen::Matrix<double, 6, 1> gmo_external_wrench_ = Eigen::Matrix<double, 6, 1>::Zero();
-  Eigen::Matrix<double, 6, 1> tau_applied_prev_ = Eigen::Matrix<double, 6, 1>::Zero();
+  Mat6x8d gmo_jacobian_ = Mat6x8d::Zero();
+  Vec6d gmo_p_integral_ = Vec6d::Zero();
+  Vec6d gmo_residual_tau_ = Vec6d::Zero();
+  Vec6d gmo_external_wrench_ = Vec6d::Zero();
+  Vec6d tau_applied_prev_ = Vec6d::Zero();
   bool gmo_contact_detected_ = false;
   std::array<double, 5> teach_damping_levels_{4.0, 3.25, 2.5, 2.25, 2.0};
   std::array<double, 5> teach_assistance_levels_{0.35, 0.475, 0.60, 0.625, 0.65};
   std::array<double, 5> teach_friction_transition_levels_{0.06, 0.06, 0.06, 0.06, 0.06};
   std::array<double, 5> teach_quiet_speed_levels_{0.06, 0.06, 0.06, 0.06, 0.06};
   lite6_interfaces::msg::ComplianceSettings compliance_settings_, compliance_filtered_;
-  Eigen::Matrix<double,6,1> compliance_q_=Eigen::Matrix<double,6,1>::Zero();
-  Eigen::Matrix<double,6,1> compliance_last_tau_=Eigen::Matrix<double,6,1>::Zero();
-  Eigen::Matrix<double,6,Eigen::Dynamic> compliance_jacobian_;
+  Vec6d compliance_q_ = Vec6d::Zero();
+  Vec6d compliance_last_tau_ = Vec6d::Zero();
+  Mat6x8d compliance_jacobian_ = Mat6x8d::Zero();
   pinocchio::SE3 compliance_pose_;
   pinocchio::FrameIndex compliance_frame_=0;
   uint64_t compliance_sequence_=0;
@@ -304,8 +319,8 @@ private:
   SystemState system_state_ = SystemState::NORMAL;
   
   // Kinematic Deceleration Tracker
-  Eigen::VectorXd estop_q_, estop_dq_; 
-  Eigen::VectorXd estop_decel_;
+  Vec6d estop_q_ = Vec6d::Zero(), estop_dq_ = Vec6d::Zero();
+  Vec6d estop_decel_ = Vec6d::Zero();
   
   rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr cmd_sub_;
   struct ModeCommand {
@@ -314,7 +329,9 @@ private:
     ModeCommand()=default;
     ModeCommand(int32_t v,uint64_t s):value(v),sequence(s) {}
   };
+  std::mutex cmd_write_mutex_;
   realtime_tools::RealtimeBuffer<ModeCommand> cmd_buffer_;
+  rclcpp::Clock::SharedPtr node_clock_;
   std::atomic<uint64_t> command_sequence_{0};
   uint64_t current_command_sequence_ = 0;
   uint64_t execution_stop_sequence_ = 0;

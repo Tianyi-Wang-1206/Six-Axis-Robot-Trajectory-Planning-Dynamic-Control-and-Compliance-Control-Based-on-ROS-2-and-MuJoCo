@@ -67,6 +67,7 @@ private:
   mjData * data_ = nullptr;
   std::array<int, 2> qpos_{}, dof_{}, joints_{}, tips_{};
   int robot_root_ = -1;
+  std::vector<uint8_t> is_robot_body_;
   std::vector<std::array<double, 2>> contact_forces_;
   int motor_ = -1;
   Snapshot state_;

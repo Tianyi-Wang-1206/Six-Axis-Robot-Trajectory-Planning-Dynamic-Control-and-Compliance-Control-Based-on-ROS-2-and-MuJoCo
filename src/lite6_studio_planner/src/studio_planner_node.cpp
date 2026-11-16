@@ -26,6 +26,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -220,6 +221,7 @@ private:
     if (effects.wake_worker) {
       {
         std::lock_guard<std::mutex> lock(worker_wake_mutex_);
+        worker_wake_pending_ = true;
       }
       worker_cv_.notify_all();
     }
@@ -367,8 +369,10 @@ private:
     const std::shared_ptr<CompileProgram::Request> req,
     std::shared_ptr<CompileProgram::Response> resp)
   {
-    compiling_.store(true);
-    ScopeExit clear_compiling{[this]() { compiling_.store(false); }};
+    compile_in_flight_.fetch_add(1, std::memory_order_acq_rel);
+    ScopeExit clear_compiling{[this]() {
+      compile_in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+    }};
 
     std::lock_guard<std::mutex> compile_lock(compile_mutex_);
     std::string busy_reason;
@@ -443,8 +447,9 @@ private:
     const std::shared_ptr<StudioCommand::Request> req,
     std::shared_ptr<StudioCommand::Response> resp)
   {
+    std::lock_guard<std::mutex> cmd_lock(command_mutex_);
     const uint8_t cmd = req->command;
-    if (compiling_.load() &&
+    if (compile_in_flight_.load(std::memory_order_acquire) > 0 &&
         (cmd == StudioCommand::Request::CMD_RUN ||
          cmd == StudioCommand::Request::CMD_RESUME ||
          cmd == StudioCommand::Request::CMD_STEP ||
@@ -516,6 +521,27 @@ private:
     }
 
     typename rclcpp_action::Client<ActionT>::SendGoalOptions opts;
+    auto abandoned = std::make_shared<std::atomic<bool>>(false);
+    bool waiting_on_goal_response = true;
+    ScopeExit abandon_pending{[&waiting_on_goal_response, abandoned]() {
+      if (waiting_on_goal_response) {
+        abandoned->store(true, std::memory_order_release);
+      }
+    }};
+    opts.goal_response_callback =
+      [client, this, session, abandoned](
+        const typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr & accepted_gh) {
+        if (!accepted_gh) {
+          return;
+        }
+        if (abandoned->load(std::memory_order_acquire) ||
+            session != supervisor_->active_session()) {
+          try {
+            (void)client->async_cancel_goal(accepted_gh);
+          } catch (const std::exception &) {
+          }
+        }
+      };
     if (on_feedback) {
       opts.feedback_callback =
         [on_feedback](
@@ -539,6 +565,7 @@ private:
     }
 
     auto goal_handle = gh_future.get();
+    waiting_on_goal_response = false;
     if (!goal_handle) {
       out_error = "Controller rejected trajectory goal";
       return ActionOutcome::FAULT;
@@ -623,11 +650,12 @@ private:
 
   void worker_loop()
   {
+    pthread_setname_np(pthread_self(), "studio_worker");
     while (true) {
       {
         std::unique_lock<std::mutex> lock(worker_wake_mutex_);
         worker_cv_.wait(lock, [this]() {
-          if (worker_exit_) {
+          if (worker_exit_ || worker_wake_pending_) {
             return true;
           }
           const uint8_t st = supervisor_->current_state();
@@ -635,6 +663,7 @@ private:
                  st == StudioState::STATE_STEPPING ||
                  st == StudioState::STATE_RECOVERING;
         });
+        worker_wake_pending_ = false;
         if (worker_exit_) {
           return;
         }
@@ -1351,8 +1380,9 @@ private:
   rclcpp::TimerBase::SharedPtr watchdog_timer_;
 
   std::mutex pub_mutex_;
+  std::mutex command_mutex_;
   std::mutex compile_mutex_;
-  std::atomic<bool> compiling_{false};
+  std::atomic<int> compile_in_flight_{0};
 
   mutable std::mutex state_data_mutex_;
   std::array<double, 6> latest_q_{};
@@ -1376,6 +1406,7 @@ private:
 
   std::mutex worker_wake_mutex_;
   std::condition_variable worker_cv_;
+  bool worker_wake_pending_ = false;
   bool worker_exit_ = false;
   std::thread worker_thread_;
 };

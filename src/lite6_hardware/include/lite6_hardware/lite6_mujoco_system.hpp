@@ -88,7 +88,8 @@ private:
   bool advance_physics(int64_t boundary_ns, EffortCommand & applied);
   void publish_snapshot(StateSnapshot & snapshot);
   void write_visual_shm(const StateSnapshot & snapshot, bool physics_active);
-  void write_joint_state_shm(const StateSnapshot & snapshot);
+  void write_joint_state_shm(
+    const StateSnapshot & snapshot, int64_t ros_stamp_ns, int64_t steady_stamp_ns);
   void refresh_mouse_target(int64_t now_ns);
   void stop_physics();
   void release_model();
@@ -102,7 +103,9 @@ private:
   mjData * m_data = nullptr;
   std::thread physics_thread_;
   std::atomic<bool> stop_requested_{true};
+  std::atomic<bool> rt_sched_active_{false};
   int physics_thread_priority_ = 60;
+  rclcpp::Clock::SharedPtr clock_;
   uint64_t command_sequence_ = 0;      // write() only, reset on activation.
   uint64_t joint_state_sequence_ = 0;  // read() only.
   detail::SpscQueue<EffortCommand, 4096> commands_;

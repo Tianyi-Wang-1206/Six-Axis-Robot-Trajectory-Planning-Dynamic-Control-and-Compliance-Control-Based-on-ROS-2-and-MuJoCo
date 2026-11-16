@@ -84,11 +84,12 @@ bool Lite6CTCController::configure_compliance() {
 
   compliance_frame_=pin_model_.getFrameId("link_eef");
   if(compliance_frame_>=static_cast<pinocchio::FrameIndex>(pin_model_.nframes)) throw std::runtime_error("Missing compliance TCP frame");
-  compliance_jacobian_.setZero(6,pin_model_.nv);
+  compliance_jacobian_.setZero();
   compliance_sub_=node->create_subscription<lite6_interfaces::msg::ComplianceCommand>(
     "~/compliance_cmd",rclcpp::QoS(10),
     [this](const lite6_interfaces::msg::ComplianceCommand::SharedPtr msg) {
       if(msg->command<3||msg->command>5||!lite6_interfaces::valid_compliance_settings(msg->settings)) return;
+      std::lock_guard<std::mutex> lock(cmd_write_mutex_);
       ModeCommand command(msg->command,++command_sequence_);
       command.settings=msg->settings;
       cmd_buffer_.writeFromNonRT(command);
@@ -113,9 +114,12 @@ void Lite6CTCController::process_compliance_command(double dt, int32_t command,
       compliance_settings_=settings;
       if(entering||settings.recapture) {
         compliance_q_=q_;
-        pinocchio::forwardKinematics(pin_model_,pin_data_,dynamics_q_);
-        pinocchio::updateFramePlacements(pin_model_,pin_data_);
-        compliance_pose_=pin_data_.oMf[compliance_frame_];
+        if(gmo_state_cached_this_cycle_) {
+          compliance_pose_=pin_data_gmo_.oMf[compliance_frame_];
+        } else {
+          pinocchio::forwardKinematics(pin_model_,pin_data_,dynamics_q_);
+          compliance_pose_=pinocchio::updateFramePlacement(pin_model_,pin_data_,compliance_frame_);
+        }
       }
       if(entering) {
         compliance_filtered_=settings;
@@ -180,26 +184,27 @@ void Lite6CTCController::compute_compliance(double dt) {
   smooth(s.rotation_stiffness,compliance_settings_.rotation_stiffness);
   smooth(s.rotation_damping,compliance_settings_.rotation_damping);
   smooth(s.sensitivity,compliance_settings_.sensitivity);
-  tau_cmd_=pinocchio::computeGeneralizedGravity(pin_model_,pin_data_,dynamics_q_).head(6);
+  tau_cmd_=(gmo_state_cached_this_cycle_
+    ? pin_data_gmo_.g
+    : pinocchio::computeGeneralizedGravity(pin_model_,pin_data_,dynamics_q_)).head<6>();
   a_d_.setZero();integral_effort_.setZero();
   if(system_state_==SystemState::JOINT_IMPEDANCE) {
     tau_cmd_+=s.joint_stiffness*(compliance_q_-q_)-s.joint_damping*dq_;
     add_passive_friction_ff(compliance_fv_scale_,compliance_fc_scale_,
       compliance_fric_trans_speed_,compliance_fric_quiet_speed_,dq_,tau_cmd_);
   } else if(system_state_==SystemState::CARTESIAN_IMPEDANCE) {
-    pinocchio::computeJointJacobians(pin_model_,pin_data_,dynamics_q_);
-    pinocchio::updateFramePlacements(pin_model_,pin_data_);
-    compliance_jacobian_.setZero();
-    pinocchio::getFrameJacobian(pin_model_,pin_data_,compliance_frame_,
-      pinocchio::LOCAL_WORLD_ALIGNED,compliance_jacobian_);
-    const auto& pose=pin_data_.oMf[compliance_frame_];
-    Eigen::Matrix<double,6,1> error, wrench;
+    const pinocchio::SE3 * pose_ptr=nullptr;
+    const Mat6x8d * jac_ptr=nullptr;
+    read_cached_tcp_kinematics(pose_ptr,jac_ptr);
+    const auto& pose=*pose_ptr;
+    const auto& jac=*jac_ptr;
+    Vec6d error, wrench;
     error.head<3>()=compliance_pose_.translation()-pose.translation();
     error.tail<3>()=pinocchio::log3(compliance_pose_.rotation()*pose.rotation().transpose());
-    const Eigen::Matrix<double,6,1> velocity=compliance_jacobian_*dynamics_dq_;
+    const Vec6d velocity=jac*dynamics_dq_;
     wrench.head<3>()=s.translation_stiffness*error.head<3>()-s.translation_damping*velocity.head<3>();
     wrench.tail<3>()=s.rotation_stiffness*error.tail<3>()-s.rotation_damping*velocity.tail<3>();
-    tau_cmd_.noalias()+=compliance_jacobian_.leftCols(6).transpose()*wrench;
+    tau_cmd_.noalias()+=jac.leftCols<6>().transpose()*wrench;
     // Small joint damping also damps task-null directions near singularities.
     tau_cmd_-=compliance_cartesian_null_damping_*dq_;
     add_passive_friction_ff(compliance_fv_scale_,compliance_fc_scale_,

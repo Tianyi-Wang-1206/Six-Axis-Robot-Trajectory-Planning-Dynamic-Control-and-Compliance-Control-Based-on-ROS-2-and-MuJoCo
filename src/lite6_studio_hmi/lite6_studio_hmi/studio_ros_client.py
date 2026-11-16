@@ -11,6 +11,7 @@ import numpy as np
 import pinocchio as pin
 import rclpy
 from PyQt5.QtCore import QThread, pyqtSignal
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
@@ -34,6 +35,15 @@ class StudioRosWorker(QThread):
         self._stop_requested = False
         self._req_queue = queue.Queue()
         self._last_telemetry_emit = 0.0
+        self._wake_gc = None
+
+    def _trigger_wake(self):
+        gc = self._wake_gc
+        if gc is not None:
+            try:
+                gc.trigger()
+            except Exception:
+                pass
 
     def request_compile(self, source_code, use_current_robot_start=True, custom_start=None):
         self._req_queue.put(
@@ -46,15 +56,19 @@ class StudioRosWorker(QThread):
                 },
             )
         )
+        self._trigger_wake()
 
     def request_command(self, command_code, reason=""):
         self._req_queue.put(("command", {"code": int(command_code), "reason": str(reason)}))
+        self._trigger_wake()
 
     def request_gripper(self, action_code):
         self._req_queue.put(("gripper", {"action": int(action_code)}))
+        self._trigger_wake()
 
     def shutdown(self):
         self._stop_requested = True
+        self._trigger_wake()
         self.wait(3000)
 
     def run(self):
@@ -99,17 +113,32 @@ class StudioRosWorker(QThread):
         command_cli = node.create_client(StudioCommand, "/studio/command")
         gripper_cli = node.create_client(GripperCommand, "/gripper/command")
 
+        executor = SingleThreadedExecutor()
+        executor.add_node(node)
+        wake_gc = node.create_guard_condition(lambda: None)
+        self._wake_gc = wake_gc
+
         pending = []  # list of (kind, meta, future, deadline)
 
         try:
+            if not self._req_queue.empty():
+                wake_gc.trigger()
             while not self._stop_requested and rclpy.ok():
                 self._drain_requests(node, compile_cli, command_cli, gripper_cli, pending)
-                rclpy.spin_once(node, timeout_sec=0.02)
+                wait_sec = 0.0 if not self._req_queue.empty() else 0.02
+                executor.spin_once(timeout_sec=wait_sec)
                 for _ in range(8):
-                    rclpy.spin_once(node, timeout_sec=0.0)
+                    executor.spin_once(timeout_sec=0.0)
                 self._poll_pending(pending)
                 self._maybe_emit_telemetry(shm_reader, pin_model, pin_data, eef_frame_id)
         finally:
+            self._wake_gc = None
+            try:
+                node.destroy_guard_condition(wake_gc)
+            except Exception:
+                pass
+            executor.remove_node(node)
+            executor.shutdown()
             shm_reader.close()
             node.destroy_node()
 
@@ -151,7 +180,7 @@ class StudioRosWorker(QThread):
                 break
 
             if kind == "compile":
-                if not compile_cli.wait_for_service(timeout_sec=0.05):
+                if not compile_cli.service_is_ready():
                     resp = CompileProgram.Response()
                     resp.success = False
                     from lite6_interfaces.msg import CompileDiagnostic
@@ -176,7 +205,7 @@ class StudioRosWorker(QThread):
 
             elif kind == "command":
                 code = payload["code"]
-                if not command_cli.wait_for_service(timeout_sec=0.05):
+                if not command_cli.service_is_ready():
                     self.command_finished.emit(
                         code, False, "Service /studio/command is unavailable"
                     )
@@ -189,7 +218,7 @@ class StudioRosWorker(QThread):
 
             elif kind == "gripper":
                 action = payload["action"]
-                if not gripper_cli.wait_for_service(timeout_sec=0.05):
+                if not gripper_cli.service_is_ready():
                     self.gripper_finished.emit(
                         action, False, "Service /gripper/command is unavailable"
                     )

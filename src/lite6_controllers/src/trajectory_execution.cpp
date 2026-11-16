@@ -89,6 +89,9 @@ void Lite6CTCController::configure_trajectory_action()
     },
     [this](const std::shared_ptr<TrajectoryGoal> goal) {
       std::lock_guard<std::mutex> lock(trajectory_mutex_);
+      if (active_trajectory_) {
+        retired_trajectories_.push_back(std::move(active_trajectory_));
+      }
       active_trajectory_ = std::make_shared<TrajectoryExecution>(goal);
       if (!trajectory_enabled_.load()) {
         active_trajectory_->result.store(TrajectoryResult::DEACTIVATED);
@@ -128,11 +131,13 @@ void Lite6CTCController::update_trajectory_reference(
   if (execution->endpoint_applied) return;
 
   const auto & points = execution->goal->get_goal()->trajectory.points;
-  const auto next = std::upper_bound(points.begin(), points.end(), execution->elapsed,
-    [](double t, const trajectory_msgs::msg::JointTrajectoryPoint & point) {
-      return t < seconds(point.time_from_start);
-    });
-  const size_t index = static_cast<size_t>(std::distance(points.begin(), next) - 1);
+  size_t index = execution->last_sample_index;
+  if (index >= points.size()) index = 0;
+  while (index + 1 < points.size() &&
+         seconds(points[index + 1].time_from_start) <= execution->elapsed) {
+    ++index;
+  }
+  execution->last_sample_index = index;
   const auto & point = points[index];
   // Zero-order hold of the latest due sample: preserve Ruckig q/dq/ddq verbatim.
   for (size_t i = 0; i < n; ++i) {
@@ -307,15 +312,31 @@ void Lite6CTCController::finish_trajectory_cycle(double dt)
 
 void Lite6CTCController::monitor_trajectory()
 {
-  std::lock_guard<std::mutex> lock(trajectory_mutex_);
-  if (!active_trajectory_) return;
-  const auto & execution = active_trajectory_;
+  std::shared_ptr<TrajectoryExecution> execution;
+  {
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    if (!active_trajectory_ && !retired_trajectories_.empty() &&
+        rt_seen_execution_.load(std::memory_order_acquire) == nullptr)
+    {
+      trajectory_buffer_.writeFromNonRT(std::shared_ptr<TrajectoryExecution>{});
+    }
+    const auto * rt_seen = rt_seen_execution_.load(std::memory_order_acquire);
+    retired_trajectories_.erase(
+      std::remove_if(
+        retired_trajectories_.begin(), retired_trajectories_.end(),
+        [rt_seen](const std::shared_ptr<TrajectoryExecution> & ptr) {
+          return ptr.use_count() == 1 && ptr.get() != rt_seen;
+        }),
+      retired_trajectories_.end());
+    execution = active_trajectory_;
+  }
+  if (!execution) return;
   const auto outcome = execution->result.load();
   const auto & goal = execution->goal;
   if (outcome == TrajectoryResult::RUNNING) {
     if (goal->is_executing()) {
       auto feedback = std::make_shared<FollowTrajectory::Feedback>();
-      feedback->header.stamp = get_node()->now();
+      feedback->header.stamp = node_clock_ ? node_clock_->now() : get_node()->now();
       feedback->joint_names = joint_names_;
       feedback->desired = goal->get_goal()->trajectory.points[execution->sample.load()];
       goal->publish_feedback(feedback);
@@ -367,7 +388,12 @@ void Lite6CTCController::monitor_trajectory()
     }
     goal->abort(result);
   }
-  active_trajectory_.reset();
-  trajectory_reserved_ = false;
+
+  std::lock_guard<std::mutex> lock(trajectory_mutex_);
+  if (active_trajectory_ == execution) {
+    retired_trajectories_.push_back(std::move(active_trajectory_));
+    trajectory_buffer_.writeFromNonRT(std::shared_ptr<TrajectoryExecution>{});
+    trajectory_reserved_ = false;
+  }
 }
 }  // namespace lite6_controllers

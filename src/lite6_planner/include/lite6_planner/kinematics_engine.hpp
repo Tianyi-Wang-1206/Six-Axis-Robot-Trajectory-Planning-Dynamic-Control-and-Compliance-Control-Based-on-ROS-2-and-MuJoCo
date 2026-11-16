@@ -46,6 +46,8 @@ public:
       : data(model),geometry(geoms) {}
   };
   CollisionWorkspace collision_workspace() const {return {pin_model_,geom_model_};}
+  pinocchio::Data create_data_workspace() const {return pinocchio::Data(pin_model_);}
+  pinocchio::FrameIndex tcp_frame_id() const {return tcp_frame_id_;}
   KinematicsEngine();
   bool load_limits(const std::string& yaml_path);
   bool load_ik_config(const std::string& yaml_path);
@@ -54,10 +56,16 @@ public:
       const std::array<double, 6>& q_ref,
       std::vector<std::array<double, 6>>& sorted,
       bool continuous, IKDiagnostics* diagnostics=nullptr) const;
+  IKResult solve_optimal_ik(const Eigen::Matrix4d& T,
+      const std::array<double, 6>& q_ref,
+      std::vector<std::array<double, 6>>& sorted,
+      bool continuous, CollisionWorkspace& workspace,
+      IKDiagnostics* diagnostics=nullptr) const;
 
   // Dimensionless, length-normalized minimum singular value of the 6x6 Jacobian.
   // Pinocchio orders spatial motions [linear; angular].
   double check_singularity(const std::array<double, 6>& q) const;
+  double check_singularity(const std::array<double, 6>& q, pinocchio::Data& data) const;
   // Geometry only (non-finite inputs are rejected). Callers validate joint limits
   // with the allowance appropriate to observations, targets or sampled trajectories.
   bool check_collision(const std::array<double, 6>& q, std::string* detail=nullptr) const;
@@ -66,6 +74,7 @@ public:
   bool joint_valid(const std::array<double,6>& q,
       double epsilon=tolerance::kJointPosition) const;
   Eigen::Matrix4d forward_pose(const std::array<double,6>& q) const;
+  Eigen::Matrix4d forward_pose(const std::array<double,6>& q, pinocchio::Data& data) const;
   const pinocchio::Model& get_pin_model() const { return pin_model_; }
   const std::array<JointLimit,6>& get_joint_limits() const { return joint_limits_; }
   const CartesianLimit& get_cartesian_limits() const { return cart_limits_; }
@@ -82,6 +91,7 @@ private:
   std::vector<double> ground_pos_{0.0,0.0,-0.05};
   std::array<double,6> ik_weights_{{1.5,1.5,1.2,1.0,1.0,0.8}};
   Eigen::Matrix4d flange_to_tcp_ = Eigen::Matrix4d::Identity();
+  pinocchio::FrameIndex tcp_frame_id_ = 0;
   pinocchio::Model pin_model_;
   pinocchio::GeometryModel geom_model_;
 };

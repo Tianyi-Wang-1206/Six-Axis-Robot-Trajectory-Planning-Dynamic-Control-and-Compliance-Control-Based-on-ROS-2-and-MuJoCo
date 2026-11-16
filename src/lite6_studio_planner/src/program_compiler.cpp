@@ -121,15 +121,15 @@ void populate_execution_block(
 // at joint configuration q into joint velocities and accelerations via damped SVD Jacobian inversion.
 bool cartesian_twist_to_joint(
   const pinocchio::Model & model,
+  pinocchio::Data & data,
+  const pinocchio::FrameIndex frame_id,
   const std::array<double, 6> & q,
   const std::array<double, 6> & spatial_vel,
   const std::array<double, 6> * spatial_acc,
   std::array<double, 6> & out_dq,
   std::array<double, 6> * out_ddq)
 {
-  pinocchio::Data data(model);
   const Eigen::Map<const Eigen::Matrix<double, 6, 1>> qe(q.data());
-  const pinocchio::FrameIndex frame_id = model.getFrameId("link_eef");
   if (frame_id >= static_cast<pinocchio::FrameIndex>(model.nframes)) {
     return false;
   }
@@ -165,7 +165,7 @@ bool cartesian_twist_to_joint(
 
   if (spatial_acc != nullptr && out_ddq != nullptr) {
     pinocchio::computeJointJacobiansTimeVariation(model, data, qe, dq);
-    pinocchio::updateFramePlacements(model, data);
+    pinocchio::updateFramePlacement(model, data, frame_id);
     pinocchio::Data::Matrix6x dJ(6, 6);
     dJ.setZero();
     pinocchio::getFrameJacobianTimeVariation(
@@ -210,6 +210,7 @@ bool ProgramCompiler::verify_sampled_trajectory_1khz(
 
   const auto & limits = engine_.get_joint_limits();
   const double sing_thresh = engine_.get_singularity_threshold();
+  auto workspace = engine_.collision_workspace();
 
   // Stage 4: Full 1 kHz Kinematic Limits Verification
   for (size_t k = 0; k < sampled.samples.size(); ++k) {
@@ -273,7 +274,7 @@ bool ProgramCompiler::verify_sampled_trajectory_1khz(
     }
 
     if (check_singularity_along_path && (k % 10 == 0 || k + 1 == sampled.samples.size())) {
-      const double sigma = engine_.check_singularity(s.q);
+      const double sigma = engine_.check_singularity(s.q, workspace.data);
       if (sigma < sing_thresh) {
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(6)
@@ -287,7 +288,6 @@ bool ProgramCompiler::verify_sampled_trajectory_1khz(
   }
 
   // Stage 5: Full 1 kHz Coal Self & Environment Collision Verification (with 0.04 rad subdivision)
-  auto workspace = engine_.collision_workspace();
   std::string col_detail;
   if (engine_.check_collision(sampled.samples.front().q, workspace, &col_detail)) {
     add_diag(
@@ -365,7 +365,8 @@ bool ProgramCompiler::compile_cartesian_group(
   ExecutionBlock & out_block,
   std::vector<Diagnostic> & out_diagnostics) const
 {
-  const Eigen::Matrix4d start_pose = engine_.forward_pose(start_q);
+  auto workspace = engine_.collision_workspace();
+  const Eigen::Matrix4d start_pose = engine_.forward_pose(start_q, workspace.data);
   CompositeCartesianPath cart_path;
   SourceLocation err_loc = group.front().loc;
   std::string err_code, err_msg;
@@ -388,8 +389,8 @@ bool ProgramCompiler::compile_cartesian_group(
       const CartesianSample cs = cart_path.eval_normalized(u);
       std::vector<std::array<double, 6>> sols;
       lite6_planner::IKDiagnostics ik_diag;
-      const auto status =
-        engine_.solve_optimal_ik(cs.pose, knots[k - 1], sols, /*continuous=*/true, &ik_diag);
+      const auto status = engine_.solve_optimal_ik(
+        cs.pose, knots[k - 1], sols, /*continuous=*/true, workspace, &ik_diag);
       if (status != IKResult::SUCCESS) {
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(4)
@@ -413,7 +414,7 @@ bool ProgramCompiler::compile_cartesian_group(
       for (int j = 0; j < 6; ++j) {
         q_arr[static_cast<size_t>(j)] = qm[j];
       }
-      const Eigen::Matrix4d fk = engine_.forward_pose(q_arr);
+      const Eigen::Matrix4d fk = engine_.forward_pose(q_arr, workspace.data);
       const CartesianSample ref = cart_path.eval_normalized(u_mid);
       const double p_err = (fk.topRightCorner<3, 1>() - ref.pose.topRightCorner<3, 1>()).norm();
       const double r_err = rot_diff(fk.topLeftCorner<3, 3>(), ref.pose.topLeftCorner<3, 3>());
@@ -466,6 +467,7 @@ bool ProgramCompiler::compile_joint_group(
   std::vector<Diagnostic> & out_diagnostics) const
 {
   const auto & limits = engine_.get_joint_limits();
+  auto workspace = engine_.collision_workspace();
   std::vector<std::array<double, 6>> target_waypoints;
   target_waypoints.reserve(group.size() + 1);
   target_waypoints.push_back(start_q);
@@ -486,7 +488,7 @@ bool ProgramCompiler::compile_joint_group(
         }
       }
       std::string col_detail;
-      if (engine_.check_collision(st.joint_target, &col_detail)) {
+      if (engine_.check_collision(st.joint_target, workspace, &col_detail)) {
         add_diag(
           out_diagnostics, D::STAGE_COLLISION, st.loc, "ERR_COLLISION",
           "MoveJ target configuration is in collision: " + col_detail);
@@ -498,7 +500,7 @@ bool ProgramCompiler::compile_joint_group(
       std::vector<std::array<double, 6>> sols;
       lite6_planner::IKDiagnostics ik_diag;
       const auto status = engine_.solve_optimal_ik(
-        st.pose_target, target_waypoints.back(), sols, /*continuous=*/false, &ik_diag);
+        st.pose_target, target_waypoints.back(), sols, /*continuous=*/false, workspace, &ik_diag);
       if (status != IKResult::SUCCESS) {
         add_diag(
           out_diagnostics, D::STAGE_PLANNING, st.loc, ik_error_code(status),
@@ -602,6 +604,7 @@ bool ProgramCompiler::compile_pva_statement(
   std::vector<Diagnostic> & out_diagnostics) const
 {
   const auto & limits = engine_.get_joint_limits();
+  auto workspace = engine_.collision_workspace();
   const size_t M = pva.waypoints.size();
   std::vector<std::array<double, 6>> q_nodes(M + 1);
   q_nodes[0] = start_q;
@@ -631,7 +634,7 @@ bool ProgramCompiler::compile_pva_statement(
       std::vector<std::array<double, 6>> sols;
       lite6_planner::IKDiagnostics ik_diag;
       const auto status = engine_.solve_optimal_ik(
-        wp.cart_pose, q_nodes[k], sols, /*continuous=*/true, &ik_diag);
+        wp.cart_pose, q_nodes[k], sols, /*continuous=*/true, workspace, &ik_diag);
       if (status != IKResult::SUCCESS) {
         add_diag(
           out_diagnostics, D::STAGE_PLANNING, wp.loc, ik_error_code(status),
@@ -672,7 +675,8 @@ bool ProgramCompiler::compile_pva_statement(
           const std::array<double, 6> * acc_ptr =
             pva.waypoints[k].acceleration.has_value() ? &(*pva.waypoints[k].acceleration) : nullptr;
           if (!cartesian_twist_to_joint(
-                engine_.get_pin_model(), q_nodes[k + 1], *pva.waypoints[k].velocity,
+                engine_.get_pin_model(), workspace.data, engine_.tcp_frame_id(),
+                q_nodes[k + 1], *pva.waypoints[k].velocity,
                 acc_ptr, v_nodes[k + 1], acc_ptr ? &a_nodes[k + 1] : nullptr)) {
             add_diag(
               out_diagnostics, D::STAGE_PLANNING, pva.waypoints[k].loc, "ERR_PVA_JACOBIAN",

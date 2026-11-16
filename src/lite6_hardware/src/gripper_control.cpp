@@ -64,6 +64,15 @@ void GripperControl::initialize(mjModel * model, mjData * data)
     throw std::runtime_error("Missing gripper motor/base or force exceeds motor rating");
   }
   contact_forces_.resize(model_->nbody);
+  is_robot_body_.assign(static_cast<size_t>(model_->nbody), 0U);
+  for (int b = 0; b < model_->nbody; ++b) {
+    for (int parent = b; parent > 0; parent = model_->body_parentid[parent]) {
+      if (parent == robot_root_) {
+        is_robot_body_[static_cast<size_t>(b)] = 1U;
+        break;
+      }
+    }
+  }
   state_ = Snapshot{};
   stop_drive(State::STOPPED);
 }
@@ -193,10 +202,9 @@ int GripperControl::grasp_contact()
       const int body = model_->geom_bodyid[contact.geom[1-side]];
       // Only an external movable rigid body qualifies; exclude table, world,
       // robot links and the other finger. Multiple geoms may belong to one body.
-      bool robot = false;
-      for (int parent = body; parent > 0; parent = model_->body_parentid[parent]) {
-        if (parent == robot_root_) {robot = true; break;}
-      }
+      const bool robot = body >= 0 &&
+        static_cast<size_t>(body) < is_robot_body_.size() &&
+        is_robot_body_[static_cast<size_t>(body)] != 0U;
       const int object = model_->body_weldid[body];
       if (robot || object <= 0 || model_->body_dofnum[object] == 0) {continue;}
       const auto * axis = data_->xaxis + 3*joints_[finger];

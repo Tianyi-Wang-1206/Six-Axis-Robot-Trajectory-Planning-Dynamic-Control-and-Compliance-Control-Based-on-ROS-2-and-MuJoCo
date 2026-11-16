@@ -11,6 +11,9 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdexcept>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 
 namespace lite6_hardware
 {
@@ -219,10 +222,15 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_configure(
     RCLCPP_ERROR(rclcpp::get_logger("Lite6MujocoSystem"), "Failed to open SysID shared memory");
     return hardware_interface::CallbackReturn::ERROR;
   }
+  if (const auto node = get_node()) {
+    clock_ = node->get_clock();
+  }
   if (m_model && m_data) {
     StateSnapshot initial;
     publish_snapshot(initial);
-    write_joint_state_shm(initial);
+    const int64_t now_steady = steady_now_ns();
+    const int64_t now_ros = clock_ ? clock_->now().nanoseconds() : 0;
+    write_joint_state_shm(initial, now_ros, now_steady);
   }
   state_shm_->get()->visual_alive_ns.store(steady_now_ns(), std::memory_order_release);
   configure_diagnostics();
@@ -246,12 +254,21 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_activate(
   diagnostics_->max_write_interval_ns.store(0);
   StateSnapshot initial;
   publish_snapshot(initial);
-  write_joint_state_shm(initial);
+  const int64_t now_steady = steady_now_ns();
+  const int64_t now_ros = clock_ ? clock_->now().nanoseconds() : 0;
+  write_joint_state_shm(initial, now_ros, now_steady);
   if (state_shm_ && state_shm_->valid()) {
-    state_shm_->get()->visual_alive_ns.store(steady_now_ns(), std::memory_order_release);
+    state_shm_->get()->visual_alive_ns.store(now_steady, std::memory_order_release);
+  }
+  rlimit memlock_limit{};
+  if (getrlimit(RLIMIT_MEMLOCK, &memlock_limit) == 0 &&
+      memlock_limit.rlim_cur == RLIM_INFINITY)
+  {
+    (void)mlockall(MCL_CURRENT | MCL_FUTURE);
   }
   stop_requested_.store(false);
-  activation_ns_ = steady_now_ns();
+  rt_sched_active_.store(false, std::memory_order_release);
+  activation_ns_ = now_steady;
   gripper_.activate();
   diagnostics_->active.store(true);
   try {
@@ -267,6 +284,8 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_activate(
   scheduling.sched_priority = physics_thread_priority_;
   const int result = pthread_setschedparam(physics_thread_.native_handle(),
     physics_thread_priority_ > 0 ? SCHED_FIFO : SCHED_OTHER, &scheduling);
+  rt_sched_active_.store(
+    physics_thread_priority_ > 0 && result == 0, std::memory_order_release);
   if (result != 0) {
     RCLCPP_WARN(rclcpp::get_logger("Lite6MujocoSystem"),
       "Physics thread scheduling request failed: %s; monitor /simulation/diagnostics for lag",
@@ -349,15 +368,14 @@ hardware_interface::return_type Lite6MujocoSystem::read(
     hw_states_velocity_[i] = snapshot.velocity[i];
     hw_states_effort_[i] = snapshot.effort[i];
   }
-  write_joint_state_shm(snapshot);
+  const int64_t observed_ros_ns = clock_ ? clock_->now().nanoseconds() : 0;
+  const int64_t observed_ns = steady_now_ns();
+  write_joint_state_shm(snapshot, observed_ros_ns, observed_ns);
   if (snapshot.started && sysid_shm_ && sysid_shm_->valid() &&
       sysid_shm_->get()->consumer_active.load(std::memory_order_acquire) != 0)
   {
     // Pair ROS and steady-clock observations here. Never label an old physical
     // snapshot as a new state merely because another controller cycle ran.
-    const auto node = get_node();
-    const int64_t observed_ros_ns = node ? node->now().nanoseconds() : 0;
-    const int64_t observed_ns = steady_now_ns();
     const double physics_lag = std::max(0.0, 1e-9 * (observed_ns - snapshot.boundary_ns));
     const int64_t lag_ns = static_cast<int64_t>(std::llround(physics_lag * 1e9));
     lite6_interfaces::shm::SysIdSamplePod sample{};
@@ -511,10 +529,10 @@ void Lite6MujocoSystem::write_visual_shm(const StateSnapshot & snapshot, bool ph
   state_shm_->get()->visual_state.write(pod);
 }
 
-void Lite6MujocoSystem::write_joint_state_shm(const StateSnapshot & snapshot)
+void Lite6MujocoSystem::write_joint_state_shm(
+  const StateSnapshot & snapshot, int64_t ros_stamp_ns, int64_t steady_stamp_ns)
 {
   if (!state_shm_ || !state_shm_->valid()) {return;}
-  const auto node = get_node();
   lite6_interfaces::shm::JointStatePod pod{};
   for (size_t i = 0; i < kJoints; ++i) {
     pod.position[i] = snapshot.position[i];
@@ -525,8 +543,8 @@ void Lite6MujocoSystem::write_joint_state_shm(const StateSnapshot & snapshot)
     pod.gripper_position[i] = snapshot.gripper.position[i];
     pod.gripper_velocity[i] = snapshot.gripper.velocity[i];
   }
-  pod.ros_stamp_ns = node ? node->now().nanoseconds() : 0;
-  pod.steady_stamp_ns = steady_now_ns();
+  pod.ros_stamp_ns = ros_stamp_ns;
+  pod.steady_stamp_ns = steady_stamp_ns;
   pod.sequence = ++joint_state_sequence_;
   pod.valid = 1;
   state_shm_->get()->joint_state.write(pod);
@@ -559,6 +577,10 @@ void Lite6MujocoSystem::publish_snapshot(StateSnapshot & snapshot)
 
 void Lite6MujocoSystem::physics_loop()
 {
+  pthread_setname_np(pthread_self(), "lite6_physics");
+  // Reduce Linux timer coalescing slack so 100 us substeps wake closer to
+  // their deadline even on standard kernels without PREEMPT_RT.
+  (void)prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
   try {
     StateSnapshot snapshot;
     EffortCommand applied;
@@ -598,7 +620,9 @@ void Lite6MujocoSystem::physics_loop()
       publish_snapshot(snapshot);
       // Keep shutdown/other work responsive during prolonged overload. The
       // outstanding simulation time is retained and visible in diagnostics.
-      if (snapshot.steps % 100 == 0 && steady_now_ns() >= end_ns + kStepNs) {
+      const uint64_t yield_stride =
+        rt_sched_active_.load(std::memory_order_acquire) ? 20ULL : 100ULL;
+      if (snapshot.steps % yield_stride == 0 && steady_now_ns() >= end_ns + kStepNs) {
         // FIFO yield alone cannot run a lower-priority controller thread.
         std::this_thread::sleep_for(std::chrono::microseconds(1));
       }

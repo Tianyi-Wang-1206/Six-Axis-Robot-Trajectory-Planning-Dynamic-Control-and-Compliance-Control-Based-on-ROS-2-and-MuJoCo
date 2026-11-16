@@ -26,6 +26,7 @@
 #include <iomanip>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -276,6 +277,7 @@ private:
     planner_thread_=std::thread([this,gh]{compute_and_dispatch(gh);});
   }
   void compute_and_dispatch(const std::shared_ptr<MotionHandle>& gh) {
+    pthread_setname_np(pthread_self(), "lite6_planner");
     const auto key=hex_uuid(gh->get_goal_id());
     try {
       MotionPlanner::InitialState start;
@@ -312,7 +314,16 @@ private:
     if(!supervisor_.permitted(key)) {
       finish_upper(key,upper,Motion::Result::ERR_CANCELLED,"Authorization revoked",0);return;
     }
-    if(!ctc_->wait_for_action_server(2s)) {
+    bool ctc_ready=false;
+    for(int attempt=0;attempt<20;++attempt) {
+      if(shutdown_.load()||!supervisor_.permitted(key)) {
+        finish_upper(key,upper,Motion::Result::ERR_CANCELLED,
+            "Goal canceled while waiting for CTC server",0);
+        return;
+      }
+      if(ctc_->wait_for_action_server(100ms)) {ctc_ready=true;break;}
+    }
+    if(!ctc_ready) {
       finish_upper(key,upper,Motion::Result::ERR_EXECUTION_ABORTED,"CTC unavailable",0);return;
     }
     if(!supervisor_.change_motion_phase(key,S::MOTION_WAITING_CTC)) {

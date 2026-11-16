@@ -346,8 +346,9 @@ struct MotionPlanner::JointSpline {
 
 trajectory_msgs::msg::JointTrajectory MotionPlanner::plan_cartesian(const Goal& goal,
     const InitialState& initial,const Cancellation& cancel) const {
+  auto workspace=engine_.collision_workspace();
   CartesianPath path;
-  const auto T0=engine_.forward_pose(initial.q);
+  const auto T0=engine_.forward_pose(initial.q,workspace.data);
   const auto T1=pose_matrix(goal.pose_target);
   path.R0=T0.topLeftCorner<3,3>();
   path.p0=T0.topRightCorner<3,1>(); path.p1=T1.topRightCorner<3,1>();
@@ -416,7 +417,8 @@ trajectory_msgs::msg::JointTrajectory MotionPlanner::plan_cartesian(const Goal& 
       const double s=static_cast<double>(k)/samples;
       const auto target=path.at(s);
       IKDiagnostics diagnostics;
-      const auto status=engine_.solve_optimal_ik(target,knots[k-1],solutions,true,&diagnostics);
+      const auto status=engine_.solve_optimal_ik(
+          target,knots[k-1],solutions,true,workspace,&diagnostics);
       if(status!=IKResult::SUCCESS) fail(ik_code(status),
           "IK failed at sample "+std::to_string(k)+"/"+std::to_string(samples)+
           ", "+path_location(s,target)+"\n"+diagnostics.summary());
@@ -437,7 +439,7 @@ trajectory_msgs::msg::JointTrajectory MotionPlanner::plan_cartesian(const Goal& 
           failure_detail="Invalid spline joint configuration at "+path_location(s,path.at(s));
           break;
         }
-        const Eigen::Matrix4d fk=engine_.forward_pose(qarr), ref=path.at(s);
+        const Eigen::Matrix4d fk=engine_.forward_pose(qarr,workspace.data), ref=path.at(s);
         const double position_error=(fk.topRightCorner<3,1>()-ref.topRightCorner<3,1>()).norm();
         const double rotation_error=angle_difference(fk.topLeftCorner<3,3>(),ref.topLeftCorner<3,3>());
         if(position_error>kPathPosTolerance||rotation_error>kPathRotTolerance) {
