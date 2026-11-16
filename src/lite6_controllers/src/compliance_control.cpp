@@ -52,17 +52,29 @@ bool Lite6CTCController::configure_compliance() {
   compliance_soft_limit_stiffness_=node->get_parameter("compliance.soft_limit_stiffness").as_double();
   compliance_soft_limit_damping_=node->get_parameter("compliance.soft_limit_damping").as_double();
   compliance_torque_slew_rate_=node->get_parameter("compliance.torque_slew_rate").as_double();
+  compliance_fv_scale_=node->get_parameter("compliance.friction_viscous_scale").as_double();
+  compliance_fc_scale_=node->get_parameter("compliance.friction_coulomb_scale").as_double();
+  compliance_fric_trans_speed_=node->get_parameter("compliance.friction_transition_speed").as_double();
+  compliance_fric_quiet_speed_=node->get_parameter("compliance.friction_quiet_speed").as_double();
+  const auto ext_lim=node->get_parameter("compliance.max_external_joint_torque").as_double_array();
+  compliance_external_torque_timeout_=node->get_parameter("compliance.external_torque_timeout").as_double();
 
   auto positive=[](double v){return std::isfinite(v)&&v>0.0;};
   auto nonneg=[](double v){return std::isfinite(v)&&v>=0.0;};
+  auto unit=[](double v){return std::isfinite(v)&&v>=0.0&&v<=1.0;};
   if(!positive(compliance_max_joint_velocity_)||!nonneg(compliance_hard_limit_tolerance_)||
      !positive(compliance_saturation_timeout_)||!positive(compliance_entry_max_speed_)||
      !positive(compliance_filter_time_constant_)||!nonneg(compliance_cartesian_null_damping_)||
      !nonneg(compliance_soft_limit_margin_)||!nonneg(compliance_soft_limit_stiffness_)||
-     !nonneg(compliance_soft_limit_damping_)||!positive(compliance_torque_slew_rate_)) {
+     !nonneg(compliance_soft_limit_damping_)||!positive(compliance_torque_slew_rate_)||
+     !unit(compliance_fv_scale_)||!unit(compliance_fc_scale_)||
+     !positive(compliance_fric_trans_speed_)||!nonneg(compliance_fric_quiet_speed_)||
+     !positive(compliance_external_torque_timeout_)||ext_lim.size()!=6||
+     !std::all_of(ext_lim.begin(),ext_lim.end(),positive)) {
     RCLCPP_ERROR(node->get_logger(),"Invalid compliance safety or control parameter");
     return false;
   }
+  for(size_t i=0;i<6;++i) compliance_max_external_torque_[i]=ext_lim[i];
   if(!load_teach_levels(node,"compliance.teach.damping_levels",0.0,false,100.0,teach_damping_levels_)||
      !load_teach_levels(node,"compliance.teach.assistance_levels",0.0,false,1.0,teach_assistance_levels_)||
      !load_teach_levels(node,"compliance.teach.friction_transition_levels",0.0,true,10.0,teach_friction_transition_levels_)||
@@ -83,7 +95,7 @@ bool Lite6CTCController::configure_compliance() {
     });
   return true;
 }
-void Lite6CTCController::process_compliance_command(int32_t command,
+void Lite6CTCController::process_compliance_command(double dt, int32_t command,
     const lite6_interfaces::msg::ComplianceSettings& settings) {
   // Process every envelope at most once: a rejected command must never become
   // effective later after ESTOP recovery. The existing recovery remains intact.
@@ -109,6 +121,7 @@ void Lite6CTCController::process_compliance_command(int32_t command,
         compliance_filtered_=settings;
         compliance_last_tau_=tau_cmd_;
         compliance_saturation_time_=0.0;
+        compliance_external_torque_time_=0.0;
         compliance_saturation_estop_pending_=false;
         integral_effort_.setZero();
       }
@@ -145,11 +158,18 @@ void Lite6CTCController::process_compliance_command(int32_t command,
         request_execution_stop();break;
       }
     }
+    int ext_joint=-1; double ext_val=0.0; double ext_limit=0.0;
+    if(check_external_torque_limit(dt,compliance_max_external_torque_,
+        compliance_external_torque_timeout_,compliance_external_torque_time_,
+        ext_joint,ext_val,ext_limit)) {
+      latch_estop_reason(CS::ESTOP_COMPLIANCE_EXTERNAL_TORQUE,ext_joint,ext_val,ext_limit);
+      request_execution_stop();
+    }
   }
 }
 void Lite6CTCController::compute_compliance(double dt) {
-  // Only encoder position/velocity and model gravity are used. No effort state,
-  // MuJoCo contact force, applied force, or hidden friction state enters here.
+  // Only encoder position/velocity and model dynamics/gravity are used. No effort
+  // state, MuJoCo contact force, applied force, or hidden friction state enters here.
   const double alpha=1.0-std::exp(-dt/compliance_filter_time_constant_);
   auto smooth=[alpha](double& value,double target){value+=alpha*(target-value);};
   auto& s=compliance_filtered_;
@@ -164,6 +184,8 @@ void Lite6CTCController::compute_compliance(double dt) {
   a_d_.setZero();integral_effort_.setZero();
   if(system_state_==SystemState::JOINT_IMPEDANCE) {
     tau_cmd_+=s.joint_stiffness*(compliance_q_-q_)-s.joint_damping*dq_;
+    add_passive_friction_ff(compliance_fv_scale_,compliance_fc_scale_,
+      compliance_fric_trans_speed_,compliance_fric_quiet_speed_,dq_,tau_cmd_);
   } else if(system_state_==SystemState::CARTESIAN_IMPEDANCE) {
     pinocchio::computeJointJacobians(pin_model_,pin_data_,dynamics_q_);
     pinocchio::updateFramePlacements(pin_model_,pin_data_);
@@ -180,6 +202,8 @@ void Lite6CTCController::compute_compliance(double dt) {
     tau_cmd_.noalias()+=compliance_jacobian_.leftCols(6).transpose()*wrench;
     // Small joint damping also damps task-null directions near singularities.
     tau_cmd_-=compliance_cartesian_null_damping_*dq_;
+    add_passive_friction_ff(compliance_fv_scale_,compliance_fc_scale_,
+      compliance_fric_trans_speed_,compliance_fric_quiet_speed_,dq_,tau_cmd_);
   } else {
     // Interpolate configured sensitivity 1..5 profiles and fade out Coulomb
     // assistance near rest so low-speed bristle dynamics stay quiet.
@@ -187,19 +211,8 @@ void Lite6CTCController::compute_compliance(double dt) {
     const double assistance=interpolate_teach_level(teach_assistance_levels_,s.sensitivity);
     const double friction_transition=interpolate_teach_level(teach_friction_transition_levels_,s.sensitivity);
     const double quiet_speed=interpolate_teach_level(teach_quiet_speed_levels_,s.sensitivity);
-    for(int i=0;i<6;++i) {
-      // Deliberately bounded below full compensation. At rest there is no
-      // guessed force direction; the user still overcomes static friction.
-      // Fade out Coulomb assistance near rest while preserving viscous
-      // compensation and positive damping across all sensitivity levels.
-      double coulomb_gate=1.0;
-      if(quiet_speed>0.0) {
-        const double ramp=std::clamp((std::abs(dq_[i])-quiet_speed)/quiet_speed,0.0,1.0);
-        coulomb_gate=ramp*ramp*(3.0-2.0*ramp);
-      }
-      tau_cmd_[i]+=-damping*dq_[i]+assistance*(friction_v_[i]*dq_[i]+
-        coulomb_gate*friction_c_[i]*std::tanh(dq_[i]/friction_transition));
-    }
+    tau_cmd_-=damping*dq_;
+    add_passive_friction_ff(assistance,assistance,friction_transition,quiet_speed,dq_,tau_cmd_);
   }
   bool saturated=false;
   int saturated_joint=-1;

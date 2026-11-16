@@ -34,6 +34,7 @@ uint8_t map_impedance_estop_reason(
     case 8: return CS::ESTOP_INVALID_COMMAND;
     case 9: return CS::ESTOP_COMMAND_WRITE;
     case 10: return CS::ESTOP_CONTROL_EXCEPTION;
+    case 11: return CS::ESTOP_COMPLIANCE_EXTERNAL_TORQUE;
     default: return CS::ESTOP_EXTERNAL;
   }
 }
@@ -73,15 +74,33 @@ bool Lite6CTCController::configure_impedance_trajectory()
     node->get_parameter("impedance_execution.entry_max_speed").as_double();
   imp_entry_position_tolerance_ =
     node->get_parameter("impedance_execution.entry_position_tolerance").as_double();
+  imp_fv_scale_ = node->get_parameter("impedance_execution.friction_viscous_scale").as_double();
+  imp_fc_scale_ = node->get_parameter("impedance_execution.friction_coulomb_scale").as_double();
+  imp_fric_trans_speed_ =
+    node->get_parameter("impedance_execution.friction_transition_speed").as_double();
+  imp_fric_quiet_speed_ =
+    node->get_parameter("impedance_execution.friction_quiet_speed").as_double();
+  const auto imp_ext_lim =
+    node->get_parameter("impedance_execution.max_external_joint_torque").as_double_array();
+  imp_external_torque_timeout_ =
+    node->get_parameter("impedance_execution.external_torque_timeout").as_double();
 
   auto positive = [](double v) { return std::isfinite(v) && v > 0.0; };
   auto nonneg = [](double v) { return std::isfinite(v) && v >= 0.0; };
+  auto unit = [](double v) { return std::isfinite(v) && v >= 0.0 && v <= 1.0; };
   if (!positive(imp_max_trans_deviation_) ||
       !positive(imp_max_rot_deviation_) ||
       !positive(imp_max_joint_deviation_) ||
       !positive(imp_max_joint_velocity_) ||
       !nonneg(imp_hard_limit_tolerance_) ||
       !positive(imp_saturation_timeout_) ||
+      !positive(imp_external_torque_timeout_) ||
+      imp_ext_lim.size() != 6 ||
+      !std::all_of(imp_ext_lim.begin(), imp_ext_lim.end(), positive) ||
+      !unit(imp_fv_scale_) ||
+      !unit(imp_fc_scale_) ||
+      !positive(imp_fric_trans_speed_) ||
+      !nonneg(imp_fric_quiet_speed_) ||
       !positive(imp_goal_trans_tolerance_) ||
       !positive(imp_goal_rot_tolerance_) ||
       !positive(imp_goal_velocity_tolerance_) ||
@@ -97,6 +116,9 @@ bool Lite6CTCController::configure_impedance_trajectory()
       imp_entry_position_tolerance_ > imp_max_joint_deviation_) {
     RCLCPP_ERROR(node->get_logger(), "Invalid impedance_execution safety or tolerance parameters");
     return false;
+  }
+  for (size_t i = 0; i < 6; ++i) {
+    imp_max_external_torque_[i] = imp_ext_lim[i];
   }
 
   imp_ref_jacobian_.setZero(6, pin_model_.nv);
@@ -187,6 +209,7 @@ void Lite6CTCController::fail_impedance_trajectory(
     case ImpedanceTrajectoryResult::INVALID_COMMAND: code = 8; break;
     case ImpedanceTrajectoryResult::COMMAND_WRITE: code = 9; break;
     case ImpedanceTrajectoryResult::CONTROL_EXCEPTION: code = 10; break;
+    case ImpedanceTrajectoryResult::EXTERNAL_TORQUE_LIMIT: code = 11; break;
     default: code = 0; break;
   }
   latch_estop_reason(map_impedance_estop_reason(code), joint, value, limit);
@@ -397,6 +420,9 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
   tau_cmd_.noalias() += compliance_jacobian_.leftCols(6).transpose() * wrench;
   // Damping relative to reference joint velocity stabilizes null-space and near-singular motions.
   tau_cmd_ -= imp_null_damping_filtered_ * (dq_ - dq_imp_ref_);
+  add_passive_friction_ff(
+    imp_fv_scale_, imp_fc_scale_, imp_fric_trans_speed_, imp_fric_quiet_speed_,
+    dq_imp_ref_, tau_cmd_);
 
   for (int i = 0; i < 6; ++i) {
     const double lo =
@@ -442,6 +468,13 @@ void Lite6CTCController::finish_impedance_trajectory_cycle(double dt)
     execution->pos_error[k].store(imp_current_pos_error_[static_cast<int>(k)], std::memory_order_relaxed);
     execution->rot_error[k].store(imp_current_rot_error_[static_cast<int>(k)], std::memory_order_relaxed);
   }
+  for (size_t k = 0; k < 6; ++k) {
+    execution->external_torque[k].store(
+      gmo_residual_tau_[static_cast<Eigen::Index>(k)], std::memory_order_relaxed);
+    execution->external_wrench[k].store(
+      gmo_external_wrench_[static_cast<Eigen::Index>(k)], std::memory_order_relaxed);
+  }
+  execution->contact_detected.store(gmo_contact_detected_, std::memory_order_relaxed);
 
   const double pos_err_norm = imp_current_pos_error_.norm();
   const double rot_err_norm = imp_current_rot_error_.norm();
@@ -476,6 +509,19 @@ void Lite6CTCController::finish_impedance_trajectory_cycle(double dt)
       ImpedanceTrajectoryResult::SATURATION, saturated_joint,
       execution->saturation_duration, imp_saturation_timeout_,
       "Continuous effort saturation timeout during impedance trajectory [s]");
+    return;
+  }
+
+  int ext_joint = -1;
+  double ext_val = 0.0;
+  double ext_limit = 0.0;
+  if (check_external_torque_limit(
+        dt, imp_max_external_torque_, imp_external_torque_timeout_,
+        execution->external_torque_duration, ext_joint, ext_val, ext_limit)) {
+    fail_impedance_trajectory(
+      ImpedanceTrajectoryResult::EXTERNAL_TORQUE_LIMIT, ext_joint,
+      ext_val, ext_limit,
+      "External joint torque estimate exceeded impedance safety limit [Nm]");
     return;
   }
 
@@ -542,6 +588,14 @@ void Lite6CTCController::monitor_impedance_trajectory()
         feedback->position_error_m[k] = execution->pos_error[k].load(std::memory_order_relaxed);
         feedback->rotation_error_rad[k] = execution->rot_error[k].load(std::memory_order_relaxed);
       }
+      for (size_t k = 0; k < 6; ++k) {
+        feedback->external_joint_torque[k] =
+          execution->external_torque[k].load(std::memory_order_relaxed);
+        feedback->external_cartesian_wrench[k] =
+          execution->external_wrench[k].load(std::memory_order_relaxed);
+      }
+      feedback->contact_detected =
+        execution->contact_detected.load(std::memory_order_relaxed);
       goal->publish_feedback(feedback);
     }
     return;
@@ -572,6 +626,9 @@ void Lite6CTCController::monitor_impedance_trajectory()
         break;
       case ImpedanceTrajectoryResult::SATURATION:
         result->error_code = FollowImpedance::Result::SATURATION_TIMEOUT;
+        break;
+      case ImpedanceTrajectoryResult::EXTERNAL_TORQUE_LIMIT:
+        result->error_code = FollowImpedance::Result::EXTERNAL_TORQUE_LIMIT_VIOLATED;
         break;
       case ImpedanceTrajectoryResult::GOAL_TIMEOUT:
         result->error_code = FollowImpedance::Result::GOAL_TIMEOUT;

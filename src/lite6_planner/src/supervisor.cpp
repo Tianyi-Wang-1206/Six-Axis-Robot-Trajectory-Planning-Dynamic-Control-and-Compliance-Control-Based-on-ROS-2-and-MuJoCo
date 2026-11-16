@@ -48,6 +48,7 @@ uint8_t map_supervisor_estop_reason(uint8_t ctc_reason) {
     case CS::ESTOP_COMPLIANCE_POSITION_LIMIT: return S::ESTOP_COMPLIANCE_POSITION_LIMIT;
     case CS::ESTOP_COMPLIANCE_VELOCITY_LIMIT: return S::ESTOP_COMPLIANCE_VELOCITY_LIMIT;
     case CS::ESTOP_COMPLIANCE_SATURATION: return S::ESTOP_COMPLIANCE_SATURATION;
+    case CS::ESTOP_COMPLIANCE_EXTERNAL_TORQUE: return S::ESTOP_COMPLIANCE_EXTERNAL_TORQUE;
     case CS::ESTOP_TRAJECTORY_PATH_POSITION:
     case CS::ESTOP_TRAJECTORY_PATH_VELOCITY:
     case CS::ESTOP_TRAJECTORY_GOAL_TIMEOUT:
@@ -90,6 +91,14 @@ std::string describe_controller_estop(const CS& status,uint8_t previous_mode) {
         "Improper operation: The applied MuJoCo mouse drag force pulled too strongly against the compliance "
         "resistance or joint-limit wall for too long. Reduce the drag force or displacement (or lower stiffness), "
         "then press RESET FAULT to recover.";
+    case CS::ESTOP_COMPLIANCE_EXTERNAL_TORQUE:
+      return "Compliance E-STOP: "+joint+" GMO external torque estimate exceeded ("+
+        format_fixed(status.estop_value,2)+" Nm > "+format_fixed(status.estop_limit,2)+" Nm)\n"+
+        "Active mode: "+mode_name+"\n"+
+        "Cause: Sensorless Generalized Momentum Observer detected sustained external load on "+joint+
+        " exceeding "+format_fixed(status.estop_limit,2)+" Nm.\n"+
+        "Improper operation: Excessive collision or drag force occurred during compliance control. "
+        "Clear the obstruction, then press RESET FAULT to recover.";
     case CS::ESTOP_TRAJECTORY_PATH_POSITION:
       return "CTC E-STOP: "+joint+" path position error exceeded ("+
         format_fixed(status.estop_value,3)+" rad > "+format_fixed(status.estop_limit,3)+" rad)\n"+
@@ -216,6 +225,9 @@ Supervisor::Effects Supervisor::observe_controller(const CS& status) {
   const auto previous=state_.controller_mode;
   seen_controller_=true;controller_time_=Clock::now();
   state_.controller_mode=mode;
+  state_.external_joint_torque=status.external_joint_torque;
+  state_.external_cartesian_wrench=status.external_cartesian_wrench;
+  state_.contact_detected=status.external_contact_detected;
   // Keep the initiating fault visible while the controller acknowledges ESTOP.
   if(state_.mode==S::MODE_ESTOP) {
     if(previous!=mode) changed_unlocked();

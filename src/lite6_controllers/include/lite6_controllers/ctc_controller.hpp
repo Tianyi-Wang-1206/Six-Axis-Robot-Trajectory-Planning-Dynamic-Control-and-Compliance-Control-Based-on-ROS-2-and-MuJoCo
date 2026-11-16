@@ -138,7 +138,7 @@ private:
   bool compliance_active() const;
   bool impedance_trajectory_active() const;
   bool configure_compliance();
-  void process_compliance_command(int32_t command, const lite6_interfaces::msg::ComplianceSettings& settings);
+  void process_compliance_command(double dt, int32_t command, const lite6_interfaces::msg::ComplianceSettings& settings);
   void compute_compliance(double dt);
 
   using FollowImpedance = lite6_interfaces::action::FollowImpedanceTrajectory;
@@ -152,6 +152,7 @@ private:
     VELOCITY_LIMIT,
     POSITION_LIMIT,
     SATURATION,
+    EXTERNAL_TORQUE_LIMIT,
     GOAL_TIMEOUT,
     MODE_CHANGED,
     INVALID_STATE,
@@ -167,6 +168,9 @@ private:
     std::atomic<size_t> sample{0};
     std::array<std::atomic<double>, 3> pos_error{{0.0, 0.0, 0.0}};
     std::array<std::atomic<double>, 3> rot_error{{0.0, 0.0, 0.0}};
+    std::array<std::atomic<double>, 6> external_torque{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+    std::array<std::atomic<double>, 6> external_wrench{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+    std::atomic<bool> contact_detected{false};
     // Control thread only fields.
     double elapsed = 0.0;
     int64_t start_time_ns = 0;
@@ -176,6 +180,7 @@ private:
     double settled_duration = 0.0;
     bool was_settled = false;
     double saturation_duration = 0.0;
+    double external_torque_duration = 0.0;
     int failure_joint = -1;
     double failure_value = 0.0;
     double failure_limit = 0.0;
@@ -241,6 +246,45 @@ private:
   double compliance_soft_limit_stiffness_ = 80.0;
   double compliance_soft_limit_damping_ = 5.0;
   double compliance_torque_slew_rate_ = 100.0;
+  double compliance_fv_scale_ = 0.85;
+  double compliance_fc_scale_ = 0.0;
+  double compliance_fric_trans_speed_ = 0.06;
+  double compliance_fric_quiet_speed_ = 0.08;
+  std::array<double, 6> compliance_max_external_torque_{35.0, 35.0, 24.0, 20.0, 20.0, 12.0};
+  double compliance_external_torque_timeout_ = 0.25;
+  double compliance_external_torque_time_ = 0.0;
+  double imp_fv_scale_ = 0.90;
+  double imp_fc_scale_ = 0.80;
+  double imp_fric_trans_speed_ = 0.04;
+  double imp_fric_quiet_speed_ = 0.01;
+  std::array<double, 6> imp_max_external_torque_{35.0, 35.0, 24.0, 20.0, 20.0, 12.0};
+  double imp_external_torque_timeout_ = 0.25;
+
+  // Sensorless Generalized Momentum Observer (GMO) state & configuration.
+  bool configure_momentum_observer();
+  void reset_momentum_observer();
+  void update_momentum_observer(double dt);
+  void add_passive_friction_ff(
+    double fv_scale, double fc_scale, double v_trans, double quiet_speed,
+    const Eigen::Ref<const Eigen::VectorXd> & dq_coulomb,
+    Eigen::VectorXd & tau_out) const;
+  bool check_external_torque_limit(
+    double dt, const std::array<double, 6> & limits, double timeout,
+    double & accum_duration, int & out_joint, double & out_val, double & out_limit) const;
+
+  bool gmo_enabled_ = true;
+  bool gmo_initialized_ = false;
+  std::array<double, 6> gmo_gains_{25.0, 25.0, 25.0, 30.0, 30.0, 30.0};
+  double gmo_jacobian_damping_ = 0.04;
+  double gmo_fric_trans_speed_ = 0.03;
+  double gmo_contact_force_threshold_ = 2.5;
+  pinocchio::Data pin_data_gmo_;
+  Eigen::Matrix<double, 6, Eigen::Dynamic> gmo_jacobian_;
+  Eigen::Matrix<double, 6, 1> gmo_p_integral_ = Eigen::Matrix<double, 6, 1>::Zero();
+  Eigen::Matrix<double, 6, 1> gmo_residual_tau_ = Eigen::Matrix<double, 6, 1>::Zero();
+  Eigen::Matrix<double, 6, 1> gmo_external_wrench_ = Eigen::Matrix<double, 6, 1>::Zero();
+  Eigen::Matrix<double, 6, 1> tau_applied_prev_ = Eigen::Matrix<double, 6, 1>::Zero();
+  bool gmo_contact_detected_ = false;
   std::array<double, 5> teach_damping_levels_{4.0, 3.25, 2.5, 2.25, 2.0};
   std::array<double, 5> teach_assistance_levels_{0.35, 0.475, 0.60, 0.625, 0.65};
   std::array<double, 5> teach_friction_transition_levels_{0.06, 0.06, 0.06, 0.06, 0.06};

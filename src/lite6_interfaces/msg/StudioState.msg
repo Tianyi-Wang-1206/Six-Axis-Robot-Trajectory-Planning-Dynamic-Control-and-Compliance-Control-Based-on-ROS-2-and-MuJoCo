@@ -36,4 +36,9 @@ int32 last_error_code
 float64[3] cartesian_pos_error_m
 float64[3] cartesian_rot_error_rad
 
+# Sensorless Generalized Momentum Observer (GMO) external load estimates.
+float64[6] external_joint_torque
+float64[6] external_cartesian_wrench
+bool contact_detected
+
 string detail

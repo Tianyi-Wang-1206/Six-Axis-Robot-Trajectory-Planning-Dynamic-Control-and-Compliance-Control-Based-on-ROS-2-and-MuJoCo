@@ -70,6 +70,9 @@ public:
     int32_t last_error_code = 0;
     std::array<double, 3> cartesian_pos_error_m{};
     std::array<double, 3> cartesian_rot_error_rad{};
+    std::array<double, 6> external_joint_torque{};
+    std::array<double, 6> external_cartesian_wrench{};
+    bool contact_detected = false;
     std::string detail;
   };
 
@@ -78,7 +81,7 @@ public:
   Snapshot snapshot() const;
 
   // Sensor & controller observers
-  Effects observe_controller(Clock::time_point now, uint8_t mode, uint8_t estop_reason);
+  Effects observe_controller(Clock::time_point now, const CS & status);
   Effects observe_joint_state(Clock::time_point now, bool positions_valid, double max_abs_dq, bool dq_valid);
   void observe_gripper(Clock::time_point now, uint8_t gripper_state, bool ready);
   Effects watchdog(Clock::time_point now);

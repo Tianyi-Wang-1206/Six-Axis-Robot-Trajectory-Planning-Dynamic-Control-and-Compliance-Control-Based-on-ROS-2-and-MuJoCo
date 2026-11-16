@@ -188,6 +188,9 @@ private:
     msg.last_error_code = snap.last_error_code;
     msg.cartesian_pos_error_m = snap.cartesian_pos_error_m;
     msg.cartesian_rot_error_rad = snap.cartesian_rot_error_rad;
+    msg.external_joint_torque = snap.external_joint_torque;
+    msg.external_cartesian_wrench = snap.external_cartesian_wrench;
+    msg.contact_detected = snap.contact_detected;
     msg.detail = snap.detail;
 
     std::lock_guard<std::mutex> pub_lock(pub_mutex_);
@@ -292,8 +295,7 @@ private:
 
   void on_controller_status(const ControllerStatus & msg)
   {
-    const auto effects = supervisor_->observe_controller(
-      StudioSupervisor::Clock::now(), msg.mode, msg.estop_reason);
+    const auto effects = supervisor_->observe_controller(StudioSupervisor::Clock::now(), msg);
     apply_effects(effects);
   }
 

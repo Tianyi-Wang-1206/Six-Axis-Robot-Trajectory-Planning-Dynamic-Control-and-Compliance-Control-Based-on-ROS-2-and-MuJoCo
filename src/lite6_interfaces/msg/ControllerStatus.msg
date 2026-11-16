@@ -37,8 +37,14 @@ uint8 ESTOP_COMMAND_WRITE=12
 uint8 ESTOP_CONTROL_EXCEPTION=13
 uint8 ESTOP_IMPEDANCE_TRAJECTORY_DEVIATION=14
 uint8 ESTOP_IMPEDANCE_TRAJECTORY_GOAL_TIMEOUT=15
+uint8 ESTOP_COMPLIANCE_EXTERNAL_TORQUE=16
 uint8 estop_reason
 # Zero-based joint index when applicable, or -1 if not joint-specific.
 int8 estop_joint
 float64 estop_value
 float64 estop_limit
+
+# Sensorless Generalized Momentum Observer (GMO) external load estimates.
+float64[6] external_joint_torque
+float64[6] external_cartesian_wrench
+bool external_contact_detected

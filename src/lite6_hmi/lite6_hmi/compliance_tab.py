@@ -1,8 +1,10 @@
 """Independent compliance and encoder teaching panel."""
 import json
+import math
 import time
 from pathlib import Path
 from PyQt5.QtCore import QTimer
+from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
                              QComboBox, QDoubleSpinBox, QCheckBox, QPushButton,
                              QGroupBox, QFileDialog, QMessageBox)
@@ -16,7 +18,8 @@ class ComplianceTab(QWidget):
         self.worker = worker
         self.pending = False
         layout = QVBoxLayout(self)
-        info = QLabel("Encoder-based compliance at link_eef. Entering a mode captures the current equilibrium.\n"
+        info = QLabel("Encoder-based compliance + passive friction feedforward + sensorless GMO load observer at link_eef. "
+                      "Entering a mode captures the current equilibrium.\n"
                       "In the viewer: select a link, then Ctrl + right drag for force or Ctrl + left drag for torque.")
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -60,6 +63,25 @@ class ComplianceTab(QWidget):
         self.status = QLabel()
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
+        observer = QGroupBox("Sensorless External Load Observer (GMO)")
+        obs_layout = QVBoxLayout(observer)
+        obs_head = QHBoxLayout()
+        self.ext_wrench_label = QLabel("TCP Force:  0.0 N  [+0.0, +0.0, +0.0]  |  Moment: [+0.00, +0.00, +0.00] Nm")
+        self.ext_wrench_label.setFont(QFont("Consolas", 9))
+        self.ext_wrench_label.setWordWrap(True)
+        self.contact_badge = QLabel("NO CONTACT")
+        self.contact_badge.setStyleSheet(
+            "background-color: #E2E8F0; color: #334155; font-weight: bold; "
+            "border-radius: 4px; padding: 3px 8px;"
+        )
+        obs_head.addWidget(self.ext_wrench_label, 1)
+        obs_head.addWidget(self.contact_badge)
+        obs_layout.addLayout(obs_head)
+        self.ext_tau_label = QLabel("Ext Joint Tau (Nm): [ +0.00,  +0.00,  +0.00,  +0.00,  +0.00,  +0.00]")
+        self.ext_tau_label.setFont(QFont("Consolas", 9))
+        self.ext_tau_label.setWordWrap(True)
+        obs_layout.addWidget(self.ext_tau_label)
+        layout.addWidget(observer)
         teaching = QGroupBox("Teaching capture (encoder positions only)")
         capture = QVBoxLayout(teaching)
         row = QHBoxLayout()
@@ -142,6 +164,36 @@ class ComplianceTab(QWidget):
             self.status.setToolTip(state.detail if fresh else "")
             self.status.setText((f"Observed mode: {labels.get(state.mode, str(state.mode))} | {detail_summary}"
                                  if fresh else "Waiting for fresh Supervisor / encoder feedback"))
+            if fresh:
+                w = state.external_cartesian_wrench
+                tau = state.external_joint_torque
+                f_norm = math.sqrt(w[0] ** 2 + w[1] ** 2 + w[2] ** 2)
+                self.ext_wrench_label.setText(
+                    f"TCP Force: {f_norm:5.1f} N [{w[0]:+5.1f}, {w[1]:+5.1f}, {w[2]:+5.1f}]  |  "
+                    f"Moment: [{w[3]:+5.2f}, {w[4]:+5.2f}, {w[5]:+5.2f}] Nm"
+                )
+                tau_str = ", ".join(f"{v:+6.2f}" for v in tau)
+                self.ext_tau_label.setText(f"Ext Joint Tau (Nm): [{tau_str}]")
+                if state.contact_detected:
+                    self.contact_badge.setText("CONTACT")
+                    self.contact_badge.setStyleSheet(
+                        "background-color: #FEF3C7; color: #B45309; font-weight: bold; "
+                        "border-radius: 4px; padding: 3px 8px;"
+                    )
+                else:
+                    self.contact_badge.setText("NO CONTACT")
+                    self.contact_badge.setStyleSheet(
+                        "background-color: #E2E8F0; color: #334155; font-weight: bold; "
+                        "border-radius: 4px; padding: 3px 8px;"
+                    )
+            else:
+                self.ext_wrench_label.setText("TCP Force:  -- N  |  Moment: -- Nm")
+                self.ext_tau_label.setText("Ext Joint Tau (Nm): [--]")
+                self.contact_badge.setText("OFFLINE")
+                self.contact_badge.setStyleSheet(
+                    "background-color: #E2E8F0; color: #64748B; font-weight: bold; "
+                    "border-radius: 4px; padding: 3px 8px;"
+                )
 
     def capture_point(self):
         with self.worker.state_lock:

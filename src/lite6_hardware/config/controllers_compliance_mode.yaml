@@ -3,6 +3,14 @@
 
 ctc_controller:
   ros__parameters:
+    # Sensorless Generalized Momentum Observer (GMO) running continuously at 1 kHz.
+    gmo:
+      enabled: true
+      observer_gains: [25.0, 25.0, 25.0, 30.0, 30.0, 30.0]  # rad/s per joint (1st-order LPF cutoff)
+      jacobian_damping: 0.04                                # DLS regularization near wrist singularities
+      friction_transition_speed: 0.03                       # rad/s; nominal Coulomb tanh smoothing for observer
+      contact_force_threshold: 2.5                          # N; Cartesian wrench magnitude to flag contact
+
     compliance:
       # Safety limits active during all three compliance modes
       # (JOINT_IMPEDANCE, CARTESIAN_IMPEDANCE, and TEACH).
@@ -10,6 +18,15 @@ ctc_controller:
       hard_limit_tolerance: 0.01      # rad; numerical allowance past URDF limits before E-STOP
       saturation_timeout: 1.0         # s; continuous effort saturation before E-STOP
       entry_max_speed: 0.01           # rad/s; max joint speed allowed when entering compliance
+      max_external_joint_torque: [35.0, 35.0, 24.0, 20.0, 20.0, 12.0]  # Nm; GMO overload limit
+      external_torque_timeout: 0.25   # s; continuous GMO overload duration before E-STOP
+
+      # Passive velocity-based friction feedforward for JOINT_IMPEDANCE & CARTESIAN_IMPEDANCE
+      # (Coulomb share stays 0.0 by default to prevent limit cycles inside virtual spring wells)
+      friction_viscous_scale: 0.85    # [0..1) share of friction_v_nominal
+      friction_coulomb_scale: 0.0     # [0..1) optional Coulomb share (keep 0 unless D is high)
+      friction_transition_speed: 0.06 # rad/s; tanh transition width
+      friction_quiet_speed: 0.08      # rad/s; C1 Hermite ramp threshold near rest
 
       # Gain smoothing and Cartesian null-space damping
       filter_time_constant: 0.15      # s; exponential smoothing time constant for mode gains
@@ -41,6 +58,13 @@ ctc_controller:
       max_joint_velocity: 3.0             # rad/s; exceeding this triggers E-STOP
       hard_limit_tolerance: 0.01          # rad; allowance past URDF joint limits before E-STOP
       saturation_timeout: 1.0             # s; continuous effort saturation before E-STOP
+      max_external_joint_torque: [35.0, 35.0, 24.0, 20.0, 20.0, 12.0]  # Nm; GMO overload limit
+      external_torque_timeout: 0.25       # s; continuous GMO overload duration before E-STOP
+      # Passive viscous FF on measured dq_ + exogenous Coulomb FF on planned dq_ref(t)
+      friction_viscous_scale: 0.90        # [0..1) share of friction_v_nominal
+      friction_coulomb_scale: 0.80        # [0..1) share of friction_c_nominal along dq_ref(t)
+      friction_transition_speed: 0.04     # rad/s; tanh transition width
+      friction_quiet_speed: 0.01          # rad/s; C1 Hermite ramp threshold near ref stop
       goal_translation_tolerance: 0.05    # m; endpoint compliant equilibrium position envelope
       goal_rotation_tolerance: 0.25       # rad; endpoint compliant equilibrium orientation envelope
       goal_velocity_tolerance: 0.01       # rad/s; endpoint stationary velocity requirement

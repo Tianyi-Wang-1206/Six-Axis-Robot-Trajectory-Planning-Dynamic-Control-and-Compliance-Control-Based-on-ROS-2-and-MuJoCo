@@ -88,6 +88,8 @@ std::string StudioSupervisor::describe_estop_reason(uint8_t reason)
       return "Impedance trajectory deviation tolerance exceeded";
     case CS::ESTOP_IMPEDANCE_TRAJECTORY_GOAL_TIMEOUT:
       return "Impedance trajectory goal settling deadline exceeded";
+    case CS::ESTOP_COMPLIANCE_EXTERNAL_TORQUE:
+      return "Compliance/impedance GMO external torque limit exceeded";
     default: return "Controller E-STOP latched";
   }
 }
@@ -138,8 +140,10 @@ StudioSupervisor::Snapshot StudioSupervisor::snapshot() const
 }
 
 StudioSupervisor::Effects StudioSupervisor::observe_controller(
-  Clock::time_point now, uint8_t mode, uint8_t estop_reason)
+  Clock::time_point now, const CS & status)
 {
+  const uint8_t mode = status.mode;
+  const uint8_t estop_reason = status.estop_reason;
   Effects effects;
   bool changed = false;
   Snapshot notify_snap;
@@ -149,6 +153,9 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(
     const uint8_t prev_mode = snap_.controller_mode;
     controller_stamp_ = now;
     snap_.controller_mode = mode;
+    snap_.external_joint_torque = status.external_joint_torque;
+    snap_.external_cartesian_wrench = status.external_cartesian_wrench;
+    snap_.contact_detected = status.external_contact_detected;
 
     if (mode == CS::MODE_ESTOP) {
       snap_.estop_latched = true;
