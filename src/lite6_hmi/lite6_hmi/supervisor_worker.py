@@ -22,13 +22,13 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 from ament_index_python.packages import get_package_share_directory
 from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import Pose
-from sensor_msgs.msg import JointState
 from std_msgs.msg import Int32
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
 from lite6_interfaces.action import IndustrialMotion
-from lite6_interfaces.msg import SupervisorState, MotionRejection, SysIdSample, GripperState
+from lite6_interfaces.msg import SupervisorState, MotionRejection, GripperState
 from lite6_interfaces.srv import SupervisorCommand, SubmitSysIdTrajectory, GripperCommand
+from lite6_shm_client import StateShmReader, SysIdShmReader, steady_now_ns
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from lite6_hmi.sysid_engine import SysIdEngine
@@ -147,9 +147,12 @@ class ROS2Worker(QThread):
                          durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.supervisor_sub = self.node.create_subscription(
             SupervisorState, "/supervisor/state", self._supervisor_cb, qos)
-        self.joint_sub = self.node.create_subscription(
-            JointState, "/joint_states", self.joint_cb, 200)
-        self.sysid_sample_sub = None
+        self._state_shm = StateShmReader()
+        self._sysid_shm = SysIdShmReader()
+        self._last_joint_seq = 0
+        self._last_joint_steady_ns = 0
+        self._sysid_shm_enabled = False
+        self.shm_timer = self.node.create_timer(0.005, self._poll_shm)
         self.gripper_state = None
         self.last_gripper_rx_time = 0.0
         self.gripper_client = self.node.create_client(GripperCommand, "/gripper/command")
@@ -243,6 +246,8 @@ class ROS2Worker(QThread):
         self._stopping = True
         self.executor.shutdown(timeout_sec=2.0)
         self.wait(2500)
+        self._sysid_shm.close()
+        self._state_shm.close()
         self.node.destroy_node()
 
     def _report_error(self, message):
@@ -314,6 +319,13 @@ class ROS2Worker(QThread):
             if msg.revision < self._revision:
                 return
             previous = self.supervisor_state
+            if (self._sysid_shm_enabled and previous is not None and
+                    previous.mode == SupervisorState.MODE_SYSID and
+                    previous.sysid_phase == SupervisorState.SYSID_EXCITING and
+                    (msg.mode != SupervisorState.MODE_SYSID or
+                     msg.sysid_phase != SupervisorState.SYSID_EXCITING)):
+                # Drain trailing samples pushed before leaving SYSID_EXCITING.
+                self._drain_sysid_shm_unlocked(update_heartbeat=False)
             self.last_supervisor_rx_time = now
             if msg.revision == self._revision and previous is not None:
                 # Repeated heartbeats may update freshness flags but do not
@@ -323,15 +335,15 @@ class ROS2Worker(QThread):
             self.supervisor_state = msg
             if msg.mode != SupervisorState.MODE_TEACH:
                 self.teaching.stop()
-            # Subscribe during preparation/alignment so discovery finishes before
-            # excitation. Ordinary motion has no extra 1 kHz telemetry traffic.
-            if msg.mode == SupervisorState.MODE_SYSID and self.sysid_sample_sub is None:
-                self.sysid_sample_sub = self.node.create_subscription(
-                    SysIdSample, "/simulation/sysid_samples", self.sysid_sample_cb,
-                    QoSProfile(depth=200, reliability=ReliabilityPolicy.BEST_EFFORT))
-            elif msg.mode != SupervisorState.MODE_SYSID and self.sysid_sample_sub is not None:
-                self.node.destroy_subscription(self.sysid_sample_sub)
-                self.sysid_sample_sub = None
+            # Enable SysID ring capture during preparation/alignment so zero
+            # excitation samples are dropped on entry.
+            if msg.mode == SupervisorState.MODE_SYSID and not self._sysid_shm_enabled:
+                self._sysid_shm.discard_all()
+                self._sysid_shm.set_active(True)
+                self._sysid_shm_enabled = True
+            elif msg.mode != SupervisorState.MODE_SYSID and self._sysid_shm_enabled:
+                self._sysid_shm.set_active(False)
+                self._sysid_shm_enabled = False
             if msg.mode == SupervisorState.MODE_SYSID and msg.session_id == self._sysid_session:
                 if self._begin_pending:
                     self._set_sysid_preparation_status("")
@@ -454,51 +466,70 @@ class ROS2Worker(QThread):
                 context=IndustrialMotion.Goal.CONTEXT_RECOVERY, session_id=sid):
             self.trigger_estop("Could not dispatch recovery reference synchronization")
 
-    def sysid_sample_cb(self, msg):
-        # Preserve raw observations, including repeated physical steps, for the
-        # archive. Deduplication and clock validation belong to the estimator.
-        with self.state_lock:
-            s = self.supervisor_state
-            if (self.sysid_calc is None or s is None or
-                    s.mode != SupervisorState.MODE_SYSID or
-                    s.sysid_phase != SupervisorState.SYSID_EXCITING or
-                    s.session_id != self._sysid_session):
-                return
+    @staticmethod
+    def _ns_to_sec(ns: int) -> float:
+        sec, nsec = divmod(int(ns), 1_000_000_000)
+        return sec + nsec * 1e-9
+
+    def _poll_shm(self):
+        self._poll_joint_shm()
+        if self._sysid_shm_enabled:
+            with self.state_lock:
+                self._drain_sysid_shm_unlocked(update_heartbeat=True)
+
+    def _drain_sysid_shm_unlocked(self, update_heartbeat: bool = True):
+        if update_heartbeat:
+            self._sysid_shm.set_active(True)
+        samples = self._sysid_shm.pop_all()
+        if not samples:
+            return
+        s = self.supervisor_state
+        if (self.sysid_calc is None or s is None or
+                s.mode != SupervisorState.MODE_SYSID or
+                s.sysid_phase != SupervisorState.SYSID_EXCITING or
+                s.session_id != self._sysid_session):
+            return
+        for pod in samples:
             self.sysid_record_data.append({
-                't': msg.stamp.sec + msg.stamp.nanosec * 1e-9,
-                'read_time': msg.read_stamp.sec + msg.read_stamp.nanosec * 1e-9,
-                'simulation_time': msg.simulation_time,
-                'step': msg.step,
-                'command_sequence': msg.command_sequence,
-                'control_period': msg.control_period,
-                'physics_lag': msg.physics_lag,
-                'command_age': msg.command_age,
-                'q': np.asarray(msg.position, dtype=float),
-                'dq': np.asarray(msg.velocity, dtype=float),
-                'tau_cmd': np.asarray(msg.effort, dtype=float),
-                'gripper_q': np.asarray(msg.gripper_position, dtype=float),
-                'gripper_dq': np.asarray(msg.gripper_velocity, dtype=float),
-                'gripper_ddq': np.asarray(msg.gripper_acceleration, dtype=float),
+                't': self._ns_to_sec(pod.stamp_ns),
+                'read_time': self._ns_to_sec(pod.read_stamp_ns),
+                'simulation_time': float(pod.simulation_time),
+                'step': int(pod.step),
+                'command_sequence': int(pod.command_sequence),
+                'control_period': float(pod.control_period),
+                'physics_lag': float(pod.physics_lag),
+                'command_age': float(pod.command_age),
+                'q': np.array(pod.position, dtype=float),
+                'dq': np.array(pod.velocity, dtype=float),
+                'tau_cmd': np.array(pod.effort, dtype=float),
+                'gripper_q': np.array(pod.gripper_position, dtype=float),
+                'gripper_dq': np.array(pod.gripper_velocity, dtype=float),
+                'gripper_ddq': np.array(pod.gripper_acceleration, dtype=float),
             })
 
-    def joint_cb(self, msg):
-        monotonic_now = time.monotonic()
-        index = {name: i for i, name in enumerate(msg.name)}
-        # Don't treat incomplete / malformed packets as healthy telemetry.
-        if any(name not in index or index[name] >= len(msg.position)
-               for name in self.joint_names):
+    def _poll_joint_shm(self):
+        pod, seq = self._state_shm.read_joint_state()
+        if pod is None or seq == self._last_joint_seq:
             return
+        now_steady_ns = steady_now_ns()
+        if pod.steady_stamp_ns <= 0 or now_steady_ns - pod.steady_stamp_ns >= 250_000_000:
+            return
+        if pod.steady_stamp_ns <= self._last_joint_steady_ns:
+            return
+        self._last_joint_seq = seq
+        self._last_joint_steady_ns = pod.steady_stamp_ns
+        q_vals = [float(pod.position[i]) for i in range(6)]
+        dq_vals = [float(pod.velocity[i]) for i in range(6)]
+        tau_vals = [float(pod.effort[i]) for i in range(6)]
+        if not all(math.isfinite(x) for x in q_vals + dq_vals):
+            return
+        monotonic_now = time.monotonic()
         with self.state_lock:
-            for i, name in enumerate(self.joint_names):
-                j = index[name]
-                self.q_curr[i] = float(msg.position[j])
-                self.dq_curr[i] = float(msg.velocity[j]) if j < len(msg.velocity) else 0.0
-                self.tau_curr[i] = float(msg.effort[j]) if j < len(msg.effort) else 0.0
-            if not all(math.isfinite(x) for x in self.q_curr + self.dq_curr):
-                return
+            self.q_curr = q_vals
+            self.dq_curr = dq_vals
+            self.tau_curr = tau_vals
             self.last_state_rx_time = monotonic_now
-            self.teaching.observe(msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
-                                  self.q_curr)
+            self.teaching.observe(self._ns_to_sec(pod.ros_stamp_ns), self.q_curr)
             if monotonic_now - self.last_ui_update_time < 0.033:
                 return
             if self.model is not None:

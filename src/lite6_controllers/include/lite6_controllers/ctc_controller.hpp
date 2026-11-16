@@ -13,10 +13,10 @@
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/int32.hpp"
 #include "realtime_tools/realtime_buffer.hpp"
-#include "sensor_msgs/msg/joint_state.hpp"
 #include "lite6_interfaces/msg/controller_status.hpp"
 #include "lite6_interfaces/msg/compliance_command.hpp"
 #include "lite6_interfaces/action/follow_impedance_trajectory.hpp"
+#include "lite6_interfaces/shm_registers.hpp"
 #include "realtime_tools/realtime_publisher.hpp"
 
 #include "pinocchio/multibody/model.hpp"
@@ -84,6 +84,7 @@ private:
   void request_execution_stop();
   void latch_estop_reason(uint8_t reason, int joint = -1, double value = 0.0, double limit = 0.0);
   void clear_estop_reason();
+  void publish_shadow_shm(const Eigen::VectorXd * target, bool valid);
   // Borrowed from the RT buffer once per update; valid until the next RT read.
   TrajectoryExecution * current_execution_ = nullptr;
   std::vector<double> path_position_tolerance_, path_velocity_tolerance_;
@@ -319,8 +320,8 @@ private:
   uint64_t execution_stop_sequence_ = 0;
   bool execution_stop_latched_ = false;
 
-  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr shadow_pub_;
-  std::shared_ptr<realtime_tools::RealtimePublisher<sensor_msgs::msg::JointState>> rt_shadow_pub_;
+  lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::StateShmSegment> state_shm_;
+  uint64_t shadow_epoch_ = 0;
 
   // Observational CTC mode feed for the external Supervisor.
   // It does not own or change this controller's internal SystemState.

@@ -17,7 +17,6 @@ find_package(lite6_interfaces REQUIRED)
 find_package(realtime_tools REQUIRED)
 find_package(Threads REQUIRED)
 find_package(glfw3 REQUIRED)
-find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
@@ -48,9 +47,13 @@ ament_target_dependencies(${PROJECT_NAME}
 target_link_libraries(${PROJECT_NAME} mujoco Threads::Threads yaml-cpp)
 
 add_executable(mujoco_viewer src/mujoco_viewer.cpp)
-ament_target_dependencies(mujoco_viewer rclcpp ament_index_cpp sensor_msgs lite6_interfaces)
+ament_target_dependencies(mujoco_viewer rclcpp ament_index_cpp lite6_interfaces)
 target_link_libraries(mujoco_viewer mujoco glfw Threads::Threads)
-install(TARGETS mujoco_viewer DESTINATION lib/${PROJECT_NAME})
+
+add_executable(robot_description_publisher src/robot_description_publisher.cpp)
+ament_target_dependencies(robot_description_publisher rclcpp std_msgs)
+
+install(TARGETS mujoco_viewer robot_description_publisher DESTINATION lib/${PROJECT_NAME})
 
 pluginlib_export_plugin_description_file(hardware_interface lite6_hardware.xml)
 

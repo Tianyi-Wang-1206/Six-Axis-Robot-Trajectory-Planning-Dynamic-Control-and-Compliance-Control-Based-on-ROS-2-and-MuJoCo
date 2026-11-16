@@ -18,7 +18,6 @@ namespace lite6_hardware
 Lite6MujocoSystem::~Lite6MujocoSystem()
 {
   if (diagnostics_timer_) {diagnostics_timer_->cancel();}
-  if (visualization_timer_) {visualization_timer_->cancel();}
   stop_physics();
   release_model();
 }
@@ -35,6 +34,16 @@ void Lite6MujocoSystem::stop_physics()
   stop_requested_.store(true);
   if (physics_thread_.joinable()) {physics_thread_.join();}
   diagnostics_->active.store(false);
+  if (state_shm_ && state_shm_->valid()) {
+    lite6_interfaces::shm::VisualStatePod pod{};
+    uint64_t seq = 0;
+    if (state_shm_->get()->visual_state.read(pod, seq)) {
+      pod.active = 0;
+      pod.published_steady_ns = steady_now_ns();
+      state_shm_->get()->visual_state.write(pod);
+    }
+    state_shm_->get()->visual_alive_ns.store(steady_now_ns(), std::memory_order_release);
+  }
 }
 
 void Lite6MujocoSystem::release_model()
@@ -173,6 +182,10 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_init(
       joint.name.c_str(), joint_id, act_id);
   }
 
+  for (size_t i = 0; i < kJoints; ++i) {
+    perturb_bodies_[i] = mj_name2id(m_model, mjOBJ_BODY, ("link" + std::to_string(i + 1)).c_str());
+  }
+
   try {
     gripper_.initialize(m_model, m_data);
   } catch (const std::exception & e) {
@@ -194,14 +207,25 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_init(
 hardware_interface::CallbackReturn Lite6MujocoSystem::on_configure(
   const rclcpp_lifecycle::State &)
 {
-  if (const auto node = get_node(); node && !sysid_publisher_) {
-    sysid_transport_ = node->create_publisher<lite6_interfaces::msg::SysIdSample>(
-      "/simulation/sysid_samples", rclcpp::QoS(200).best_effort());
-    sysid_publisher_ = std::make_shared<realtime_tools::RealtimePublisher<
-      lite6_interfaces::msg::SysIdSample>>(sysid_transport_);
+  if (!state_shm_->valid() && !state_shm_->open(true)) {
+    RCLCPP_ERROR(rclcpp::get_logger("Lite6MujocoSystem"), "Failed to open state shared memory");
+    return hardware_interface::CallbackReturn::ERROR;
   }
+  if (!perturb_shm_.valid() && !perturb_shm_.open(false)) {
+    RCLCPP_ERROR(rclcpp::get_logger("Lite6MujocoSystem"), "Failed to open perturbation shared memory");
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+  if (!sysid_shm_->valid() && !sysid_shm_->open(true)) {
+    RCLCPP_ERROR(rclcpp::get_logger("Lite6MujocoSystem"), "Failed to open SysID shared memory");
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+  if (m_model && m_data) {
+    StateSnapshot initial;
+    publish_snapshot(initial);
+    write_joint_state_shm(initial);
+  }
+  state_shm_->get()->visual_alive_ns.store(steady_now_ns(), std::memory_order_release);
   configure_diagnostics();
-  configure_visualization();
   gripper_.configure(get_node());
   return hardware_interface::CallbackReturn::SUCCESS;
 }
@@ -214,11 +238,18 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_activate(
   commands_.reset();
   command_sequence_ = 0;
   std::fill(hw_commands_effort_.begin(), hw_commands_effort_.end(), 0.0);
+  last_mouse_seq_ = 0;
+  mjv_defaultPerturb(&last_mouse_target_.perturb);
+  last_mouse_target_.issued_ns = 0;
   diagnostics_->fault.store(Fault::NONE);
   diagnostics_->last_write_ns.store(0);
   diagnostics_->max_write_interval_ns.store(0);
   StateSnapshot initial;
   publish_snapshot(initial);
+  write_joint_state_shm(initial);
+  if (state_shm_ && state_shm_->valid()) {
+    state_shm_->get()->visual_alive_ns.store(steady_now_ns(), std::memory_order_release);
+  }
   stop_requested_.store(false);
   activation_ns_ = steady_now_ns();
   gripper_.activate();
@@ -318,28 +349,37 @@ hardware_interface::return_type Lite6MujocoSystem::read(
     hw_states_velocity_[i] = snapshot.velocity[i];
     hw_states_effort_[i] = snapshot.effort[i];
   }
-  if (snapshot.started && diagnostics_->sysid_observed.load() &&
-      sysid_publisher_ && sysid_publisher_->trylock()) {
+  write_joint_state_shm(snapshot);
+  if (snapshot.started && sysid_shm_ && sysid_shm_->valid() &&
+      sysid_shm_->get()->consumer_active.load(std::memory_order_acquire) != 0)
+  {
     // Pair ROS and steady-clock observations here. Never label an old physical
     // snapshot as a new state merely because another controller cycle ran.
-    const auto observed = get_node()->now();
-    const auto observed_ns = steady_now_ns();
-    auto & sample = sysid_publisher_->msg_;
-    sample.read_stamp = observed;
-    sample.physics_lag = std::max(0.0, 1e-9 * (observed_ns - snapshot.boundary_ns));
-    sample.stamp = observed - rclcpp::Duration::from_seconds(sample.physics_lag);
+    const auto node = get_node();
+    const int64_t observed_ros_ns = node ? node->now().nanoseconds() : 0;
+    const int64_t observed_ns = steady_now_ns();
+    const double physics_lag = std::max(0.0, 1e-9 * (observed_ns - snapshot.boundary_ns));
+    const int64_t lag_ns = static_cast<int64_t>(std::llround(physics_lag * 1e9));
+    lite6_interfaces::shm::SysIdSamplePod sample{};
+    sample.stamp_ns = observed_ros_ns - lag_ns;
+    sample.read_stamp_ns = observed_ros_ns;
     sample.simulation_time = snapshot.simulation_time;
     sample.step = snapshot.steps;
     sample.command_sequence = snapshot.command_sequence;
     sample.control_period = period.seconds();
+    sample.physics_lag = physics_lag;
     sample.command_age = std::max(0.0, 1e-9 * (snapshot.boundary_ns - snapshot.command_ns));
-    sample.position = snapshot.position;
-    sample.velocity = snapshot.velocity;
-    sample.effort = snapshot.effort;
-    sample.gripper_position = snapshot.gripper.position;
-    sample.gripper_velocity = snapshot.gripper.velocity;
-    sample.gripper_acceleration = snapshot.gripper.acceleration;
-    sysid_publisher_->unlockAndPublish();
+    for (size_t i = 0; i < kJoints; ++i) {
+      sample.position[i] = snapshot.position[i];
+      sample.velocity[i] = snapshot.velocity[i];
+      sample.effort[i] = snapshot.effort[i];
+    }
+    for (size_t i = 0; i < 2; ++i) {
+      sample.gripper_position[i] = snapshot.gripper.position[i];
+      sample.gripper_velocity[i] = snapshot.gripper.velocity[i];
+      sample.gripper_acceleration[i] = snapshot.gripper.acceleration[i];
+    }
+    sysid_shm_->get()->ring.push(sample);
   }
   return hardware_interface::return_type::OK;
 }
@@ -373,17 +413,59 @@ hardware_interface::return_type Lite6MujocoSystem::write(
   return hardware_interface::return_type::OK;
 }
 
+void Lite6MujocoSystem::refresh_mouse_target(int64_t now_ns)
+{
+  if (!perturb_shm_.valid()) {return;}
+  lite6_interfaces::shm::MousePerturbationPod message{};
+  if (!perturb_shm_->mouse_perturbation.read_if_updated(message, last_mouse_seq_)) {
+    return;
+  }
+  MouseTarget target;
+  mjv_defaultPerturb(&target.perturb);
+  auto finite = [](const double * begin, const double * end) {
+      return std::all_of(begin, end,
+        [](double v) {return std::isfinite(v) && std::abs(v) <= 100.0;});
+    };
+  const bool valid = message.issued_ns > 0 && message.issued_ns <= now_ns &&
+    now_ns - message.issued_ns < 200000000 &&
+    std::find(perturb_bodies_.begin(), perturb_bodies_.end(), message.body_id) !=
+      perturb_bodies_.end() &&
+    (message.active == mjPERT_TRANSLATE || message.active == mjPERT_ROTATE) &&
+    finite(message.refpos, message.refpos + 3) &&
+    finite(message.refselpos, message.refselpos + 3) &&
+    finite(message.refquat, message.refquat + 4) &&
+    finite(message.localpos, message.localpos + 3) &&
+    std::isfinite(message.localmass) && message.localmass > 0 && message.localmass < 100;
+  if (valid) {
+    target.issued_ns = message.issued_ns;
+    target.perturb.select = message.body_id;
+    target.perturb.active = message.active;
+    mju_copy3(target.perturb.refpos, message.refpos);
+    mju_copy3(target.perturb.refselpos, message.refselpos);
+    mju_copy4(target.perturb.refquat, message.refquat);
+    if (mju_normalize4(target.perturb.refquat) < 1e-6) {
+      target.perturb.active = 0;
+    }
+    mju_copy3(target.perturb.localpos, message.localpos);
+    target.perturb.localmass = message.localmass;
+  }
+  last_mouse_target_ = target;
+}
+
 bool Lite6MujocoSystem::advance_physics(int64_t boundary_ns, EffortCommand & applied)
 {
   // Only this thread touches live mjData. Recompute the native spring against
   // the current physics state, rather than holding a force computed at 60 Hz.
   mju_zero(m_data->xfrc_applied, 6 * m_model->nbody);
-  const auto target = visualization_->targets.read();
   const auto now = steady_now_ns();
-  if (target.issued_ns >= activation_ns_ && target.issued_ns <= boundary_ns &&
-    now >= target.issued_ns && now - target.issued_ns < 200000000 && target.perturb.active)
+  refresh_mouse_target(now);
+  if (last_mouse_target_.issued_ns >= activation_ns_ &&
+    last_mouse_target_.issued_ns <= boundary_ns &&
+    now >= last_mouse_target_.issued_ns &&
+    now - last_mouse_target_.issued_ns < 200000000 &&
+    last_mouse_target_.perturb.active)
   {
-    mjv_applyPerturbForce(m_model, m_data, &target.perturb);
+    mjv_applyPerturbForce(m_model, m_data, &last_mouse_target_.perturb);
   }
   // A command takes effect at the first step START at or after its submission.
   // In particular, a new command cannot be applied to overdue historical steps.
@@ -408,6 +490,48 @@ bool Lite6MujocoSystem::advance_physics(int64_t boundary_ns, EffortCommand & app
   return valid;
 }
 
+void Lite6MujocoSystem::write_visual_shm(const StateSnapshot & snapshot, bool physics_active)
+{
+  if (!state_shm_ || !state_shm_->valid()) {return;}
+  lite6_interfaces::shm::VisualStatePod pod{};
+  for (size_t i = 0; i < kJoints; ++i) {
+    pod.position[i] = snapshot.position[i];
+    pod.velocity[i] = snapshot.velocity[i];
+  }
+  for (size_t i = 0; i < 2; ++i) {
+    pod.gripper_position[i] = snapshot.gripper.position[i];
+    pod.gripper_velocity[i] = snapshot.gripper.velocity[i];
+  }
+  std::copy_n(snapshot.object_qpos.begin(), 14, pod.object_qpos);
+  pod.simulation_time = snapshot.simulation_time;
+  pod.published_steady_ns = snapshot.published_ns;
+  pod.steps = snapshot.steps;
+  pod.active = physics_active ? 1 : 0;
+  pod.valid = 1;
+  state_shm_->get()->visual_state.write(pod);
+}
+
+void Lite6MujocoSystem::write_joint_state_shm(const StateSnapshot & snapshot)
+{
+  if (!state_shm_ || !state_shm_->valid()) {return;}
+  const auto node = get_node();
+  lite6_interfaces::shm::JointStatePod pod{};
+  for (size_t i = 0; i < kJoints; ++i) {
+    pod.position[i] = snapshot.position[i];
+    pod.velocity[i] = snapshot.velocity[i];
+    pod.effort[i] = snapshot.effort[i];
+  }
+  for (size_t i = 0; i < 2; ++i) {
+    pod.gripper_position[i] = snapshot.gripper.position[i];
+    pod.gripper_velocity[i] = snapshot.gripper.velocity[i];
+  }
+  pod.ros_stamp_ns = node ? node->now().nanoseconds() : 0;
+  pod.steady_stamp_ns = steady_now_ns();
+  pod.sequence = ++joint_state_sequence_;
+  pod.valid = 1;
+  state_shm_->get()->joint_state.write(pod);
+}
+
 void Lite6MujocoSystem::publish_snapshot(StateSnapshot & snapshot)
 {
   for (size_t i = 0; i < kJoints; ++i) {
@@ -428,72 +552,9 @@ void Lite6MujocoSystem::publish_snapshot(StateSnapshot & snapshot)
   }
   states_.publish(snapshot);
   diagnostics_->snapshots.publish(snapshot);
-  visualization_->snapshots.publish(snapshot);
-}
-
-void Lite6MujocoSystem::configure_visualization()
-{
-  if (visualization_timer_) {return;}
-  const auto node = get_node();
-  if (!node) {return;}
-  const auto exchange = visualization_;
-  const auto diagnostics = diagnostics_;
-  auto publisher = node->create_publisher<lite6_interfaces::msg::SimulationState>(
-    "/simulation/visual_state", rclcpp::QoS(1).best_effort());
-  // A dedicated consumer: neither read() nor the diagnostics timer shares its
-  // triple buffer. Callbacks capture shared storage, never the hardware object.
-  visualization_timer_ = node->create_wall_timer(std::chrono::milliseconds(8),
-    [exchange, diagnostics, publisher] {
-      if (!publisher->get_subscription_count()) {return;}
-      const auto state = exchange->snapshots.read();
-      lite6_interfaces::msg::SimulationState message;
-      message.position = state.position;
-      message.velocity = state.velocity;
-      message.gripper_position = state.gripper.position;
-      message.gripper_velocity = state.gripper.velocity;
-      message.object_qpos = state.object_qpos;
-      message.simulation_time = state.simulation_time;
-      message.active = diagnostics->active.load() && state.started &&
-        diagnostics->fault.load() == Fault::NONE;
-      publisher->publish(message);
-    });
-  std::array<int, kJoints> bodies{};
-  for (size_t i = 0; i < kJoints; ++i) {
-    bodies[i] = mj_name2id(m_model, mjOBJ_BODY, ("link" + std::to_string(i + 1)).c_str());
-  }
-  mouse_subscription_ = node->create_subscription<lite6_interfaces::msg::MousePerturbation>(
-    "/simulation/mouse_perturbation", rclcpp::QoS(1).best_effort(),
-    [exchange, bodies](const lite6_interfaces::msg::MousePerturbation & message) {
-      MouseTarget target;
-      mjv_defaultPerturb(&target.perturb);
-      const auto now = steady_now_ns();
-      auto finite = [](const auto & values) {
-          return std::all_of(values.begin(), values.end(),
-            [](double v) {return std::isfinite(v) && std::abs(v) <= 100.0;});
-        };
-      const bool valid = message.issued_ns > 0 && message.issued_ns <= now &&
-        now - message.issued_ns < 200000000 &&
-        std::find(bodies.begin(), bodies.end(), message.body_id) != bodies.end() &&
-        (message.active == mjPERT_TRANSLATE || message.active == mjPERT_ROTATE) &&
-        finite(message.refpos) && finite(message.refselpos) &&
-        finite(message.refquat) && finite(message.localpos) &&
-        std::isfinite(message.localmass) && message.localmass > 0 && message.localmass < 100;
-      if (valid) {
-        target.issued_ns = message.issued_ns;
-        target.perturb.select = message.body_id;
-        target.perturb.active = message.active;
-        mju_copy3(target.perturb.refpos, message.refpos.data());
-        mju_copy3(target.perturb.refselpos, message.refselpos.data());
-        mju_copy4(target.perturb.refquat, message.refquat.data());
-        if (mju_normalize4(target.perturb.refquat) < 1e-6) {
-          target.perturb.active = 0;
-        }
-        mju_copy3(target.perturb.localpos, message.localpos.data());
-        target.perturb.localmass = message.localmass;
-      }
-      // Release, invalid messages and stale messages all clear the spring.
-      exchange->targets.publish(target);
-    });
+  const bool vis_active = diagnostics_->active.load() && snapshot.started &&
+    diagnostics_->fault.load() == Fault::NONE;
+  write_visual_shm(snapshot, vis_active);
 }
 
 void Lite6MujocoSystem::physics_loop()
@@ -549,6 +610,15 @@ void Lite6MujocoSystem::physics_loop()
   }
   gripper_.deactivate();
   diagnostics_->active.store(false);
+  if (state_shm_ && state_shm_->valid()) {
+    lite6_interfaces::shm::VisualStatePod pod{};
+    uint64_t seq = 0;
+    if (state_shm_->get()->visual_state.read(pod, seq)) {
+      pod.active = 0;
+      pod.published_steady_ns = steady_now_ns();
+      state_shm_->get()->visual_state.write(pod);
+    }
+  }
 }
 
 void Lite6MujocoSystem::configure_diagnostics()
@@ -560,16 +630,31 @@ void Lite6MujocoSystem::configure_diagnostics()
     "/simulation/diagnostics", rclcpp::QoS(1).best_effort());
   const auto clock = node->get_clock();
   const auto diagnostics = diagnostics_;
-  const auto sysid_transport = sysid_transport_;
+  const auto state_shm = state_shm_;
+  const auto sysid_shm = sysid_shm_;
   const auto hardware_name = info_.name;
   // No captured hardware pointer: an in-flight callback remains valid even
   // during plugin destruction. All ROS formatting/publication is non-RT.
   diagnostics_timer_ = node->create_wall_timer(std::chrono::milliseconds(100),
-    [diagnostics, publisher, clock, hardware_name, sysid_transport] {
-      diagnostics->sysid_observed.store(
-        sysid_transport && sysid_transport->get_subscription_count() > 0);
-      const auto snapshot = diagnostics->snapshots.read();
+    [diagnostics, publisher, clock, hardware_name, state_shm, sysid_shm] {
       const int64_t now = steady_now_ns();
+      if (state_shm && state_shm->valid()) {
+        state_shm->get()->visual_alive_ns.store(now, std::memory_order_release);
+      }
+      bool sysid_obs = false;
+      if (sysid_shm && sysid_shm->valid() &&
+          sysid_shm->get()->consumer_active.load(std::memory_order_acquire) != 0)
+      {
+        const int64_t hb =
+          sysid_shm->get()->consumer_heartbeat_ns.load(std::memory_order_acquire);
+        if (now - hb <= 1500000000LL) {
+          sysid_obs = true;
+        } else {
+          sysid_shm->get()->consumer_active.store(0U, std::memory_order_release);
+        }
+      }
+      diagnostics->sysid_observed.store(sysid_obs);
+      const auto snapshot = diagnostics->snapshots.read();
       const bool active = diagnostics->active.load();
       const auto fault = diagnostics->fault.load();
       const auto last_write = diagnostics->last_write_ns.load();

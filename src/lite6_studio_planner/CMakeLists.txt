@@ -11,7 +11,6 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
-find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 find_package(control_msgs REQUIRED)
@@ -58,7 +57,6 @@ ament_export_libraries(studio_planner_core)
 ament_export_dependencies(
   rclcpp
   rclcpp_action
-  sensor_msgs
   std_msgs
   trajectory_msgs
   control_msgs
@@ -87,7 +85,6 @@ target_link_libraries(lite6_studio_planner_node
 ament_target_dependencies(lite6_studio_planner_node
   rclcpp
   rclcpp_action
-  sensor_msgs
   std_msgs
   trajectory_msgs
   control_msgs

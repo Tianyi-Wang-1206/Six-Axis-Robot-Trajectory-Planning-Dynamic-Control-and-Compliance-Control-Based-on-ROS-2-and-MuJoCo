@@ -283,18 +283,11 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
     return controller_interface::CallbackReturn::ERROR;
   }
 
-  // Visualization needs the latest target, not a queue of obsolete samples.
-  shadow_pub_ = get_node()->create_publisher<sensor_msgs::msg::JointState>(
-    "/shadow/joint_states", rclcpp::QoS(1).reliable());
-  
-  // Wrap it in the RealtimePublisher
-  rt_shadow_pub_ = std::make_shared<realtime_tools::RealtimePublisher<sensor_msgs::msg::JointState>>(shadow_pub_);
-  
-  // Pre-allocate the memory for the message to avoid dynamic memory allocation in the RT loop
-  rt_shadow_pub_->msg_.name = joint_names_;
-  rt_shadow_pub_->msg_.position.resize(n, 0.0);
-  rt_shadow_pub_->msg_.velocity.resize(n, 0.0);
-  rt_shadow_pub_->msg_.effort.resize(n, 0.0);
+  if (!state_shm_.valid() && !state_shm_.open(true)) {
+    RCLCPP_ERROR(get_node()->get_logger(), "Failed to open state shared memory for shadow output");
+    return controller_interface::CallbackReturn::ERROR;
+  }
+  shadow_epoch_ = static_cast<uint64_t>(lite6_interfaces::shm::steady_now_ns());
 
   // Observe the actual CTC mode without modifying any control behavior.
   // Reliable + volatile matches the planner's /ctc_controller/status subscriber.
@@ -354,6 +347,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   // Never infer a mode from the last received system_cmd value.
   status_publish_counter_ = 0;
   status_publish_pending_ = true;
+  publish_shadow_shm(&q_, true);
   trajectory_enabled_.store(true);
   return controller_interface::CallbackReturn::SUCCESS;
 }
@@ -361,6 +355,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
 controller_interface::CallbackReturn Lite6CTCController::on_deactivate(const rclcpp_lifecycle::State &)
 {
   trajectory_enabled_.store(false);
+  publish_shadow_shm(nullptr, false);
   std::lock_guard<std::mutex> lock(trajectory_mutex_);
   if (active_trajectory_) {
     auto expected = TrajectoryResult::RUNNING;
@@ -569,15 +564,8 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   finish_trajectory_cycle(dt);
   finish_impedance_trajectory_cycle(dt);
 
-  // 6. Offer this cycle's actual reference to the display.
-  if (rt_shadow_pub_->trylock()) {
-    rt_shadow_pub_->msg_.header.stamp = time;
-    for (size_t i = 0; i < n; ++i) {
-      rt_shadow_pub_->msg_.position[i] = q_target_[i];
-      // rt_shadow_pub_->msg_.velocity[i] = dq_target_[i];
-    }
-    rt_shadow_pub_->unlockAndPublish();
-  }
+  // 6. Write this cycle's actual reference directly to the shared-memory register.
+  publish_shadow_shm(&q_target_, true);
 
   // 7. Publish the actual internal CTC mode, observed by the Supervisor.
   // The mode is mapped explicitly: SystemState is NOT the wire enum.
@@ -638,6 +626,21 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   }
 
   return controller_interface::return_type::OK;
+}
+
+void Lite6CTCController::publish_shadow_shm(const Eigen::VectorXd * target, bool valid)
+{
+  if (!state_shm_.valid()) {return;}
+  lite6_interfaces::shm::ShadowStatePod pod{};
+  if (target && target->size() >= static_cast<Eigen::Index>(joint_names_.size())) {
+    for (size_t i = 0; i < joint_names_.size(); ++i) {
+      pod.position[i] = (*target)[static_cast<Eigen::Index>(i)];
+    }
+  }
+  pod.stamp_ns = lite6_interfaces::shm::steady_now_ns();
+  pod.controller_epoch = shadow_epoch_;
+  pod.valid = valid ? 1 : 0;
+  state_shm_->shadow_state.write(pod);
 }
 
 bool Lite6CTCController::configure_momentum_observer()

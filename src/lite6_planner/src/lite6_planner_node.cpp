@@ -7,7 +7,6 @@
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <control_msgs/action/follow_joint_trajectory.hpp>
-#include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/int32.hpp>
 #include <lite6_interfaces/action/industrial_motion.hpp>
 #include <lite6_interfaces/msg/controller_status.hpp>
@@ -16,6 +15,7 @@
 #include <lite6_interfaces/srv/supervisor_command.hpp>
 #include <lite6_interfaces/msg/compliance_command.hpp>
 #include <lite6_interfaces/compliance_validation.hpp>
+#include <lite6_interfaces/shm_registers.hpp>
 #include <lite6_interfaces/srv/submit_sys_id_trajectory.hpp>
 
 #include <algorithm>
@@ -88,8 +88,10 @@ public:
         }
         publish_state();
       },sensor_options);
-    joints_sub_=create_subscription<sensor_msgs::msg::JointState>("/joint_states",rclcpp::QoS(10),
-      [this](const sensor_msgs::msg::JointState::SharedPtr msg){on_joints(*msg);},sensor_options);
+    if(!state_shm_.open(false))
+      throw std::runtime_error("Failed to open read-only state shared memory");
+    joint_poll_timer_=create_wall_timer(10ms,[this]{poll_joint_state_shm();},io_group_);
+    poll_joint_state_shm();
     ctc_=rclcpp_action::create_client<FJT>(this,"/ctc_controller/follow_joint_trajectory");
     action_server_=rclcpp_action::create_server<Motion>(this,"industrial_motion",
       [this](const rclcpp_action::GoalUUID& id,std::shared_ptr<const Motion::Goal> goal){
@@ -148,19 +150,22 @@ private:
   // Serialize a state transition with its mode-command publication. Otherwise
   // a pending NORMAL command could be published after a concurrent ESTOP.
   std::mutex transition_mutex_;
-  int64_t last_joint_stamp_=0,last_controller_stamp_=0;
+  int64_t last_controller_stamp_=0;
+  uint64_t last_joint_seq_=0;
+  int64_t last_joint_steady_ns_=0;
   MotionPlanner::InitialState actual_{};
   std::unique_ptr<CTCOperation> operation_;
   std::thread planner_thread_;
   rclcpp::CallbackGroup::SharedPtr io_group_;
   rclcpp::CallbackGroup::SharedPtr validation_group_;
   std::atomic<bool> shutdown_{false};
+  lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::StateShmSegment> state_shm_;
+  rclcpp::TimerBase::SharedPtr joint_poll_timer_;
   rclcpp::Publisher<lite6_interfaces::msg::ComplianceCommand>::SharedPtr compliance_pub_;
   rclcpp::Publisher<S>::SharedPtr state_pub_;
   rclcpp::Publisher<lite6_interfaces::msg::MotionRejection>::SharedPtr rejection_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr cmd_pub_;
   rclcpp::Subscription<lite6_interfaces::msg::ControllerStatus>::SharedPtr controller_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joints_sub_;
   rclcpp_action::Client<FJT>::SharedPtr ctc_;
   rclcpp_action::Server<Motion>::SharedPtr action_server_;
   rclcpp::Service<lite6_interfaces::srv::SupervisorCommand>::SharedPtr command_service_;
@@ -172,27 +177,35 @@ private:
     state.stamp=get_clock()->now();
     state_pub_->publish(state);
   }
-  void on_joints(const sensor_msgs::msg::JointState& msg) {
-    const auto stamp=rclcpp::Time(msg.header.stamp).nanoseconds();
-    if(stamp<=last_joint_stamp_) return;
+  bool read_shm_joints(MotionPlanner::InitialState& out, double& max_speed,
+      uint64_t& out_seq, int64_t& out_steady_ns) const {
+    if(!state_shm_.valid()) return false;
+    lite6_interfaces::shm::JointStatePod pod{};
+    if(!state_shm_->joint_state.read(pod,out_seq)||pod.valid==0) return false;
+    const int64_t now_ns=lite6_interfaces::shm::steady_now_ns();
+    if(pod.steady_stamp_ns<=0||now_ns-pod.steady_stamp_ns>=800000000LL) return false;
+    max_speed=0.0;
+    for(int i=0;i<6;++i) {
+      out.q[i]=pod.position[i];out.dq[i]=pod.velocity[i];
+      if(!std::isfinite(out.q[i])||!std::isfinite(out.dq[i])) return false;
+      max_speed=std::max(max_speed,std::abs(out.dq[i]));
+    }
+    out_steady_ns=pod.steady_stamp_ns;
+    return true;
+  }
+  void poll_joint_state_shm() {
     MotionPlanner::InitialState candidate;
     double max_speed=0.0;
-    for(int i=0;i<6;++i) {
-      const auto name="joint"+std::to_string(i+1);
-      auto it=std::find(msg.name.begin(),msg.name.end(),name);
-      if(it==msg.name.end()) return;
-      const auto index=std::distance(msg.name.begin(),it);
-      if(index<0||static_cast<size_t>(index)>=msg.position.size()||
-         static_cast<size_t>(index)>=msg.velocity.size()) return;
-      candidate.q[i]=msg.position[index];candidate.dq[i]=msg.velocity[index];
-      if(!std::isfinite(candidate.q[i])||!std::isfinite(candidate.dq[i])) return;
-      max_speed=std::max(max_speed,std::abs(candidate.dq[i]));
-    }
+    uint64_t seq=0;
+    int64_t steady_ns=0;
+    if(!read_shm_joints(candidate,max_speed,seq,steady_ns)) return;
+    if(seq==last_joint_seq_||steady_ns<=last_joint_steady_ns_) return;
     {
       std::lock_guard<std::mutex> lock(joints_mutex_);
       actual_=candidate;
     }
-    last_joint_stamp_=stamp;
+    last_joint_seq_=seq;
+    last_joint_steady_ns_=steady_ns;
     supervisor_.observe_joint_state(max_speed);
   }
   void issue_ctc_command(int value) {
@@ -266,7 +279,8 @@ private:
     const auto key=hex_uuid(gh->get_goal_id());
     try {
       MotionPlanner::InitialState start;
-      {
+      double dummy_speed=0.0; uint64_t dummy_seq=0; int64_t dummy_ns=0;
+      if(!read_shm_joints(start,dummy_speed,dummy_seq,dummy_ns)) {
         std::lock_guard<std::mutex> lock(joints_mutex_);
         start=actual_;
       }
@@ -446,10 +460,15 @@ private:
     }
     // The Fourier reference must start at the current physical pose; no jump.
     {
-      std::lock_guard<std::mutex> lock(joints_mutex_);
+      MotionPlanner::InitialState current;
+      double dummy_speed=0.0; uint64_t dummy_seq=0; int64_t dummy_ns=0;
+      if(!read_shm_joints(current,dummy_speed,dummy_seq,dummy_ns)) {
+        std::lock_guard<std::mutex> lock(joints_mutex_);
+        current=actual_;
+      }
       for(int i=0;i<6;++i) {
-        if(std::abs(req.trajectory.points.front().positions[i]-actual_.q[i])>0.05||
-           std::abs(actual_.dq[i])>0.02) {
+        if(std::abs(req.trajectory.points.front().positions[i]-current.q[i])>0.05||
+           std::abs(current.dq[i])>0.02) {
           resp.accepted=false;
           resp.message="SysID reference start differs from stationary physical state";
           supervisor_.end_excitation_validation(req.session_id);

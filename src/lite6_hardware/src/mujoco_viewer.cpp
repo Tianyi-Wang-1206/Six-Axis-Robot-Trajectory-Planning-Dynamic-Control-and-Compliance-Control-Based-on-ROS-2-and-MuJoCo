@@ -4,9 +4,7 @@
 #include <mujoco/mujoco.h>
 #include <rclcpp/rclcpp.hpp>
 #include <ament_index_cpp/get_package_share_directory.hpp>
-#include <sensor_msgs/msg/joint_state.hpp>
-#include "lite6_interfaces/msg/simulation_state.hpp"
-#include "lite6_interfaces/msg/mouse_perturbation.hpp"
+#include "lite6_interfaces/shm_registers.hpp"
 
 #include <algorithm>
 #include <array>
@@ -21,12 +19,9 @@
 namespace
 {
 using Clock = std::chrono::steady_clock;
-using State = lite6_interfaces::msg::SimulationState;
-using Target = lite6_interfaces::msg::MousePerturbation;
 int64_t now_ns()
 {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-    Clock::now().time_since_epoch()).count();
+  return lite6_interfaces::shm::steady_now_ns();
 }
 
 class Viewer
@@ -86,57 +81,12 @@ public:
     options_.sitegroup[4] = 0;
     reset_camera();
 
-    publisher_ = node_->create_publisher<Target>(
-      "/simulation/mouse_perturbation", rclcpp::QoS(1).best_effort());
-    state_subscription_ = node_->create_subscription<State>(
-      "/simulation/visual_state", rclcpp::QoS(1).best_effort(),
-      [this](const State & state) {
-        for (size_t i = 0; i < 6; ++i) {
-          if (!std::isfinite(state.position[i]) || !std::isfinite(state.velocity[i])) {return;}
-        }
-        for (size_t i = 0; i < 6; ++i) {
-          data_->qpos[qpos_[i]] = state.position[i];
-          data_->qvel[qvel_[i]] = state.velocity[i];
-        }
-        for (size_t i = 0; i < 2; ++i) {
-          if (!std::isfinite(state.gripper_position[i]) || !std::isfinite(state.gripper_velocity[i])) {return;}
-          data_->qpos[gripper_qpos_[i]] = state.gripper_position[i];
-          data_->qvel[gripper_qvel_[i]] = state.gripper_velocity[i];
-          shadow_->qpos[gripper_qpos_[i]] = state.gripper_position[i];
-        }
-        for (size_t i = 0; i < object_qpos_.size(); ++i) {
-          const auto first = state.object_qpos.begin() + 7 * i;
-          if (!std::all_of(first, first + 7, [](double v) {return std::isfinite(v);})) {
-            return;
-          }
-          const double norm = std::hypot(std::hypot(first[3], first[4]),
-            std::hypot(first[5], first[6]));
-          if (norm < 1e-6) {return;}
-          std::copy_n(first, 7, data_->qpos + object_qpos_[i]);
-          mju_normalize4(data_->qpos + object_qpos_[i] + 3);
-        }
-        data_->time = state.simulation_time;
-        active_ = state.active;
-        last_state_ = Clock::now();
-        dirty_ = true;
-        shadow_dirty_ = true;  // The shadow shares measured gripper positions.
-      });
-    shadow_subscription_ = node_->create_subscription<sensor_msgs::msg::JointState>(
-      "/shadow/joint_states", rclcpp::QoS(1).best_effort(),
-      [this](const sensor_msgs::msg::JointState & state) {
-        std::array<double, 6> positions{};
-        for (size_t i = 0; i < 6; ++i) {
-          const auto name = "joint" + std::to_string(i + 1);
-          const auto it = std::find(state.name.begin(), state.name.end(), name);
-          const auto index = static_cast<size_t>(it - state.name.begin());
-          if (it == state.name.end() || index >= state.position.size() ||
-            !std::isfinite(state.position[index])) {return;}
-          positions[i] = state.position[index];
-        }
-        for (size_t i = 0; i < 6; ++i) {shadow_->qpos[qpos_[i]] = positions[i];}
-        last_shadow_ = Clock::now();
-        shadow_dirty_ = true;
-      });
+    if (!state_shm_.open(false)) {
+      throw std::runtime_error("Cannot open read-only state shared memory");
+    }
+    if (!perturb_shm_.open(true)) {
+      throw std::runtime_error("Cannot open perturbation shared memory");
+    }
 
     glfwWindowHint(GLFW_SAMPLES, 8);
     glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
@@ -212,7 +162,8 @@ public:
     executor.add_node(node_);
     RCLCPP_INFO(node_->get_logger(), "Native MuJoCo viewer: %d FPS target; H for controls", fps_limit_);
     while (rclcpp::ok() && !glfwWindowShouldClose(window_.get())) {
-      executor.spin_some(std::chrono::milliseconds(2));
+      executor.spin_some(std::chrono::milliseconds(0));
+      poll_shm_state();
       if (dirty_) {mj_forward(model_.get(), data_.get()); dirty_ = false;}
       glfwPollEvents();
       const bool fresh = Clock::now() - last_state_ < std::chrono::milliseconds(250);
@@ -280,23 +231,101 @@ private:
     camera_.distance = 2.65;
     camera_.azimuth = 135; camera_.elevation = -22;
   }
+  void poll_shm_state()
+  {
+    if (!state_shm_.valid()) {return;}
+    const int64_t steady_now = now_ns();
+    const int64_t alive_ns = state_shm_->visual_alive_ns.load(std::memory_order_acquire);
+
+    lite6_interfaces::shm::VisualStatePod vis{};
+    uint64_t vis_seq = 0;
+    if (state_shm_->visual_state.read(vis, vis_seq) && vis.valid != 0) {
+      const int64_t latest_stamp = std::max(vis.published_steady_ns, alive_ns);
+      if (latest_stamp > 0 && steady_now - latest_stamp < 250000000LL) {
+        bool ok = std::isfinite(vis.simulation_time);
+        for (size_t i = 0; i < 6 && ok; ++i) {
+          ok = std::isfinite(vis.position[i]) && std::isfinite(vis.velocity[i]);
+        }
+        for (size_t i = 0; i < 2 && ok; ++i) {
+          ok = std::isfinite(vis.gripper_position[i]) && std::isfinite(vis.gripper_velocity[i]);
+        }
+        for (size_t i = 0; i < object_qpos_.size() && ok; ++i) {
+          const double * first = vis.object_qpos + 7 * i;
+          ok = std::all_of(first, first + 7, [](double v) {return std::isfinite(v);});
+          if (ok) {
+            const double norm = std::hypot(std::hypot(first[3], first[4]),
+              std::hypot(first[5], first[6]));
+            ok = norm >= 1e-6;
+          }
+        }
+        if (ok) {
+          if (vis_seq != last_visual_seq_) {
+            for (size_t i = 0; i < 6; ++i) {
+              data_->qpos[qpos_[i]] = vis.position[i];
+              data_->qvel[qvel_[i]] = vis.velocity[i];
+            }
+            for (size_t i = 0; i < 2; ++i) {
+              data_->qpos[gripper_qpos_[i]] = vis.gripper_position[i];
+              data_->qvel[gripper_qvel_[i]] = vis.gripper_velocity[i];
+              shadow_->qpos[gripper_qpos_[i]] = vis.gripper_position[i];
+            }
+            for (size_t i = 0; i < object_qpos_.size(); ++i) {
+              const double * first = vis.object_qpos + 7 * i;
+              std::copy_n(first, 7, data_->qpos + object_qpos_[i]);
+              mju_normalize4(data_->qpos + object_qpos_[i] + 3);
+            }
+            data_->time = vis.simulation_time;
+            dirty_ = true;
+            shadow_dirty_ = true;
+            last_visual_seq_ = vis_seq;
+          }
+          active_ = (vis.active != 0);
+          last_state_ = Clock::now();
+        }
+      }
+    } else if (alive_ns > 0 && steady_now - alive_ns < 250000000LL) {
+      active_ = false;
+      last_state_ = Clock::now();
+    }
+
+    lite6_interfaces::shm::ShadowStatePod shadow{};
+    uint64_t shadow_seq = 0;
+    if (state_shm_->shadow_state.read(shadow, shadow_seq) && shadow.valid != 0 &&
+      shadow.stamp_ns > 0 && steady_now - shadow.stamp_ns < 500000000LL)
+    {
+      bool ok = true;
+      for (size_t i = 0; i < 6; ++i) {
+        if (!std::isfinite(shadow.position[i])) {ok = false; break;}
+      }
+      if (ok) {
+        if (shadow_seq != last_shadow_seq_) {
+          for (size_t i = 0; i < 6; ++i) {shadow_->qpos[qpos_[i]] = shadow.position[i];}
+          shadow_dirty_ = true;
+          last_shadow_seq_ = shadow_seq;
+        }
+        last_shadow_ = Clock::now();
+      }
+    }
+  }
   void send_target()
   {
-    if (!perturb_.active) {return;}
-    Target message;
-    message.issued_ns = now_ns();
-    message.body_id = perturb_.select;
-    message.active = perturb_.active;
-    std::copy_n(perturb_.refpos, 3, message.refpos.begin());
-    std::copy_n(perturb_.refselpos, 3, message.refselpos.begin());
-    std::copy_n(perturb_.refquat, 4, message.refquat.begin());
-    std::copy_n(perturb_.localpos, 3, message.localpos.begin());
-    message.localmass = perturb_.localmass;
-    publisher_->publish(message);
+    if (!perturb_.active || !perturb_shm_.valid()) {return;}
+    lite6_interfaces::shm::MousePerturbationPod pod{};
+    pod.issued_ns = now_ns();
+    pod.body_id = perturb_.select;
+    pod.active = perturb_.active;
+    std::copy_n(perturb_.refpos, 3, pod.refpos);
+    std::copy_n(perturb_.refselpos, 3, pod.refselpos);
+    std::copy_n(perturb_.refquat, 4, pod.refquat);
+    std::copy_n(perturb_.localpos, 3, pod.localpos);
+    pod.localmass = perturb_.localmass;
+    perturb_shm_->mouse_perturbation.write(pod);
   }
   void release()
   {
-    if (perturb_.active && rclcpp::ok()) {publisher_->publish(Target{});}
+    if (perturb_.active && perturb_shm_.valid()) {
+      perturb_shm_->mouse_perturbation.write(lite6_interfaces::shm::MousePerturbationPod{});
+    }
     perturb_.active = 0;
   }
   void button(int button, int action, int mods)
@@ -368,9 +397,10 @@ private:
   std::array<int, 2> object_qpos_{};
   std::array<int, 6> qpos_{}, qvel_{};
   std::array<int, 2> gripper_qpos_{}, gripper_qvel_{};
-  rclcpp::Publisher<Target>::SharedPtr publisher_;
-  rclcpp::Subscription<State>::SharedPtr state_subscription_;
-  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr shadow_subscription_;
+  lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::StateShmSegment> state_shm_;
+  lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::PerturbShmSegment> perturb_shm_;
+  uint64_t last_visual_seq_ = 0;
+  uint64_t last_shadow_seq_ = 0;
   Clock::time_point last_state_{}, last_shadow_{};
   bool active_ = false, dirty_ = false, shadow_dirty_ = false;
   bool show_shadow_ = false, help_ = true;

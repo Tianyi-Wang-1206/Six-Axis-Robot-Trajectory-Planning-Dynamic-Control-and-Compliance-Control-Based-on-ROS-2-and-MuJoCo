@@ -2,16 +2,9 @@ controller_manager:
   ros__parameters:
     update_rate: 1000  # 1000Hz Hard Real-Time Control Loop
 
-    joint_state_broadcaster:
-      type: joint_state_broadcaster/JointStateBroadcaster
-
     # 1. Declare the CTC controller, which is a custom controller that implements Computed Torque Control (CTC) for the 6-DOF robot arm
     ctc_controller:
       type: lite6_controllers/Lite6CTCController
-
-joint_state_broadcaster:  # Broadcaster for the joint states of the robot arm
-  ros__parameters:
-    update_rate: 1000  # 1 ms measured feedback, matching CTC and SysID references.
 
 # --- Computed Torque Control (CTC) Controller Configuration ---
 ctc_controller:

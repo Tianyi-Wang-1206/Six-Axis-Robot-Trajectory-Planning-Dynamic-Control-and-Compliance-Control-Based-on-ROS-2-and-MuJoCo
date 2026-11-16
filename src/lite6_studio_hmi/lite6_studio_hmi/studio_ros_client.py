@@ -1,35 +1,21 @@
 """Background ROS 2 QThread client bridging Studio services/topics and PyQt5 signals."""
 
 import math
+import os
 import queue
 import time
 
+from ament_index_python.packages import get_package_share_directory
+from lite6_shm_client import StateShmReader, steady_now_ns
+import numpy as np
+import pinocchio as pin
 import rclpy
 from PyQt5.QtCore import QThread, pyqtSignal
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import JointState
-from tf2_ros import Buffer, TransformListener
 
 from lite6_interfaces.msg import GripperState, StudioState
 from lite6_interfaces.srv import CompileProgram, GripperCommand, StudioCommand
-
-JOINT_NAMES = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
-
-
-def _quat_to_rpy(x, y, z, w):
-    """Convert unit quaternion [x, y, z, w] to extrinsic XYZ / intrinsic ZYX RPY [rad]."""
-    t0 = 2.0 * (w * x + y * z)
-    t1 = 1.0 - 2.0 * (x * x + y * y)
-    roll = math.atan2(t0, t1)
-
-    t2 = max(-1.0, min(1.0, 2.0 * (w * y - z * x)))
-    pitch = math.asin(t2)
-
-    t3 = 2.0 * (w * z + x * y)
-    t4 = 1.0 - 2.0 * (y * y + z * z)
-    yaw = math.atan2(t3, t4)
-    return [roll, pitch, yaw]
 
 
 class StudioRosWorker(QThread):
@@ -47,8 +33,6 @@ class StudioRosWorker(QThread):
         super().__init__(parent)
         self._stop_requested = False
         self._req_queue = queue.Queue()
-        self._latest_q = None
-        self._latest_dq = None
         self._last_telemetry_emit = 0.0
 
     def request_compile(self, source_code, use_current_robot_start=True, custom_start=None):
@@ -93,15 +77,23 @@ class StudioRosWorker(QThread):
             lambda msg: self.gripper_state_updated.emit(msg),
             10,
         )
-        node.create_subscription(
-            JointState,
-            "/joint_states",
-            self._on_joint_state,
-            20,
-        )
 
-        tf_buffer = Buffer()
-        _tf_listener = TransformListener(tf_buffer, node, spin_thread=False)
+        pin_model = None
+        pin_data = None
+        eef_frame_id = None
+        try:
+            urdf_path = os.path.join(
+                get_package_share_directory("lite6_description"),
+                "urdf",
+                "lite6_arm.urdf",
+            )
+            pin_model = pin.buildModelFromUrdf(urdf_path)
+            pin_data = pin_model.createData()
+            eef_frame_id = pin_model.getFrameId("link_eef")
+        except Exception as exc:
+            self.ros_log.emit(f"Pinocchio FK init warning: {exc}")
+
+        shm_reader = StateShmReader()
 
         compile_cli = node.create_client(CompileProgram, "/studio/compile")
         command_cli = node.create_client(StudioCommand, "/studio/command")
@@ -113,46 +105,43 @@ class StudioRosWorker(QThread):
             while not self._stop_requested and rclpy.ok():
                 self._drain_requests(node, compile_cli, command_cli, gripper_cli, pending)
                 rclpy.spin_once(node, timeout_sec=0.02)
+                for _ in range(8):
+                    rclpy.spin_once(node, timeout_sec=0.0)
                 self._poll_pending(pending)
-                self._maybe_emit_telemetry(tf_buffer)
+                self._maybe_emit_telemetry(shm_reader, pin_model, pin_data, eef_frame_id)
         finally:
+            shm_reader.close()
             node.destroy_node()
 
-    def _on_joint_state(self, msg):
-        idx_map = {name: i for i, name in enumerate(msg.name)}
-        q = []
-        dq = []
-        for jname in JOINT_NAMES:
-            idx = idx_map.get(jname)
-            if idx is None or idx >= len(msg.position):
-                return
-            q.append(float(msg.position[idx]))
-            dq.append(float(msg.velocity[idx]) if idx < len(msg.velocity) else 0.0)
-        self._latest_q = q
-        self._latest_dq = dq
-
-    def _maybe_emit_telemetry(self, tf_buffer):
+    def _maybe_emit_telemetry(self, shm_reader, pin_model, pin_data, eef_frame_id):
         now = time.monotonic()
         if now - self._last_telemetry_emit < 0.05:  # 20 Hz UI throttle
             return
         self._last_telemetry_emit = now
 
-        tcp6 = None
-        try:
-            tf = tf_buffer.lookup_transform("link_base", "link_eef", rclpy.time.Time())
-            t = tf.transform.translation
-            r = tf.transform.rotation
-            rpy = _quat_to_rpy(r.x, r.y, r.z, r.w)
-            tcp6 = [float(t.x), float(t.y), float(t.z)] + rpy
-        except Exception:
-            tcp6 = None
+        pod, _ = shm_reader.read_joint_state()
+        if pod is None or pod.steady_stamp_ns <= 0:
+            return
+        if steady_now_ns() - pod.steady_stamp_ns >= 500_000_000:
+            return
+        q_list = [float(pod.position[i]) for i in range(6)]
+        dq_list = [float(pod.velocity[i]) for i in range(6)]
+        if not all(math.isfinite(x) for x in q_list + dq_list):
+            return
 
-        if self._latest_q is not None or tcp6 is not None:
-            self.telemetry_updated.emit(
-                list(self._latest_q) if self._latest_q is not None else None,
-                list(self._latest_dq) if self._latest_dq is not None else None,
-                tcp6,
-            )
+        tcp6 = None
+        if pin_model is not None and pin_data is not None and eef_frame_id is not None:
+            try:
+                q_arr = np.asarray(q_list, dtype=float)
+                pin.forwardKinematics(pin_model, pin_data, q_arr)
+                pin.updateFramePlacements(pin_model, pin_data)
+                frame = pin_data.oMf[eef_frame_id]
+                rpy = pin.rpy.matrixToRpy(frame.rotation)
+                tcp6 = [*frame.translation.tolist(), *rpy.tolist()]
+            except Exception:
+                tcp6 = None
+
+        self.telemetry_updated.emit(q_list, dq_list, tcp6)
 
     def _drain_requests(self, _node, compile_cli, command_cli, gripper_cli, pending):
         while True:

@@ -21,18 +21,20 @@ def generate_launch_description():
         hw_pkg, 'config', 'controllers_compliance_mode.yaml'
     )
 
+    # Publish /robot_description (transient_local) for controller_manager without TF/RSP
+    robot_description_pub_node = Node(
+        package="lite6_hardware",
+        executable="robot_description_publisher",
+        parameters=[{'robot_description': robot_desc}],
+        output="screen",
+    )
+
     # Core nodes for the robot system bringup
     control_node = Node(
         package="controller_manager", 
         executable="ros2_control_node", 
         parameters=[{'robot_description': robot_desc}, controller_config, compliance_controller_config], 
         output="screen"
-    )
-    
-    rsp_node = Node(
-        package='robot_state_publisher', 
-        executable='robot_state_publisher', 
-        parameters=[{'robot_description': robot_desc}, {'publish_frequency': 200.0}]
     )
 
     # Native MuJoCo display in its own process. The hardware physics thread is
@@ -49,8 +51,7 @@ def generate_launch_description():
         }],
     )
 
-    # Load controllers: Joint State Broadcaster and CTC Controller
-    jsb_spawner = Node(package="controller_manager", executable="spawner", arguments=["joint_state_broadcaster"])
+    # Load controller: CTC Controller
     ctc_spawner = Node(package="controller_manager", executable="spawner", arguments=["ctc_controller"])
     # Planner and HMI nodes
     planner_node = Node(
@@ -75,7 +76,7 @@ def generate_launch_description():
         DeclareLaunchArgument('viewer_fps', default_value='60', description='Render rate, 15..240 Hz'),
         DeclareLaunchArgument('viewer_shadows', default_value='false', description='Render cast shadows (may show mesh artifacts)'),
         DeclareLaunchArgument('viewer_shadow', default_value='false', description='Show cyan target robot'),
-        control_node, rsp_node, viewer_node, jsb_spawner, ctc_spawner,
+        control_node, robot_description_pub_node, viewer_node, ctc_spawner,
         # 2. Launch the planner and HMI after the direct trajectory CTC controller is ready.
         delay_upper_layer_after_ctc
     ])

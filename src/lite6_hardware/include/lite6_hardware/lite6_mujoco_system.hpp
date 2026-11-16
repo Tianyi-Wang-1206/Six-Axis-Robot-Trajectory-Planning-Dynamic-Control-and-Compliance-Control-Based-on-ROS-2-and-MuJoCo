@@ -16,10 +16,7 @@
 #include "lite6_hardware/lugre_friction.hpp"
 #include "lite6_hardware/simulation_exchange.hpp"
 #include "lite6_hardware/gripper_control.hpp"
-#include "lite6_interfaces/msg/sys_id_sample.hpp"
-#include "lite6_interfaces/msg/simulation_state.hpp"
-#include "lite6_interfaces/msg/mouse_perturbation.hpp"
-#include "realtime_tools/realtime_publisher.hpp"
+#include "lite6_interfaces/shm_registers.hpp"
 
 #include <mujoco/mujoco.h>
 
@@ -86,19 +83,16 @@ private:
     mjvPerturb perturb{};
     int64_t issued_ns = 0;
   };
-  struct Visualization
-  {
-    detail::LatestSnapshot<StateSnapshot> snapshots;
-    detail::LatestSnapshot<MouseTarget> targets;
-  };
   static int64_t steady_now_ns();
   void physics_loop();
   bool advance_physics(int64_t boundary_ns, EffortCommand & applied);
   void publish_snapshot(StateSnapshot & snapshot);
+  void write_visual_shm(const StateSnapshot & snapshot, bool physics_active);
+  void write_joint_state_shm(const StateSnapshot & snapshot);
+  void refresh_mouse_target(int64_t now_ns);
   void stop_physics();
   void release_model();
   void configure_diagnostics();
-  void configure_visualization();
 
   GripperControl gripper_;
   GripperControl::Feedback gripper_feedback_;
@@ -109,19 +103,25 @@ private:
   std::thread physics_thread_;
   std::atomic<bool> stop_requested_{true};
   int physics_thread_priority_ = 60;
-  uint64_t command_sequence_ = 0;  // write() only, reset on activation.
+  uint64_t command_sequence_ = 0;      // write() only, reset on activation.
+  uint64_t joint_state_sequence_ = 0;  // read() only.
   detail::SpscQueue<EffortCommand, 4096> commands_;
   detail::LatestSnapshot<StateSnapshot> states_;
   std::shared_ptr<Diagnostics> diagnostics_ = std::make_shared<Diagnostics>();
   rclcpp::TimerBase::SharedPtr diagnostics_timer_;
-  std::shared_ptr<Visualization> visualization_ = std::make_shared<Visualization>();
-  rclcpp::TimerBase::SharedPtr visualization_timer_;
-  rclcpp::Subscription<lite6_interfaces::msg::MousePerturbation>::SharedPtr mouse_subscription_;
   int64_t activation_ns_ = 0;  // Set before starting the physics thread.
-  rclcpp::Publisher<lite6_interfaces::msg::SysIdSample>::SharedPtr sysid_transport_;
-  // Published from read(), never from the physics thread; fixed-size and nonblocking.
-  std::shared_ptr<realtime_tools::RealtimePublisher<lite6_interfaces::msg::SysIdSample>>
-    sysid_publisher_;
+
+  std::shared_ptr<lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::StateShmSegment>>
+    state_shm_ = std::make_shared<
+    lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::StateShmSegment>>();
+  lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::PerturbShmSegment> perturb_shm_;
+  std::shared_ptr<lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::SysIdShmSegment>>
+    sysid_shm_ = std::make_shared<
+    lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::SysIdShmSegment>>();
+
+  std::array<int, kJoints> perturb_bodies_{};
+  MouseTarget last_mouse_target_{};
+  uint64_t last_mouse_seq_ = 0;
 
   std::vector<double> hw_commands_effort_;
   std::vector<double> hw_states_position_;

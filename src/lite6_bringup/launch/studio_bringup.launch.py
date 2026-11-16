@@ -24,6 +24,13 @@ def generate_launch_description():
         hw_pkg, 'config', 'controllers_compliance_mode.yaml'
     )
 
+    robot_description_pub_node = Node(
+        package='lite6_hardware',
+        executable='robot_description_publisher',
+        parameters=[{'robot_description': robot_desc}],
+        output='screen',
+    )
+
     control_node = Node(
         package='controller_manager',
         executable='ros2_control_node',
@@ -33,12 +40,6 @@ def generate_launch_description():
             compliance_controller_config,
         ],
         output='screen',
-    )
-
-    rsp_node = Node(
-        package='robot_state_publisher',
-        executable='robot_state_publisher',
-        parameters=[{'robot_description': robot_desc}, {'publish_frequency': 200.0}],
     )
 
     viewer_node = Node(
@@ -53,11 +54,6 @@ def generate_launch_description():
         }],
     )
 
-    jsb_spawner = Node(
-        package='controller_manager',
-        executable='spawner',
-        arguments=['joint_state_broadcaster'],
-    )
     ctc_spawner = Node(
         package='controller_manager',
         executable='spawner',
@@ -103,9 +99,8 @@ def generate_launch_description():
             'viewer_shadow', default_value='false', description='Show cyan target robot'
         ),
         control_node,
-        rsp_node,
+        robot_description_pub_node,
         viewer_node,
-        jsb_spawner,
         ctc_spawner,
         delay_studio_after_ctc,
     ])

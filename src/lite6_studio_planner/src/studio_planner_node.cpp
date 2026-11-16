@@ -9,12 +9,12 @@
 #include "lite6_interfaces/msg/controller_status.hpp"
 #include "lite6_interfaces/msg/gripper_state.hpp"
 #include "lite6_interfaces/msg/studio_state.hpp"
+#include "lite6_interfaces/shm_registers.hpp"
 #include "lite6_interfaces/srv/compile_program.hpp"
 #include "lite6_interfaces/srv/gripper_command.hpp"
 #include "lite6_interfaces/srv/studio_command.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
-#include "sensor_msgs/msg/joint_state.hpp"
 #include "std_msgs/msg/int32.hpp"
 
 #include <algorithm>
@@ -30,7 +30,6 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 namespace lite6_studio_planner
@@ -83,8 +82,13 @@ public:
     compiler_ = std::make_unique<ProgramCompiler>(kinematics_);
 
     telemetry_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    shm_poll_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     service_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     client_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+
+    if (!state_shm_.open(false)) {
+      throw std::runtime_error("Failed to open read-only state shared memory");
+    }
 
     const auto state_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     state_pub_ = create_publisher<StudioState>("/studio/state", state_qos);
@@ -97,10 +101,11 @@ public:
     rclcpp::SubscriptionOptions telemetry_opts;
     telemetry_opts.callback_group = telemetry_group_;
 
-    joint_sub_ = create_subscription<sensor_msgs::msg::JointState>(
-      "/joint_states", rclcpp::QoS(20),
-      [this](const sensor_msgs::msg::JointState::SharedPtr msg) { on_joint_state(*msg); },
-      telemetry_opts);
+    joint_poll_timer_ = create_wall_timer(
+      std::chrono::milliseconds(10),
+      [this]() { poll_joint_state_shm(); },
+      shm_poll_group_);
+    poll_joint_state_shm();
 
     controller_sub_ = create_subscription<ControllerStatus>(
       "/ctc_controller/status", rclcpp::QoS(10),
@@ -243,41 +248,42 @@ private:
     }
   }
 
-  void on_joint_state(const sensor_msgs::msg::JointState & msg)
+  void poll_joint_state_shm()
   {
+    if (!state_shm_.valid()) {
+      return;
+    }
+    lite6_interfaces::shm::JointStatePod pod{};
+    uint64_t seq = 0;
+    if (!state_shm_->joint_state.read(pod, seq) || pod.valid == 0) {
+      return;
+    }
+    const int64_t now_ns = lite6_interfaces::shm::steady_now_ns();
+    if (pod.steady_stamp_ns <= 0 || now_ns - pod.steady_stamp_ns >= 800000000LL) {
+      return;
+    }
+    if (seq == last_joint_seq_ || pod.steady_stamp_ns <= last_joint_steady_ns_) {
+      return;
+    }
+    last_joint_seq_ = seq;
+    last_joint_steady_ns_ = pod.steady_stamp_ns;
+
     std::array<double, 6> q{};
     std::array<double, 6> dq{};
     bool pos_valid = true;
     bool dq_valid = true;
     double max_abs_dq = 0.0;
 
-    std::unordered_map<std::string, size_t> name_to_idx;
-    name_to_idx.reserve(msg.name.size());
-    for (size_t i = 0; i < msg.name.size(); ++i) {
-      name_to_idx[msg.name[i]] = i;
-    }
-
     for (size_t j = 0; j < 6; ++j) {
-      const auto it = name_to_idx.find(kJointNames[j]);
-      if (it == name_to_idx.end() || it->second >= msg.position.size()) {
-        pos_valid = false;
-        dq_valid = false;
-        break;
-      }
-      const size_t idx = it->second;
-      q[j] = msg.position[idx];
+      q[j] = pod.position[j];
+      dq[j] = pod.velocity[j];
       if (!std::isfinite(q[j])) {
         pos_valid = false;
       }
-      if (idx < msg.velocity.size()) {
-        dq[j] = msg.velocity[idx];
-        if (!std::isfinite(dq[j])) {
-          dq_valid = false;
-        } else {
-          max_abs_dq = std::max(max_abs_dq, std::abs(dq[j]));
-        }
-      } else {
+      if (!std::isfinite(dq[j])) {
         dq_valid = false;
+      } else {
+        max_abs_dq = std::max(max_abs_dq, std::abs(dq[j]));
       }
     }
 
@@ -321,6 +327,29 @@ private:
   {
     if (!supervisor_->is_fresh_joint()) {
       return false;
+    }
+    if (state_shm_.valid()) {
+      lite6_interfaces::shm::JointStatePod pod{};
+      uint64_t seq = 0;
+      const int64_t now_ns = lite6_interfaces::shm::steady_now_ns();
+      if (state_shm_->joint_state.read(pod, seq) && pod.valid != 0 &&
+          pod.steady_stamp_ns > 0 && now_ns - pod.steady_stamp_ns < 800000000LL)
+      {
+        bool finite_ok = true;
+        double max_dq = 0.0;
+        for (size_t i = 0; i < 6; ++i) {
+          if (!std::isfinite(pod.position[i]) || !std::isfinite(pod.velocity[i])) {
+            finite_ok = false;
+            break;
+          }
+          out_q[i] = pod.position[i];
+          max_dq = std::max(max_dq, std::abs(pod.velocity[i]));
+        }
+        if (finite_ok) {
+          out_max_dq = max_dq;
+          return true;
+        }
+      }
     }
     std::lock_guard<std::mutex> lock(state_data_mutex_);
     if (!has_latest_joint_) {
@@ -1301,12 +1330,17 @@ private:
   std::unique_ptr<StudioSupervisor> supervisor_;
 
   rclcpp::CallbackGroup::SharedPtr telemetry_group_;
+  rclcpp::CallbackGroup::SharedPtr shm_poll_group_;
   rclcpp::CallbackGroup::SharedPtr service_group_;
   rclcpp::CallbackGroup::SharedPtr client_group_;
 
+  lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::StateShmSegment> state_shm_;
+  uint64_t last_joint_seq_ = 0;
+  int64_t last_joint_steady_ns_ = 0;
+  rclcpp::TimerBase::SharedPtr joint_poll_timer_;
+
   rclcpp::Publisher<StudioState>::SharedPtr state_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr system_cmd_pub_;
-  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_sub_;
   rclcpp::Subscription<ControllerStatus>::SharedPtr controller_sub_;
   rclcpp::Subscription<GripperState>::SharedPtr gripper_sub_;
   rclcpp_action::Client<FollowJointTrajectory>::SharedPtr rigid_client_;
