@@ -140,14 +140,21 @@ public:
 
     glfwWindowHint(GLFW_SAMPLES, 8);
     glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
+    glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
     int width = 1400, height = 1400;
+    float content_xscale = 1.0f, content_yscale = 1.0f;
     if (auto * monitor = glfwGetPrimaryMonitor()) {
-      int work_x, work_y, work_width, work_height;
-      glfwGetMonitorWorkarea(monitor, &work_x, &work_y, &work_width, &work_height);
-      // Leave room for window decorations, including on scaled desktops.
-      if (work_width > 80 && work_height > 100) {
-        width = std::min(width, work_width - 80);
-        height = std::min(height, work_height - 100);
+      glfwGetMonitorContentScale(monitor, &content_xscale, &content_yscale);
+      // On unscaled desktops (1.0x), clamp to the work area; on HiDPI X11
+      // fractional scaling, GLFW reports CRTC work area smaller than the X11
+      // virtual screen while GLFW_SCALE_TO_MONITOR multiplies width/height.
+      if (content_xscale <= 1.05f && content_yscale <= 1.05f) {
+        int work_x, work_y, work_width, work_height;
+        glfwGetMonitorWorkarea(monitor, &work_x, &work_y, &work_width, &work_height);
+        if (work_width > 80 && work_height > 100) {
+          width = std::min(width, work_width - 80);
+          height = std::min(height, work_height - 100);
+        }
       }
     }
     window_.reset(glfwCreateWindow(width, height, "Robot | MuJoCo Studio", nullptr, nullptr));
@@ -155,7 +162,9 @@ public:
     glfwMakeContextCurrent(window_.get());
     glfwSwapInterval(1);
     mjv_makeScene(model_.get(), &scene_, 512);
-    mjr_makeContext(model_.get(), &context_, mjFONTSCALE_150);
+    const int font_scale = (content_xscale >= 1.75f || content_yscale >= 1.75f) ?
+      mjFONTSCALE_200 : mjFONTSCALE_150;
+    mjr_makeContext(model_.get(), &context_, font_scale);
     scene_.flags[mjRND_REFLECTION] = 0;
     scene_.flags[mjRND_SHADOW] = shadows;
     glfwSetWindowUserPointer(window_.get(), this);

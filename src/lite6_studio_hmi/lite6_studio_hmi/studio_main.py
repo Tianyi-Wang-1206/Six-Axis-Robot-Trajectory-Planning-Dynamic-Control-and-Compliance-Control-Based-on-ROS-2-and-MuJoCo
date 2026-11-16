@@ -3,7 +3,7 @@
 import signal
 import sys
 
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QFont, QPalette
 from PyQt5.QtWidgets import QApplication
 import rclpy
@@ -37,6 +37,14 @@ def _apply_light_palette(app):
 
 def main(args=None):
     rclpy.init(args=args)
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    try:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+    except AttributeError:
+        pass
     app = QApplication(sys.argv)
     app.setApplicationName("Robot Industrial Studio")
     _apply_light_palette(app)
