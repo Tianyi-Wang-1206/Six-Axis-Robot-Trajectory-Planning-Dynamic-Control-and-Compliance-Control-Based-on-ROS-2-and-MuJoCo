@@ -753,19 +753,27 @@ class StudioMainWindow(QMainWindow):
             lambda: self.worker.request_command(StudioCommand.Request.CMD_PAUSE)
         )
         self.btn_step.clicked.connect(
-            lambda: self.worker.request_command(StudioCommand.Request.CMD_STEP)
+            lambda: self.worker.request_command(
+                StudioCommand.Request.CMD_STEP, expected_revision=self._current_revision()
+            )
         )
         self.btn_stop.clicked.connect(
             lambda: self.worker.request_command(StudioCommand.Request.CMD_STOP)
         )
         self.btn_reset_fault.clicked.connect(
-            lambda: self.worker.request_command(StudioCommand.Request.CMD_RESET_FAULT)
+            lambda: self.worker.request_command(
+                StudioCommand.Request.CMD_RESET_FAULT, expected_revision=self._current_revision()
+            )
         )
         self.btn_recover.clicked.connect(
-            lambda: self.worker.request_command(StudioCommand.Request.CMD_RECOVER)
+            lambda: self.worker.request_command(
+                StudioCommand.Request.CMD_RECOVER, expected_revision=self._current_revision()
+            )
         )
         self.btn_clear.clicked.connect(
-            lambda: self.worker.request_command(StudioCommand.Request.CMD_CLEAR_PROGRAM)
+            lambda: self.worker.request_command(
+                StudioCommand.Request.CMD_CLEAR_PROGRAM, expected_revision=self._current_revision()
+            )
         )
         self.btn_estop.clicked.connect(
             lambda: self.worker.request_command(
@@ -789,6 +797,7 @@ class StudioMainWindow(QMainWindow):
         self.worker.compile_finished.connect(self.on_compile_finished)
         self.worker.command_finished.connect(self.on_command_finished)
         self.worker.gripper_finished.connect(self.on_gripper_finished)
+        self.worker.supervisor_offline.connect(self.on_supervisor_offline)
 
     # ------------------------------------------------------------------ Helpers
 
@@ -806,6 +815,11 @@ class StudioMainWindow(QMainWindow):
             return StudioState.STATE_BOOT_INIT
         return int(self._latest_studio_state.state)
 
+    def _current_revision(self):
+        if self._latest_studio_state is None:
+            return 0
+        return int(self._latest_studio_state.revision)
+
     def _refresh_button_states(self):
         st = self._current_state_code()
         online = self._latest_studio_state is not None
@@ -813,11 +827,10 @@ class StudioMainWindow(QMainWindow):
         can_compile = (not self._compile_in_flight) and st in (
             StudioState.STATE_IDLE,
             StudioState.STATE_COMPILED_READY,
-            StudioState.STATE_PAUSED,
             StudioState.STATE_FAULT,
             StudioState.STATE_ESTOP,
         )
-        # Keep editor read-only while program is actively executing or paused mid-run
+        # Keep editor and script-authoring controls disabled while executing or paused.
         active_exec = st in (
             StudioState.STATE_RUNNING,
             StudioState.STATE_STEPPING,
@@ -826,6 +839,14 @@ class StudioMainWindow(QMainWindow):
             StudioState.STATE_RECOVERING,
         )
         self.editor.setReadOnly(active_exec)
+        for btn in (
+            self.btn_new,
+            self.btn_open,
+            self.btn_load_preset,
+            self.btn_insert_joints,
+            self.btn_insert_pose,
+        ):
+            btn.setEnabled(not active_exec)
         self.btn_compile.setEnabled(can_compile if online else True)
 
         if st == StudioState.STATE_PAUSED:
@@ -940,10 +961,15 @@ class StudioMainWindow(QMainWindow):
 
     def _on_run_or_resume(self):
         st = self._current_state_code()
+        rev = self._current_revision()
         if st == StudioState.STATE_PAUSED:
-            self.worker.request_command(StudioCommand.Request.CMD_RESUME)
+            self.worker.request_command(
+                StudioCommand.Request.CMD_RESUME, expected_revision=rev
+            )
         else:
-            self.worker.request_command(StudioCommand.Request.CMD_RUN)
+            self.worker.request_command(
+                StudioCommand.Request.CMD_RUN, expected_revision=rev
+            )
 
     def _on_diag_clicked(self, row, _col):
         if 0 <= row < len(self._diagnostics):
@@ -1017,6 +1043,13 @@ class StudioMainWindow(QMainWindow):
         tag = {1: "OPEN", 2: "CLOSE", 3: "STOP"}.get(action_code, str(action_code))
         status = "queued" if accepted else "rejected"
         self.append_log(f"Gripper {tag} {status}: {detail}")
+
+    def on_supervisor_offline(self, reason):
+        self._latest_studio_state = None
+        self.lbl_state_badge.setText("OFFLINE")
+        self.lbl_state_badge.setStyleSheet(_styled_pill("#DC2626", "#FFFFFF"))
+        self.lbl_exec_detail.setText(reason)
+        self._refresh_button_states()
 
     def on_studio_state(self, msg):
         self._latest_studio_state = msg

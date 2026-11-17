@@ -12,6 +12,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <utility>
 
 namespace lite6_studio_planner
 {
@@ -29,15 +30,15 @@ public:
   {
     NONE = 0,
     WAIT_SETTLE = 1,
-    SYNC_REFERENCE = 2,
-    ENABLE_NORMAL = 3,
-    POST_SETTLE = 4
+    ENABLE_NORMAL = 2,
+    POST_SETTLE = 3
   };
 
   struct Effects
   {
     bool cancel_controller_goals = false;
     bool send_estop_cmd = false;
+    bool send_enter_normal_cmd = false;
     bool wake_worker = false;
   };
 
@@ -45,6 +46,8 @@ public:
   {
     bool accepted = false;
     uint64_t revision = 0;
+    uint8_t state = S::STATE_BOOT_INIT;
+    uint64_t controller_epoch = 0;
     std::string message;
     Effects effects;
   };
@@ -74,6 +77,9 @@ public:
     std::array<double, 6> external_cartesian_wrench{};
     bool contact_detected = false;
     std::string detail;
+    uint64_t controller_epoch = 0;
+    uint64_t program_revision = 0;
+    uint64_t last_compile_request_id = 0;
   };
 
   explicit StudioSupervisor(std::function<void(const Snapshot &)> on_change = {});
@@ -88,15 +94,21 @@ public:
 
   // Compile coordination
   bool can_compile(std::string & out_reason) const;
-  void on_compile_succeeded(const std::string & program_id, int32_t total_blocks);
-  void on_compile_failed();
+  void on_compile_dry_run(uint64_t request_id);
+  void on_compile_succeeded(
+    const std::string & program_id,
+    int32_t total_blocks,
+    uint64_t program_revision,
+    uint64_t request_id);
+  void on_compile_failed(uint64_t request_id);
 
   // Command handling
-  CommandResult handle_command(uint8_t command, const std::string & reason);
+  CommandResult handle_command(uint8_t command, uint64_t expected_revision, const std::string & reason);
 
   // Worker synchronization queries & callbacks (session-checked)
   uint64_t active_session() const;
   uint8_t current_state() const;
+  std::pair<uint8_t, uint64_t> state_and_session() const;
   RecoverySubPhase recovery_subphase() const;
   bool stop_requested(uint64_t session) const;
   bool pause_requested(uint64_t session) const;
@@ -141,7 +153,6 @@ public:
     bool trigger_estop,
     Effects & out_effects);
 
-  void on_recovery_sync_succeeded(uint64_t session);
   void on_recovery_failed(uint64_t session, const std::string & reason);
 
 private:
@@ -153,6 +164,7 @@ private:
   Snapshot make_snapshot_unlocked(Clock::time_point now) const;
   void enter_estop_unlocked(const std::string & detail, uint8_t reason, Effects & effects);
   void enter_fault_unlocked(int32_t code, const std::string & detail);
+  void finish_stop_unlocked(const std::string & detail);
 
   static std::string describe_estop_reason(uint8_t reason);
 
@@ -175,6 +187,10 @@ private:
   Clock::time_point gripper_stamp_{};
 
   bool settling_ = false;
+  bool last_dq_valid_ = false;
+  double last_max_abs_dq_ = 0.0;
+  uint64_t last_controller_epoch_ = 0;
+  uint64_t last_status_seq_ = 0;
   Clock::time_point settle_start_{};
   Clock::time_point last_settle_obs_{};
 };

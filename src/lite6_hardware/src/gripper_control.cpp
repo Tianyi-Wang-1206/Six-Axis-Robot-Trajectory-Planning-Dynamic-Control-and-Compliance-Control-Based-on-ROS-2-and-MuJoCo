@@ -75,6 +75,8 @@ void GripperControl::initialize(mjModel * model, mjData * data)
     }
   }
   state_ = Snapshot{};
+  active_max_force_ = parameters_.max_force;
+  state_.max_force = active_max_force_;
   stop_drive(State::STOPPED);
 }
 
@@ -88,6 +90,10 @@ void GripperControl::activate()
   }
   channel_->commands.reset();
   channel_->physics_stamp.store(0);
+  active_max_force_ = parameters_.max_force;
+  state_.max_force = active_max_force_;
+  state_.last_command = 0;
+  state_.last_cmd_result = State::CMD_RES_NONE;
   stop_drive(State::STOPPED);
   channel_->active.store(true, std::memory_order_release);
 }
@@ -102,9 +108,10 @@ void GripperControl::configure(const rclcpp::Node::SharedPtr & node)
 {
   if (timer_ || !node) {return;}
   const auto channel = channel_;
+  const auto params = parameters_;
   service_ = node->create_service<Service>("/gripper/command",
-    [channel](const std::shared_ptr<Service::Request> request,
-              std::shared_ptr<Service::Response> response) {
+    [channel, params](const std::shared_ptr<Service::Request> request,
+                      std::shared_ptr<Service::Response> response) {
       struct InflightGuard
       {
         std::atomic<uint32_t> & count;
@@ -112,6 +119,7 @@ void GripperControl::configure(const rclcpp::Node::SharedPtr & node)
       };
       channel->inflight_callbacks.fetch_add(1U, std::memory_order_acq_rel);
       InflightGuard guard{channel->inflight_callbacks};
+      std::lock_guard<std::mutex> lock(channel->service_mutex);
 
       const auto now = steady_ns();
       if (!channel->active.load(std::memory_order_acquire) ||
@@ -125,11 +133,17 @@ void GripperControl::configure(const rclcpp::Node::SharedPtr & node)
         response->detail = "Only OPEN, CLOSE and STOP are supported";
         return;
       }
+      if (!std::isfinite(request->max_force_override) ||
+          request->max_force_override > params.max_force) {
+        response->detail = "max_force_override must be finite and <= configured max_force";
+        return;
+      }
       Command command;
       command.action = request->command;
       command.issued_ns = now;
       command.sequence = channel->sequence.fetch_add(1ULL, std::memory_order_acq_rel) + 1ULL;
       command.epoch = channel->epoch.load(std::memory_order_acquire);
+      command.max_force_override = request->max_force_override;
       if (command.action == Service::Request::STOP) {
         channel->stops.publish(command);
       } else if (!channel->commands.push(command)) {
@@ -142,7 +156,6 @@ void GripperControl::configure(const rclcpp::Node::SharedPtr & node)
     });
   auto publisher = node->create_publisher<State>("/gripper/state", rclcpp::QoS(1).reliable());
   const auto clock = node->get_clock();
-  const auto params = parameters_;
   timer_ = node->create_wall_timer(std::chrono::milliseconds(20), [channel, publisher, clock, params] {
     const auto state = channel->snapshots.read();
     State message;
@@ -152,12 +165,20 @@ void GripperControl::configure(const rclcpp::Node::SharedPtr & node)
     message.ready = message.active && state.ready;
     message.state = message.ready ? state.state : State::BLOCKED;
     message.applied_sequence = state.sequence;
+    message.last_command = state.last_command;
+    if (message.ready) {
+      message.last_cmd_result = state.last_cmd_result;
+    } else if (state.last_cmd_result == State::CMD_RES_IN_PROGRESS) {
+      message.last_cmd_result = State::CMD_RES_BLOCKED;
+    } else {
+      message.last_cmd_result = state.last_cmd_result;
+    }
     message.position = state.feedback.position;
     message.velocity = state.feedback.velocity;
     message.effort = state.effort;
     message.stiffness = params.stiffness;
     message.damping = params.damping;
-    message.max_force = params.max_force;
+    message.max_force = state.max_force > 0.0 ? state.max_force : params.max_force;
     message.max_velocity = params.max_velocity;
     switch (message.state) {
       case State::BLOCKED: message.detail = "Gripper hardware inactive or feedback stale"; break;
@@ -251,26 +272,49 @@ void GripperControl::step(int64_t boundary_ns, int64_t now_ns)
   channel_->physics_stamp.store(now_ns);
   const auto epoch = channel_->epoch.load();
   const bool ready = channel_->active.load() && now_ns - boundary_ns < kPhysicsFreshNs;
-  if (!ready) {stop_drive(State::BLOCKED);}
-  else if (state_.state == State::BLOCKED) {stop_drive(State::STOPPED);}
+  if (!ready) {
+    stop_drive(State::BLOCKED);
+    if (state_.last_cmd_result == State::CMD_RES_IN_PROGRESS) {
+      state_.last_cmd_result = State::CMD_RES_BLOCKED;
+    }
+  } else if (state_.state == State::BLOCKED) {
+    stop_drive(State::STOPPED);
+  }
   const auto stop = channel_->stops.read();
   if (stop.sequence > state_.sequence && stop.epoch == epoch && stop.issued_ns <= boundary_ns) {
     stop_drive(ready ? State::STOPPED : State::BLOCKED);
     state_.sequence = stop.sequence;
+    state_.last_command = Service::Request::STOP;
+    state_.last_cmd_result = ready ? State::CMD_RES_STOPPED : State::CMD_RES_BLOCKED;
   }
   Command command;
   while (channel_->commands.pop_due(boundary_ns, command)) {
-    if (!ready || command.epoch != epoch || command.sequence <= state_.sequence ||
-        now_ns - command.issued_ns > kCommandAgeNs) {continue;}
+    if (command.epoch != epoch || command.sequence <= state_.sequence) {continue;}
     state_.sequence = command.sequence;
+    state_.last_command = command.action;
+    if (!ready) {
+      stop_drive(State::BLOCKED);
+      state_.last_cmd_result = State::CMD_RES_BLOCKED;
+      continue;
+    }
+    if (now_ns - command.issued_ns > kCommandAgeNs) {
+      stop_drive(State::FAULT);
+      state_.last_cmd_result = State::CMD_RES_FAULT;
+      continue;
+    }
     stop_drive(State::STOPPED);
+    active_max_force_ = command.max_force_override > 0.0 ?
+      std::min(command.max_force_override, parameters_.max_force) : parameters_.max_force;
+    state_.max_force = active_max_force_;
     action_ = command.action;
     target_ = action_ == Service::Request::OPEN ? open_ : closed_;
     state_.state = action_ == Service::Request::OPEN ? State::OPENING : State::CLOSING;
+    state_.last_cmd_result = State::CMD_RES_IN_PROGRESS;
   }
   if (action_ == Service::Request::STOP || !ready) {publish(ready); return;}
 
   const auto & p = parameters_;
+  const double max_force = active_max_force_ > 0.0 ? active_max_force_ : p.max_force;
   const double dt = model_->opt.timestep;
   const double left = data_->qpos[qpos_[0]], right = data_->qpos[qpos_[1]];
   const double vl = data_->qvel[dof_[0]], vr = data_->qvel[dof_[1]];
@@ -285,23 +329,25 @@ void GripperControl::step(int64_t boundary_ns, int64_t now_ns)
     reference_ = target_; reference_velocity_ = 0;
   } else {reference_ += advance;}
   // Bound position windup against an obstruction; retain finite closing force.
-  const double max_error = p.max_force / p.stiffness;
+  const double max_error = max_force / p.stiffness;
   reference_ = std::clamp(reference_, q-max_error, q+max_error);
   const double feedforward = data_->qfrc_bias[dof_[0]] - data_->qfrc_bias[dof_[1]];
   const double effort = p.stiffness*(reference_-q) + p.damping*(reference_velocity_-v) + feedforward;
   // Finite torque-speed envelope: drive falls to zero at the rated finger
   // speed and becomes braking above it. Never clamp qpos/qvel or lock a jaw.
   // Use both measured jaw speeds so coupling error cannot hide an overspeed.
-  const double upper = p.max_force*std::clamp(1-std::max(vl,-vr)/p.max_velocity, -1.0, 1.0);
-  const double lower = -p.max_force*std::clamp(1+std::min(vl,-vr)/p.max_velocity, -1.0, 1.0);
+  const double upper = max_force*std::clamp(1-std::max(vl,-vr)/p.max_velocity, -1.0, 1.0);
+  const double lower = -max_force*std::clamp(1+std::min(vl,-vr)/p.max_velocity, -1.0, 1.0);
   state_.effort = lower <= upper ? std::clamp(effort, lower, upper) :
-    std::clamp(-p.damping*v, -p.max_force, p.max_force);
+    std::clamp(-p.damping*v, -max_force, max_force);
   data_->ctrl[motor_] = state_.effort;
 
   const bool stationary = std::abs(vl) < p.stationary_velocity && std::abs(vr) < p.stationary_velocity;
   settled_ = stationary ? settled_+dt : 0;
   const bool endpoint = std::abs(target_-left) < p.position_tolerance &&
     std::abs(-target_-right) < p.position_tolerance;
+  const bool hold_band = std::abs(target_-left) < 2.0*p.position_tolerance &&
+    std::abs(-target_-right) < 2.0*p.position_tolerance;
   const int object = action_ == Service::Request::CLOSE && !endpoint ? grasp_contact() : -1;
   if (object >= 0 && stationary) {
     grasp_time_ = object == candidate_object_ ? grasp_time_+dt : dt;
@@ -312,24 +358,31 @@ void GripperControl::step(int64_t boundary_ns, int64_t now_ns)
     lost_time_ = object == grasped_object_ && stationary ? 0 : lost_time_+dt;
     if (lost_time_ >= p.grasp_loss_time) {
       state_.state = State::CLOSING;
+      state_.last_cmd_result = State::CMD_RES_IN_PROGRESS;
       grasped_object_ = -1;
       elapsed_ = 0;
     }
   }
   if (endpoint && settled_ >= p.settle_time) {
     state_.state = action_ == Service::Request::OPEN ? State::OPEN : State::CLOSED;
+    state_.last_cmd_result = State::CMD_RES_SUCCEEDED;
     grasped_object_ = -1;
   } else if (grasp_time_ >= p.grasp_confirm_time) {
     state_.state = State::GRASPED;
+    state_.last_cmd_result = State::CMD_RES_SUCCEEDED;
     grasped_object_ = object;
     lost_time_ = 0;
-  } else if (state_.state == State::OPEN || state_.state == State::CLOSED) {
+  } else if ((state_.state == State::OPEN || state_.state == State::CLOSED) && !hold_band) {
     state_.state = action_ == Service::Request::OPEN ? State::OPENING : State::CLOSING;
+    state_.last_cmd_result = State::CMD_RES_IN_PROGRESS;
     elapsed_ = 0;
   }
   if (state_.state == State::OPENING || state_.state == State::CLOSING) {
     elapsed_ += dt;
-    if (elapsed_ >= p.travel_timeout) {stop_drive(State::FAULT);}
+    if (elapsed_ >= p.travel_timeout) {
+      stop_drive(State::FAULT);
+      state_.last_cmd_result = State::CMD_RES_FAULT;
+    }
   } else {elapsed_ = 0;}
   publish(ready);
 }

@@ -7,14 +7,14 @@
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <control_msgs/action/follow_joint_trajectory.hpp>
-#include <std_msgs/msg/int32.hpp>
 #include <lite6_interfaces/action/industrial_motion.hpp>
 #include <lite6_interfaces/msg/controller_status.hpp>
 #include <lite6_interfaces/msg/supervisor_state.hpp>
 #include <lite6_interfaces/msg/motion_rejection.hpp>
+#include <lite6_interfaces/srv/controller_command.hpp>
 #include <lite6_interfaces/srv/supervisor_command.hpp>
-#include <lite6_interfaces/msg/compliance_command.hpp>
 #include <lite6_interfaces/compliance_validation.hpp>
+#include <lite6_interfaces/motion_contract.hpp>
 #include <lite6_interfaces/shm_registers.hpp>
 #include <lite6_interfaces/srv/submit_sys_id_trajectory.hpp>
 
@@ -64,27 +64,40 @@ public:
       throw std::runtime_error("Robot planning model / YAML initialization failed");
     io_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     validation_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    cmd_client_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     const auto state_qos=rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     state_pub_=create_publisher<S>("/supervisor/state",state_qos);
     rejection_pub_=create_publisher<lite6_interfaces::msg::MotionRejection>(
       "/supervisor/motion_rejections",rclcpp::QoS(32).reliable());
-    cmd_pub_=create_publisher<std_msgs::msg::Int32>("/ctc_controller/system_cmd",10);
-    compliance_pub_=create_publisher<lite6_interfaces::msg::ComplianceCommand>(
-      "/ctc_controller/compliance_cmd",10);
+    ctc_cmd_client_=create_client<lite6_interfaces::srv::ControllerCommand>(
+      "/ctc_controller/command",rclcpp::ServicesQoS(),cmd_client_group_);
     rclcpp::SubscriptionOptions sensor_options;
     sensor_options.callback_group=io_group_;
     controller_sub_=create_subscription<lite6_interfaces::msg::ControllerStatus>(
       "/ctc_controller/status",rclcpp::QoS(10),
       [this](const lite6_interfaces::msg::ControllerStatus::SharedPtr msg) {
         const auto stamp=rclcpp::Time(msg->stamp).nanoseconds();
-        if(stamp<=last_controller_stamp_) return;
-        last_controller_stamp_=stamp;
+        if(msg->controller_epoch!=0||msg->status_seq!=0) {
+          if(msg->controller_epoch<last_controller_epoch_) return;
+          if(msg->controller_epoch==last_controller_epoch_&&
+             msg->status_seq<=last_controller_status_seq_) return;
+          last_controller_epoch_=msg->controller_epoch;
+          last_controller_status_seq_=msg->status_seq;
+          last_controller_stamp_=stamp;
+        } else {
+          if(stamp<=last_controller_stamp_) return;
+          last_controller_stamp_=stamp;
+        }
         {
           std::lock_guard<std::mutex> transition(transition_mutex_);
           do_effects(supervisor_.observe_controller(*msg));
         }
         {
           std::lock_guard<std::mutex> lock(ctc_mutex_);
+          if(msg->trajectory_start.sec>0) {
+            last_traj_start_id_=msg->trajectory_id;
+            last_traj_start_time_=msg->trajectory_start;
+          }
           if(operation_&&operation_->downstream&&
               operation_->downstream->get_goal_id()==msg->trajectory_id)
             supervisor_.observe_excitation_start(operation_->key,msg->trajectory_start);
@@ -106,21 +119,32 @@ public:
       "/supervisor/command",
       [this](const std::shared_ptr<lite6_interfaces::srv::SupervisorCommand::Request> req,
              std::shared_ptr<lite6_interfaces::srv::SupervisorCommand::Response> resp) {
+        using SC=lite6_interfaces::srv::SupervisorCommand;
         std::lock_guard<std::mutex> transition(transition_mutex_);
-        const bool compliance=req->command>=8&&req->command<=10;
+        const bool compliance=(req->command>=8&&req->command<=10)||req->command==12;
         if(compliance&&!lite6_interfaces::valid_compliance_settings(req->compliance)) {
-          resp->accepted=false;resp->message="Invalid compliance gains / sensitivity";return;
+          const auto snap=supervisor_.snapshot();
+          resp->accepted=false;resp->session_id=snap.session_id;
+          resp->revision=snap.revision;resp->mode=snap.mode;
+          resp->message="Invalid compliance gains / sensitivity";return;
         }
-        auto reply=supervisor_.command(req->command,req->session_id,req->reason);
-        if(reply.accepted&&compliance) {
-          lite6_interfaces::msg::ComplianceCommand msg;
-          msg.command=reply.effects.ctc_command;msg.settings=req->compliance;
-          compliance_pub_->publish(msg);
-          reply.effects.ctc_command=-1;
+        if(req->command==SC::Request::CMD_SET_PAYLOAD&&
+           !lite6_interfaces::valid_payload_params(req->payload_mass,req->payload_com_tcp)) {
+          const auto snap=supervisor_.snapshot();
+          resp->accepted=false;resp->session_id=snap.session_id;
+          resp->revision=snap.revision;resp->mode=snap.mode;
+          resp->message="Invalid payload parameters";return;
         }
+        auto reply=supervisor_.command(*req);
         resp->accepted=reply.accepted;resp->session_id=reply.session_id;
-        resp->revision=reply.revision;resp->message=reply.message;
-        do_effects(reply.effects);publish_state();
+        resp->revision=reply.revision;resp->mode=reply.mode;resp->message=reply.message;
+        const bool cmd_ok=do_effects(reply.effects);
+        if(!cmd_ok&&req->command!=SC::Request::CMD_ESTOP&&reply.accepted) {
+          const auto snap=supervisor_.snapshot();
+          resp->accepted=false;resp->revision=snap.revision;resp->mode=snap.mode;
+          resp->message=snap.detail;
+        }
+        publish_state();
       });
     sysid_service_=create_service<lite6_interfaces::srv::SubmitSysIdTrajectory>(
       "/supervisor/submit_sysid_trajectory",
@@ -160,6 +184,10 @@ private:
   // a pending NORMAL command could be published after a concurrent ESTOP.
   std::mutex transition_mutex_;
   int64_t last_controller_stamp_=0;
+  uint64_t last_controller_epoch_=0;
+  uint64_t last_controller_status_seq_=0;
+  std::array<uint8_t,16> last_traj_start_id_{};
+  builtin_interfaces::msg::Time last_traj_start_time_{};
   uint64_t last_joint_seq_=0;
   int64_t last_joint_steady_ns_=0;
   MotionPlanner::InitialState actual_{};
@@ -171,13 +199,13 @@ private:
   std::thread planner_thread_;
   rclcpp::CallbackGroup::SharedPtr io_group_;
   rclcpp::CallbackGroup::SharedPtr validation_group_;
+  rclcpp::CallbackGroup::SharedPtr cmd_client_group_;
   std::atomic<bool> shutdown_{false};
   lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::StateShmSegment> state_shm_;
   rclcpp::TimerBase::SharedPtr joint_poll_timer_;
-  rclcpp::Publisher<lite6_interfaces::msg::ComplianceCommand>::SharedPtr compliance_pub_;
   rclcpp::Publisher<S>::SharedPtr state_pub_;
   rclcpp::Publisher<lite6_interfaces::msg::MotionRejection>::SharedPtr rejection_pub_;
-  rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr cmd_pub_;
+  rclcpp::Client<lite6_interfaces::srv::ControllerCommand>::SharedPtr ctc_cmd_client_;
   rclcpp::Subscription<lite6_interfaces::msg::ControllerStatus>::SharedPtr controller_sub_;
   rclcpp_action::Client<FJT>::SharedPtr ctc_;
   rclcpp_action::Server<Motion>::SharedPtr action_server_;
@@ -196,7 +224,8 @@ private:
     lite6_interfaces::shm::JointStatePod pod{};
     if(!state_shm_->joint_state.read(pod,out_seq)||pod.valid==0) return false;
     const int64_t now_ns=lite6_interfaces::shm::steady_now_ns();
-    if(pod.steady_stamp_ns<=0||now_ns-pod.steady_stamp_ns>=800000000LL) return false;
+    if(pod.steady_stamp_ns<=0||
+       now_ns-pod.steady_stamp_ns>lite6_interfaces::contract::kJointStateStaleTimeoutNs) return false;
     max_speed=0.0;
     for(int i=0;i<6;++i) {
       out.q[i]=pod.position[i];out.dq[i]=pod.velocity[i];
@@ -221,15 +250,43 @@ private:
     last_joint_steady_ns_=steady_ns;
     supervisor_.observe_joint_state(max_speed);
   }
-  void issue_ctc_command(int value) {
-    std_msgs::msg::Int32 msg;
-    msg.data=value;
-    cmd_pub_->publish(msg);
+  bool issue_ctc_command(const Supervisor::Effects& effects) {
+    using CTC=lite6_interfaces::srv::ControllerCommand;
+    if(!ctc_cmd_client_->service_is_ready()&&!ctc_cmd_client_->wait_for_service(20ms)) {
+      supervisor_.on_controller_command_ack(
+        effects.ctc_cmd,false,CTC::Response::ACK_RT_TIMEOUT,0,
+        "CTC command service unavailable");
+      return false;
+    }
+    auto req=std::make_shared<CTC::Request>();
+    req->command=effects.ctc_cmd;
+    req->expected_epoch=effects.expected_controller_epoch;
+    if(effects.has_compliance) req->compliance=effects.compliance;
+    if(effects.has_payload) {
+      req->payload_mass=effects.payload_mass;
+      req->payload_com_tcp=effects.payload_com_tcp;
+    }
+    req->reason=effects.cmd_reason;
+    auto future=ctc_cmd_client_->async_send_request(req);
+    if(future.wait_for(250ms)!=std::future_status::ready) {
+      supervisor_.on_controller_command_ack(
+        effects.ctc_cmd,false,CTC::Response::ACK_RT_TIMEOUT,0,
+        "Timed out waiting for /ctc_controller/command response");
+      return false;
+    }
+    const auto resp=future.get();
+    supervisor_.on_controller_command_ack(
+      effects.ctc_cmd,resp->accepted,resp->ack_result,resp->current_mode,resp->message);
+    return resp->accepted;
   }
-  void do_effects(const Supervisor::Effects& effects) {
+  bool do_effects(const Supervisor::Effects& effects) {
     // CTC ESTOP is requested immediately, before slower cancellation paths.
-    if(effects.ctc_command>=0) issue_ctc_command(effects.ctc_command);
+    bool cmd_ok=true;
+    if(effects.ctc_cmd!=lite6_interfaces::srv::ControllerCommand::Request::CMD_NONE) {
+      cmd_ok=issue_ctc_command(effects);
+    }
     if(effects.cancel_active) cancel_ctc(effects.cancel_key);
+    return cmd_ok;
   }
   void cancel_ctc(const std::string& key) {
     FJTHandle::SharedPtr downstream;
@@ -264,21 +321,26 @@ private:
       return reject(Motion::Result::ERR_INVALID_INPUT,"Scaling factors must be finite and in [0.01, 1]; velocity_scale="+
           std::to_string(goal->velocity_scale)+", acceleration_scale="+std::to_string(goal->acceleration_scale));
     if(goal->context!=Motion::Goal::CONTEXT_NORMAL&&
-       goal->context!=Motion::Goal::CONTEXT_SYSID&&
-       goal->context!=Motion::Goal::CONTEXT_RECOVERY)
-      return reject(Motion::Result::ERR_INVALID_INPUT,"Unknown motion context="+std::to_string(goal->context));
+       goal->context!=Motion::Goal::CONTEXT_SYSID)
+      return reject(Motion::Result::ERR_INVALID_INPUT,"Unsupported motion context="+std::to_string(goal->context));
     if(goal->context!=Motion::Goal::CONTEXT_NORMAL&&goal->command_type!=Motion::Goal::MOVEJ)
-      return reject(Motion::Result::ERR_SUPERVISOR_DENIED,"SYSID / RECOVERY context only permits MoveJ reference alignment");
+      return reject(Motion::Result::ERR_SUPERVISOR_DENIED,"SYSID context only permits MoveJ reference alignment");
     std::string reason;
-    if(!supervisor_.reserve_motion(key,goal->context,goal->session_id,reason)) {
-      return reject(Motion::Result::ERR_SUPERVISOR_DENIED,reason);
+    {
+      std::lock_guard<std::mutex> transition(transition_mutex_);
+      if(!supervisor_.reserve_motion(key,goal->context,goal->session_id,reason)) {
+        return reject(Motion::Result::ERR_SUPERVISOR_DENIED,reason);
+      }
     }
     publish_state();
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
   rclcpp_action::CancelResponse on_cancel(const std::shared_ptr<MotionHandle>& gh) {
     const auto key=hex_uuid(gh->get_goal_id());
-    if(!supervisor_.request_cancel(key)) return rclcpp_action::CancelResponse::REJECT;
+    {
+      std::lock_guard<std::mutex> transition(transition_mutex_);
+      if(!supervisor_.request_cancel(key)) return rclcpp_action::CancelResponse::REJECT;
+    }
     cancel_ctc(key);publish_state();
     return rclcpp_action::CancelResponse::ACCEPT;
   }
@@ -382,13 +444,22 @@ private:
         finish_ctc(key,Motion::Result::ERR_EXECUTION_ABORTED,"CTC rejected goal");return;
       }
       bool should_cancel=false;
+      bool cached_start=false;
+      builtin_interfaces::msg::Time cached_start_time{};
       {
         std::lock_guard<std::mutex> lock(ctc_mutex_);
         if(!operation_||operation_->key!=key) should_cancel=true;
         else {
           operation_->downstream=downstream;
           should_cancel=operation_->cancel_pending;
+          if(last_traj_start_time_.sec>0&&downstream->get_goal_id()==last_traj_start_id_) {
+            cached_start=true;
+            cached_start_time=last_traj_start_time_;
+          }
         }
+      }
+      if(cached_start) {
+        supervisor_.observe_excitation_start(key,cached_start_time);
       }
       if(should_cancel||!supervisor_.permitted(key)) {
         try {ctc_->async_cancel_goal(downstream);}

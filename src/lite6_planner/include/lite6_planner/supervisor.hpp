@@ -1,9 +1,12 @@
 #ifndef LITE6_PLANNER_SUPERVISOR_HPP_
 #define LITE6_PLANNER_SUPERVISOR_HPP_
 
+#include <lite6_interfaces/msg/compliance_settings.hpp>
 #include <lite6_interfaces/msg/supervisor_state.hpp>
 #include <lite6_interfaces/msg/controller_status.hpp>
+#include <lite6_interfaces/srv/controller_command.hpp>
 #include <lite6_interfaces/srv/supervisor_command.hpp>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
@@ -17,16 +20,37 @@ class Supervisor {
 public:
   using State=lite6_interfaces::msg::SupervisorState;
   using Command=lite6_interfaces::srv::SupervisorCommand;
-  struct Effects { int ctc_command=-1; bool cancel_active=false; bool terminal_success=false; std::string cancel_key; };
-  struct Reply {bool accepted=false; uint64_t session_id=0; uint64_t revision=0;std::string message; Effects effects;};
+  struct Effects {
+    uint8_t ctc_cmd = lite6_interfaces::srv::ControllerCommand::Request::CMD_NONE;
+    bool has_compliance = false;
+    lite6_interfaces::msg::ComplianceSettings compliance{};
+    bool has_payload = false;
+    double payload_mass = 0.0;
+    std::array<double, 3> payload_com_tcp{0.0, 0.0, 0.0};
+    uint64_t expected_controller_epoch = 0;
+    std::string cmd_reason;
+    bool cancel_active = false;
+    bool terminal_success = false;
+    std::string cancel_key;
+  };
+  struct Reply {
+    bool accepted = false;
+    uint64_t session_id = 0;
+    uint64_t revision = 0;
+    uint8_t mode = 0;
+    std::string message;
+    Effects effects;
+  };
 
   Supervisor();
   void observe_joint_state(double max_speed);
   void observe_excitation_start(const std::string& key, const builtin_interfaces::msg::Time& start);
   Effects observe_controller(const lite6_interfaces::msg::ControllerStatus& status);
+  void on_controller_command_ack(uint8_t cmd, bool accepted, uint8_t ack_result,
+    uint8_t current_mode, const std::string& msg);
   Effects watchdog();
   State snapshot() const;
-  Reply command(uint8_t event,uint64_t session,const std::string& reason);
+  Reply command(const Command::Request& req);
 
   // Key is an opaque ROS action UUID (hex) or a unique SysID excitation token.
   bool reserve_motion(const std::string& key,uint8_t context,uint64_t session,std::string& why);
@@ -51,12 +75,15 @@ private:
   void clear_motion_unlocked();
   void settle_unlocked();
   void complete_sysid_unlocked();
+  bool sync_from_initializing_unlocked();
   mutable std::mutex mutex_;
   State state_;
   Clock::time_point controller_time_{},joint_time_{},phase_deadline_{};
   Clock::time_point stable_since_{};
   std::string sysid_failure_;
   uint8_t compliance_target_=0;
+  uint8_t pre_switch_mode_=State::MODE_NORMAL;
+  uint64_t last_controller_epoch_=0;
   bool seen_controller_=false,seen_joint_=false;
   std::string active_key_;
   bool cancel_requested_=false;

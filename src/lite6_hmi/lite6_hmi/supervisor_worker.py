@@ -23,12 +23,13 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 from ament_index_python.packages import get_package_share_directory
 from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import Pose
-from std_msgs.msg import Int32
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
 from lite6_interfaces.action import IndustrialMotion
 from lite6_interfaces.msg import SupervisorState, MotionRejection, GripperState
-from lite6_interfaces.srv import SupervisorCommand, SubmitSysIdTrajectory, GripperCommand
+from lite6_interfaces.srv import (
+    ControllerCommand, SupervisorCommand, SubmitSysIdTrajectory, GripperCommand,
+)
 from lite6_shm_client import StateShmReader, SysIdShmReader, steady_now_ns
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -141,10 +142,10 @@ class ROS2Worker(QThread):
             SupervisorCommand, "/supervisor/command")
         self.sysid_client = self.node.create_client(
             SubmitSysIdTrajectory, "/supervisor/submit_sysid_trajectory")
-        # Emergency fallback only. The normal mode (0) and SYS_ID mode (2)
-        # are *never* commanded directly by the GUI.
-        self.cmd_pub = self.node.create_publisher(
-            Int32, "/ctc_controller/system_cmd", 10)
+        # Emergency fallback only. Normal and SYS_ID transitions are *never*
+        # commanded directly by the GUI.
+        self.ctc_cmd_client = self.node.create_client(
+            ControllerCommand, "/ctc_controller/command")
         qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
                          reliability=ReliabilityPolicy.RELIABLE,
                          durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -361,13 +362,17 @@ class ROS2Worker(QThread):
         for message in messages:
             self._report_error(message)
 
-    def _send_command(self, event, session=0, reason="", done=None, compliance=None):
+    def _send_command(self, event, session=0, reason="", done=None, compliance=None,
+                      expected_revision=0):
         if self._executor_thread_id is not None and threading.get_ident() == self._executor_thread_id:
-            return self._send_command_on_executor(event, session, reason, done, compliance)
+            return self._send_command_on_executor(
+                event, session, reason, done, compliance, expected_revision)
         return self._run_on_executor(
-            lambda: self._send_command_on_executor(event, session, reason, done, compliance))
+            lambda: self._send_command_on_executor(
+                event, session, reason, done, compliance, expected_revision))
 
-    def _send_command_on_executor(self, event, session=0, reason="", done=None, compliance=None):
+    def _send_command_on_executor(self, event, session=0, reason="", done=None,
+                                  compliance=None, expected_revision=0):
         if not self.command_client.service_is_ready():
             self._report_error("Supervisor command service is unavailable")
             if done is not None:
@@ -375,6 +380,7 @@ class ROS2Worker(QThread):
             return False
         req = SupervisorCommand.Request()
         req.command = event
+        req.expected_revision = int(expected_revision)
         req.session_id = int(session)
         req.reason = str(reason)
         if compliance is not None:
@@ -404,6 +410,9 @@ class ROS2Worker(QThread):
     def _supervisor_cb(self, msg):
         now = time.monotonic()
         with self.state_lock:
+            # Reset monotonic revision filter if supervisor went stale (e.g. planner restart).
+            if self.last_supervisor_rx_time and (now - self.last_supervisor_rx_time > 0.8):
+                self._revision = -1
             # A stale latched / out-of-order message cannot roll back the view.
             if msg.revision < self._revision:
                 return
@@ -494,7 +503,6 @@ class ROS2Worker(QThread):
         if estop_popup is not None:
             self.estop_fault_signal.emit(estop_popup)
         self._drive_supervisor_phase(msg)
-        self._drive_recovery_phase(msg)
 
     def _drive_supervisor_phase(self, msg):
         """Entry actions only; the Supervisor decides every next state."""
@@ -537,24 +545,6 @@ class ROS2Worker(QThread):
                     context=IndustrialMotion.Goal.CONTEXT_SYSID, session_id=sid):
                 self._abort_sysid(sid, "Could not dispatch return-alignment")
 
-    def _drive_recovery_phase(self, msg):
-        with self.state_lock:
-            sid = self._recovery_session
-            if (sid == 0 or msg.session_id != sid or
-                    msg.mode != SupervisorState.MODE_RECOVERING or
-                    msg.recovery_phase != SupervisorState.RECOVERY_SYNC_REFERENCE or
-                    msg.waiting_for_settle):
-                return
-            key = (sid, "recovery-sync")
-            if key in self._phase_actions:
-                return
-            self._phase_actions.add(key)
-            q_now = list(self.q_curr)
-        if not self.execute_joint_target(
-                q_now, 0.1, 0.1,
-                context=IndustrialMotion.Goal.CONTEXT_RECOVERY, session_id=sid):
-            self.trigger_estop("Could not dispatch recovery reference synchronization")
-
     @staticmethod
     def _ns_to_sec(ns: int) -> float:
         sec, nsec = divmod(int(ns), 1_000_000_000)
@@ -569,10 +559,14 @@ class ROS2Worker(QThread):
     def _drain_sysid_shm_unlocked(self, update_heartbeat: bool = True):
         if update_heartbeat:
             self._sysid_shm.set_active(True)
+        s = self.supervisor_state
+        if (s is not None and
+                s.mode == SupervisorState.MODE_SYSID and
+                s.sysid_phase == SupervisorState.SYSID_VALIDATING):
+            return
         samples = self._sysid_shm.pop_all()
         if not samples:
             return
-        s = self.supervisor_state
         if (self.sysid_calc is None or s is None or
                 s.mode != SupervisorState.MODE_SYSID or
                 s.sysid_phase != SupervisorState.SYSID_EXCITING or
@@ -601,7 +595,7 @@ class ROS2Worker(QThread):
         if pod is None or seq == self._last_joint_seq:
             return
         now_steady_ns = steady_now_ns()
-        if pod.steady_stamp_ns <= 0 or now_steady_ns - pod.steady_stamp_ns >= 250_000_000:
+        if pod.steady_stamp_ns <= 0 or now_steady_ns - pod.steady_stamp_ns >= 100_000_000:
             return
         if pod.steady_stamp_ns <= self._last_joint_steady_ns:
             return
@@ -746,8 +740,6 @@ class ROS2Worker(QThread):
     def _scoped_dispatch_failed(self, context, session, reason):
         if context == IndustrialMotion.Goal.CONTEXT_SYSID:
             self._abort_sysid(session, reason)
-        elif context == IndustrialMotion.Goal.CONTEXT_RECOVERY:
-            self.trigger_estop("Recovery synchronization failed: " + reason)
 
     def _goal_response(self, future, epoch, context, session, key):
         try:
@@ -848,8 +840,16 @@ class ROS2Worker(QThread):
         with self.state_lock:
             if self._direct_estop_sent:
                 return
+            if not self.ctc_cmd_client.service_is_ready():
+                self.node.get_logger().error(
+                    f"CTC DIRECT ESTOP FALLBACK unavailable ({reason}): /ctc_controller/command not ready")
+                return
             self._direct_estop_sent = True
-        self.cmd_pub.publish(Int32(data=1))
+        req = ControllerCommand.Request()
+        req.command = ControllerCommand.Request.CMD_ESTOP
+        req.expected_epoch = 0
+        req.reason = str(reason)
+        self.ctc_cmd_client.call_async(req)
         self.node.get_logger().error(f"CTC DIRECT ESTOP FALLBACK: {reason}")
 
     def check_watchdog(self):
@@ -860,6 +860,9 @@ class ROS2Worker(QThread):
             age = now - self.last_supervisor_rx_time if self.last_supervisor_rx_time else float("inf")
             pending_stop = self._estop_requested_at
             already_fallback = self._direct_estop_sent
+            if self.last_supervisor_rx_time and age > 1.2:
+                # Reset monotonic filter when supervisor feed goes stale so planner restarts are accepted.
+                self._revision = -1
         if age > 1.2 and now - self.boot_time > 2.0:
             if not already_fallback:
                 self.trigger_estop("SUPERVISOR HEARTBEAT LOST", force_fallback=True)
@@ -871,10 +874,16 @@ class ROS2Worker(QThread):
 
     def begin_recovery(self):
         not_ready = False
+        is_fault = False
         with self.state_lock:
             s = self.supervisor_state
-            if s is None or s.mode != SupervisorState.MODE_ESTOP:
+            if s is not None and s.mode == SupervisorState.MODE_FAULT and not s.estop_latched:
+                is_fault = True
+            elif s is None or s.mode != SupervisorState.MODE_ESTOP:
                 not_ready = True
+        if is_fault:
+            self.acknowledge_soft_fault()
+            return
         if not_ready:
             self._report_error("Recovery requires Supervisor ESTOP mode")
             return
@@ -889,10 +898,7 @@ class ROS2Worker(QThread):
             return
         with self.state_lock:
             self._recovery_session = int(resp.session_id)
-            snap = self.supervisor_state
             self._phase_actions.clear()
-        if snap is not None:
-            self._drive_recovery_phase(snap)
 
     def start_sysid_sequence(self, prep_pose, max_limits):
         if self.sysid_calc is None:
@@ -982,6 +988,7 @@ class ROS2Worker(QThread):
                         f'samples/message {time.monotonic() - generated:.3f} s, '
                         f'{len(trajectory.points)} points')
                 if not self._send_command(SupervisorCommand.Request.CMD_BEGIN_SYSID,
+                                          expected_revision=revision,
                                           done=lambda resp: self._begin_sysid_reply(resp, epoch)):
                     with self.state_lock:
                         if (not self._stopping and epoch == self._prepare_epoch and

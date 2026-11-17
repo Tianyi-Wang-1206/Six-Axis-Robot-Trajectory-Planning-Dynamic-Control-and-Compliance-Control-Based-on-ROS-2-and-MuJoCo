@@ -72,9 +72,14 @@ void Lite6CTCController::configure_trajectory_action()
   trajectory_server_ = rclcpp_action::create_server<FollowTrajectory>(
     get_node(), "~/follow_joint_trajectory",
     [this](const rclcpp_action::GoalUUID &, std::shared_ptr<const FollowTrajectory::Goal> goal) {
+      using CS = lite6_interfaces::msg::ControllerStatus;
       std::lock_guard<std::mutex> lock(trajectory_mutex_);
-      if (!trajectory_enabled_.load() || compliance_blocks_trajectory_.load() ||
-          trajectory_reserved_ || impedance_trajectory_reserved_ || !valid_trajectory_goal(*goal))
+      const uint8_t mode = current_mode_atomic_.load(std::memory_order_acquire);
+      if (!trajectory_enabled_.load(std::memory_order_acquire) ||
+          compliance_blocks_trajectory_.load() ||
+          (mode != CS::MODE_NORMAL && mode != CS::MODE_SYSID) ||
+          trajectory_reserved_ || impedance_trajectory_reserved_ ||
+          !valid_trajectory_goal(*goal))
         return rclcpp_action::GoalResponse::REJECT;
       trajectory_reserved_ = true;
       return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
@@ -113,16 +118,31 @@ void Lite6CTCController::update_trajectory_reference(
   if (!execution || execution->result.load() != TrajectoryResult::RUNNING) return;
   const size_t n = joint_names_.size();
   if (execution->cancel.load()) {
-    for (size_t i = 0; i < n; ++i) {
-      reference_interfaces_[i] = q_[i];
-      reference_interfaces_[n + i] = 0.0;
-      reference_interfaces_[2 * n + i] = 0.0;
+    if (!execution->started) {
+      execution->cancel_applied = true;
+      return;
     }
-    execution->cancel_applied = true;
+    if (!execution->cancel_applied) {
+      begin_deceleration_tracker();
+      rigid_cancel_braking_ = true;
+      rigid_cancel_elapsed_ = 0.0;
+      execution->cancel_applied = true;
+    }
+    rigid_cancel_elapsed_ += period.seconds();
+    step_deceleration_tracker(period.seconds());
+    for (size_t i = 0; i < n; ++i) {
+      reference_interfaces_[i] = estop_q_[i];
+      reference_interfaces_[n + i] = estop_dq_[i];
+      reference_interfaces_[2 * n + i] = ddq_target_[i];
+    }
     return;
   }
   if (execution->started) execution->elapsed += period.seconds();
   else {
+    if (system_state_ != SystemState::NORMAL && system_state_ != SystemState::SYS_ID) {
+      execution->result.store(TrajectoryResult::MODE_CHANGED);
+      return;
+    }
     execution->started = true;
     execution->start_time_ns = time.nanoseconds();
     execution->start_mode = static_cast<int>(system_state_);
@@ -174,17 +194,12 @@ void Lite6CTCController::clear_estop_reason()
 
 void Lite6CTCController::request_execution_stop()
 {
-  if (!execution_stop_latched_) {
-    execution_stop_sequence_ = current_command_sequence_;
-    execution_stop_latched_ = true;
-  }
+  rigid_cancel_braking_ = false;
+  rigid_cancel_elapsed_ = 0.0;
   if (system_state_ != SystemState::ESTOP) {
     // Invalid feedback is handled by fail_controller(), not fed into the brake tracker.
-    if (q_.allFinite() && dq_.allFinite()) {
-      estop_q_ = q_;
-      estop_dq_ = dq_;
-    }
-    system_state_ = SystemState::ESTOP;
+    begin_deceleration_tracker();
+    transition_system_state(SystemState::ESTOP);
   }
   status_publish_pending_ = true;
 }
@@ -260,7 +275,31 @@ void Lite6CTCController::finish_trajectory_cycle(double dt)
   if (!execution || execution->result.load() != TrajectoryResult::RUNNING) return;
   // Numerical/interface failures have already taken precedence over cancellation.
   if (execution->cancel.load()) {
-    if (execution->cancel_applied) execution->result.store(TrajectoryResult::CANCELED);
+    if (execution->cancel_applied) {
+      const bool settled =
+        !execution->started ||
+        (estop_dq_.cwiseAbs().maxCoeff() < 1e-4 &&
+         dq_.cwiseAbs().maxCoeff() <= 0.01);
+      const bool mode_left =
+        execution->started && system_state_ != static_cast<SystemState>(execution->start_mode);
+      if (settled || mode_left) {
+        rigid_cancel_braking_ = false;
+        rigid_cancel_elapsed_ = 0.0;
+        if (system_state_ == SystemState::NORMAL || system_state_ == SystemState::SYS_ID) {
+          const size_t n = joint_names_.size();
+          for (size_t i = 0; i < n; ++i) {
+            reference_interfaces_[i] = q_[i];
+            reference_interfaces_[n + i] = 0.0;
+            reference_interfaces_[2 * n + i] = 0.0;
+          }
+        }
+        execution->result.store(TrajectoryResult::CANCELED);
+      } else if (rigid_cancel_elapsed_ >= lite6_interfaces::contract::kComplianceStoppingTimeoutSec) {
+        rigid_cancel_braking_ = false;
+        rigid_cancel_elapsed_ = 0.0;
+        fail_trajectory(TrajectoryResult::PATH_VELOCITY);
+      }
+    }
     return;
   }
   for (size_t i = 0; i < joint_names_.size(); ++i) {
@@ -343,10 +382,19 @@ void Lite6CTCController::monitor_trajectory()
     }
     return;
   }
+  if (outcome == TrajectoryResult::CANCELED && !goal->is_canceling()) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    if (active_trajectory_ == execution) {
+      retired_trajectories_.push_back(std::move(active_trajectory_));
+      trajectory_buffer_.writeFromNonRT(std::shared_ptr<TrajectoryExecution>{});
+      trajectory_reserved_ = false;
+    }
+  }
   auto result = std::make_shared<FollowTrajectory::Result>();
   if (outcome == TrajectoryResult::CANCELED) {
-    // The cancel callback returns before rclcpp_action enters CANCELING.
-    if (!goal->is_canceling()) return;
     result->error_code = FollowTrajectory::Result::SUCCESSFUL;
     result->error_string = "Trajectory canceled";
     goal->canceled(result);
@@ -387,13 +435,6 @@ void Lite6CTCController::monitor_trajectory()
         ", limit=" + std::to_string(execution->failure_limit);
     }
     goal->abort(result);
-  }
-
-  std::lock_guard<std::mutex> lock(trajectory_mutex_);
-  if (active_trajectory_ == execution) {
-    retired_trajectories_.push_back(std::move(active_trajectory_));
-    trajectory_buffer_.writeFromNonRT(std::shared_ptr<TrajectoryExecution>{});
-    trajectory_reserved_ = false;
   }
 }
 }  // namespace lite6_controllers

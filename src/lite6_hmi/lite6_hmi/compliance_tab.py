@@ -125,22 +125,40 @@ class ComplianceTab(QWidget):
         for name, field in self.fields.items():
             setattr(settings, name, field.value())
         settings.recapture = self.recapture.isChecked()
-        self.request([C.Request.CMD_JOINT_IMPEDANCE, C.Request.CMD_CARTESIAN_IMPEDANCE,
-                      C.Request.CMD_TEACH][self.mode.currentIndex()], settings)
+        target_cmd = [C.Request.CMD_JOINT_IMPEDANCE, C.Request.CMD_CARTESIAN_IMPEDANCE,
+                      C.Request.CMD_TEACH][self.mode.currentIndex()]
+        expected_rev = 0
+        with self.worker.state_lock:
+            state = self.worker.supervisor_state
+            if state is not None:
+                expected_rev = int(state.revision)
+                same_mode = (
+                    (target_cmd == C.Request.CMD_JOINT_IMPEDANCE and state.mode == S.MODE_JOINT_IMPEDANCE) or
+                    (target_cmd == C.Request.CMD_CARTESIAN_IMPEDANCE and state.mode == S.MODE_CARTESIAN_IMPEDANCE) or
+                    (target_cmd == C.Request.CMD_TEACH and state.mode == S.MODE_TEACH)
+                )
+                if same_mode:
+                    target_cmd = C.Request.CMD_UPDATE_COMPLIANCE
+        self.request(target_cmd, settings, expected_rev)
 
     def leave(self):
-        self.request(C.Request.CMD_EXIT_COMPLIANCE)
+        expected_rev = 0
+        with self.worker.state_lock:
+            if self.worker.supervisor_state is not None:
+                expected_rev = int(self.worker.supervisor_state.revision)
+        self.request(C.Request.CMD_EXIT_COMPLIANCE, expected_revision=expected_rev)
 
     def _on_command_done(self):
         self.pending = False
         self.refresh()
 
-    def request(self, event, settings=None):
+    def request(self, event, settings=None, expected_revision=0):
         self.pending = True
         def done(_):
             # ROS callback runs on the executor thread; marshal completion to Qt thread.
             self._command_done_signal.emit()
-        if not self.worker._send_command(event, compliance=settings, done=done):
+        if not self.worker._send_command(event, compliance=settings,
+                                         expected_revision=expected_revision, done=done):
             self.pending = False
         self.refresh()
 

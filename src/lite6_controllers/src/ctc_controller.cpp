@@ -1,11 +1,14 @@
 #include "lite6_controllers/ctc_controller.hpp"
+#include "lite6_interfaces/compliance_validation.hpp"
 #include "pluginlib/class_list_macros.hpp"
 #include "ament_index_cpp/get_package_share_directory.hpp"
 #include <pinocchio/algorithm/crba.hpp>
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/jacobian.hpp>
+#include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <thread>
 
 namespace lite6_controllers
 {
@@ -254,18 +257,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
       friction_error_gain_[idx] = error_gain_v[i];
   }
 
-  {
-    std::lock_guard<std::mutex> lock(cmd_write_mutex_);
-    cmd_buffer_.writeFromNonRT(ModeCommand{0, ++command_sequence_});
-  }
-  cmd_sub_ = get_node()->create_subscription<std_msgs::msg::Int32>(
-    "~/system_cmd", rclcpp::SystemDefaultsQoS(),
-    [this](const std_msgs::msg::Int32::SharedPtr msg) {
-      if (msg->data < 0 || msg->data > 6 || (msg->data >= 3 && msg->data <= 5)) return;
-      if (msg->data == 1) emergency_pending_.store(true);
-      std::lock_guard<std::mutex> lock(cmd_write_mutex_);
-      cmd_buffer_.writeFromNonRT(ModeCommand{msg->data, ++command_sequence_});
-    });
+  configure_command_service();
 
   try {
     std::string urdf_path = ament_index_cpp::get_package_share_directory("lite6_description") + "/urdf/lite6.urdf";
@@ -316,6 +308,15 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   rt_status_pub_->msg_.external_joint_torque.fill(0.0);
   rt_status_pub_->msg_.external_cartesian_wrench.fill(0.0);
   rt_status_pub_->msg_.external_contact_detected = false;
+  rt_status_pub_->msg_.status_seq = 0;
+  rt_status_pub_->msg_.controller_epoch = 0;
+  rt_status_pub_->msg_.mode_epoch = 0;
+  rt_status_pub_->msg_.last_cmd_seq = 0;
+  rt_status_pub_->msg_.last_cmd_code = lite6_interfaces::srv::ControllerCommand::Request::CMD_NONE;
+  rt_status_pub_->msg_.last_cmd_result = lite6_interfaces::msg::ControllerStatus::ACK_NONE;
+  rt_status_pub_->msg_.rigid_trajectory_active = false;
+  rt_status_pub_->msg_.payload_mass = 0.0;
+  rt_status_pub_->msg_.payload_com_tcp.fill(0.0);
   status_publish_counter_ = 0;
   status_publish_pending_ = true;
 
@@ -331,9 +332,11 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   size_t n = joint_names_.size();
   // Never reuse a bias learned before deactivation or a hardware restart.
   integral_effort_.setZero();
-  execution_stop_latched_ = false;
   compliance_blocks_trajectory_.store(false);
   emergency_pending_.store(false);
+  compliance_stopping_elapsed_ = 0.0;
+  rigid_cancel_braking_ = false;
+  rigid_cancel_elapsed_ = 0.0;
   clear_estop_reason();
 
   for (size_t i = 0; i < n; ++i) {
@@ -351,27 +354,48 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
     dq_imp_ref_[i] = 0.0;
     ddq_imp_ref_[i] = 0.0;
   }
-  
+
+  controller_epoch_ = std::max<uint64_t>(
+    controller_epoch_ + 1ULL,
+    static_cast<uint64_t>(lite6_interfaces::shm::steady_now_ns()));
+  shadow_epoch_ = controller_epoch_;
+  mode_epoch_ = 1ULL;
+  status_seq_ = 0ULL;
+  last_cmd_seq_ = 0ULL;
+  last_cmd_code_ = lite6_interfaces::srv::ControllerCommand::Request::CMD_NONE;
+  last_cmd_result_ = lite6_interfaces::msg::ControllerStatus::ACK_NONE;
+
   system_state_ = SystemState::NORMAL;
+  last_reported_state_ = SystemState::NORMAL;
   tau_applied_prev_.setZero();
   imp_ref_kinematics_cached_ = false;
   reset_momentum_observer();
-  {
-    std::lock_guard<std::mutex> lock(cmd_write_mutex_);
-    cmd_buffer_.writeFromNonRT(ModeCommand{0, ++command_sequence_});
-  }
+  cmd_ring_.discard_all();
+  controller_epoch_atomic_.store(controller_epoch_, std::memory_order_release);
+  mode_epoch_atomic_.store(mode_epoch_, std::memory_order_release);
+  current_mode_atomic_.store(
+    lite6_interfaces::msg::ControllerStatus::MODE_NORMAL, std::memory_order_release);
+  last_cmd_ack_code_.store(last_cmd_code_, std::memory_order_relaxed);
+  last_cmd_ack_result_.store(last_cmd_result_, std::memory_order_relaxed);
+  last_cmd_ack_mode_.store(
+    lite6_interfaces::msg::ControllerStatus::MODE_NORMAL, std::memory_order_relaxed);
+  last_cmd_ack_mode_epoch_.store(mode_epoch_, std::memory_order_relaxed);
+  last_cmd_ack_seq_.store(0ULL, std::memory_order_release);
+
   // Force a fresh NORMAL observation on the first successful update.
-  // Never infer a mode from the last received system_cmd value.
+  // Never infer a mode from the last command sent before reactivation.
   status_publish_counter_ = 0;
   status_publish_pending_ = true;
   publish_shadow_shm(&q_, true);
-  trajectory_enabled_.store(true);
+  trajectory_enabled_.store(true, std::memory_order_release);
   return controller_interface::CallbackReturn::SUCCESS;
 }
 
 controller_interface::CallbackReturn Lite6CTCController::on_deactivate(const rclcpp_lifecycle::State &)
 {
-  trajectory_enabled_.store(false);
+  trajectory_enabled_.store(false, std::memory_order_release);
+  current_mode_atomic_.store(
+    lite6_interfaces::msg::ControllerStatus::MODE_UNKNOWN, std::memory_order_release);
   publish_shadow_shm(nullptr, false);
   std::lock_guard<std::mutex> lock(trajectory_mutex_);
   if (active_trajectory_) {
@@ -430,47 +454,14 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   gmo_tcp_cached_this_cycle_ = false;
   update_momentum_observer(dt);
 
+  // Process ordered edge-triggered ControllerCommand requests and emergency triggers.
+  process_controller_commands(dt);
+
   update_trajectory_reference(time, period);
   update_impedance_trajectory_reference(time, period);
 
-  // 2. State Machine & Kinematic Deceleration Trajectory Generation
-  const auto * cmd_ptr = cmd_buffer_.readFromRT();
-  const int32_t current_cmd = emergency_pending_.exchange(false) ? 1 : cmd_ptr->value;
-  current_command_sequence_ = cmd_ptr->sequence;
-
-  if (current_cmd == 1 && system_state_ != SystemState::ESTOP) {
-      if (compliance_saturation_estop_pending_) {
-          latch_estop_reason(
-              lite6_interfaces::msg::ControllerStatus::ESTOP_COMPLIANCE_SATURATION,
-              pending_estop_joint_, pending_estop_value_, pending_estop_limit_);
-          compliance_saturation_estop_pending_ = false;
-      } else {
-          latch_estop_reason(lite6_interfaces::msg::ControllerStatus::ESTOP_EXTERNAL);
-      }
-      system_state_ = SystemState::ESTOP;
-      estop_q_ = q_; 
-      estop_dq_ = dq_;
-      status_publish_pending_ = true;
-  } else if (current_cmd == 2 && system_state_ == SystemState::NORMAL) {
-      system_state_ = SystemState::SYS_ID;
-  } else if (current_cmd == 0 && system_state_ != SystemState::NORMAL &&
-      !impedance_trajectory_active() &&
-      (!execution_stop_latched_ || current_command_sequence_ > execution_stop_sequence_)) {
-      Eigen::Map<Vec6d> map_q_d(reference_interfaces_.data());
-      if ((map_q_d - q_).cwiseAbs().maxCoeff() < 0.05 &&
-          dq_.cwiseAbs().maxCoeff() < 0.01) {
-          system_state_ = SystemState::NORMAL;
-          execution_stop_latched_ = false;
-          clear_estop_reason();
-          for(size_t i=0; i<n; ++i) {
-              reference_interfaces_[i] = q_[i];
-              reference_interfaces_[n+i] = 0.0;
-              reference_interfaces_[2*n+i] = 0.0;
-          }
-      }
-  }
-
-  process_compliance_command(dt, current_cmd, cmd_ptr->settings);
+  check_compliance_safety_limits(dt);
+  step_compliance_stopping(dt);
   compliance_blocks_trajectory_.store(
     compliance_active() ||
     system_state_ == SystemState::COMPLIANCE_STOPPING ||
@@ -490,27 +481,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       q_target_=compliance_q_; dq_target_.setZero(); ddq_target_.setZero();
       if(system_state_==SystemState::TEACH) q_target_=q_;
   } else {
-      for (size_t i = 0; i < n; ++i) {
-          if (std::abs(estop_dq_[i]) > 1e-4) {
-              double sign = (estop_dq_[i] > 0.0) ? 1.0 : -1.0;
-              ddq_target_[i] = -sign * estop_decel_[i];
-              
-              double next_dq = estop_dq_[i] + ddq_target_[i] * dt;
-              
-              if ((sign > 0.0 && next_dq <= 0.0) || (sign < 0.0 && next_dq >= 0.0)) {
-                  double t_zero = std::abs(estop_dq_[i] / estop_decel_[i]);
-                  estop_q_[i] += estop_dq_[i] * t_zero + 0.5 * ddq_target_[i] * t_zero * t_zero;
-                  estop_dq_[i] = 0.0;
-                  ddq_target_[i] = 0.0;
-              } else {
-                  estop_q_[i] += estop_dq_[i] * dt + 0.5 * ddq_target_[i] * dt * dt;
-                  estop_dq_[i] = next_dq;
-              }
-          } else {
-              estop_dq_[i] = 0.0;
-              ddq_target_[i] = 0.0;
-          }
-      }
+      step_deceleration_tracker(dt);
       q_target_ = estop_q_;
       dq_target_ = estop_dq_;
   }
@@ -609,27 +580,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
         status.trajectory_start = rclcpp::Time(imp_execution->start_time_ns);
         status.trajectory_id = imp_execution->goal->get_goal_id();
       }
-      switch (system_state_) {
-        case SystemState::NORMAL:
-          status.mode = lite6_interfaces::msg::ControllerStatus::MODE_NORMAL;
-          break;
-        case SystemState::ESTOP:
-          status.mode = lite6_interfaces::msg::ControllerStatus::MODE_ESTOP;
-          break;
-        case SystemState::JOINT_IMPEDANCE:
-          status.mode = lite6_interfaces::msg::ControllerStatus::MODE_JOINT_IMPEDANCE; break;
-        case SystemState::CARTESIAN_IMPEDANCE:
-          status.mode = lite6_interfaces::msg::ControllerStatus::MODE_CARTESIAN_IMPEDANCE; break;
-        case SystemState::TEACH:
-          status.mode = lite6_interfaces::msg::ControllerStatus::MODE_TEACH; break;
-        case SystemState::COMPLIANCE_STOPPING:
-          status.mode = lite6_interfaces::msg::ControllerStatus::MODE_COMPLIANCE_STOPPING; break;
-        case SystemState::CARTESIAN_IMPEDANCE_TRAJECTORY:
-          status.mode = lite6_interfaces::msg::ControllerStatus::MODE_CARTESIAN_IMPEDANCE_TRAJECTORY; break;
-        case SystemState::SYS_ID:
-          status.mode = lite6_interfaces::msg::ControllerStatus::MODE_SYSID;
-          break;
-      }
+      status.mode = controller_mode_for_state(system_state_);
       status.estop_reason = estop_reason_;
       status.estop_joint = estop_joint_;
       status.estop_value = estop_value_;
@@ -639,6 +590,16 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
         status.external_cartesian_wrench[i] = gmo_external_wrench_[static_cast<Eigen::Index>(i)];
       }
       status.external_contact_detected = gmo_contact_detected_;
+      ++status_seq_;
+      status.status_seq = status_seq_;
+      status.controller_epoch = controller_epoch_;
+      status.mode_epoch = mode_epoch_;
+      status.last_cmd_seq = last_cmd_seq_;
+      status.last_cmd_code = last_cmd_code_;
+      status.last_cmd_result = last_cmd_result_;
+      status.rigid_trajectory_active = rigid_trajectory_active() || rigid_cancel_braking_;
+      status.payload_mass = payload_mass_;
+      status.payload_com_tcp = payload_com_tcp_;
       rt_status_pub_->unlockAndPublish();
       last_reported_state_ = system_state_;
       status_publish_counter_ = 0;
@@ -866,6 +827,425 @@ bool Lite6CTCController::check_external_torque_limit(
     accum_duration = 0.0;
   }
   return false;
+}
+
+uint8_t Lite6CTCController::controller_mode_for_state(SystemState state)
+{
+  using CS = lite6_interfaces::msg::ControllerStatus;
+  switch (state) {
+    case SystemState::NORMAL: return CS::MODE_NORMAL;
+    case SystemState::ESTOP: return CS::MODE_ESTOP;
+    case SystemState::SYS_ID: return CS::MODE_SYSID;
+    case SystemState::JOINT_IMPEDANCE: return CS::MODE_JOINT_IMPEDANCE;
+    case SystemState::CARTESIAN_IMPEDANCE: return CS::MODE_CARTESIAN_IMPEDANCE;
+    case SystemState::TEACH: return CS::MODE_TEACH;
+    case SystemState::COMPLIANCE_STOPPING: return CS::MODE_COMPLIANCE_STOPPING;
+    case SystemState::CARTESIAN_IMPEDANCE_TRAJECTORY: return CS::MODE_CARTESIAN_IMPEDANCE_TRAJECTORY;
+    default: return CS::MODE_UNKNOWN;
+  }
+}
+
+uint8_t Lite6CTCController::current_mode_code() const
+{
+  return controller_mode_for_state(system_state_);
+}
+
+bool Lite6CTCController::rigid_trajectory_active() const
+{
+  return current_execution_ != nullptr &&
+    current_execution_->result.load(std::memory_order_acquire) == TrajectoryResult::RUNNING;
+}
+
+void Lite6CTCController::transition_system_state(SystemState next_state)
+{
+  if (system_state_ != next_state) {
+    system_state_ = next_state;
+    ++mode_epoch_;
+    mode_epoch_atomic_.store(mode_epoch_, std::memory_order_release);
+    current_mode_atomic_.store(controller_mode_for_state(next_state), std::memory_order_release);
+    status_publish_pending_ = true;
+    if (next_state != SystemState::COMPLIANCE_STOPPING) {
+      compliance_stopping_elapsed_ = 0.0;
+    }
+  }
+}
+
+void Lite6CTCController::begin_deceleration_tracker()
+{
+  if (q_.allFinite() && dq_.allFinite()) {
+    estop_q_ = q_;
+    estop_dq_ = dq_;
+  }
+  ddq_target_.setZero();
+}
+
+bool Lite6CTCController::step_deceleration_tracker(double dt)
+{
+  const size_t n = joint_names_.size();
+  for (size_t i = 0; i < n; ++i) {
+    if (std::abs(estop_dq_[i]) > 1e-4) {
+      const double sign = (estop_dq_[i] > 0.0) ? 1.0 : -1.0;
+      ddq_target_[i] = -sign * estop_decel_[i];
+      const double next_dq = estop_dq_[i] + ddq_target_[i] * dt;
+      if ((sign > 0.0 && next_dq <= 0.0) || (sign < 0.0 && next_dq >= 0.0)) {
+        const double t_zero = std::abs(estop_dq_[i] / estop_decel_[i]);
+        estop_q_[i] += estop_dq_[i] * t_zero + 0.5 * ddq_target_[i] * t_zero * t_zero;
+        estop_dq_[i] = 0.0;
+        ddq_target_[i] = 0.0;
+      } else {
+        estop_q_[i] += estop_dq_[i] * dt + 0.5 * ddq_target_[i] * dt * dt;
+        estop_dq_[i] = next_dq;
+      }
+    } else {
+      estop_dq_[i] = 0.0;
+      ddq_target_[i] = 0.0;
+    }
+  }
+  return estop_dq_.cwiseAbs().maxCoeff() < 1e-4;
+}
+
+void Lite6CTCController::configure_command_service()
+{
+  command_service_ = get_node()->create_service<lite6_interfaces::srv::ControllerCommand>(
+    "~/command",
+    [this](
+      const std::shared_ptr<lite6_interfaces::srv::ControllerCommand::Request> req,
+      std::shared_ptr<lite6_interfaces::srv::ControllerCommand::Response> resp)
+    {
+      using Cmd = lite6_interfaces::srv::ControllerCommand::Request;
+      using Resp = lite6_interfaces::srv::ControllerCommand::Response;
+      std::lock_guard<std::mutex> lock(cmd_service_mutex_);
+
+      auto fill_snapshot = [this, &resp]() {
+        resp->controller_epoch = controller_epoch_atomic_.load(std::memory_order_acquire);
+        resp->mode_epoch = mode_epoch_atomic_.load(std::memory_order_acquire);
+        resp->current_mode = current_mode_atomic_.load(std::memory_order_acquire);
+      };
+
+      if (!req->reason.empty()) {
+        RCLCPP_DEBUG(
+          get_node()->get_logger(), "ControllerCommand(%u): %s",
+          static_cast<unsigned>(req->command), req->reason.c_str());
+      }
+
+      if (!lite6_interfaces::valid_controller_command(*req)) {
+        resp->accepted = false;
+        resp->ack_result = Resp::ACK_REJECTED_INVALID_ARG;
+        resp->cmd_seq = 0;
+        fill_snapshot();
+        resp->message = "Invalid ControllerCommand code or out-of-bounds parameter";
+        return;
+      }
+
+      if (!trajectory_enabled_.load(std::memory_order_acquire)) {
+        resp->accepted = false;
+        resp->ack_result = Resp::ACK_REJECTED_STATE;
+        resp->cmd_seq = 0;
+        fill_snapshot();
+        resp->message = "CTC controller is not active";
+        return;
+      }
+
+      const uint64_t active_epoch = controller_epoch_atomic_.load(std::memory_order_acquire);
+      if (req->expected_epoch > 0 && req->expected_epoch != active_epoch) {
+        resp->accepted = false;
+        resp->ack_result = Resp::ACK_REJECTED_EPOCH;
+        resp->cmd_seq = 0;
+        fill_snapshot();
+        resp->message = "Controller epoch mismatch";
+        return;
+      }
+
+      if (req->command == Cmd::CMD_ESTOP) {
+        emergency_pending_.store(true, std::memory_order_release);
+      }
+
+      PendingControllerCommand pending{};
+      pending.cmd_seq = command_sequence_.fetch_add(1ULL, std::memory_order_acq_rel) + 1ULL;
+      pending.command = req->command;
+      pending.compliance_recapture = req->compliance.recapture;
+      pending.joint_stiffness = req->compliance.joint_stiffness;
+      pending.joint_damping = req->compliance.joint_damping;
+      pending.translation_stiffness = req->compliance.translation_stiffness;
+      pending.translation_damping = req->compliance.translation_damping;
+      pending.rotation_stiffness = req->compliance.rotation_stiffness;
+      pending.rotation_damping = req->compliance.rotation_damping;
+      pending.sensitivity = req->compliance.sensitivity;
+      pending.nullspace_stiffness = req->compliance.nullspace_stiffness;
+      pending.nullspace_damping = req->compliance.nullspace_damping;
+      pending.payload_mass = req->payload_mass;
+      for (size_t i = 0; i < 3; ++i) {
+        pending.payload_com_tcp[i] = req->payload_com_tcp[i];
+      }
+
+      if (!cmd_ring_.push(pending)) {
+        resp->accepted = false;
+        resp->ack_result = Resp::ACK_RT_TIMEOUT;
+        resp->cmd_seq = 0;
+        fill_snapshot();
+        resp->message = "RT command ring buffer full";
+        return;
+      }
+
+      const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(lite6_interfaces::contract::kControllerCmdWaitTimeoutMs);
+      while (std::chrono::steady_clock::now() < deadline) {
+        if (last_cmd_ack_seq_.load(std::memory_order_acquire) >= pending.cmd_seq) {
+          const uint8_t ack = last_cmd_ack_result_.load(std::memory_order_relaxed);
+          resp->accepted = (ack == Resp::ACK_APPLIED);
+          resp->ack_result = ack;
+          resp->cmd_seq = pending.cmd_seq;
+          resp->controller_epoch = active_epoch;
+          resp->mode_epoch = last_cmd_ack_mode_epoch_.load(std::memory_order_relaxed);
+          resp->current_mode = last_cmd_ack_mode_.load(std::memory_order_relaxed);
+          resp->message = resp->accepted ? "Applied" : "Rejected by RT controller";
+          return;
+        }
+        if (!trajectory_enabled_.load(std::memory_order_acquire)) {
+          resp->accepted = false;
+          resp->ack_result = Resp::ACK_REJECTED_STATE;
+          resp->cmd_seq = pending.cmd_seq;
+          fill_snapshot();
+          resp->message = "CTC controller deactivated while waiting for RT ACK";
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(250));
+      }
+
+      resp->accepted = false;
+      resp->ack_result = Resp::ACK_RT_TIMEOUT;
+      resp->cmd_seq = pending.cmd_seq;
+      fill_snapshot();
+      resp->message = "Timed out waiting for 1 kHz RT controller handshake";
+    });
+}
+
+void Lite6CTCController::process_controller_commands(double /*dt*/)
+{
+  using Cmd = lite6_interfaces::srv::ControllerCommand::Request;
+  using CS = lite6_interfaces::msg::ControllerStatus;
+
+  const bool emerg = emergency_pending_.exchange(false, std::memory_order_acq_rel);
+  PendingControllerCommand batch[32];
+  const size_t count = cmd_ring_.pop_batch(batch, 32);
+  bool estop_handled = false;
+
+  if (emerg && compliance_saturation_estop_pending_) {
+    latch_estop_reason(
+      CS::ESTOP_COMPLIANCE_SATURATION,
+      pending_estop_joint_, pending_estop_value_, pending_estop_limit_);
+    compliance_saturation_estop_pending_ = false;
+    if (system_state_ != SystemState::ESTOP) {
+      begin_deceleration_tracker();
+      transition_system_state(SystemState::ESTOP);
+    }
+    estop_handled = true;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    const auto & cmd = batch[i];
+    const uint8_t res = apply_controller_command(cmd);
+    last_cmd_seq_ = cmd.cmd_seq;
+    last_cmd_code_ = cmd.command;
+    last_cmd_result_ = res;
+    last_cmd_ack_code_.store(cmd.command, std::memory_order_relaxed);
+    last_cmd_ack_result_.store(res, std::memory_order_relaxed);
+    last_cmd_ack_mode_.store(current_mode_code(), std::memory_order_relaxed);
+    last_cmd_ack_mode_epoch_.store(mode_epoch_, std::memory_order_relaxed);
+    last_cmd_ack_seq_.store(cmd.cmd_seq, std::memory_order_release);
+    status_publish_pending_ = true;
+    if (cmd.command == Cmd::CMD_ESTOP) {
+      estop_handled = true;
+    }
+  }
+
+  if (emerg && !estop_handled) {
+    latch_estop_reason(CS::ESTOP_EXTERNAL);
+    if (system_state_ != SystemState::ESTOP) {
+      begin_deceleration_tracker();
+      transition_system_state(SystemState::ESTOP);
+    }
+  }
+}
+
+uint8_t Lite6CTCController::apply_controller_command(const PendingControllerCommand & cmd)
+{
+  using Cmd = lite6_interfaces::srv::ControllerCommand::Request;
+  using Resp = lite6_interfaces::srv::ControllerCommand::Response;
+  using CS = lite6_interfaces::msg::ControllerStatus;
+
+  const bool rigid_busy = rigid_trajectory_active() || rigid_cancel_braking_;
+  const bool imp_traj_busy =
+    (current_impedance_execution_ != nullptr &&
+     current_impedance_execution_->result.load(std::memory_order_acquire) == ImpedanceTrajectoryResult::RUNNING) ||
+    impedance_trajectory_active();
+  const bool stopping_busy = (system_state_ == SystemState::COMPLIANCE_STOPPING);
+  const bool busy = rigid_busy || imp_traj_busy || stopping_busy;
+  const double max_speed = dq_.cwiseAbs().maxCoeff();
+
+  auto populate_compliance_settings = [&cmd](lite6_interfaces::msg::ComplianceSettings & out) {
+    out.joint_stiffness = cmd.joint_stiffness;
+    out.joint_damping = cmd.joint_damping;
+    out.translation_stiffness = cmd.translation_stiffness;
+    out.translation_damping = cmd.translation_damping;
+    out.rotation_stiffness = cmd.rotation_stiffness;
+    out.rotation_damping = cmd.rotation_damping;
+    out.sensitivity = cmd.sensitivity;
+    out.recapture = cmd.compliance_recapture;
+    out.nullspace_stiffness = cmd.nullspace_stiffness;
+    out.nullspace_damping = cmd.nullspace_damping;
+  };
+
+  auto within_hard_limits = [this]() -> bool {
+    for (int i = 0; i < 6; ++i) {
+      if (q_[i] < pin_model_.lowerPositionLimit[i] - compliance_hard_limit_tolerance_ ||
+          q_[i] > pin_model_.upperPositionLimit[i] + compliance_hard_limit_tolerance_) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  switch (cmd.command) {
+    case Cmd::CMD_ESTOP:
+      latch_estop_reason(CS::ESTOP_EXTERNAL);
+      if (system_state_ != SystemState::ESTOP) {
+        begin_deceleration_tracker();
+        transition_system_state(SystemState::ESTOP);
+      }
+      return Resp::ACK_APPLIED;
+
+    case Cmd::CMD_CLEAR_ESTOP:
+      if (busy) return Resp::ACK_REJECTED_BUSY;
+      if (system_state_ != SystemState::ESTOP) return Resp::ACK_REJECTED_STATE;
+      if (max_speed > lite6_interfaces::contract::kClearEstopMaxSpeedRadPerSec) {
+        return Resp::ACK_REJECTED_SPEED;
+      }
+      for (size_t i = 0; i < joint_names_.size(); ++i) {
+        reference_interfaces_[i] = q_[i];
+        reference_interfaces_[joint_names_.size() + i] = 0.0;
+        reference_interfaces_[2 * joint_names_.size() + i] = 0.0;
+      }
+      q_target_ = q_;
+      dq_target_.setZero();
+      ddq_target_.setZero();
+      estop_q_ = q_;
+      estop_dq_.setZero();
+      clear_estop_reason();
+      transition_system_state(SystemState::NORMAL);
+      return Resp::ACK_APPLIED;
+
+    case Cmd::CMD_ENTER_NORMAL:
+      if (busy) return Resp::ACK_REJECTED_BUSY;
+      if (system_state_ == SystemState::ESTOP) return Resp::ACK_REJECTED_STATE;
+      if (system_state_ == SystemState::NORMAL) return Resp::ACK_APPLIED;
+      if (system_state_ == SystemState::SYS_ID) {
+        if (max_speed > lite6_interfaces::contract::kControllerEntryMaxSpeedRadPerSec) {
+          return Resp::ACK_REJECTED_SPEED;
+        }
+        for (size_t i = 0; i < joint_names_.size(); ++i) {
+          reference_interfaces_[i] = q_[i];
+          reference_interfaces_[joint_names_.size() + i] = 0.0;
+          reference_interfaces_[2 * joint_names_.size() + i] = 0.0;
+        }
+        transition_system_state(SystemState::NORMAL);
+        return Resp::ACK_APPLIED;
+      }
+      if (compliance_active()) {
+        begin_deceleration_tracker();
+        integral_effort_.setZero();
+        compliance_stopping_elapsed_ = 0.0;
+        transition_system_state(SystemState::COMPLIANCE_STOPPING);
+        return Resp::ACK_APPLIED;
+      }
+      return Resp::ACK_REJECTED_STATE;
+
+    case Cmd::CMD_ENTER_SYSID:
+      if (busy) return Resp::ACK_REJECTED_BUSY;
+      if (system_state_ != SystemState::NORMAL) return Resp::ACK_REJECTED_STATE;
+      if (max_speed > lite6_interfaces::contract::kControllerEntryMaxSpeedRadPerSec) {
+        return Resp::ACK_REJECTED_SPEED;
+      }
+      if (!within_hard_limits()) return Resp::ACK_REJECTED_LIMIT;
+      for (size_t i = 0; i < joint_names_.size(); ++i) {
+        reference_interfaces_[i] = q_[i];
+        reference_interfaces_[joint_names_.size() + i] = 0.0;
+        reference_interfaces_[2 * joint_names_.size() + i] = 0.0;
+      }
+      transition_system_state(SystemState::SYS_ID);
+      return Resp::ACK_APPLIED;
+
+    case Cmd::CMD_ENTER_JOINT_IMPEDANCE:
+    case Cmd::CMD_ENTER_CARTESIAN_IMPEDANCE:
+    case Cmd::CMD_ENTER_TEACH: {
+      if (busy) return Resp::ACK_REJECTED_BUSY;
+      if (system_state_ != SystemState::NORMAL && !compliance_active()) {
+        return Resp::ACK_REJECTED_STATE;
+      }
+      const SystemState desired =
+        cmd.command == Cmd::CMD_ENTER_JOINT_IMPEDANCE ? SystemState::JOINT_IMPEDANCE :
+        (cmd.command == Cmd::CMD_ENTER_CARTESIAN_IMPEDANCE ? SystemState::CARTESIAN_IMPEDANCE :
+         SystemState::TEACH);
+      const bool entering = (desired != system_state_);
+      if (entering && max_speed > lite6_interfaces::contract::kControllerEntryMaxSpeedRadPerSec) {
+        return Resp::ACK_REJECTED_SPEED;
+      }
+      if (!within_hard_limits()) return Resp::ACK_REJECTED_LIMIT;
+      populate_compliance_settings(compliance_settings_);
+      if (entering || cmd.compliance_recapture) {
+        compliance_q_ = q_;
+        if (gmo_tcp_cached_this_cycle_) {
+          compliance_pose_ = pin_data_gmo_.oMf[compliance_frame_];
+        } else {
+          pinocchio::forwardKinematics(pin_model_, pin_data_, dynamics_q_);
+          compliance_pose_ = pinocchio::updateFramePlacement(pin_model_, pin_data_, compliance_frame_);
+        }
+      }
+      if (entering) {
+        compliance_filtered_ = compliance_settings_;
+        compliance_last_tau_ = tau_cmd_;
+        compliance_saturation_time_ = 0.0;
+        compliance_external_torque_time_ = 0.0;
+        compliance_saturation_estop_pending_ = false;
+        integral_effort_.setZero();
+      }
+      transition_system_state(desired);
+      return Resp::ACK_APPLIED;
+    }
+
+    case Cmd::CMD_UPDATE_COMPLIANCE_SETTINGS:
+      if (busy) return Resp::ACK_REJECTED_BUSY;
+      if (!compliance_active()) return Resp::ACK_REJECTED_STATE;
+      populate_compliance_settings(compliance_settings_);
+      if (cmd.compliance_recapture) {
+        compliance_q_ = q_;
+        if (gmo_tcp_cached_this_cycle_) {
+          compliance_pose_ = pin_data_gmo_.oMf[compliance_frame_];
+        } else {
+          pinocchio::forwardKinematics(pin_model_, pin_data_, dynamics_q_);
+          compliance_pose_ = pinocchio::updateFramePlacement(pin_model_, pin_data_, compliance_frame_);
+        }
+      }
+      return Resp::ACK_APPLIED;
+
+    case Cmd::CMD_SET_PAYLOAD:
+      if (busy) return Resp::ACK_REJECTED_BUSY;
+      payload_mass_ = cmd.payload_mass;
+      payload_com_tcp_ = {cmd.payload_com_tcp[0], cmd.payload_com_tcp[1], cmd.payload_com_tcp[2]};
+      return Resp::ACK_APPLIED;
+
+    case Cmd::CMD_TARE_GMO:
+      if (busy) return Resp::ACK_REJECTED_BUSY;
+      if (system_state_ == SystemState::ESTOP) return Resp::ACK_REJECTED_STATE;
+      if (max_speed > lite6_interfaces::contract::kControllerEntryMaxSpeedRadPerSec) {
+        return Resp::ACK_REJECTED_SPEED;
+      }
+      reset_momentum_observer();
+      return Resp::ACK_APPLIED;
+
+    default:
+      return Resp::ACK_REJECTED_INVALID_ARG;
+  }
 }
 
 }  // namespace lite6_controllers

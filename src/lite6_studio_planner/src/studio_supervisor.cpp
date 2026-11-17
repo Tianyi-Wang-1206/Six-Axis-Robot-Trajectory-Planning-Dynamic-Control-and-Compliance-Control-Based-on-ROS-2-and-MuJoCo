@@ -1,20 +1,26 @@
 #include "lite6_studio_planner/studio_supervisor.hpp"
+#include "lite6_interfaces/motion_contract.hpp"
 
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace lite6_studio_planner
 {
 namespace
 {
-constexpr auto kObservationTimeout = std::chrono::milliseconds(800);
+constexpr auto kControllerObservationTimeout =
+  std::chrono::nanoseconds(lite6_interfaces::contract::kControllerStatusStaleTimeoutNs);
+constexpr auto kJointObservationTimeout =
+  std::chrono::nanoseconds(lite6_interfaces::contract::kJointStateStaleTimeoutNs);
 constexpr auto kGripperTimeout = std::chrono::milliseconds(1500);
 constexpr auto kSettleDuration = std::chrono::milliseconds(300);
 constexpr auto kSettleGap = std::chrono::milliseconds(100);
 constexpr auto kPostRecoverySettle = std::chrono::milliseconds(200);
 constexpr auto kRecoveryPhaseTimeout = std::chrono::seconds(8);
 constexpr auto kStoppingTimeout = std::chrono::seconds(5);
-constexpr double kSettleSpeedThreshold = 0.01;
+constexpr double kSettleSpeedThreshold =
+  lite6_interfaces::contract::kPlannerSettleSpeedRadPerSec;
 }  // namespace
 
 StudioSupervisor::StudioSupervisor(std::function<void(const Snapshot &)> on_change)
@@ -26,13 +32,13 @@ StudioSupervisor::StudioSupervisor(std::function<void(const Snapshot &)> on_chan
 
 bool StudioSupervisor::fresh_joint_unlocked(Clock::time_point now) const
 {
-  return joint_stamp_ != Clock::time_point{} && (now - joint_stamp_) <= kObservationTimeout;
+  return joint_stamp_ != Clock::time_point{} && (now - joint_stamp_) <= kJointObservationTimeout;
 }
 
 bool StudioSupervisor::fresh_controller_unlocked(Clock::time_point now) const
 {
   return controller_stamp_ != Clock::time_point{} &&
-         (now - controller_stamp_) <= kObservationTimeout;
+         (now - controller_stamp_) <= kControllerObservationTimeout;
 }
 
 bool StudioSupervisor::settled_unlocked(Clock::time_point now) const
@@ -90,8 +96,27 @@ std::string StudioSupervisor::describe_estop_reason(uint8_t reason)
       return "Impedance trajectory goal settling deadline exceeded";
     case CS::ESTOP_COMPLIANCE_EXTERNAL_TORQUE:
       return "Compliance/impedance GMO external torque limit exceeded";
+    case CS::ESTOP_COMPLIANCE_STOPPING_TIMEOUT:
+      return "Compliance/impedance exit deceleration timed out";
     default: return "Controller E-STOP latched";
   }
+}
+
+void StudioSupervisor::finish_stop_unlocked(const std::string & detail)
+{
+  ++session_id_;
+  stop_requested_ = false;
+  pause_requested_ = false;
+  step_mode_ = false;
+  snap_.current_block_index = 0;
+  snap_.current_line_number = 0;
+  snap_.current_statement_index = -1;
+  snap_.block_progress_percent = 0.0;
+  snap_.total_progress_percent = 0.0;
+  snap_.cartesian_pos_error_m.fill(0.0);
+  snap_.cartesian_rot_error_rad.fill(0.0);
+  snap_.state = has_program_ ? S::STATE_COMPILED_READY : S::STATE_IDLE;
+  notify_unlocked(detail);
 }
 
 void StudioSupervisor::enter_estop_unlocked(
@@ -148,6 +173,38 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
   Snapshot notify_snap;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (status.controller_epoch != 0 || status.status_seq != 0) {
+      if (status.controller_epoch < last_controller_epoch_) {
+        return effects;
+      }
+      if (status.controller_epoch == last_controller_epoch_ &&
+          status.status_seq <= last_status_seq_)
+      {
+        return effects;
+      }
+      const bool epoch_changed =
+        last_controller_epoch_ != 0 &&
+        status.controller_epoch != 0 &&
+        status.controller_epoch != last_controller_epoch_;
+      last_controller_epoch_ = status.controller_epoch;
+      last_status_seq_ = status.status_seq;
+      snap_.controller_epoch = status.controller_epoch;
+      if (epoch_changed &&
+          (snap_.state == S::STATE_RUNNING || snap_.state == S::STATE_STEPPING ||
+           snap_.state == S::STATE_STOPPING || snap_.state == S::STATE_RECOVERING))
+      {
+        effects.cancel_controller_goals = true;
+        if (mode == CS::MODE_ESTOP) {
+          enter_estop_unlocked(
+            "Controller reactivated in ESTOP mid-operation (epoch changed)",
+            estop_reason, effects);
+        } else {
+          enter_fault_unlocked(-12, "Controller reactivated mid-operation (controller_epoch changed)");
+        }
+        changed = true;
+      }
+    }
+
     const auto now = Clock::now();
     const bool was_fresh = fresh_controller_unlocked(now);
     const uint8_t prev_mode = snap_.controller_mode;
@@ -157,7 +214,9 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
     snap_.external_cartesian_wrench = status.external_cartesian_wrench;
     snap_.contact_detected = status.external_contact_detected;
 
-    if (mode == CS::MODE_ESTOP) {
+    if (changed) {
+      notify_snap = make_snapshot_unlocked(now);
+    } else if (mode == CS::MODE_ESTOP) {
       snap_.estop_latched = true;
       if (estop_reason != CS::ESTOP_NONE) {
         snap_.estop_reason = estop_reason;
@@ -194,7 +253,8 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
       }
     } else if (
       mode == CS::MODE_CARTESIAN_IMPEDANCE_TRAJECTORY ||
-      mode == CS::MODE_COMPLIANCE_STOPPING)
+      mode == CS::MODE_COMPLIANCE_STOPPING ||
+      mode == CS::MODE_CARTESIAN_IMPEDANCE)
     {
       // Permitted during active impedance blocks, pauses, or clean stops.
       if (snap_.state == S::STATE_BOOT_INIT || snap_.state == S::STATE_IDLE ||
@@ -204,7 +264,7 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
         changed = true;
       }
     } else {
-      // Unexpected external controller mode (SYSID, TEACH, standalone impedance, UNKNOWN)
+      // Unexpected external controller mode (SYSID, TEACH, standalone joint impedance, UNKNOWN)
       if (snap_.state == S::STATE_RUNNING || snap_.state == S::STATE_STEPPING ||
           snap_.state == S::STATE_RECOVERING)
       {
@@ -245,6 +305,7 @@ StudioSupervisor::Effects StudioSupervisor::observe_joint_state(
     const auto now = Clock::now();
     if (!positions_valid || !dq_valid || !std::isfinite(max_abs_dq)) {
       reset_settle_unlocked();
+      last_dq_valid_ = false;
       if (snap_.state == S::STATE_RUNNING || snap_.state == S::STATE_STEPPING ||
           snap_.state == S::STATE_RECOVERING || snap_.state == S::STATE_STOPPING)
       {
@@ -260,6 +321,8 @@ StudioSupervisor::Effects StudioSupervisor::observe_joint_state(
     } else {
       const bool was_fresh = fresh_joint_unlocked(now);
       joint_stamp_ = now;
+      last_dq_valid_ = true;
+      last_max_abs_dq_ = max_abs_dq;
 
       if (max_abs_dq <= kSettleSpeedThreshold) {
         if (!settling_ || (now - last_settle_obs_) > kSettleGap) {
@@ -291,10 +354,10 @@ StudioSupervisor::Effects StudioSupervisor::observe_joint_state(
             phase_deadline_ = now + kRecoveryPhaseTimeout;
             notify_unlocked("Robot settled and controller already NORMAL; finalizing recovery");
           } else {
-            recovery_phase_ = RecoverySubPhase::SYNC_REFERENCE;
+            recovery_phase_ = RecoverySubPhase::ENABLE_NORMAL;
             phase_deadline_ = now + kRecoveryPhaseTimeout;
             effects.wake_worker = true;
-            notify_unlocked("Robot settled; synchronizing controller reference pose");
+            notify_unlocked("Robot settled; issuing CMD_CLEAR_ESTOP to controller");
           }
           changed = true;
         } else if (
@@ -374,6 +437,10 @@ StudioSupervisor::Effects StudioSupervisor::watchdog()
         "Feedback timeout on /joint_states or /ctc_controller/status during motion",
         CS::ESTOP_EXTERNAL, effects);
       changed = true;
+    } else if (snap_.state == S::STATE_ESTOP && c_fresh &&
+               snap_.controller_mode != CS::MODE_ESTOP)
+    {
+      effects.send_estop_cmd = true;
     } else if (snap_.state == S::STATE_RECOVERING) {
       if (recovery_phase_ == RecoverySubPhase::POST_SETTLE &&
           snap_.controller_mode == CS::MODE_NORMAL &&
@@ -423,23 +490,50 @@ bool StudioSupervisor::can_compile(std::string & out_reason) const
   switch (snap_.state) {
     case S::STATE_IDLE:
     case S::STATE_COMPILED_READY:
-    case S::STATE_PAUSED:
     case S::STATE_FAULT:
     case S::STATE_ESTOP:
       return true;
     default:
-      out_reason = "Cannot compile while system state is active (RUNNING/STEPPING/STOPPING/RECOVERING/BOOT_INIT)";
+      out_reason =
+        "Cannot compile while system state is PAUSED or active "
+        "(RUNNING/STEPPING/STOPPING/RECOVERING/BOOT_INIT); STOP program first";
       return false;
   }
 }
 
-void StudioSupervisor::on_compile_succeeded(const std::string & program_id, int32_t total_blocks)
+void StudioSupervisor::on_compile_dry_run(uint64_t request_id)
+{
+  bool changed = false;
+  Snapshot notify_snap;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (request_id != 0 && snap_.last_compile_request_id != request_id) {
+      snap_.last_compile_request_id = request_id;
+      notify_unlocked(snap_.detail);
+      changed = true;
+      notify_snap = make_snapshot_unlocked(Clock::now());
+    }
+  }
+  if (changed && on_change_) {
+    on_change_(notify_snap);
+  }
+}
+
+void StudioSupervisor::on_compile_succeeded(
+  const std::string & program_id,
+  int32_t total_blocks,
+  uint64_t program_revision,
+  uint64_t request_id)
 {
   Snapshot notify_snap;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     has_program_ = true;
     snap_.loaded_program_id = program_id;
+    snap_.program_revision = program_revision;
+    if (request_id != 0) {
+      snap_.last_compile_request_id = request_id;
+    }
     snap_.total_blocks = total_blocks;
     snap_.current_block_index = 0;
     snap_.current_line_number = 0;
@@ -448,9 +542,7 @@ void StudioSupervisor::on_compile_succeeded(const std::string & program_id, int3
     snap_.total_progress_percent = 0.0;
     snap_.cartesian_pos_error_m.fill(0.0);
     snap_.cartesian_rot_error_rad.fill(0.0);
-    if (snap_.state == S::STATE_IDLE || snap_.state == S::STATE_COMPILED_READY ||
-        snap_.state == S::STATE_PAUSED)
-    {
+    if (snap_.state == S::STATE_IDLE || snap_.state == S::STATE_COMPILED_READY) {
       snap_.state = S::STATE_COMPILED_READY;
       notify_unlocked("Program compiled and ready (" + std::to_string(total_blocks) + " blocks)");
     } else {
@@ -465,15 +557,19 @@ void StudioSupervisor::on_compile_succeeded(const std::string & program_id, int3
   }
 }
 
-void StudioSupervisor::on_compile_failed()
+void StudioSupervisor::on_compile_failed(uint64_t request_id)
 {
   bool changed = false;
   Snapshot notify_snap;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (request_id != 0) {
+      snap_.last_compile_request_id = request_id;
+    }
     if (has_program_ || snap_.state == S::STATE_COMPILED_READY || snap_.state == S::STATE_PAUSED) {
       has_program_ = false;
       snap_.loaded_program_id.clear();
+      snap_.program_revision = 0;
       snap_.total_blocks = 0;
       snap_.current_block_index = 0;
       snap_.current_line_number = 0;
@@ -486,6 +582,10 @@ void StudioSupervisor::on_compile_failed()
       notify_unlocked("Compilation failed; previously loaded program cleared");
       changed = true;
       notify_snap = make_snapshot_unlocked(Clock::now());
+    } else if (request_id != 0) {
+      notify_unlocked("Compilation failed");
+      changed = true;
+      notify_snap = make_snapshot_unlocked(Clock::now());
     }
   }
   if (changed && on_change_) {
@@ -494,7 +594,7 @@ void StudioSupervisor::on_compile_failed()
 }
 
 StudioSupervisor::CommandResult StudioSupervisor::handle_command(
-  uint8_t command, const std::string & reason)
+  uint8_t command, uint64_t expected_revision, const std::string & reason)
 {
   CommandResult res;
   bool changed = false;
@@ -505,11 +605,22 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
     auto reject = [&](const std::string & msg) {
       res.accepted = false;
       res.revision = snap_.revision;
+      res.state = snap_.state;
+      res.controller_epoch = snap_.controller_epoch;
       res.message = msg;
     };
 
+    if (command != C::Request::CMD_ESTOP &&
+        expected_revision > 0 && expected_revision != snap_.revision)
+    {
+      reject("Revision mismatch: expected " + std::to_string(expected_revision) +
+        ", current " + std::to_string(snap_.revision));
+      return res;
+    }
+
     const bool j_fresh = fresh_joint_unlocked(now);
     const bool c_fresh = fresh_controller_unlocked(now);
+    const bool stationary = last_dq_valid_ && (last_max_abs_dq_ <= kSettleSpeedThreshold);
 
     switch (command) {
       case C::Request::CMD_ESTOP: {
@@ -534,9 +645,9 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
           break;
         }
         if (!j_fresh || !c_fresh || snap_.estop_latched ||
-            snap_.controller_mode != CS::MODE_NORMAL)
+            snap_.controller_mode != CS::MODE_NORMAL || !stationary)
         {
-          reject("RUN requires fresh telemetry, no E-STOP latch, and controller in MODE_NORMAL");
+          reject("RUN requires fresh telemetry, stationary joints, no E-STOP latch, and controller in MODE_NORMAL");
           break;
         }
         ++session_id_;
@@ -565,9 +676,9 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
           break;
         }
         if (!j_fresh || !c_fresh || snap_.estop_latched ||
-            snap_.controller_mode != CS::MODE_NORMAL)
+            snap_.controller_mode != CS::MODE_NORMAL || !stationary)
         {
-          reject("RESUME requires fresh telemetry and controller in MODE_NORMAL");
+          reject("RESUME requires fresh telemetry, stationary joints, and controller in MODE_NORMAL");
           break;
         }
         ++session_id_;
@@ -590,9 +701,9 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
           break;
         }
         if (!j_fresh || !c_fresh || snap_.estop_latched ||
-            snap_.controller_mode != CS::MODE_NORMAL)
+            snap_.controller_mode != CS::MODE_NORMAL || !stationary)
         {
-          reject("STEP requires fresh telemetry and controller in MODE_NORMAL");
+          reject("STEP requires fresh telemetry, stationary joints, and controller in MODE_NORMAL");
           break;
         }
         if (snap_.state == S::STATE_COMPILED_READY) {
@@ -673,6 +784,12 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
           reject("RECOVER requires fresh /joint_states and /ctc_controller/status");
           break;
         }
+        if (snap_.controller_mode != CS::MODE_ESTOP &&
+            snap_.controller_mode != CS::MODE_NORMAL)
+        {
+          reject("RECOVER requires controller in MODE_ESTOP (or already MODE_NORMAL)");
+          break;
+        }
         ++session_id_;
         stop_requested_ = false;
         pause_requested_ = false;
@@ -702,7 +819,8 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
           break;
         }
         if (snap_.controller_mode != CS::MODE_NORMAL) {
-          reject("Controller is not in MODE_NORMAL yet");
+          res.effects.send_enter_normal_cmd = true;
+          reject("Controller is returning to MODE_NORMAL; retry RESET_FAULT once NORMAL");
           break;
         }
         snap_.last_error_code = 0;
@@ -727,6 +845,7 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
         }
         has_program_ = false;
         snap_.loaded_program_id.clear();
+        snap_.program_revision = 0;
         snap_.total_blocks = 0;
         snap_.current_block_index = 0;
         snap_.current_line_number = 0;
@@ -749,6 +868,8 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
 
     if (res.accepted) {
       res.revision = snap_.revision;
+      res.state = snap_.state;
+      res.controller_epoch = snap_.controller_epoch;
       res.message = snap_.detail;
     }
     if (changed) {
@@ -771,6 +892,12 @@ uint8_t StudioSupervisor::current_state() const
 {
   std::lock_guard<std::mutex> lock(mutex_);
   return snap_.state;
+}
+
+std::pair<uint8_t, uint64_t> StudioSupervisor::state_and_session() const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return {snap_.state, session_id_};
 }
 
 StudioSupervisor::RecoverySubPhase StudioSupervisor::recovery_subphase() const
@@ -854,22 +981,26 @@ void StudioSupervisor::on_pause_settled(
   Snapshot notify_snap;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (session != session_id_ ||
-        (snap_.state != S::STATE_RUNNING && snap_.state != S::STATE_STEPPING))
-    {
+    if (session != session_id_) {
       return;
     }
-    pause_requested_ = false;
-    step_mode_ = false;
-    snap_.state = S::STATE_PAUSED;
-    snap_.current_line_number = line_number;
-    snap_.current_statement_index = statement_index;
-    snap_.current_block_index = block_index;
-    snap_.block_progress_percent = block_progress_pct;
-    snap_.total_progress_percent = total_progress_pct;
-    notify_unlocked("Paused at line " + std::to_string(line_number));
-    changed = true;
-    notify_snap = make_snapshot_unlocked(Clock::now());
+    if (snap_.state == S::STATE_STOPPING || stop_requested_) {
+      finish_stop_unlocked("Program execution stopped cleanly");
+      changed = true;
+      notify_snap = make_snapshot_unlocked(Clock::now());
+    } else if (snap_.state == S::STATE_RUNNING || snap_.state == S::STATE_STEPPING) {
+      pause_requested_ = false;
+      step_mode_ = false;
+      snap_.state = S::STATE_PAUSED;
+      snap_.current_line_number = line_number;
+      snap_.current_statement_index = statement_index;
+      snap_.current_block_index = block_index;
+      snap_.block_progress_percent = block_progress_pct;
+      snap_.total_progress_percent = total_progress_pct;
+      notify_unlocked("Paused at line " + std::to_string(line_number));
+      changed = true;
+      notify_snap = make_snapshot_unlocked(Clock::now());
+    }
   }
   if (changed && on_change_) {
     on_change_(notify_snap);
@@ -888,30 +1019,36 @@ void StudioSupervisor::on_step_block_done(
   Snapshot notify_snap;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (session != session_id_ || snap_.state != S::STATE_STEPPING) {
+    if (session != session_id_) {
       return;
     }
-    step_mode_ = false;
-    pause_requested_ = false;
-    snap_.cartesian_pos_error_m.fill(0.0);
-    snap_.cartesian_rot_error_rad.fill(0.0);
-    if (more_blocks_remaining) {
-      snap_.state = S::STATE_PAUSED;
-      snap_.current_block_index = next_block_idx;
-      snap_.current_line_number = next_line_number;
-      snap_.current_statement_index = next_statement_index;
-      snap_.block_progress_percent = 0.0;
-      snap_.total_progress_percent = total_progress_pct;
-      notify_unlocked("Step complete; paused before block " + std::to_string(next_block_idx + 1));
-    } else {
-      snap_.state = has_program_ ? S::STATE_COMPILED_READY : S::STATE_IDLE;
-      snap_.current_block_index = snap_.total_blocks;
-      snap_.block_progress_percent = 100.0;
-      snap_.total_progress_percent = 100.0;
-      notify_unlocked("Step reached end of program");
+    if (snap_.state == S::STATE_STOPPING || stop_requested_) {
+      finish_stop_unlocked("Program execution stopped cleanly");
+      changed = true;
+      notify_snap = make_snapshot_unlocked(Clock::now());
+    } else if (snap_.state == S::STATE_STEPPING) {
+      step_mode_ = false;
+      pause_requested_ = false;
+      snap_.cartesian_pos_error_m.fill(0.0);
+      snap_.cartesian_rot_error_rad.fill(0.0);
+      if (more_blocks_remaining) {
+        snap_.state = S::STATE_PAUSED;
+        snap_.current_block_index = next_block_idx;
+        snap_.current_line_number = next_line_number;
+        snap_.current_statement_index = next_statement_index;
+        snap_.block_progress_percent = 0.0;
+        snap_.total_progress_percent = total_progress_pct;
+        notify_unlocked("Step complete; paused before block " + std::to_string(next_block_idx + 1));
+      } else {
+        snap_.state = has_program_ ? S::STATE_COMPILED_READY : S::STATE_IDLE;
+        snap_.current_block_index = snap_.total_blocks;
+        snap_.block_progress_percent = 100.0;
+        snap_.total_progress_percent = 100.0;
+        notify_unlocked("Step reached end of program");
+      }
+      changed = true;
+      notify_snap = make_snapshot_unlocked(Clock::now());
     }
-    changed = true;
-    notify_snap = make_snapshot_unlocked(Clock::now());
   }
   if (changed && on_change_) {
     on_change_(notify_snap);
@@ -924,22 +1061,26 @@ void StudioSupervisor::on_program_completed(uint64_t session)
   Snapshot notify_snap;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (session != session_id_ ||
-        (snap_.state != S::STATE_RUNNING && snap_.state != S::STATE_STEPPING))
-    {
+    if (session != session_id_) {
       return;
     }
-    pause_requested_ = false;
-    step_mode_ = false;
-    snap_.state = has_program_ ? S::STATE_COMPILED_READY : S::STATE_IDLE;
-    snap_.current_block_index = snap_.total_blocks;
-    snap_.block_progress_percent = 100.0;
-    snap_.total_progress_percent = 100.0;
-    snap_.cartesian_pos_error_m.fill(0.0);
-    snap_.cartesian_rot_error_rad.fill(0.0);
-    notify_unlocked("Program execution completed");
-    changed = true;
-    notify_snap = make_snapshot_unlocked(Clock::now());
+    if (snap_.state == S::STATE_STOPPING || stop_requested_) {
+      finish_stop_unlocked("Program execution stopped cleanly");
+      changed = true;
+      notify_snap = make_snapshot_unlocked(Clock::now());
+    } else if (snap_.state == S::STATE_RUNNING || snap_.state == S::STATE_STEPPING) {
+      pause_requested_ = false;
+      step_mode_ = false;
+      snap_.state = has_program_ ? S::STATE_COMPILED_READY : S::STATE_IDLE;
+      snap_.current_block_index = snap_.total_blocks;
+      snap_.block_progress_percent = 100.0;
+      snap_.total_progress_percent = 100.0;
+      snap_.cartesian_pos_error_m.fill(0.0);
+      snap_.cartesian_rot_error_rad.fill(0.0);
+      notify_unlocked("Program execution completed");
+      changed = true;
+      notify_snap = make_snapshot_unlocked(Clock::now());
+    }
   }
   if (changed && on_change_) {
     on_change_(notify_snap);
@@ -955,18 +1096,7 @@ void StudioSupervisor::on_stop_completed(uint64_t session)
     if (session != session_id_ || snap_.state != S::STATE_STOPPING) {
       return;
     }
-    stop_requested_ = false;
-    pause_requested_ = false;
-    step_mode_ = false;
-    snap_.current_block_index = 0;
-    snap_.current_line_number = 0;
-    snap_.current_statement_index = -1;
-    snap_.block_progress_percent = 0.0;
-    snap_.total_progress_percent = 0.0;
-    snap_.cartesian_pos_error_m.fill(0.0);
-    snap_.cartesian_rot_error_rad.fill(0.0);
-    snap_.state = has_program_ ? S::STATE_COMPILED_READY : S::STATE_IDLE;
-    notify_unlocked("Program execution stopped cleanly");
+    finish_stop_unlocked("Program execution stopped cleanly");
     changed = true;
     notify_snap = make_snapshot_unlocked(Clock::now());
   }
@@ -995,28 +1125,6 @@ void StudioSupervisor::on_execution_fault(
     } else {
       enter_fault_unlocked(error_code, detail);
     }
-    changed = true;
-    notify_snap = make_snapshot_unlocked(Clock::now());
-  }
-  if (changed && on_change_) {
-    on_change_(notify_snap);
-  }
-}
-
-void StudioSupervisor::on_recovery_sync_succeeded(uint64_t session)
-{
-  bool changed = false;
-  Snapshot notify_snap;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (session != session_id_ || snap_.state != S::STATE_RECOVERING ||
-        recovery_phase_ != RecoverySubPhase::SYNC_REFERENCE)
-    {
-      return;
-    }
-    recovery_phase_ = RecoverySubPhase::ENABLE_NORMAL;
-    phase_deadline_ = Clock::now() + kRecoveryPhaseTimeout;
-    notify_unlocked("Reference synchronized; commanding controller back to MODE_NORMAL");
     changed = true;
     notify_snap = make_snapshot_unlocked(Clock::now());
   }

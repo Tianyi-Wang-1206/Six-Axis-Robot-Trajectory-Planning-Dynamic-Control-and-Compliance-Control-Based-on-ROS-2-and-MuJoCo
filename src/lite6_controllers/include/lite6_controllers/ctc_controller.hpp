@@ -11,11 +11,11 @@
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "control_msgs/action/follow_joint_trajectory.hpp"
 #include "rclcpp/rclcpp.hpp"
-#include "std_msgs/msg/int32.hpp"
 #include "realtime_tools/realtime_buffer.hpp"
 #include "lite6_interfaces/msg/controller_status.hpp"
-#include "lite6_interfaces/msg/compliance_command.hpp"
+#include "lite6_interfaces/srv/controller_command.hpp"
 #include "lite6_interfaces/action/follow_impedance_trajectory.hpp"
+#include "lite6_interfaces/motion_contract.hpp"
 #include "lite6_interfaces/shm_registers.hpp"
 #include "realtime_tools/realtime_publisher.hpp"
 
@@ -147,8 +147,8 @@ private:
   };
   bool compliance_active() const;
   bool impedance_trajectory_active() const;
+  bool rigid_trajectory_active() const;
   bool configure_compliance();
-  void process_compliance_command(double dt, int32_t command, const lite6_interfaces::msg::ComplianceSettings& settings);
   void compute_compliance(double dt);
 
   using FollowImpedance = lite6_interfaces::action::FollowImpedanceTrajectory;
@@ -165,6 +165,8 @@ private:
     EXTERNAL_TORQUE_LIMIT,
     GOAL_TIMEOUT,
     MODE_CHANGED,
+    EPOCH_MISMATCH,
+    STOPPING_TIMEOUT,
     INVALID_STATE,
     INVALID_COMMAND,
     COMMAND_WRITE,
@@ -321,27 +323,65 @@ private:
   double compliance_saturation_time_=0.0;
   std::atomic<bool> compliance_blocks_trajectory_{false};
   std::atomic<bool> emergency_pending_{false};
-  rclcpp::Subscription<lite6_interfaces::msg::ComplianceCommand>::SharedPtr compliance_sub_;
   SystemState system_state_ = SystemState::NORMAL;
-  
+
   // Kinematic Deceleration Tracker
   Vec6d estop_q_ = Vec6d::Zero(), estop_dq_ = Vec6d::Zero();
   Vec6d estop_decel_ = Vec6d::Zero();
-  
-  rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr cmd_sub_;
-  struct ModeCommand {
-    int32_t value=0; uint64_t sequence=0;
-    lite6_interfaces::msg::ComplianceSettings settings;
-    ModeCommand()=default;
-    ModeCommand(int32_t v,uint64_t s):value(v),sequence(s) {}
+
+  struct PendingControllerCommand {
+    uint64_t cmd_seq = 0;
+    uint8_t command = 0;
+    bool compliance_recapture = false;
+    double joint_stiffness = 20.0;
+    double joint_damping = 3.0;
+    double translation_stiffness = 200.0;
+    double translation_damping = 25.0;
+    double rotation_stiffness = 8.0;
+    double rotation_damping = 1.5;
+    double sensitivity = 3.0;
+    double nullspace_stiffness = 0.0;
+    double nullspace_damping = 0.5;
+    double payload_mass = 0.0;
+    double payload_com_tcp[3]{0.0, 0.0, 0.0};
   };
-  std::mutex cmd_write_mutex_;
-  realtime_tools::RealtimeBuffer<ModeCommand> cmd_buffer_;
+
+  void configure_command_service();
+  static uint8_t controller_mode_for_state(SystemState state);
+  uint8_t current_mode_code() const;
+  void transition_system_state(SystemState next_state);
+  void process_controller_commands(double dt);
+  uint8_t apply_controller_command(const PendingControllerCommand & cmd);
+  void step_compliance_stopping(double dt);
+  void check_compliance_safety_limits(double dt);
+  void begin_deceleration_tracker();
+  bool step_deceleration_tracker(double dt);
+
   rclcpp::Clock::SharedPtr node_clock_;
+  std::mutex cmd_service_mutex_;
+  rclcpp::Service<lite6_interfaces::srv::ControllerCommand>::SharedPtr command_service_;
+  lite6_interfaces::shm::ShmSpscRing<PendingControllerCommand, 32> cmd_ring_;
   std::atomic<uint64_t> command_sequence_{0};
-  uint64_t current_command_sequence_ = 0;
-  uint64_t execution_stop_sequence_ = 0;
-  bool execution_stop_latched_ = false;
+  std::atomic<uint64_t> controller_epoch_atomic_{0};
+  std::atomic<uint64_t> mode_epoch_atomic_{0};
+  std::atomic<uint8_t> current_mode_atomic_{lite6_interfaces::msg::ControllerStatus::MODE_UNKNOWN};
+  std::atomic<uint64_t> last_cmd_ack_seq_{0};
+  std::atomic<uint8_t> last_cmd_ack_code_{lite6_interfaces::srv::ControllerCommand::Request::CMD_NONE};
+  std::atomic<uint8_t> last_cmd_ack_result_{lite6_interfaces::srv::ControllerCommand::Response::ACK_NONE};
+  std::atomic<uint8_t> last_cmd_ack_mode_{lite6_interfaces::msg::ControllerStatus::MODE_UNKNOWN};
+  std::atomic<uint64_t> last_cmd_ack_mode_epoch_{0};
+
+  uint64_t controller_epoch_ = 0;
+  uint64_t mode_epoch_ = 0;
+  uint64_t status_seq_ = 0;
+  uint64_t last_cmd_seq_ = 0;
+  uint8_t last_cmd_code_ = lite6_interfaces::srv::ControllerCommand::Request::CMD_NONE;
+  uint8_t last_cmd_result_ = lite6_interfaces::srv::ControllerCommand::Response::ACK_NONE;
+  double payload_mass_ = 0.0;
+  std::array<double, 3> payload_com_tcp_{0.0, 0.0, 0.0};
+  double compliance_stopping_elapsed_ = 0.0;
+  bool rigid_cancel_braking_ = false;
+  double rigid_cancel_elapsed_ = 0.0;
 
   lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::StateShmSegment> state_shm_;
   uint64_t shadow_epoch_ = 0;

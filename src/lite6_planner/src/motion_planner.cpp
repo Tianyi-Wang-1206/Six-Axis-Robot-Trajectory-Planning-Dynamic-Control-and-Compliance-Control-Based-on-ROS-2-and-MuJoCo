@@ -139,11 +139,11 @@ trajectory_msgs::msg::JointTrajectory MotionPlanner::plan(const Goal& goal,
   check_cancelled(cancel);
   if(goal.command_type==Goal::MOVEJ||goal.command_type==Goal::MOVEP) {
     Goal target=goal;
-    // Recovery/SysID alignment may send a snapshot of measured joint positions
+    // SysID alignment may send a snapshot of measured joint positions
     // back as the target. Apply the observation allowance only to such local
     // alignment requests, never to an arbitrary normal-motion target.
     bool observation_target=goal.command_type==Goal::MOVEJ&&
-        (goal.context==Goal::CONTEXT_RECOVERY||goal.context==Goal::CONTEXT_SYSID);
+        goal.context==Goal::CONTEXT_SYSID;
     for(size_t i=0;i<6;++i)
       observation_target=observation_target&&std::isfinite(goal.joint_target[i])&&
           std::abs(goal.joint_target[i]-initial.q[i])<=tolerance::kObservedPosition;

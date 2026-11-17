@@ -36,7 +36,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/IndustrialMotion.action"
   "action/FollowImpedanceTrajectory.action"
   "msg/ComplianceSettings.msg"
-  "msg/ComplianceCommand.msg"
   "msg/ControllerStatus.msg"
   "msg/SysIdSample.msg"
   "msg/SimulationState.msg"

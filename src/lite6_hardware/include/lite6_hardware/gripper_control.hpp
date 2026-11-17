@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <mujoco/mujoco.h>
 #include <rclcpp/rclcpp.hpp>
@@ -41,6 +42,7 @@ private:
     int64_t issued_ns = 0;
     uint64_t sequence = 0, epoch = 0;
     uint8_t action = 0;
+    double max_force_override = 0.0;
   };
   struct Snapshot {
     Feedback feedback;
@@ -48,8 +50,12 @@ private:
     bool ready = false;
     uint64_t sequence = 0;
     double effort = 0.0;
+    uint8_t last_command = 0;
+    uint8_t last_cmd_result = State::CMD_RES_NONE;
+    double max_force = 0.0;
   };
   struct Channel {
+    std::mutex service_mutex;
     detail::SpscQueue<Command, 32> commands;
     // STOP cannot be refused because the motion queue is full.
     detail::LatestSnapshot<Command> stops;
@@ -71,6 +77,7 @@ private:
   std::vector<std::array<double, 2>> contact_forces_;
   int motor_ = -1;
   Snapshot state_;
+  double active_max_force_ = 0.0;
   double open_ = 0.0, closed_ = 0.0, target_ = 0.0, reference_ = 0.0, reference_velocity_ = 0.0;
   double elapsed_ = 0.0, settled_ = 0.0, grasp_time_ = 0.0, lost_time_ = 0.0;
   int candidate_object_ = -1, grasped_object_ = -1;

@@ -125,8 +125,12 @@ bool Lite6CTCController::configure_impedance_trajectory()
   impedance_trajectory_server_ = rclcpp_action::create_server<FollowImpedance>(
     node, "~/follow_impedance_trajectory",
     [this](const rclcpp_action::GoalUUID &, std::shared_ptr<const FollowImpedance::Goal> goal) {
+      using CS = lite6_interfaces::msg::ControllerStatus;
       std::lock_guard<std::mutex> lock(trajectory_mutex_);
-      if (!trajectory_enabled_.load() || compliance_blocks_trajectory_.load() ||
+      const uint8_t mode = current_mode_atomic_.load(std::memory_order_acquire);
+      if (!trajectory_enabled_.load(std::memory_order_acquire) ||
+          compliance_blocks_trajectory_.load() ||
+          mode != CS::MODE_NORMAL ||
           trajectory_reserved_ || impedance_trajectory_reserved_ ||
           !valid_impedance_trajectory_goal(*goal)) {
         return rclcpp_action::GoalResponse::REJECT;
@@ -160,7 +164,10 @@ bool Lite6CTCController::configure_impedance_trajectory()
 bool Lite6CTCController::valid_impedance_trajectory_goal(
   const FollowImpedance::Goal & goal) const
 {
-  if (goal.joint_names != joint_names_ || goal.points.empty()) {
+  if (goal.joint_names != joint_names_ || goal.points.empty() ||
+      !lite6_interfaces::valid_transition_time(goal.transition_time) ||
+      (goal.end_behavior != FollowImpedance::Goal::END_TRANSITION_NORMAL &&
+       goal.end_behavior != FollowImpedance::Goal::END_HOLD_CARTESIAN_IMPEDANCE)) {
     return false;
   }
   double previous = -1.0;
@@ -236,30 +243,53 @@ void Lite6CTCController::update_impedance_trajectory_reference(
     return;
   }
   if (execution->cancel.load()) {
+    if (!execution->started) {
+      execution->cancel_applied = true;
+      return;
+    }
     if (!execution->cancel_applied) {
       if (system_state_ == SystemState::CARTESIAN_IMPEDANCE_TRAJECTORY) {
-        system_state_ = SystemState::COMPLIANCE_STOPPING;
-        estop_q_ = q_;
-        estop_dq_ = dq_;
+        begin_deceleration_tracker();
+        compliance_stopping_elapsed_ = 0.0;
         integral_effort_.setZero();
-        status_publish_pending_ = true;
+        transition_system_state(SystemState::COMPLIANCE_STOPPING);
       }
       execution->cancel_applied = true;
     }
     return;
   }
 
-  const auto & points = execution->goal->get_goal()->points;
+  auto abort_prestart = [&](
+    ImpedanceTrajectoryResult reason, int joint, double value, double limit,
+    const char * detail) {
+    execution->failure_joint = joint;
+    execution->failure_value = value;
+    execution->failure_limit = limit;
+    execution->failure_detail = detail;
+    execution->result.store(reason);
+  };
+
+  const auto & goal = *execution->goal->get_goal();
+  const auto & points = goal.points;
   if (!execution->started) {
-    if (system_state_ != SystemState::NORMAL || execution_stop_latched_) {
-      fail_impedance_trajectory(
+    if (goal.expected_controller_epoch > 0 &&
+        goal.expected_controller_epoch != controller_epoch_) {
+      abort_prestart(
+        ImpedanceTrajectoryResult::EPOCH_MISMATCH, -1,
+        static_cast<double>(goal.expected_controller_epoch),
+        static_cast<double>(controller_epoch_),
+        "Expected controller_epoch does not match active controller epoch");
+      return;
+    }
+    if (system_state_ != SystemState::NORMAL) {
+      abort_prestart(
         ImpedanceTrajectoryResult::MODE_CHANGED, -1, 0.0, 0.0,
         "Controller must be in NORMAL mode to start impedance trajectory");
       return;
     }
     for (size_t i = 0; i < joint_names_.size(); ++i) {
       if (std::abs(dq_[i]) > imp_entry_max_speed_) {
-        fail_impedance_trajectory(
+        abort_prestart(
           ImpedanceTrajectoryResult::VELOCITY_LIMIT, static_cast<int>(i),
           std::abs(dq_[i]), imp_entry_max_speed_,
           "Entry joint speed exceeds impedance_execution.entry_max_speed [rad/s]");
@@ -267,7 +297,7 @@ void Lite6CTCController::update_impedance_trajectory_reference(
       }
       const double pos_diff = std::abs(points.front().positions[i] - q_[i]);
       if (pos_diff > imp_entry_position_tolerance_) {
-        fail_impedance_trajectory(
+        abort_prestart(
           ImpedanceTrajectoryResult::DEVIATION_LIMIT, static_cast<int>(i),
           pos_diff, imp_entry_position_tolerance_,
           "Initial impedance trajectory point deviates from measured joint pose [rad]");
@@ -276,7 +306,7 @@ void Lite6CTCController::update_impedance_trajectory_reference(
     }
     execution->started = true;
     execution->start_time_ns = time.nanoseconds();
-    system_state_ = SystemState::CARTESIAN_IMPEDANCE_TRAJECTORY;
+    transition_system_state(SystemState::CARTESIAN_IMPEDANCE_TRAJECTORY);
     // Preserve last cycle's output torque for bumpless transition into impedance control.
     compliance_last_tau_ = tau_cmd_;
     compliance_saturation_time_ = 0.0;
@@ -471,10 +501,22 @@ void Lite6CTCController::finish_impedance_trajectory_cycle(double dt)
   }
   if (execution->cancel.load()) {
     // Wait until COMPLIANCE_STOPPING decelerates the arm to rest and restores NORMAL
-    // (or ESTOP if interrupted), ensuring a stationary, reference-synced post-cancel state.
-    if (execution->cancel_applied &&
-        (system_state_ == SystemState::NORMAL || system_state_ == SystemState::ESTOP)) {
-      execution->result.store(ImpedanceTrajectoryResult::CANCELED);
+    // (or ESTOP if interrupted/timed out), ensuring a stationary, reference-synced post-cancel state.
+    if (execution->cancel_applied) {
+      if (!execution->started || system_state_ == SystemState::NORMAL) {
+        execution->result.store(ImpedanceTrajectoryResult::CANCELED);
+      } else if (system_state_ == SystemState::ESTOP) {
+        if (estop_reason_ ==
+            lite6_interfaces::msg::ControllerStatus::ESTOP_COMPLIANCE_STOPPING_TIMEOUT) {
+          execution->failure_value = lite6_interfaces::contract::kComplianceStoppingTimeoutSec;
+          execution->failure_limit = lite6_interfaces::contract::kComplianceStoppingTimeoutSec;
+          execution->failure_detail =
+            "COMPLIANCE_STOPPING timed out during impedance trajectory cancellation";
+          execution->result.store(ImpedanceTrajectoryResult::STOPPING_TIMEOUT);
+        } else {
+          execution->result.store(ImpedanceTrajectoryResult::CANCELED);
+        }
+      }
     }
     return;
   }
@@ -569,22 +611,68 @@ void Lite6CTCController::finish_impedance_trajectory_cycle(double dt)
       worst_ratio, 1.0,
       "Impedance trajectory goal settling deadline exceeded");
   } else if (execution->settled_duration >= imp_goal_settle_duration_) {
-    // Recapture the actual resting pose into reference_interfaces_ before restoring NORMAL,
-    // guaranteeing zero initial position/velocity error and bumpless handover to rigid CTC.
-    const size_t n = joint_names_.size();
-    for (size_t i = 0; i < n; ++i) {
-      reference_interfaces_[i] = q_[i];
-      reference_interfaces_[n + i] = 0.0;
-      reference_interfaces_[2 * n + i] = 0.0;
+    const auto & goal = *execution->goal->get_goal();
+    if (goal.end_behavior == FollowImpedance::Goal::END_HOLD_CARTESIAN_IMPEDANCE) {
+      const auto & last = goal.points.back();
+      dynamics_q_ref_.head<6>() = q_imp_ref_;
+      dynamics_q_ref_.tail<2>() = dynamics_q_.tail<2>();
+      pinocchio::forwardKinematics(pin_model_, pin_data_ref_, dynamics_q_ref_);
+      compliance_pose_ = pinocchio::updateFramePlacement(
+        pin_model_, pin_data_ref_, compliance_frame_);
+      compliance_q_ = q_imp_ref_;
+      compliance_settings_.joint_stiffness = 20.0;
+      compliance_settings_.joint_damping = 3.0;
+      compliance_settings_.translation_stiffness = std::clamp(
+        (last.translation_stiffness[0] + last.translation_stiffness[1] + last.translation_stiffness[2]) / 3.0,
+        lite6_interfaces::contract::kMinTranslationStiffness,
+        lite6_interfaces::contract::kMaxTranslationStiffness);
+      compliance_settings_.translation_damping = std::clamp(
+        (last.translation_damping[0] + last.translation_damping[1] + last.translation_damping[2]) / 3.0,
+        lite6_interfaces::contract::kMinTranslationDamping,
+        lite6_interfaces::contract::kMaxTranslationDamping);
+      compliance_settings_.rotation_stiffness = std::clamp(
+        (last.rotation_stiffness[0] + last.rotation_stiffness[1] + last.rotation_stiffness[2]) / 3.0,
+        lite6_interfaces::contract::kMinRotationStiffness,
+        lite6_interfaces::contract::kMaxRotationStiffness);
+      compliance_settings_.rotation_damping = std::clamp(
+        (last.rotation_damping[0] + last.rotation_damping[1] + last.rotation_damping[2]) / 3.0,
+        lite6_interfaces::contract::kMinRotationDamping,
+        lite6_interfaces::contract::kMaxRotationDamping);
+      compliance_settings_.sensitivity = 3.0;
+      compliance_settings_.recapture = false;
+      compliance_settings_.nullspace_stiffness = std::clamp(
+        last.nullspace_stiffness,
+        lite6_interfaces::contract::kMinNullspaceStiffness,
+        lite6_interfaces::contract::kMaxNullspaceStiffness);
+      compliance_settings_.nullspace_damping = std::clamp(
+        last.nullspace_damping,
+        lite6_interfaces::contract::kMinNullspaceDamping,
+        lite6_interfaces::contract::kMaxNullspaceDamping);
+      compliance_filtered_ = compliance_settings_;
+      compliance_last_tau_ = tau_cmd_;
+      compliance_saturation_time_ = 0.0;
+      compliance_external_torque_time_ = 0.0;
+      compliance_saturation_estop_pending_ = false;
+      integral_effort_.setZero();
+      transition_system_state(SystemState::CARTESIAN_IMPEDANCE);
+      execution->result.store(ImpedanceTrajectoryResult::SUCCEEDED);
+    } else {
+      // Recapture the actual resting pose into reference_interfaces_ before restoring NORMAL,
+      // guaranteeing zero initial position/velocity error and bumpless handover to rigid CTC.
+      const size_t n = joint_names_.size();
+      for (size_t i = 0; i < n; ++i) {
+        reference_interfaces_[i] = q_[i];
+        reference_interfaces_[n + i] = 0.0;
+        reference_interfaces_[2 * n + i] = 0.0;
+      }
+      q_target_ = q_;
+      dq_target_.setZero();
+      ddq_target_.setZero();
+      integral_effort_.setZero();
+      clear_estop_reason();
+      transition_system_state(SystemState::NORMAL);
+      execution->result.store(ImpedanceTrajectoryResult::SUCCEEDED);
     }
-    q_target_ = q_;
-    dq_target_.setZero();
-    ddq_target_.setZero();
-    integral_effort_.setZero();
-    clear_estop_reason();
-    system_state_ = SystemState::NORMAL;
-    status_publish_pending_ = true;
-    execution->result.store(ImpedanceTrajectoryResult::SUCCEEDED);
   }
 }
 
@@ -636,17 +724,30 @@ void Lite6CTCController::monitor_impedance_trajectory()
     return;
   }
 
+  if (outcome == ImpedanceTrajectoryResult::CANCELED && !goal->is_canceling()) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    if (active_impedance_trajectory_ == execution) {
+      retired_impedance_trajectories_.push_back(std::move(active_impedance_trajectory_));
+      impedance_trajectory_buffer_.writeFromNonRT(
+        std::shared_ptr<ImpedanceTrajectoryExecution>{});
+      impedance_trajectory_reserved_ = false;
+    }
+  }
+
   auto result = std::make_shared<FollowImpedance::Result>();
   if (outcome == ImpedanceTrajectoryResult::CANCELED) {
-    if (!goal->is_canceling()) {
-      return;
-    }
     result->error_code = FollowImpedance::Result::SUCCESSFUL;
     result->error_string = "Impedance trajectory canceled and safely settled to NORMAL";
     goal->canceled(result);
   } else if (outcome == ImpedanceTrajectoryResult::SUCCEEDED) {
     result->error_code = FollowImpedance::Result::SUCCESSFUL;
-    result->error_string = "Impedance trajectory completed; reference synced to resting pose";
+    result->error_string =
+      goal->get_goal()->end_behavior == FollowImpedance::Goal::END_HOLD_CARTESIAN_IMPEDANCE ?
+      "Impedance trajectory completed; holding pose in CARTESIAN_IMPEDANCE" :
+      "Impedance trajectory completed; reference synced to resting pose";
     goal->succeed(result);
   } else {
     switch (outcome) {
@@ -671,6 +772,12 @@ void Lite6CTCController::monitor_impedance_trajectory()
       case ImpedanceTrajectoryResult::MODE_CHANGED:
         result->error_code = FollowImpedance::Result::MODE_CHANGED;
         break;
+      case ImpedanceTrajectoryResult::EPOCH_MISMATCH:
+        result->error_code = FollowImpedance::Result::CONTROLLER_EPOCH_MISMATCH;
+        break;
+      case ImpedanceTrajectoryResult::STOPPING_TIMEOUT:
+        result->error_code = FollowImpedance::Result::STOPPING_TIMEOUT;
+        break;
       default:
         result->error_code = FollowImpedance::Result::CONTROLLER_FAULT;
         break;
@@ -686,14 +793,6 @@ void Lite6CTCController::monitor_impedance_trajectory()
         ", limit=" + std::to_string(execution->failure_limit);
     }
     goal->abort(result);
-  }
-
-  std::lock_guard<std::mutex> lock(trajectory_mutex_);
-  if (active_impedance_trajectory_ == execution) {
-    retired_impedance_trajectories_.push_back(std::move(active_impedance_trajectory_));
-    impedance_trajectory_buffer_.writeFromNonRT(
-      std::shared_ptr<ImpedanceTrajectoryExecution>{});
-    impedance_trajectory_reserved_ = false;
   }
 }
 

@@ -9,13 +9,14 @@
 #include "lite6_interfaces/msg/controller_status.hpp"
 #include "lite6_interfaces/msg/gripper_state.hpp"
 #include "lite6_interfaces/msg/studio_state.hpp"
+#include "lite6_interfaces/motion_contract.hpp"
 #include "lite6_interfaces/shm_registers.hpp"
 #include "lite6_interfaces/srv/compile_program.hpp"
+#include "lite6_interfaces/srv/controller_command.hpp"
 #include "lite6_interfaces/srv/gripper_command.hpp"
 #include "lite6_interfaces/srv/studio_command.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
-#include "std_msgs/msg/int32.hpp"
 
 #include <algorithm>
 #include <array>
@@ -61,6 +62,7 @@ public:
   using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
   using FollowImpedanceTrajectory = lite6_interfaces::action::FollowImpedanceTrajectory;
   using CompileProgram = lite6_interfaces::srv::CompileProgram;
+  using ControllerCommand = lite6_interfaces::srv::ControllerCommand;
   using StudioCommand = lite6_interfaces::srv::StudioCommand;
   using GripperCommand = lite6_interfaces::srv::GripperCommand;
   using GripperState = lite6_interfaces::msg::GripperState;
@@ -87,6 +89,7 @@ public:
     compile_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     service_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     client_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    ctc_cmd_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
     if (!state_shm_.open(false)) {
       throw std::runtime_error("Failed to open read-only state shared memory");
@@ -94,8 +97,8 @@ public:
 
     const auto state_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     state_pub_ = create_publisher<StudioState>("/studio/state", state_qos);
-    system_cmd_pub_ = create_publisher<std_msgs::msg::Int32>(
-      "/ctc_controller/system_cmd", rclcpp::QoS(10).reliable());
+    ctc_cmd_client_ = create_client<ControllerCommand>(
+      "/ctc_controller/command", rclcpp::ServicesQoS(), ctc_cmd_group_);
 
     supervisor_ = std::make_unique<StudioSupervisor>(
       [this](const StudioSupervisor::Snapshot & snap) { publish_snapshot(snap); });
@@ -199,6 +202,9 @@ private:
     msg.external_cartesian_wrench = snap.external_cartesian_wrench;
     msg.contact_detected = snap.contact_detected;
     msg.detail = snap.detail;
+    msg.controller_epoch = snap.controller_epoch;
+    msg.program_revision = snap.program_revision;
+    msg.last_compile_request_id = snap.last_compile_request_id;
 
     std::lock_guard<std::mutex> pub_lock(pub_mutex_);
     if (msg.revision < last_published_revision_) {
@@ -210,15 +216,56 @@ private:
     }
   }
 
+  void send_controller_command_async(
+    uint8_t command, uint64_t expected_epoch, const std::string & reason)
+  {
+    if (!ctc_cmd_client_ || !ctc_cmd_client_->service_is_ready()) {
+      return;
+    }
+    auto req = std::make_shared<ControllerCommand::Request>();
+    req->command = command;
+    req->expected_epoch = expected_epoch;
+    req->reason = reason;
+    ctc_cmd_client_->async_send_request(req);
+  }
+
+  bool send_controller_command_sync(
+    uint8_t command,
+    uint64_t expected_epoch,
+    const std::string & reason,
+    uint8_t & out_ack,
+    std::string & out_msg)
+  {
+    out_ack = ControllerCommand::Response::ACK_NONE;
+    if (!ctc_cmd_client_->wait_for_service(std::chrono::milliseconds(50))) {
+      out_msg = "/ctc_controller/command service unavailable";
+      return false;
+    }
+    auto req = std::make_shared<ControllerCommand::Request>();
+    req->command = command;
+    req->expected_epoch = expected_epoch;
+    req->reason = reason;
+    auto future = ctc_cmd_client_->async_send_request(req);
+    if (future.wait_for(std::chrono::milliseconds(250)) != std::future_status::ready) {
+      out_ack = ControllerCommand::Response::ACK_RT_TIMEOUT;
+      out_msg = "Timed out waiting for /ctc_controller/command response";
+      return false;
+    }
+    const auto resp = future.get();
+    out_ack = resp->ack_result;
+    out_msg = resp->message;
+    return resp->accepted;
+  }
+
   void apply_effects(const StudioSupervisor::Effects & effects)
   {
     if (effects.send_estop_cmd) {
-      std_msgs::msg::Int32 cmd;
-      cmd.data = 1;
-      std::lock_guard<std::mutex> pub_lock(pub_mutex_);
-      if (system_cmd_pub_) {
-        system_cmd_pub_->publish(cmd);
-      }
+      send_controller_command_async(
+        ControllerCommand::Request::CMD_ESTOP, 0, "StudioSupervisor E-STOP");
+    }
+    if (effects.send_enter_normal_cmd) {
+      send_controller_command_async(
+        ControllerCommand::Request::CMD_ENTER_NORMAL, 0, "StudioSupervisor enter NORMAL");
     }
     if (effects.cancel_controller_goals) {
       cancel_active_controller_goals();
@@ -266,7 +313,9 @@ private:
       return;
     }
     const int64_t now_ns = lite6_interfaces::shm::steady_now_ns();
-    if (pod.steady_stamp_ns <= 0 || now_ns - pod.steady_stamp_ns >= 800000000LL) {
+    if (pod.steady_stamp_ns <= 0 ||
+        now_ns - pod.steady_stamp_ns > lite6_interfaces::contract::kJointStateStaleTimeoutNs)
+    {
       return;
     }
     if (seq == last_joint_seq_ || pod.steady_stamp_ns <= last_joint_steady_ns_) {
@@ -338,7 +387,8 @@ private:
       uint64_t seq = 0;
       const int64_t now_ns = lite6_interfaces::shm::steady_now_ns();
       if (state_shm_->joint_state.read(pod, seq) && pod.valid != 0 &&
-          pod.steady_stamp_ns > 0 && now_ns - pod.steady_stamp_ns < 800000000LL)
+          pod.steady_stamp_ns > 0 &&
+          now_ns - pod.steady_stamp_ns <= lite6_interfaces::contract::kJointStateStaleTimeoutNs)
       {
         bool finite_ok = true;
         double max_dq = 0.0;
@@ -377,9 +427,12 @@ private:
       compile_in_flight_.fetch_sub(1, std::memory_order_acq_rel);
     }};
 
+    resp->request_id = req->request_id;
+    resp->program_revision = 0;
+
     std::lock_guard<std::mutex> compile_lock(compile_mutex_);
     std::string busy_reason;
-    if (!supervisor_->can_compile(busy_reason)) {
+    if (req->auto_load && !supervisor_->can_compile(busy_reason)) {
       Diagnostic d;
       d.severity = Diagnostic::SEVERITY_ERROR;
       d.stage = Diagnostic::STAGE_SEMANTIC;
@@ -405,7 +458,9 @@ private:
         d.statement_index = -1;
         d.code = "ERR_NO_JOINT_STATE";
         d.message = "Cannot resolve current robot start pose: /joint_states unavailable or stale";
-        supervisor_->on_compile_failed();
+        if (req->auto_load) {
+          supervisor_->on_compile_failed(req->request_id);
+        }
         resp->success = false;
         resp->diagnostics.push_back(d);
         return;
@@ -418,24 +473,36 @@ private:
     std::vector<Diagnostic> diags;
     const bool ok = compiler_->compile(req->source_code, start_joints, *compiled, diags);
     if (!ok) {
-      {
-        std::lock_guard<std::mutex> exec_lock(exec_mutex_);
-        loaded_program_.reset();
-        reset_exec_cursor_unlocked();
+      if (req->auto_load) {
+        {
+          std::lock_guard<std::mutex> exec_lock(exec_mutex_);
+          loaded_program_.reset();
+          reset_exec_cursor_unlocked();
+        }
+        supervisor_->on_compile_failed(req->request_id);
       }
-      supervisor_->on_compile_failed();
       resp->success = false;
       resp->diagnostics = std::move(diags);
       return;
     }
 
-    {
+    if (req->auto_load) {
+      uint64_t new_rev = 0;
+      {
+        std::lock_guard<std::mutex> exec_lock(exec_mutex_);
+        loaded_program_ = compiled;
+        reset_exec_cursor_unlocked();
+        new_rev = ++program_revision_;
+      }
+      supervisor_->on_compile_succeeded(
+        compiled->program_id, static_cast<int32_t>(compiled->total_blocks),
+        new_rev, req->request_id);
+      resp->program_revision = new_rev;
+    } else {
+      supervisor_->on_compile_dry_run(req->request_id);
       std::lock_guard<std::mutex> exec_lock(exec_mutex_);
-      loaded_program_ = compiled;
-      reset_exec_cursor_unlocked();
+      resp->program_revision = program_revision_;
     }
-    supervisor_->on_compile_succeeded(
-      compiled->program_id, static_cast<int32_t>(compiled->total_blocks));
 
     resp->success = true;
     resp->program_id = compiled->program_id;
@@ -458,13 +525,45 @@ private:
          cmd == StudioCommand::Request::CMD_STEP ||
          cmd == StudioCommand::Request::CMD_CLEAR_PROGRAM))
     {
+      const auto snap = supervisor_->snapshot();
       resp->accepted = false;
-      resp->revision = supervisor_->snapshot().revision;
+      resp->revision = snap.revision;
+      resp->state = snap.state;
+      resp->controller_epoch = snap.controller_epoch;
       resp->message = "Compilation is currently in progress; wait for completion";
       return;
     }
 
-    const auto result = supervisor_->handle_command(cmd, req->reason);
+    if (cmd == StudioCommand::Request::CMD_RESET_FAULT) {
+      const auto pre_snap = supervisor_->snapshot();
+      if (pre_snap.state == StudioState::STATE_FAULT &&
+          !pre_snap.estop_latched &&
+          pre_snap.controller_fresh &&
+          pre_snap.controller_mode != ControllerStatus::MODE_ESTOP &&
+          pre_snap.controller_mode != ControllerStatus::MODE_NORMAL &&
+          (req->expected_revision == 0 || req->expected_revision == pre_snap.revision))
+      {
+        uint8_t ack = ControllerCommand::Response::ACK_NONE;
+        std::string ack_msg;
+        (void)send_controller_command_sync(
+          ControllerCommand::Request::CMD_ENTER_NORMAL,
+          pre_snap.controller_epoch,
+          "Return controller to MODE_NORMAL before resetting Studio fault",
+          ack, ack_msg);
+        const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1800);
+        while (rclcpp::ok() && std::chrono::steady_clock::now() < wait_deadline) {
+          const auto cur = supervisor_->snapshot();
+          if (cur.controller_mode == ControllerStatus::MODE_NORMAL ||
+              cur.controller_mode == ControllerStatus::MODE_ESTOP)
+          {
+            break;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+      }
+    }
+
+    const auto result = supervisor_->handle_command(cmd, req->expected_revision, req->reason);
     if (result.accepted &&
         (cmd == StudioCommand::Request::CMD_RUN ||
          cmd == StudioCommand::Request::CMD_ESTOP ||
@@ -482,6 +581,8 @@ private:
 
     resp->accepted = result.accepted;
     resp->revision = result.revision;
+    resp->state = result.state;
+    resp->controller_epoch = result.controller_epoch;
     resp->message = result.message;
   }
 
@@ -666,8 +767,7 @@ private:
         }
       }
 
-      const uint8_t st = supervisor_->current_state();
-      const uint64_t session = supervisor_->active_session();
+      const auto [st, session] = supervisor_->state_and_session();
       if (st == StudioState::STATE_RECOVERING) {
         execute_recovery(session);
       } else if (st == StudioState::STATE_RUNNING || st == StudioState::STATE_STEPPING) {
@@ -678,13 +778,14 @@ private:
 
   void execute_recovery(uint64_t session)
   {
-    bool sent_normal_cmd = false;
-    auto last_normal_cmd_tp = std::chrono::steady_clock::time_point{};
+    bool sent_clear_cmd = false;
+    auto last_clear_cmd_tp = std::chrono::steady_clock::time_point{};
 
-    while (rclcpp::ok() && !worker_exit_ &&
-           supervisor_->active_session() == session &&
-           supervisor_->current_state() == StudioState::STATE_RECOVERING)
-    {
+    while (rclcpp::ok() && !worker_exit_) {
+      const auto [st, active_sess] = supervisor_->state_and_session();
+      if (active_sess != session || st != StudioState::STATE_RECOVERING) {
+        return;
+      }
       const auto sub = supervisor_->recovery_subphase();
       if (sub == StudioSupervisor::RecoverySubPhase::WAIT_SETTLE ||
           sub == StudioSupervisor::RecoverySubPhase::POST_SETTLE)
@@ -693,74 +794,32 @@ private:
         continue;
       }
 
-      if (sub == StudioSupervisor::RecoverySubPhase::SYNC_REFERENCE) {
-        bool synced = false;
-        std::string last_err;
-        for (int attempt = 0; attempt < 6 && rclcpp::ok() &&
-             supervisor_->active_session() == session &&
-             supervisor_->current_state() == StudioState::STATE_RECOVERING &&
-             supervisor_->recovery_subphase() == StudioSupervisor::RecoverySubPhase::SYNC_REFERENCE;
-             ++attempt)
-        {
-          std::array<double, 6> q_actual{};
-          double max_dq = 0.0;
-          if (!get_latest_joint_state(q_actual, max_dq)) {
-            last_err = "Joint telemetry stale during recovery reference sync";
-            break;
-          }
-
-          FollowJointTrajectory::Goal goal;
-          goal.trajectory.joint_names = kJointNames;
-          trajectory_msgs::msg::JointTrajectoryPoint p0;
-          p0.positions.assign(q_actual.begin(), q_actual.end());
-          p0.velocities.assign(6, 0.0);
-          p0.accelerations.assign(6, 0.0);
-          p0.time_from_start.sec = 0;
-          p0.time_from_start.nanosec = 0;
-
-          trajectory_msgs::msg::JointTrajectoryPoint p1 = p0;
-          p1.time_from_start.nanosec = 50000000;  // 50 ms stationary sync
-
-          goal.trajectory.points = {p0, p1};
-
-          const auto outcome = run_controller_action<FollowJointTrajectory>(
-            rigid_client_, goal, session, 6.0, nullptr, true, false, last_err);
-          if (outcome == ActionOutcome::SESSION_SUPERSEDED) {
-            return;
-          }
-          if (outcome == ActionOutcome::SUCCEEDED) {
-            synced = true;
-            break;
-          }
-          std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-
-        if (synced) {
-          supervisor_->on_recovery_sync_succeeded(session);
-          sent_normal_cmd = false;
-        } else if (supervisor_->active_session() == session &&
-                   supervisor_->current_state() == StudioState::STATE_RECOVERING)
-        {
-          supervisor_->on_recovery_failed(
-            session, last_err.empty() ? "Reference sync failed" : last_err);
-          return;
-        }
-        continue;
-      }
-
       if (sub == StudioSupervisor::RecoverySubPhase::ENABLE_NORMAL) {
         const auto now_tp = std::chrono::steady_clock::now();
-        if (!sent_normal_cmd || (now_tp - last_normal_cmd_tp) > std::chrono::milliseconds(500)) {
-          std_msgs::msg::Int32 cmd;
-          cmd.data = 0;
+        if (!sent_clear_cmd || (now_tp - last_clear_cmd_tp) > std::chrono::milliseconds(300)) {
+          uint8_t ack = ControllerCommand::Response::ACK_NONE;
+          std::string err;
+          const uint64_t epoch = supervisor_->snapshot().controller_epoch;
+          const bool ok = send_controller_command_sync(
+            ControllerCommand::Request::CMD_CLEAR_ESTOP,
+            epoch,
+            "Studio E-STOP recovery via CMD_CLEAR_ESTOP",
+            ack,
+            err);
+          sent_clear_cmd = true;
+          last_clear_cmd_tp = now_tp;
+          if (!ok && ack != ControllerCommand::Response::ACK_REJECTED_SPEED &&
+              ack != ControllerCommand::Response::ACK_RT_TIMEOUT)
           {
-            std::lock_guard<std::mutex> pub_lock(pub_mutex_);
-            if (system_cmd_pub_) {
-              system_cmd_pub_->publish(cmd);
+            const auto [cur_st, cur_sess] = supervisor_->state_and_session();
+            if (cur_sess == session && cur_st == StudioState::STATE_RECOVERING &&
+                supervisor_->recovery_subphase() == StudioSupervisor::RecoverySubPhase::ENABLE_NORMAL)
+            {
+              supervisor_->on_recovery_failed(
+                session, err.empty() ? "Controller rejected CMD_CLEAR_ESTOP" : err);
+              return;
             }
           }
-          sent_normal_cmd = true;
-          last_normal_cmd_tp = now_tp;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
       }
@@ -1134,9 +1193,11 @@ private:
       supervisor_->update_impedance_errors(session, fb.position_error_m, fb.rotation_error_rad);
     };
 
+    auto imp_goal = blk.impedance_goal;
+    imp_goal.expected_controller_epoch = supervisor_->snapshot().controller_epoch;
     std::string err;
     const auto outcome = run_controller_action<FollowImpedanceTrajectory>(
-      imp_client_, blk.impedance_goal, session, blk.duration_sec + 12.0, fb_cb, false, true, err);
+      imp_client_, imp_goal, session, blk.duration_sec + 12.0, fb_cb, false, true, err);
     supervisor_->clear_impedance_errors();
     return handle_trajectory_outcome(
       session, blk, block_idx, last_sample.load(), total_pts, outcome, err, calc_total_pct);
@@ -1176,6 +1237,9 @@ private:
         paused_mid_block_ = true;
         paused_sample_idx_ = safe_idx;
         paused_block_snapshot_ = blk;
+        if (blk.type == ExecutionBlockType::IMPEDANCE_TRAJECTORY) {
+          post_impedance_offset_active_ = true;
+        }
       }
       supervisor_->on_pause_settled(
         session, loc.line, loc.statement_index, static_cast<int32_t>(block_idx),
@@ -1261,28 +1325,45 @@ private:
       }
 
       if (have_gs && gs.applied_sequence >= target_seq) {
-        if (gs.state == GripperState::FAULT) {
+        const bool seq_exact = (gs.applied_sequence == target_seq);
+        if (gs.state == GripperState::FAULT ||
+            (seq_exact &&
+             (gs.last_cmd_result == GripperState::CMD_RES_FAULT ||
+              gs.last_cmd_result == GripperState::CMD_RES_BLOCKED)))
+        {
           StudioSupervisor::Effects eff;
           supervisor_->on_execution_fault(
-            session, -33, "Gripper hardware reported FAULT: " + gs.detail, false, eff);
+            session, -33, "Gripper command failed: " + gs.detail, false, eff);
           apply_effects(eff);
           return false;
         }
-        bool done = false;
-        if (blk.gripper_cmd.action == GripperActionType::OPEN &&
-            gs.state == GripperState::OPEN)
+        if (seq_exact &&
+            gs.last_cmd_result == GripperState::CMD_RES_STOPPED &&
+            blk.gripper_cmd.action != GripperActionType::STOP)
         {
-          done = true;
-        } else if (
-          blk.gripper_cmd.action == GripperActionType::CLOSE &&
-          (gs.state == GripperState::CLOSED || gs.state == GripperState::GRASPED))
-        {
-          done = true;
-        } else if (
-          blk.gripper_cmd.action == GripperActionType::STOP &&
-          gs.state == GripperState::STOPPED)
-        {
-          done = true;
+          StudioSupervisor::Effects eff;
+          supervisor_->on_execution_fault(
+            session, -33, "Gripper motion stopped externally before completion", false, eff);
+          apply_effects(eff);
+          return false;
+        }
+        bool done = seq_exact && (gs.last_cmd_result == GripperState::CMD_RES_SUCCEEDED);
+        if (!done) {
+          if (blk.gripper_cmd.action == GripperActionType::OPEN &&
+              gs.state == GripperState::OPEN)
+          {
+            done = true;
+          } else if (
+            blk.gripper_cmd.action == GripperActionType::CLOSE &&
+            (gs.state == GripperState::CLOSED || gs.state == GripperState::GRASPED))
+          {
+            done = true;
+          } else if (
+            blk.gripper_cmd.action == GripperActionType::STOP &&
+            gs.state == GripperState::STOPPED)
+          {
+            done = true;
+          }
         }
         if (done) {
           supervisor_->update_execution_progress(
@@ -1360,6 +1441,7 @@ private:
   rclcpp::CallbackGroup::SharedPtr compile_group_;
   rclcpp::CallbackGroup::SharedPtr service_group_;
   rclcpp::CallbackGroup::SharedPtr client_group_;
+  rclcpp::CallbackGroup::SharedPtr ctc_cmd_group_;
 
   lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::StateShmSegment> state_shm_;
   uint64_t last_joint_seq_ = 0;
@@ -1367,7 +1449,7 @@ private:
   rclcpp::TimerBase::SharedPtr joint_poll_timer_;
 
   rclcpp::Publisher<StudioState>::SharedPtr state_pub_;
-  rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr system_cmd_pub_;
+  rclcpp::Client<ControllerCommand>::SharedPtr ctc_cmd_client_;
   rclcpp::Subscription<ControllerStatus>::SharedPtr controller_sub_;
   rclcpp::Subscription<GripperState>::SharedPtr gripper_sub_;
   rclcpp_action::Client<FollowJointTrajectory>::SharedPtr rigid_client_;
@@ -1396,6 +1478,7 @@ private:
 
   std::mutex exec_mutex_;
   std::shared_ptr<const CompiledProgram> loaded_program_;
+  uint64_t program_revision_ = 0;
   size_t exec_block_idx_ = 0;
   bool paused_mid_block_ = false;
   size_t paused_sample_idx_ = 0;

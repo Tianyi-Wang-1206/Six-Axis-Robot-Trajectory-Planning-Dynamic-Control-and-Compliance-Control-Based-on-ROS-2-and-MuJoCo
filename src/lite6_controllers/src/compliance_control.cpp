@@ -1,5 +1,6 @@
 #include "lite6_controllers/ctc_controller.hpp"
 #include "lite6_interfaces/compliance_validation.hpp"
+#include "lite6_interfaces/motion_contract.hpp"
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/jacobian.hpp>
 #include <pinocchio/spatial/explog.hpp>
@@ -85,90 +86,71 @@ bool Lite6CTCController::configure_compliance() {
   compliance_frame_=pin_model_.getFrameId("link_eef");
   if(compliance_frame_>=static_cast<pinocchio::FrameIndex>(pin_model_.nframes)) throw std::runtime_error("Missing compliance TCP frame");
   compliance_jacobian_.setZero();
-  compliance_sub_=node->create_subscription<lite6_interfaces::msg::ComplianceCommand>(
-    "~/compliance_cmd",rclcpp::QoS(10),
-    [this](const lite6_interfaces::msg::ComplianceCommand::SharedPtr msg) {
-      if(msg->command<3||msg->command>5||!lite6_interfaces::valid_compliance_settings(msg->settings)) return;
-      std::lock_guard<std::mutex> lock(cmd_write_mutex_);
-      ModeCommand command(msg->command,++command_sequence_);
-      command.settings=msg->settings;
-      cmd_buffer_.writeFromNonRT(command);
-    });
   return true;
 }
-void Lite6CTCController::process_compliance_command(double dt, int32_t command,
-    const lite6_interfaces::msg::ComplianceSettings& settings) {
-  // Process every envelope at most once: a rejected command must never become
-  // effective later after ESTOP recovery. The existing recovery remains intact.
-  if(current_command_sequence_!=compliance_sequence_) {
-    compliance_sequence_=current_command_sequence_;
-    if(command>=3&&command<=5&&(system_state_==SystemState::NORMAL||compliance_active())&&
-       !execution_stop_latched_&&(!current_execution_||
-       current_execution_->result.load()!=TrajectoryResult::RUNNING)&&
-       (!current_impedance_execution_||
-       current_impedance_execution_->result.load()!=ImpedanceTrajectoryResult::RUNNING)) {
-      const auto desired=command==3?SystemState::JOINT_IMPEDANCE:
-        (command==4?SystemState::CARTESIAN_IMPEDANCE:SystemState::TEACH);
-      const bool entering=desired!=system_state_;
-      if(entering&&dq_.cwiseAbs().maxCoeff()>=compliance_entry_max_speed_) return;
-      compliance_settings_=settings;
-      if(entering||settings.recapture) {
-        compliance_q_=q_;
-        if(gmo_tcp_cached_this_cycle_) {
-          compliance_pose_=pin_data_gmo_.oMf[compliance_frame_];
-        } else {
-          pinocchio::forwardKinematics(pin_model_,pin_data_,dynamics_q_);
-          compliance_pose_=pinocchio::updateFramePlacement(pin_model_,pin_data_,compliance_frame_);
-        }
-      }
-      if(entering) {
-        compliance_filtered_=settings;
-        compliance_last_tau_=tau_cmd_;
-        compliance_saturation_time_=0.0;
-        compliance_external_torque_time_=0.0;
-        compliance_saturation_estop_pending_=false;
-        integral_effort_.setZero();
-      }
-      system_state_=desired;
-    } else if(command==6&&compliance_active()) {
-      system_state_=SystemState::COMPLIANCE_STOPPING;
-      estop_q_=q_;estop_dq_=dq_;
-      integral_effort_.setZero();
-    }
+
+void Lite6CTCController::check_compliance_safety_limits(double dt) {
+  if (!compliance_active() && system_state_ != SystemState::COMPLIANCE_STOPPING) {
+    return;
   }
-  if(system_state_==SystemState::COMPLIANCE_STOPPING&&
-     estop_dq_.cwiseAbs().maxCoeff()<1e-4&&dq_.cwiseAbs().maxCoeff()<0.01) {
-    // Resume NORMAL at the measured resting pose, never at the old equilibrium.
-    for(size_t i=0;i<6;++i) {
-      reference_interfaces_[i]=q_[i];
-      reference_interfaces_[6+i]=0.0;reference_interfaces_[12+i]=0.0;
-    }
-    clear_estop_reason();
-    system_state_=SystemState::NORMAL;
-  }
-  if(compliance_active()) {
-    using CS=lite6_interfaces::msg::ControllerStatus;
-    for(int i=0;i<6;++i) {
-      if(q_[i]<pin_model_.lowerPositionLimit[i]-compliance_hard_limit_tolerance_) {
-        latch_estop_reason(CS::ESTOP_COMPLIANCE_POSITION_LIMIT,i,q_[i],pin_model_.lowerPositionLimit[i]);
-        request_execution_stop();break;
-      }
-      if(q_[i]>pin_model_.upperPositionLimit[i]+compliance_hard_limit_tolerance_) {
-        latch_estop_reason(CS::ESTOP_COMPLIANCE_POSITION_LIMIT,i,q_[i],pin_model_.upperPositionLimit[i]);
-        request_execution_stop();break;
-      }
-      if(std::abs(dq_[i])>compliance_max_joint_velocity_) {
-        latch_estop_reason(CS::ESTOP_COMPLIANCE_VELOCITY_LIMIT,i,dq_[i],compliance_max_joint_velocity_);
-        request_execution_stop();break;
-      }
-    }
-    int ext_joint=-1; double ext_val=0.0; double ext_limit=0.0;
-    if(check_external_torque_limit(dt,compliance_max_external_torque_,
-        compliance_external_torque_timeout_,compliance_external_torque_time_,
-        ext_joint,ext_val,ext_limit)) {
-      latch_estop_reason(CS::ESTOP_COMPLIANCE_EXTERNAL_TORQUE,ext_joint,ext_val,ext_limit);
+  using CS = lite6_interfaces::msg::ControllerStatus;
+  for (int i = 0; i < 6; ++i) {
+    if (q_[i] < pin_model_.lowerPositionLimit[i] - compliance_hard_limit_tolerance_) {
+      latch_estop_reason(CS::ESTOP_COMPLIANCE_POSITION_LIMIT, i, q_[i], pin_model_.lowerPositionLimit[i]);
       request_execution_stop();
+      return;
     }
+    if (q_[i] > pin_model_.upperPositionLimit[i] + compliance_hard_limit_tolerance_) {
+      latch_estop_reason(CS::ESTOP_COMPLIANCE_POSITION_LIMIT, i, q_[i], pin_model_.upperPositionLimit[i]);
+      request_execution_stop();
+      return;
+    }
+    if (std::abs(dq_[i]) > compliance_max_joint_velocity_) {
+      latch_estop_reason(CS::ESTOP_COMPLIANCE_VELOCITY_LIMIT, i, dq_[i], compliance_max_joint_velocity_);
+      request_execution_stop();
+      return;
+    }
+  }
+  int ext_joint = -1;
+  double ext_val = 0.0;
+  double ext_limit = 0.0;
+  if (check_external_torque_limit(
+        dt, compliance_max_external_torque_,
+        compliance_external_torque_timeout_, compliance_external_torque_time_,
+        ext_joint, ext_val, ext_limit)) {
+    latch_estop_reason(CS::ESTOP_COMPLIANCE_EXTERNAL_TORQUE, ext_joint, ext_val, ext_limit);
+    request_execution_stop();
+  }
+}
+
+void Lite6CTCController::step_compliance_stopping(double dt) {
+  if (system_state_ != SystemState::COMPLIANCE_STOPPING) {
+    return;
+  }
+  compliance_stopping_elapsed_ += dt;
+  if (estop_dq_.cwiseAbs().maxCoeff() < 1e-4 &&
+      dq_.cwiseAbs().maxCoeff() <= lite6_interfaces::contract::kPlannerSettleSpeedRadPerSec) {
+    // Resume NORMAL at the measured resting pose, never at the old equilibrium.
+    for (size_t i = 0; i < 6; ++i) {
+      reference_interfaces_[i] = q_[i];
+      reference_interfaces_[6 + i] = 0.0;
+      reference_interfaces_[12 + i] = 0.0;
+    }
+    q_target_ = q_;
+    dq_target_.setZero();
+    ddq_target_.setZero();
+    clear_estop_reason();
+    compliance_stopping_elapsed_ = 0.0;
+    transition_system_state(SystemState::NORMAL);
+    return;
+  }
+  if (compliance_stopping_elapsed_ >= lite6_interfaces::contract::kComplianceStoppingTimeoutSec) {
+    latch_estop_reason(
+      lite6_interfaces::msg::ControllerStatus::ESTOP_COMPLIANCE_STOPPING_TIMEOUT,
+      -1, compliance_stopping_elapsed_,
+      lite6_interfaces::contract::kComplianceStoppingTimeoutSec);
+    compliance_stopping_elapsed_ = 0.0;
+    request_execution_stop();
   }
 }
 void Lite6CTCController::compute_compliance(double dt) {

@@ -1,4 +1,6 @@
 #include "lite6_planner/supervisor.hpp"
+#include <lite6_interfaces/compliance_validation.hpp>
+#include <lite6_interfaces/motion_contract.hpp>
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
@@ -11,15 +13,39 @@ namespace {
 using S=lite6_interfaces::msg::SupervisorState;
 using C=lite6_interfaces::srv::SupervisorCommand;
 using CS=lite6_interfaces::msg::ControllerStatus;
-constexpr auto kObservationTimeout=std::chrono::milliseconds(800);
+using CTC=lite6_interfaces::srv::ControllerCommand;
+constexpr auto kControllerObservationTimeout=
+  std::chrono::nanoseconds(lite6_interfaces::contract::kControllerStatusStaleTimeoutNs);
+constexpr auto kJointObservationTimeout=
+  std::chrono::nanoseconds(lite6_interfaces::contract::kJointStateStaleTimeoutNs);
 constexpr auto kModeTimeout=std::chrono::seconds(8);
 constexpr auto kSettleDuration=std::chrono::milliseconds(300);
 constexpr auto kSettleFeedbackGap=std::chrono::milliseconds(100);
 constexpr auto kDispatchTimeout=std::chrono::seconds(15);
 constexpr auto kValidationTimeout=std::chrono::seconds(120);
 constexpr auto kCalculationTimeout=std::chrono::seconds(60);
-constexpr double kSettleSpeed=0.01; // Stricter than the planner's 0.02 rad/s admission guard.
+constexpr double kSettleSpeed=lite6_interfaces::contract::kPlannerSettleSpeedRadPerSec;
 constexpr double kRadToDeg=57.29577951308232;
+
+uint8_t map_compliance_supervisor_mode(uint8_t ctc_mode) {
+  switch (ctc_mode) {
+    case CS::MODE_NORMAL: return S::MODE_NORMAL;
+    case CS::MODE_JOINT_IMPEDANCE: return S::MODE_JOINT_IMPEDANCE;
+    case CS::MODE_CARTESIAN_IMPEDANCE: return S::MODE_CARTESIAN_IMPEDANCE;
+    case CS::MODE_TEACH: return S::MODE_TEACH;
+    default: return S::MODE_INITIALIZING;
+  }
+}
+
+uint8_t map_compliance_controller_mode(uint8_t sup_mode) {
+  switch (sup_mode) {
+    case S::MODE_NORMAL: return CS::MODE_NORMAL;
+    case S::MODE_JOINT_IMPEDANCE: return CS::MODE_JOINT_IMPEDANCE;
+    case S::MODE_CARTESIAN_IMPEDANCE: return CS::MODE_CARTESIAN_IMPEDANCE;
+    case S::MODE_TEACH: return CS::MODE_TEACH;
+    default: return CS::MODE_UNKNOWN;
+  }
+}
 
 std::string format_fixed(double value,int precision=3) {
   std::ostringstream out;
@@ -99,6 +125,12 @@ std::string describe_controller_estop(const CS& status,uint8_t previous_mode) {
         " exceeding "+format_fixed(status.estop_limit,2)+" Nm.\n"+
         "Improper operation: Excessive collision or drag force occurred during compliance control. "
         "Clear the obstruction, then press RESET FAULT to recover.";
+    case CS::ESTOP_COMPLIANCE_STOPPING_TIMEOUT:
+      return "Compliance E-STOP: transition braking timed out ("+
+        format_fixed(status.estop_value,2)+" s >= "+format_fixed(status.estop_limit,2)+" s)\n"+
+        "Active mode: "+mode_name+"\n"+
+        "Cause: External load or motion prevented safe settling during compliance exit.\n"
+        "Release external load, then press RESET FAULT to recover.";
     case CS::ESTOP_TRAJECTORY_PATH_POSITION:
       return "CTC E-STOP: "+joint+" path position error exceeded ("+
         format_fixed(status.estop_value,3)+" rad > "+format_fixed(status.estop_limit,3)+" rad)\n"+
@@ -150,10 +182,19 @@ void Supervisor::changed_unlocked(const std::string& description) {
   if(!description.empty()) state_.detail=description;
 }
 bool Supervisor::fresh_controller_unlocked() const {
-  return seen_controller_&&(Clock::now()-controller_time_<kObservationTimeout);
+  return seen_controller_&&(Clock::now()-controller_time_<kControllerObservationTimeout);
 }
 bool Supervisor::fresh_joint_unlocked() const {
-  return seen_joint_&&(Clock::now()-joint_time_<kObservationTimeout);
+  return seen_joint_&&(Clock::now()-joint_time_<kJointObservationTimeout);
+}
+bool Supervisor::sync_from_initializing_unlocked() {
+  if(state_.mode!=S::MODE_INITIALIZING||!fresh_controller_unlocked()||!fresh_joint_unlocked())
+    return false;
+  const uint8_t mapped=map_compliance_supervisor_mode(state_.controller_mode);
+  if(mapped==S::MODE_INITIALIZING) return false;
+  state_.mode=mapped;
+  changed_unlocked("Ready");
+  return true;
 }
 void Supervisor::observe_joint_state(double max_speed) {
   std::lock_guard<std::mutex> guard(mutex_);
@@ -163,11 +204,7 @@ void Supervisor::observe_joint_state(double max_speed) {
   if(std::isfinite(max_speed)&&max_speed<=kSettleSpeed&&stable_since_==Clock::time_point{})
     stable_since_=now;
   seen_joint_=true; joint_time_=now;
-  if(state_.mode==S::MODE_INITIALIZING&&fresh_controller_unlocked()&&
-     state_.controller_mode==CS::MODE_NORMAL) {
-    state_.mode=S::MODE_NORMAL;
-    changed_unlocked("Ready");
-  }
+  sync_from_initializing_unlocked();
 }
 void Supervisor::observe_excitation_start(const std::string& key,
     const builtin_interfaces::msg::Time& start) {
@@ -207,7 +244,9 @@ void Supervisor::fault_unlocked(const std::string& reason,bool estop,Effects& ef
     state_.mode=S::MODE_ESTOP;
     state_.estop_latched=true;
     state_.estop_reason=estop_reason!=S::ESTOP_NONE?estop_reason:S::ESTOP_SUPERVISOR;
-    effect.ctc_command=1;
+    effect.ctc_cmd=CTC::Request::CMD_ESTOP;
+    effect.expected_controller_epoch=0;
+    effect.cmd_reason=reason;
   } else state_.mode=S::MODE_SOFT_FAULT;
   state_.sysid_phase=S::SYSID_NONE;
   state_.recovery_phase=S::RECOVERY_NONE;
@@ -221,32 +260,48 @@ Supervisor::Effects Supervisor::observe_controller(const CS& status) {
   std::lock_guard<std::mutex> guard(mutex_);
   Effects fx;
   const uint8_t mode=status.mode;
-  if(mode<CS::MODE_NORMAL||mode>CS::MODE_COMPLIANCE_STOPPING) return fx;
+  if(mode<CS::MODE_NORMAL||mode>CS::MODE_CARTESIAN_IMPEDANCE_TRAJECTORY) return fx;
   const auto previous=state_.controller_mode;
+  const uint64_t prev_epoch=last_controller_epoch_;
   seen_controller_=true;controller_time_=Clock::now();
   state_.controller_mode=mode;
+  state_.controller_epoch=status.controller_epoch;
+  state_.payload_mass=status.payload_mass;
+  state_.payload_com_tcp=status.payload_com_tcp;
   state_.external_joint_torque=status.external_joint_torque;
   state_.external_cartesian_wrench=status.external_cartesian_wrench;
   state_.contact_detected=status.external_contact_detected;
+  if(status.controller_epoch!=0) last_controller_epoch_=status.controller_epoch;
+
+  if(prev_epoch!=0&&status.controller_epoch!=0&&status.controller_epoch!=prev_epoch) {
+    if(state_.mode==S::MODE_SYSID||state_.mode==S::MODE_RECOVERING||
+       state_.mode==S::MODE_COMPLIANCE_SWITCHING||!active_key_.empty()) {
+      fault_unlocked("Controller epoch changed mid-operation",mode==CS::MODE_ESTOP,fx);
+      if(mode==CS::MODE_ESTOP) fx.ctc_cmd=CTC::Request::CMD_NONE;
+      return fx;
+    }
+  }
   // Keep the initiating fault visible while the controller acknowledges ESTOP.
   if(state_.mode==S::MODE_ESTOP) {
     if(previous!=mode) changed_unlocked();
     return fx;
   }
+  if(mode==CS::MODE_ESTOP&&state_.mode!=S::MODE_ESTOP&&state_.mode!=S::MODE_RECOVERING) {
+    fault_unlocked(describe_controller_estop(status,state_.mode),true,fx,
+      map_supervisor_estop_reason(status.estop_reason));
+    fx.ctc_cmd=CTC::Request::CMD_NONE; // already in ESTOP; do not echo a redundant command
+    return fx;
+  }
   if(state_.mode==S::MODE_COMPLIANCE_SWITCHING && mode==compliance_target_) {
-    state_.mode=mode==CS::MODE_NORMAL?S::MODE_NORMAL:static_cast<uint8_t>(mode+3);
+    state_.mode=map_compliance_supervisor_mode(mode);
     phase_deadline_=Clock::time_point{};
     changed_unlocked("Compliance transition acknowledged by controller");
     return fx;
   }
-  if(mode==CS::MODE_ESTOP&&state_.mode!=S::MODE_ESTOP&&state_.mode!=S::MODE_RECOVERING) {
-    fault_unlocked(describe_controller_estop(status,state_.mode),true,fx,
-      map_supervisor_estop_reason(status.estop_reason));
-    fx.ctc_command=-1; // already in ESTOP; do not echo a redundant command
-  } else if(mode==CS::MODE_SYSID&&state_.mode!=S::MODE_SYSID) {
+  if(mode==CS::MODE_SYSID&&state_.mode!=S::MODE_SYSID) {
     fault_unlocked("CTC entered SYS_ID without supervisor authorization",true,fx,S::ESTOP_CONTROLLER_FAULT);
-  } else if(state_.mode==S::MODE_INITIALIZING&&mode==CS::MODE_NORMAL&&fresh_joint_unlocked()) {
-    state_.mode=S::MODE_NORMAL;changed_unlocked("Ready");
+  } else if(state_.mode==S::MODE_INITIALIZING) {
+    sync_from_initializing_unlocked();
   } else if(state_.mode==S::MODE_SYSID&&state_.sysid_phase==S::SYSID_WAIT_CONTROLLER_MODE&&
       !state_.waiting_for_settle&&mode==CS::MODE_SYSID) {
     state_.sysid_phase=S::SYSID_READY_FOR_EXCITATION;
@@ -266,11 +321,49 @@ Supervisor::Effects Supervisor::observe_controller(const CS& status) {
   } else if(previous!=mode) changed_unlocked("CTC mode observation changed");
   return fx;
 }
+void Supervisor::on_controller_command_ack(uint8_t cmd,bool accepted,uint8_t ack_result,
+    uint8_t current_mode,const std::string& msg) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  if(accepted) return;
+  if(state_.mode==S::MODE_COMPLIANCE_SWITCHING) {
+    const uint8_t mapped=map_compliance_supervisor_mode(current_mode);
+    state_.mode=(mapped!=S::MODE_INITIALIZING)?mapped:pre_switch_mode_;
+    phase_deadline_=Clock::time_point{};
+    changed_unlocked("Compliance transition rejected by CTC ("+
+      std::to_string(ack_result)+"): "+msg);
+  } else if(state_.mode==S::MODE_RECOVERING&&cmd==CTC::Request::CMD_CLEAR_ESTOP&&
+            !state_.waiting_for_settle) {
+    if(ack_result==CTC::Response::ACK_REJECTED_SPEED) {
+      settle_unlocked();
+      changed_unlocked("Waiting for joint speed to drop below clear-ESTOP limit");
+    } else {
+      Effects unused;
+      fault_unlocked("CTC rejected CMD_CLEAR_ESTOP: "+msg,true,unused,S::ESTOP_CONTROLLER_FAULT);
+    }
+  } else if(state_.mode==S::MODE_SYSID&&!state_.waiting_for_settle&&
+            (cmd==CTC::Request::CMD_ENTER_SYSID||cmd==CTC::Request::CMD_ENTER_NORMAL)) {
+    if(ack_result==CTC::Response::ACK_REJECTED_SPEED) {
+      settle_unlocked();
+      changed_unlocked("Waiting for joint speed to settle before SysID mode change");
+    } else {
+      Effects unused;
+      fault_unlocked("CTC rejected SysID transition: "+msg,true,unused,S::ESTOP_CONTROLLER_FAULT);
+    }
+  }
+}
 Supervisor::Effects Supervisor::watchdog() {
   std::lock_guard<std::mutex> guard(mutex_);
   Effects fx;
   if(state_.mode==S::MODE_INITIALIZING) return fx;
-  if(state_.mode==S::MODE_ESTOP||state_.mode==S::MODE_FAULT) return fx;
+  if(state_.mode==S::MODE_ESTOP) {
+    if(fresh_controller_unlocked()&&state_.controller_mode!=CS::MODE_ESTOP) {
+      fx.ctc_cmd=CTC::Request::CMD_ESTOP;
+      fx.expected_controller_epoch=0;
+      fx.cmd_reason="Re-latching controller E-STOP to match SupervisorState";
+    }
+    return fx;
+  }
+  if(state_.mode==S::MODE_FAULT||state_.mode==S::MODE_SOFT_FAULT) return fx;
   if(!fresh_controller_unlocked()||!fresh_joint_unlocked()) {
     fault_unlocked("CTC / joint_states heartbeat expired",true,fx);
     return fx;
@@ -280,7 +373,7 @@ Supervisor::Effects Supervisor::watchdog() {
     return fx;
   }
   if(state_.mode>=S::MODE_JOINT_IMPEDANCE&&state_.mode<=S::MODE_TEACH&&
-     state_.controller_mode!=state_.mode-3) {
+     state_.controller_mode!=map_compliance_controller_mode(state_.mode)) {
     fault_unlocked("Unexpected controller mode in compliance operation",true,fx);
     return fx;
   }
@@ -300,9 +393,10 @@ Supervisor::Effects Supervisor::watchdog() {
     }
   }
   if(state_.mode==S::MODE_RECOVERING&&
-     state_.recovery_phase==S::RECOVERY_SYNC_REFERENCE&&
-     state_.controller_mode!=CS::MODE_ESTOP) {
-    fault_unlocked("CTC mode mismatch during recovery sync",true,fx);
+     state_.recovery_phase==S::RECOVERY_WAIT_NORMAL_MODE&&
+     state_.controller_mode!=CS::MODE_ESTOP&&
+     state_.controller_mode!=CS::MODE_NORMAL) {
+    fault_unlocked("CTC mode mismatch while clearing ESTOP",true,fx);
     return fx;
   }
   if(state_.mode==S::MODE_RECOVERING&&state_.recovery_phase==S::RECOVERY_SETTLING&&
@@ -323,10 +417,14 @@ Supervisor::Effects Supervisor::watchdog() {
     phase_deadline_=now+kDispatchTimeout;
     if(state_.mode==S::MODE_SYSID) {
       if(state_.sysid_phase==S::SYSID_WAIT_CONTROLLER_MODE) {
-        fx.ctc_command=2;
+        fx.ctc_cmd=CTC::Request::CMD_ENTER_SYSID;
+        fx.expected_controller_epoch=state_.controller_epoch;
+        fx.cmd_reason="SysID pre-alignment settled";
         phase_deadline_=now+kModeTimeout;
       } else if(state_.sysid_phase==S::SYSID_WAIT_NORMAL_MODE) {
-        fx.ctc_command=0;
+        fx.ctc_cmd=CTC::Request::CMD_ENTER_NORMAL;
+        fx.expected_controller_epoch=state_.controller_epoch;
+        fx.cmd_reason="SysID post-alignment settled";
         phase_deadline_=now+kModeTimeout;
       } else if(state_.sysid_phase==S::SYSID_COMPLETING) {
         complete_sysid_unlocked();
@@ -334,7 +432,9 @@ Supervisor::Effects Supervisor::watchdog() {
       }
     } else if(state_.mode==S::MODE_RECOVERING) {
       if(state_.recovery_phase==S::RECOVERY_WAIT_NORMAL_MODE) {
-        fx.ctc_command=0;
+        fx.ctc_cmd=CTC::Request::CMD_CLEAR_ESTOP;
+        fx.expected_controller_epoch=state_.controller_epoch;
+        fx.cmd_reason="Arm settled; clearing controller E-STOP";
         phase_deadline_=now+kModeTimeout;
       } else if(state_.recovery_phase==S::RECOVERY_SETTLING) {
         state_.mode=S::MODE_NORMAL;
@@ -364,7 +464,7 @@ bool Supervisor::can_start_motion_unlocked(uint8_t context,uint64_t session,std:
   if(!active_key_.empty()||state_.motion_phase!=S::MOTION_IDLE) {why="Motion slot busy";return false;}
   if(!fresh_controller_unlocked()||!fresh_joint_unlocked()) {why="Missing fresh hardware observation";return false;}
   if(state_.waiting_for_settle) {why="Waiting for physical settling";return false;}
-  if(state_.estop_latched && context!=2) {why="ESTOP is latched";return false;}
+  if(state_.estop_latched) {why="ESTOP is latched";return false;}
   if(context==0) {
     if(state_.mode!=S::MODE_NORMAL||state_.controller_mode!=CS::MODE_NORMAL||session!=0) {
       why="Normal motion requires NORMAL mode and zero session";return false;
@@ -384,12 +484,6 @@ bool Supervisor::can_start_motion_unlocked(uint8_t context,uint64_t session,std:
     }
     if(state_.sysid_phase==S::SYSID_RETURN_ALIGN&&state_.controller_mode!=CS::MODE_NORMAL) {
       why="SysID return alignment requires normal CTC mode";return false;
-    }
-  } else if(context==2) {
-    if(state_.mode!=S::MODE_RECOVERING||session==0||session!=state_.session_id||
-       state_.recovery_phase!=S::RECOVERY_SYNC_REFERENCE||
-       state_.controller_mode!=CS::MODE_ESTOP) {
-      why="Recovery phase/session does not permit reference sync";return false;
     }
   } else {why="Unknown motion context";return false;}
   return true;
@@ -454,9 +548,6 @@ bool Supervisor::permitted(const std::string& key) const {
       return state_.controller_mode==CS::MODE_NORMAL;
     return state_.controller_mode==CS::MODE_SYSID;
   }
-  if(state_.mode==S::MODE_RECOVERING)
-    return state_.recovery_phase==S::RECOVERY_SYNC_REFERENCE&&
-           state_.controller_mode==CS::MODE_ESTOP;
   return false;
 }
 bool Supervisor::change_motion_phase(const std::string& key,uint8_t phase) {
@@ -485,8 +576,7 @@ Supervisor::Effects Supervisor::finish_motion(const std::string& key,bool succes
   if(active_key_!=key||key.empty()) return fx; // stale async result
   const bool was_cancel_requested=cancel_requested_;
   const bool authorized=success&&!cancel_requested_&&
-    (state_.mode==S::MODE_NORMAL||state_.mode==S::MODE_SYSID||
-     state_.mode==S::MODE_RECOVERING);
+    (state_.mode==S::MODE_NORMAL||state_.mode==S::MODE_SYSID);
   const bool excitation=key.rfind("sysid-excitation:",0)==0;
   clear_motion_unlocked();
   fx.terminal_success=authorized;
@@ -505,10 +595,6 @@ Supervisor::Effects Supervisor::finish_motion(const std::string& key,bool succes
         state_.sysid_phase=S::SYSID_COMPLETING;
         settle_unlocked();
       }
-    } else if(state_.mode==S::MODE_RECOVERING&&
-              state_.recovery_phase==S::RECOVERY_SYNC_REFERENCE) {
-      state_.recovery_phase=S::RECOVERY_WAIT_NORMAL_MODE;
-      settle_unlocked();
     }
     state_.last_error_code=1;
     changed_unlocked("Motion completed: "+message);
@@ -528,25 +614,36 @@ Supervisor::Effects Supervisor::finish_motion(const std::string& key,bool succes
   }
   return fx;
 }
-Supervisor::Reply Supervisor::command(uint8_t event,uint64_t session,const std::string& reason) {
+Supervisor::Reply Supervisor::command(const Command::Request& req) {
   std::lock_guard<std::mutex> guard(mutex_);
   Reply r;
   auto reject=[&](const std::string& why){r.message=why;};
-  switch(event) {
+  if(req.command!=C::Request::CMD_ESTOP&&
+     req.expected_revision>0&&req.expected_revision!=state_.revision) {
+    reject("Revision mismatch: expected "+std::to_string(req.expected_revision)+
+      ", current "+std::to_string(state_.revision));
+    r.session_id=state_.session_id;
+    r.revision=state_.revision;
+    r.mode=state_.mode;
+    return r;
+  }
+  switch(req.command) {
   case C::Request::CMD_ESTOP:
     r.accepted=true;
-    fault_unlocked("ESTOP: "+reason,true,r.effects,
-      reason=="SOFTWARE E-STOP PRESSED"?S::ESTOP_MANUAL:S::ESTOP_SUPERVISOR);
+    fault_unlocked("ESTOP: "+req.reason,true,r.effects,
+      req.reason=="SOFTWARE E-STOP PRESSED"?S::ESTOP_MANUAL:S::ESTOP_SUPERVISOR);
     break;
   case C::Request::CMD_JOINT_IMPEDANCE:
   case C::Request::CMD_CARTESIAN_IMPEDANCE:
   case C::Request::CMD_TEACH:
   case C::Request::CMD_EXIT_COMPLIANCE: {
     const bool compliant=state_.mode>=S::MODE_JOINT_IMPEDANCE&&state_.mode<=S::MODE_TEACH;
-    const bool exiting=event==C::Request::CMD_EXIT_COMPLIANCE;
-    const uint8_t target=exiting?CS::MODE_NORMAL:static_cast<uint8_t>(event-4);
+    const bool exiting=req.command==C::Request::CMD_EXIT_COMPLIANCE;
+    const uint8_t target=exiting?CS::MODE_NORMAL:
+      (req.command==C::Request::CMD_JOINT_IMPEDANCE?CS::MODE_JOINT_IMPEDANCE:
+       (req.command==C::Request::CMD_CARTESIAN_IMPEDANCE?CS::MODE_CARTESIAN_IMPEDANCE:CS::MODE_TEACH));
     const bool same=compliant&&target==state_.controller_mode;
-    if(session!=0||state_.estop_latched||!active_key_.empty()||
+    if(req.session_id!=0||state_.estop_latched||!active_key_.empty()||
        !fresh_joint_unlocked()||!fresh_controller_unlocked()||
        !(compliant||(state_.mode==S::MODE_NORMAL&&state_.controller_mode==CS::MODE_NORMAL))||
        (exiting&&!compliant)) {
@@ -556,8 +653,19 @@ Supervisor::Reply Supervisor::command(uint8_t event,uint64_t session,const std::
        Clock::now()-stable_since_<kSettleDuration)) {
       reject("Release the arm and wait until stationary before changing compliance mode");break;
     }
-    r.effects.ctc_command=exiting?6:static_cast<int>(event-5);
+    if(!exiting&&!lite6_interfaces::valid_compliance_settings(req.compliance)) {
+      reject("Invalid compliance gains / sensitivity");break;
+    }
+    r.effects.ctc_cmd=exiting?CTC::Request::CMD_ENTER_NORMAL:
+      (req.command==C::Request::CMD_JOINT_IMPEDANCE?CTC::Request::CMD_ENTER_JOINT_IMPEDANCE:
+       (req.command==C::Request::CMD_CARTESIAN_IMPEDANCE?CTC::Request::CMD_ENTER_CARTESIAN_IMPEDANCE:
+        CTC::Request::CMD_ENTER_TEACH));
+    r.effects.has_compliance=!exiting;
+    if(!exiting) r.effects.compliance=req.compliance;
+    r.effects.expected_controller_epoch=state_.controller_epoch;
+    r.effects.cmd_reason=req.reason;
     if(!same) {
+      pre_switch_mode_=state_.mode;
       compliance_target_=target;
       state_.mode=S::MODE_COMPLIANCE_SWITCHING;
       phase_deadline_=Clock::now()+kModeTimeout;
@@ -566,21 +674,70 @@ Supervisor::Reply Supervisor::command(uint8_t event,uint64_t session,const std::
     r.accepted=true;
     break;
   }
+  case C::Request::CMD_UPDATE_COMPLIANCE: {
+    const bool compliant=state_.mode>=S::MODE_JOINT_IMPEDANCE&&state_.mode<=S::MODE_TEACH;
+    if(!compliant||req.session_id!=0||state_.estop_latched||!active_key_.empty()||
+       !fresh_joint_unlocked()||!fresh_controller_unlocked()) {
+      reject("Compliance update requires active idle compliance mode and fresh feedback");break;
+    }
+    if(!lite6_interfaces::valid_compliance_settings(req.compliance)) {
+      reject("Invalid compliance gains / sensitivity");break;
+    }
+    r.effects.ctc_cmd=CTC::Request::CMD_UPDATE_COMPLIANCE_SETTINGS;
+    r.effects.has_compliance=true;
+    r.effects.compliance=req.compliance;
+    r.effects.expected_controller_epoch=state_.controller_epoch;
+    r.effects.cmd_reason=req.reason;
+    changed_unlocked("Updating live compliance settings");
+    r.accepted=true;
+    break;
+  }
+  case C::Request::CMD_SET_PAYLOAD:
+    if(req.session_id!=0||!active_key_.empty()||!fresh_controller_unlocked()||
+       state_.mode==S::MODE_INITIALIZING||state_.mode==S::MODE_COMPLIANCE_SWITCHING) {
+      reject("Payload update requires idle state and fresh controller observation");break;
+    }
+    if(!lite6_interfaces::valid_payload_params(req.payload_mass,req.payload_com_tcp)) {
+      reject("Payload parameters out of bounds");break;
+    }
+    r.effects.ctc_cmd=CTC::Request::CMD_SET_PAYLOAD;
+    r.effects.has_payload=true;
+    r.effects.payload_mass=req.payload_mass;
+    r.effects.payload_com_tcp=req.payload_com_tcp;
+    r.effects.expected_controller_epoch=state_.controller_epoch;
+    r.effects.cmd_reason=req.reason;
+    r.accepted=true;
+    break;
+  case C::Request::CMD_TARE_GMO:
+    if(req.session_id!=0||state_.estop_latched||state_.mode==S::MODE_ESTOP||
+       state_.mode==S::MODE_INITIALIZING||state_.mode==S::MODE_COMPLIANCE_SWITCHING||
+       !active_key_.empty()||!fresh_joint_unlocked()||!fresh_controller_unlocked()) {
+      reject("GMO tare requires non-ESTOP idle state and fresh feedback");break;
+    }
+    if(stable_since_==Clock::time_point{}||Clock::now()-stable_since_<kSettleDuration) {
+      reject("Robot must be stationary to tare GMO");break;
+    }
+    r.effects.ctc_cmd=CTC::Request::CMD_TARE_GMO;
+    r.effects.expected_controller_epoch=state_.controller_epoch;
+    r.effects.cmd_reason=req.reason;
+    r.accepted=true;
+    break;
   case C::Request::CMD_BEGIN_RECOVERY:
-    if(state_.mode!=S::MODE_ESTOP||!state_.estop_latched||session!=0||
+    if(state_.mode!=S::MODE_ESTOP||!state_.estop_latched||req.session_id!=0||
        !active_key_.empty()||!fresh_joint_unlocked()||!fresh_controller_unlocked()||
        state_.controller_mode!=CS::MODE_ESTOP) {
       reject("Recovery requires observed ESTOP, idle motion slot and fresh feedback");break;
     }
     state_.mode=S::MODE_RECOVERING;
-    state_.recovery_phase=S::RECOVERY_SYNC_REFERENCE;
+    state_.recovery_phase=S::RECOVERY_WAIT_NORMAL_MODE;
     state_.session_id=next_session_++;
     settle_unlocked();
-    changed_unlocked("Waiting for recovery settling before reference synchronization");
+    changed_unlocked("Waiting for stationary settle before clearing controller ESTOP");
     r.accepted=true;
     break;
   case C::Request::CMD_ACK_SOFT_FAULT:
-    if(state_.mode!=S::MODE_SOFT_FAULT||session!=0||!active_key_.empty()||
+    if((state_.mode!=S::MODE_SOFT_FAULT&&state_.mode!=S::MODE_FAULT)||
+       state_.estop_latched||req.session_id!=0||!active_key_.empty()||
        !fresh_joint_unlocked()||!fresh_controller_unlocked()||
        state_.controller_mode!=CS::MODE_NORMAL) {
       reject("Cannot acknowledge while controller unhealthy or task running");break;
@@ -591,7 +748,7 @@ Supervisor::Reply Supervisor::command(uint8_t event,uint64_t session,const std::
     r.accepted=true;
     break;
   case C::Request::CMD_BEGIN_SYSID:
-    if(state_.mode!=S::MODE_NORMAL||state_.estop_latched||session!=0||
+    if(state_.mode!=S::MODE_NORMAL||state_.estop_latched||req.session_id!=0||
        !active_key_.empty()||!fresh_joint_unlocked()||!fresh_controller_unlocked()||
        state_.controller_mode!=CS::MODE_NORMAL) {
       reject("SysID requires idle NORMAL mode and fresh observations");break;
@@ -607,12 +764,12 @@ Supervisor::Reply Supervisor::command(uint8_t event,uint64_t session,const std::
     break;
   case C::Request::CMD_SYSID_CALCULATION_DONE:
   case C::Request::CMD_SYSID_CALCULATION_FAILED:
-    if(state_.mode!=S::MODE_SYSID||session==0||session!=state_.session_id||
+    if(state_.mode!=S::MODE_SYSID||req.session_id==0||req.session_id!=state_.session_id||
        state_.sysid_phase!=S::SYSID_CALCULATING||!active_key_.empty()) {
       reject("Calculation-done event out of phase/session");break;
     }
-    if(event==C::Request::CMD_SYSID_CALCULATION_FAILED)
-      sysid_failure_=reason.empty()?"Parameter estimation failed":reason;
+    if(req.command==C::Request::CMD_SYSID_CALCULATION_FAILED)
+      sysid_failure_=req.reason.empty()?"Parameter estimation failed":req.reason;
     state_.sysid_phase=S::SYSID_POST_ALIGN;
     settle_unlocked();
     changed_unlocked(sysid_failure_.empty()?"Waiting for SysID post-alignment settling":
@@ -620,16 +777,17 @@ Supervisor::Reply Supervisor::command(uint8_t event,uint64_t session,const std::
     r.accepted=true;
     break;
   case C::Request::CMD_ABORT_SYSID:
-    if(state_.mode!=S::MODE_SYSID||session==0||session!=state_.session_id) {
+    if(state_.mode!=S::MODE_SYSID||req.session_id==0||req.session_id!=state_.session_id) {
       reject("Invalid SysID abort session");break;
     }
-    fault_unlocked("SysID aborted: "+reason,true,r.effects);
+    fault_unlocked("SysID aborted: "+req.reason,true,r.effects);
     r.accepted=true;
     break;
   default: reject("Unknown supervisor event");break;
   }
   r.session_id=state_.session_id;
   r.revision=state_.revision;
+  r.mode=state_.mode;
   if(r.accepted) r.message=state_.detail;
   return r;
 }
