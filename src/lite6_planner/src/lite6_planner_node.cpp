@@ -28,6 +28,7 @@
 #include <iomanip>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <pthread.h>
 #include <sstream>
 #include <string>
@@ -65,6 +66,8 @@ public:
     io_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     validation_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     cmd_client_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    // Joint freshness must never stall behind status/heartbeat callbacks.
+    joint_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     const auto state_qos=rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     state_pub_=create_publisher<S>("/supervisor/state",state_qos);
     rejection_pub_=create_publisher<lite6_interfaces::msg::MotionRejection>(
@@ -106,7 +109,7 @@ public:
       },sensor_options);
     if(!state_shm_.open(false))
       throw std::runtime_error("Failed to open read-only state shared memory");
-    joint_poll_timer_=create_wall_timer(10ms,[this]{poll_joint_state_shm();},io_group_);
+    joint_poll_timer_=create_wall_timer(10ms,[this]{poll_joint_state_shm();},joint_group_);
     poll_joint_state_shm();
     ctc_=rclcpp_action::create_client<FJT>(this,"/ctc_controller/follow_joint_trajectory");
     action_server_=rclcpp_action::create_server<Motion>(this,"industrial_motion",
@@ -120,7 +123,6 @@ public:
       [this](const std::shared_ptr<lite6_interfaces::srv::SupervisorCommand::Request> req,
              std::shared_ptr<lite6_interfaces::srv::SupervisorCommand::Response> resp) {
         using SC=lite6_interfaces::srv::SupervisorCommand;
-        std::lock_guard<std::mutex> transition(transition_mutex_);
         const bool compliance=(req->command>=8&&req->command<=10)||req->command==12;
         if(compliance&&!lite6_interfaces::valid_compliance_settings(req->compliance)) {
           const auto snap=supervisor_.snapshot();
@@ -135,10 +137,19 @@ public:
           resp->revision=snap.revision;resp->mode=snap.mode;
           resp->message="Invalid payload parameters";return;
         }
-        auto reply=supervisor_.command(*req);
+        Supervisor::Reply reply;
+        PendingCtcCommand pending;
+        bool sent=true;
+        {
+          std::lock_guard<std::mutex> transition(transition_mutex_);
+          reply=supervisor_.command(*req);
+          sent=do_effects(reply.effects,&pending);
+        }
         resp->accepted=reply.accepted;resp->session_id=reply.session_id;
         resp->revision=reply.revision;resp->mode=reply.mode;resp->message=reply.message;
-        const bool cmd_ok=do_effects(reply.effects);
+        // Wait for the CTC response outside transition_mutex_ so status/heartbeat
+        // callbacks keep refreshing controller and joint freshness meanwhile.
+        const bool cmd_ok=sent&&await_ctc_command(pending);
         if(!cmd_ok&&req->command!=SC::Request::CMD_ESTOP&&reply.accepted) {
           const auto snap=supervisor_.snapshot();
           resp->accepted=false;resp->revision=snap.revision;resp->mode=snap.mode;
@@ -200,6 +211,7 @@ private:
   rclcpp::CallbackGroup::SharedPtr io_group_;
   rclcpp::CallbackGroup::SharedPtr validation_group_;
   rclcpp::CallbackGroup::SharedPtr cmd_client_group_;
+  rclcpp::CallbackGroup::SharedPtr joint_group_;
   std::atomic<bool> shutdown_{false};
   lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::StateShmSegment> state_shm_;
   rclcpp::TimerBase::SharedPtr joint_poll_timer_;
@@ -250,15 +262,24 @@ private:
     last_joint_steady_ns_=steady_ns;
     supervisor_.observe_joint_state(max_speed);
   }
-  bool issue_ctc_command(const Supervisor::Effects& effects) {
-    using CTC=lite6_interfaces::srv::ControllerCommand;
+  using CtcCommand=lite6_interfaces::srv::ControllerCommand;
+  struct PendingCtcCommand {
+    uint8_t cmd=CtcCommand::Request::CMD_NONE;
+    std::optional<rclcpp::Client<CtcCommand>::FutureAndRequestId> request;
+  };
+  // Sends a CTC command without waiting for its response (called under
+  // transition_mutex_, which only orders command emission). With `pending`, the
+  // caller awaits the response after releasing the mutex; otherwise the response is
+  // acknowledged from cmd_client_group_.
+  bool issue_ctc_command(const Supervisor::Effects& effects,PendingCtcCommand* pending) {
     if(!ctc_cmd_client_->service_is_ready()&&!ctc_cmd_client_->wait_for_service(20ms)) {
+      // Never sent: definitively not applied.
       supervisor_.on_controller_command_ack(
-        effects.ctc_cmd,false,CTC::Response::ACK_RT_TIMEOUT,0,
+        effects.ctc_cmd,false,CtcCommand::Response::ACK_RT_TIMEOUT,0,
         "CTC command service unavailable");
       return false;
     }
-    auto req=std::make_shared<CTC::Request>();
+    auto req=std::make_shared<CtcCommand::Request>();
     req->command=effects.ctc_cmd;
     req->expected_epoch=effects.expected_controller_epoch;
     if(effects.has_compliance) req->compliance=effects.compliance;
@@ -267,23 +288,42 @@ private:
       req->payload_com_tcp=effects.payload_com_tcp;
     }
     req->reason=effects.cmd_reason;
-    auto future=ctc_cmd_client_->async_send_request(req);
-    if(future.wait_for(250ms)!=std::future_status::ready) {
+    if(pending) {
+      pending->cmd=effects.ctc_cmd;
+      pending->request.emplace(ctc_cmd_client_->async_send_request(req));
+      return true;
+    }
+    const uint8_t cmd=effects.ctc_cmd;
+    ctc_cmd_client_->async_send_request(req,
+      [this,cmd](rclcpp::Client<CtcCommand>::SharedFuture future) {
+        const auto resp=future.get();
+        supervisor_.on_controller_command_ack(
+          cmd,resp->accepted,resp->ack_result,resp->current_mode,resp->message);
+        publish_state();
+      });
+    return true;
+  }
+  // Must be called without holding transition_mutex_.
+  bool await_ctc_command(PendingCtcCommand& pending) {
+    if(!pending.request) return true;
+    if(pending.request->future.wait_for(250ms)!=std::future_status::ready) {
+      ctc_cmd_client_->remove_pending_request(*pending.request);
+      // No response: the CTC may have applied it, so do not assume rejection.
       supervisor_.on_controller_command_ack(
-        effects.ctc_cmd,false,CTC::Response::ACK_RT_TIMEOUT,0,
-        "Timed out waiting for /ctc_controller/command response");
+        pending.cmd,false,CtcCommand::Response::ACK_RT_TIMEOUT,0,
+        "Timed out waiting for /ctc_controller/command response",true);
       return false;
     }
-    const auto resp=future.get();
+    const auto resp=pending.request->future.get();
     supervisor_.on_controller_command_ack(
-      effects.ctc_cmd,resp->accepted,resp->ack_result,resp->current_mode,resp->message);
+      pending.cmd,resp->accepted,resp->ack_result,resp->current_mode,resp->message);
     return resp->accepted;
   }
-  bool do_effects(const Supervisor::Effects& effects) {
+  bool do_effects(const Supervisor::Effects& effects,PendingCtcCommand* pending=nullptr) {
     // CTC ESTOP is requested immediately, before slower cancellation paths.
     bool cmd_ok=true;
-    if(effects.ctc_cmd!=lite6_interfaces::srv::ControllerCommand::Request::CMD_NONE) {
-      cmd_ok=issue_ctc_command(effects);
+    if(effects.ctc_cmd!=CtcCommand::Request::CMD_NONE) {
+      cmd_ok=issue_ctc_command(effects,pending);
     }
     if(effects.cancel_active) cancel_ctc(effects.cancel_key);
     return cmd_ok;
@@ -599,6 +639,9 @@ private:
     dispatch_ctc(key,req.trajectory,nullptr);
   }
   void on_heartbeat() {
+    // Drop bookkeeping for callback-style CTC requests that never got a response.
+    ctc_cmd_client_->prune_requests_older_than(
+      std::chrono::system_clock::now()-std::chrono::seconds(5));
     {
       std::lock_guard<std::mutex> transition(transition_mutex_);
       do_effects(supervisor_.watchdog());

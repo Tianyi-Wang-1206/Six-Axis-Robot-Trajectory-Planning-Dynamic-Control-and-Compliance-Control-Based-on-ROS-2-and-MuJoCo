@@ -331,6 +331,9 @@ private:
 
   struct PendingControllerCommand {
     uint64_t cmd_seq = 0;
+    // E-STOP generation observed when the service request arrived. A command
+    // received before a later E-STOP request is rejected instead of applied after it.
+    uint64_t estop_generation = 0;
     uint8_t command = 0;
     bool compliance_recapture = false;
     double joint_stiffness = 20.0;
@@ -358,10 +361,19 @@ private:
   bool step_deceleration_tracker(double dt);
 
   rclcpp::Clock::SharedPtr node_clock_;
+  // Serializes non-E-STOP commands: the single producer of cmd_ring_.
   std::mutex cmd_service_mutex_;
+  // Reentrant so CMD_ESTOP never waits behind a pending command's RT handshake.
+  rclcpp::CallbackGroup::SharedPtr command_callback_group_;
   rclcpp::Service<lite6_interfaces::srv::ControllerCommand>::SharedPtr command_service_;
   lite6_interfaces::shm::ShmSpscRing<PendingControllerCommand, 32> cmd_ring_;
   std::atomic<uint64_t> command_sequence_{0};
+  // Claim gate for the single queued command: holds its cmd_seq while it may be applied.
+  // The RT loop and a timed-out service call race on a CAS to 0; exactly one wins, so
+  // ACK_RT_TIMEOUT always means the command was withdrawn and will never be applied.
+  std::atomic<uint64_t> cmd_gate_{0};
+  // Incremented by every CMD_ESTOP request (fast path, bypasses cmd_ring_).
+  std::atomic<uint64_t> estop_generation_{0};
   std::atomic<uint64_t> controller_epoch_atomic_{0};
   std::atomic<uint64_t> mode_epoch_atomic_{0};
   std::atomic<uint8_t> current_mode_atomic_{lite6_interfaces::msg::ControllerStatus::MODE_UNKNOWN};

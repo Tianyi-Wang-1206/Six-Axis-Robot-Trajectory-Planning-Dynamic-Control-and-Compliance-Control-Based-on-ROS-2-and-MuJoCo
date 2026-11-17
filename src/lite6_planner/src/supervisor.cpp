@@ -26,6 +26,17 @@ constexpr auto kValidationTimeout=std::chrono::seconds(120);
 constexpr auto kCalculationTimeout=std::chrono::seconds(60);
 constexpr double kSettleSpeed=lite6_interfaces::contract::kPlannerSettleSpeedRadPerSec;
 constexpr double kRadToDeg=57.29577951308232;
+// Grace period before a compliance switch with an unknown CTC outcome is resolved
+// from the observed controller mode (the CTC answers or withdraws within ~0.15 s).
+constexpr auto kSwitchUnknownGrace=std::chrono::milliseconds(1500);
+// An RT fault (fail_controller) makes controller_manager deactivate the CTC; it then
+// stops publishing status and no supervisor command can bring it back.
+const char* const kControllerLostHint=
+  "No /ctc_controller/status heartbeat: ctc_controller may have been deactivated by "
+  "controller_manager after an RT fault (non-finite feedback, effort write failure or "
+  "update exception). Reactivate it with: ros2 service call "
+  "/controller_manager/switch_controller controller_manager_msgs/srv/SwitchController "
+  "\"{activate_controllers: [ctc_controller], strictness: 2}\" -- then recover the E-STOP.";
 
 uint8_t map_compliance_supervisor_mode(uint8_t ctc_mode) {
   switch (ctc_mode) {
@@ -240,6 +251,7 @@ void Supervisor::fault_unlocked(const std::string& reason,bool estop,Effects& ef
     cancel_requested_=true;
     state_.motion_phase=S::MOTION_CANCELING;
   }
+  switch_unknown_deadline_=Clock::time_point{};
   if(estop) {
     state_.mode=S::MODE_ESTOP;
     state_.estop_latched=true;
@@ -264,6 +276,7 @@ Supervisor::Effects Supervisor::observe_controller(const CS& status) {
   const auto previous=state_.controller_mode;
   const uint64_t prev_epoch=last_controller_epoch_;
   seen_controller_=true;controller_time_=Clock::now();
+  controller_lost_notified_=false;
   state_.controller_mode=mode;
   state_.controller_epoch=status.controller_epoch;
   state_.payload_mass=status.payload_mass;
@@ -295,6 +308,7 @@ Supervisor::Effects Supervisor::observe_controller(const CS& status) {
   if(state_.mode==S::MODE_COMPLIANCE_SWITCHING && mode==compliance_target_) {
     state_.mode=map_compliance_supervisor_mode(mode);
     phase_deadline_=Clock::time_point{};
+    switch_unknown_deadline_=Clock::time_point{};
     changed_unlocked("Compliance transition acknowledged by controller");
     return fx;
   }
@@ -322,13 +336,25 @@ Supervisor::Effects Supervisor::observe_controller(const CS& status) {
   return fx;
 }
 void Supervisor::on_controller_command_ack(uint8_t cmd,bool accepted,uint8_t ack_result,
-    uint8_t current_mode,const std::string& msg) {
+    uint8_t current_mode,const std::string& msg,bool outcome_unknown) {
   std::lock_guard<std::mutex> guard(mutex_);
   if(accepted) return;
+  if(outcome_unknown) {
+    // Never assume rejection: the command may still have been applied. Compliance
+    // switches resolve from the observed mode after a short grace period; recovery
+    // and SysID sequences advance on observation or fail via phase_deadline_.
+    if(state_.mode==S::MODE_COMPLIANCE_SWITCHING) {
+      switch_unknown_deadline_=Clock::now()+kSwitchUnknownGrace;
+      changed_unlocked("No CTC response to compliance command; resolving from observed controller mode");
+    }
+    return;
+  }
   if(state_.mode==S::MODE_COMPLIANCE_SWITCHING) {
+    // ACK_RT_TIMEOUT is definitive here: the CTC withdrew the command (never applied).
     const uint8_t mapped=map_compliance_supervisor_mode(current_mode);
     state_.mode=(mapped!=S::MODE_INITIALIZING)?mapped:pre_switch_mode_;
     phase_deadline_=Clock::time_point{};
+    switch_unknown_deadline_=Clock::time_point{};
     changed_unlocked("Compliance transition rejected by CTC ("+
       std::to_string(ack_result)+"): "+msg);
   } else if(state_.mode==S::MODE_RECOVERING&&cmd==CTC::Request::CMD_CLEAR_ESTOP&&
@@ -355,6 +381,11 @@ Supervisor::Effects Supervisor::watchdog() {
   std::lock_guard<std::mutex> guard(mutex_);
   Effects fx;
   if(state_.mode==S::MODE_INITIALIZING) return fx;
+  if((state_.mode==S::MODE_ESTOP||state_.mode==S::MODE_FAULT||state_.mode==S::MODE_SOFT_FAULT)&&
+     seen_controller_&&!fresh_controller_unlocked()&&!controller_lost_notified_) {
+    controller_lost_notified_=true;
+    changed_unlocked(state_.detail+"\n\n"+kControllerLostHint);
+  }
   if(state_.mode==S::MODE_ESTOP) {
     if(fresh_controller_unlocked()&&state_.controller_mode!=CS::MODE_ESTOP) {
       fx.ctc_cmd=CTC::Request::CMD_ESTOP;
@@ -365,7 +396,12 @@ Supervisor::Effects Supervisor::watchdog() {
   }
   if(state_.mode==S::MODE_FAULT||state_.mode==S::MODE_SOFT_FAULT) return fx;
   if(!fresh_controller_unlocked()||!fresh_joint_unlocked()) {
-    fault_unlocked("CTC / joint_states heartbeat expired",true,fx);
+    if(!fresh_controller_unlocked()) {
+      controller_lost_notified_=true;
+      fault_unlocked(std::string("CTC status heartbeat expired\n\n")+kControllerLostHint,true,fx);
+    } else {
+      fault_unlocked("joint_states heartbeat expired",true,fx);
+    }
     return fx;
   }
   if(state_.mode==S::MODE_NORMAL&&state_.controller_mode!=CS::MODE_NORMAL) {
@@ -405,6 +441,18 @@ Supervisor::Effects Supervisor::watchdog() {
     return fx;
   }
   const auto now=Clock::now();
+  if(state_.mode==S::MODE_COMPLIANCE_SWITCHING&&
+     switch_unknown_deadline_!=Clock::time_point{}&&now>switch_unknown_deadline_) {
+    const uint8_t observed=map_compliance_supervisor_mode(state_.controller_mode);
+    if(observed!=S::MODE_INITIALIZING&&state_.controller_mode!=compliance_target_) {
+      state_.mode=observed;
+      phase_deadline_=Clock::time_point{};
+      switch_unknown_deadline_=Clock::time_point{};
+      changed_unlocked("Compliance command was not applied (no CTC response); "
+        "staying in the observed controller mode");
+      return fx;
+    }
+  }
   if(phase_deadline_!=Clock::time_point{}&&now>phase_deadline_) {
     fault_unlocked(state_.waiting_for_settle?"Physical settling timed out":
         (state_.sysid_phase==S::SYSID_VALIDATING?"SysID trajectory validation timed out":
@@ -665,6 +713,7 @@ Supervisor::Reply Supervisor::command(const Command::Request& req) {
     r.effects.expected_controller_epoch=state_.controller_epoch;
     r.effects.cmd_reason=req.reason;
     if(!same) {
+      switch_unknown_deadline_=Clock::time_point{};
       pre_switch_mode_=state_.mode;
       compliance_target_=target;
       state_.mode=S::MODE_COMPLIANCE_SWITCHING;
@@ -726,7 +775,10 @@ Supervisor::Reply Supervisor::command(const Command::Request& req) {
     if(state_.mode!=S::MODE_ESTOP||!state_.estop_latched||req.session_id!=0||
        !active_key_.empty()||!fresh_joint_unlocked()||!fresh_controller_unlocked()||
        state_.controller_mode!=CS::MODE_ESTOP) {
-      reject("Recovery requires observed ESTOP, idle motion slot and fresh feedback");break;
+      reject(seen_controller_&&!fresh_controller_unlocked()?
+        std::string("Recovery requires fresh controller feedback.\n")+kControllerLostHint:
+        std::string("Recovery requires observed ESTOP, idle motion slot and fresh feedback"));
+      break;
     }
     state_.mode=S::MODE_RECOVERING;
     state_.recovery_phase=S::RECOVERY_WAIT_NORMAL_MODE;

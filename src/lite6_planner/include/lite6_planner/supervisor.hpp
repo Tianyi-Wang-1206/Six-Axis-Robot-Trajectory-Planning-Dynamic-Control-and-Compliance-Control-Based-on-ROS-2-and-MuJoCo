@@ -46,8 +46,10 @@ public:
   void observe_joint_state(double max_speed);
   void observe_excitation_start(const std::string& key, const builtin_interfaces::msg::Time& start);
   Effects observe_controller(const lite6_interfaces::msg::ControllerStatus& status);
+  // outcome_unknown=true: no response arrived from /ctc_controller/command, so the
+  // command may or may not have been applied; decide from observed controller mode.
   void on_controller_command_ack(uint8_t cmd, bool accepted, uint8_t ack_result,
-    uint8_t current_mode, const std::string& msg);
+    uint8_t current_mode, const std::string& msg, bool outcome_unknown=false);
   Effects watchdog();
   State snapshot() const;
   Reply command(const Command::Request& req);
@@ -83,6 +85,10 @@ private:
   std::string sysid_failure_;
   uint8_t compliance_target_=0;
   uint8_t pre_switch_mode_=State::MODE_NORMAL;
+  // Set when a compliance switch command's outcome is unknown (client-side timeout).
+  Clock::time_point switch_unknown_deadline_{};
+  // Latched once per controller-status outage to show the reactivation hint.
+  bool controller_lost_notified_=false;
   uint64_t last_controller_epoch_=0;
   bool seen_controller_=false,seen_joint_=false;
   std::string active_key_;

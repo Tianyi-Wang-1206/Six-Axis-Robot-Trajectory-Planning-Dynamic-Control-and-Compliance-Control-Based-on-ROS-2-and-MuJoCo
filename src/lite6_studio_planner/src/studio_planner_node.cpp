@@ -234,9 +234,13 @@ private:
     uint64_t expected_epoch,
     const std::string & reason,
     uint8_t & out_ack,
-    std::string & out_msg)
+    std::string & out_msg,
+    uint8_t * out_mode = nullptr)
   {
     out_ack = ControllerCommand::Response::ACK_NONE;
+    if (out_mode) {
+      *out_mode = ControllerStatus::MODE_UNKNOWN;
+    }
     if (!ctc_cmd_client_->wait_for_service(std::chrono::milliseconds(50))) {
       out_msg = "/ctc_controller/command service unavailable";
       return false;
@@ -247,6 +251,8 @@ private:
     req->reason = reason;
     auto future = ctc_cmd_client_->async_send_request(req);
     if (future.wait_for(std::chrono::milliseconds(250)) != std::future_status::ready) {
+      ctc_cmd_client_->remove_pending_request(future);
+      // No response: outcome unknown (callers must decide from observed controller mode).
       out_ack = ControllerCommand::Response::ACK_RT_TIMEOUT;
       out_msg = "Timed out waiting for /ctc_controller/command response";
       return false;
@@ -254,6 +260,9 @@ private:
     const auto resp = future.get();
     out_ack = resp->ack_result;
     out_msg = resp->message;
+    if (out_mode) {
+      *out_mode = resp->current_mode;
+    }
     return resp->accepted;
   }
 
@@ -265,7 +274,8 @@ private:
     }
     if (effects.send_enter_normal_cmd) {
       send_controller_command_async(
-        ControllerCommand::Request::CMD_ENTER_NORMAL, 0, "StudioSupervisor enter NORMAL");
+        ControllerCommand::Request::CMD_ENTER_NORMAL, effects.controller_epoch,
+        "StudioSupervisor enter NORMAL");
     }
     if (effects.cancel_controller_goals) {
       cancel_active_controller_goals();
@@ -422,17 +432,13 @@ private:
     const std::shared_ptr<CompileProgram::Request> req,
     std::shared_ptr<CompileProgram::Response> resp)
   {
-    compile_in_flight_.fetch_add(1, std::memory_order_acq_rel);
-    ScopeExit clear_compiling{[this]() {
-      compile_in_flight_.fetch_sub(1, std::memory_order_acq_rel);
-    }};
-
     resp->request_id = req->request_id;
     resp->program_revision = 0;
 
     std::lock_guard<std::mutex> compile_lock(compile_mutex_);
     std::string busy_reason;
-    if (req->auto_load && !supervisor_->can_compile(busy_reason)) {
+    // Atomic with RUN/RESUME/STEP/CLEAR_PROGRAM admission inside the supervisor.
+    if (!supervisor_->begin_compile(req->auto_load, busy_reason)) {
       Diagnostic d;
       d.severity = Diagnostic::SEVERITY_ERROR;
       d.stage = Diagnostic::STAGE_SEMANTIC;
@@ -445,6 +451,7 @@ private:
       resp->diagnostics.push_back(d);
       return;
     }
+    ScopeExit end_compiling{[this]() { supervisor_->end_compile(); }};
 
     std::array<double, 6> start_joints{};
     if (req->use_current_robot_start) {
@@ -519,53 +526,16 @@ private:
   {
     std::lock_guard<std::mutex> cmd_lock(command_mutex_);
     const uint8_t cmd = req->command;
-    if (compile_in_flight_.load(std::memory_order_acquire) > 0 &&
-        (cmd == StudioCommand::Request::CMD_RUN ||
-         cmd == StudioCommand::Request::CMD_RESUME ||
-         cmd == StudioCommand::Request::CMD_STEP ||
-         cmd == StudioCommand::Request::CMD_CLEAR_PROGRAM))
-    {
-      const auto snap = supervisor_->snapshot();
-      resp->accepted = false;
-      resp->revision = snap.revision;
-      resp->state = snap.state;
-      resp->controller_epoch = snap.controller_epoch;
-      resp->message = "Compilation is currently in progress; wait for completion";
-      return;
-    }
-
-    if (cmd == StudioCommand::Request::CMD_RESET_FAULT) {
-      const auto pre_snap = supervisor_->snapshot();
-      if (pre_snap.state == StudioState::STATE_FAULT &&
-          !pre_snap.estop_latched &&
-          pre_snap.controller_fresh &&
-          pre_snap.controller_mode != ControllerStatus::MODE_ESTOP &&
-          pre_snap.controller_mode != ControllerStatus::MODE_NORMAL &&
-          (req->expected_revision == 0 || req->expected_revision == pre_snap.revision))
-      {
-        uint8_t ack = ControllerCommand::Response::ACK_NONE;
-        std::string ack_msg;
-        (void)send_controller_command_sync(
-          ControllerCommand::Request::CMD_ENTER_NORMAL,
-          pre_snap.controller_epoch,
-          "Return controller to MODE_NORMAL before resetting Studio fault",
-          ack, ack_msg);
-        const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1800);
-        while (rclcpp::ok() && std::chrono::steady_clock::now() < wait_deadline) {
-          const auto cur = supervisor_->snapshot();
-          if (cur.controller_mode == ControllerStatus::MODE_NORMAL ||
-              cur.controller_mode == ControllerStatus::MODE_ESTOP)
-          {
-            break;
-          }
-          std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-      }
-    }
 
     const auto result = supervisor_->handle_command(cmd, req->expected_revision, req->reason);
+    // STEP from COMPILED_READY always starts at block 0: a cursor left behind by a
+    // step-to-end, FAULT, or controller-originated E-STOP must not be reused.
+    const bool step_from_ready =
+      cmd == StudioCommand::Request::CMD_STEP &&
+      result.prev_state == StudioState::STATE_COMPILED_READY;
     if (result.accepted &&
-        (cmd == StudioCommand::Request::CMD_RUN ||
+        (step_from_ready ||
+         cmd == StudioCommand::Request::CMD_RUN ||
          cmd == StudioCommand::Request::CMD_ESTOP ||
          cmd == StudioCommand::Request::CMD_CLEAR_PROGRAM ||
          (cmd == StudioCommand::Request::CMD_STOP &&
@@ -584,6 +554,15 @@ private:
     resp->state = result.state;
     resp->controller_epoch = result.controller_epoch;
     resp->message = result.message;
+
+    if (result.accepted && cmd == StudioCommand::Request::CMD_PAUSE &&
+        gripper_block_active_.load(std::memory_order_acquire))
+    {
+      const std::string note =
+        "Pause requested; it takes effect after the active gripper command completes";
+      supervisor_->note_pause_deferred(note);
+      resp->message = note;
+    }
   }
 
   void reset_exec_cursor_unlocked()
@@ -798,6 +777,7 @@ private:
         const auto now_tp = std::chrono::steady_clock::now();
         if (!sent_clear_cmd || (now_tp - last_clear_cmd_tp) > std::chrono::milliseconds(300)) {
           uint8_t ack = ControllerCommand::Response::ACK_NONE;
+          uint8_t ack_mode = ControllerStatus::MODE_UNKNOWN;
           std::string err;
           const uint64_t epoch = supervisor_->snapshot().controller_epoch;
           const bool ok = send_controller_command_sync(
@@ -805,12 +785,21 @@ private:
             epoch,
             "Studio E-STOP recovery via CMD_CLEAR_ESTOP",
             ack,
-            err);
+            err,
+            &ack_mode);
           sent_clear_cmd = true;
           last_clear_cmd_tp = now_tp;
-          if (!ok && ack != ControllerCommand::Response::ACK_REJECTED_SPEED &&
-              ack != ControllerCommand::Response::ACK_RT_TIMEOUT)
-          {
+          // Transient rejections are retried: SPEED (still moving), BUSY (trajectory
+          // or stopping ramp finishing), RT_TIMEOUT (withdrawn or no response).
+          // STATE while the controller already reports NORMAL means an earlier
+          // CLEAR_ESTOP took effect; the NORMAL observation advances the phase.
+          const bool transient =
+            ack == ControllerCommand::Response::ACK_REJECTED_SPEED ||
+            ack == ControllerCommand::Response::ACK_REJECTED_BUSY ||
+            ack == ControllerCommand::Response::ACK_RT_TIMEOUT ||
+            (ack == ControllerCommand::Response::ACK_REJECTED_STATE &&
+             ack_mode == ControllerStatus::MODE_NORMAL);
+          if (!ok && !transient) {
             const auto [cur_st, cur_sess] = supervisor_->state_and_session();
             if (cur_sess == session && cur_st == StudioState::STATE_RECOVERING &&
                 supervisor_->recovery_subphase() == StudioSupervisor::RecoverySubPhase::ENABLE_NORMAL)
@@ -1256,6 +1245,11 @@ private:
     size_t block_idx,
     const std::function<double(size_t, double)> & calc_total_pct)
   {
+    // PAUSE is not honored inside a gripper block; let the command handler say so.
+    gripper_block_active_.store(true, std::memory_order_release);
+    ScopeExit clear_gripper_flag{[this]() {
+      gripper_block_active_.store(false, std::memory_order_release);
+    }};
     supervisor_->update_execution_progress(
       session, blk.loc.line, blk.loc.statement_index,
       static_cast<int32_t>(block_idx), 10.0, calc_total_pct(block_idx, 0.1));
@@ -1463,7 +1457,7 @@ private:
   uint64_t last_published_revision_ = 0;
   std::mutex command_mutex_;
   std::mutex compile_mutex_;
-  std::atomic<int> compile_in_flight_{0};
+  std::atomic<bool> gripper_block_active_{false};
 
   mutable std::mutex state_data_mutex_;
   std::array<double, 6> latest_q_{};

@@ -19,6 +19,16 @@ constexpr auto kSettleGap = std::chrono::milliseconds(100);
 constexpr auto kPostRecoverySettle = std::chrono::milliseconds(200);
 constexpr auto kRecoveryPhaseTimeout = std::chrono::seconds(8);
 constexpr auto kStoppingTimeout = std::chrono::seconds(5);
+// Bound for the controller to return to NORMAL after an accepted RESET_FAULT.
+constexpr auto kFaultResetTimeout = std::chrono::seconds(3);
+// An RT fault (fail_controller) makes controller_manager deactivate the CTC; it then
+// stops publishing status and no Studio command can bring it back.
+constexpr const char * kControllerLostHint =
+  "No /ctc_controller/status heartbeat: ctc_controller may have been deactivated by "
+  "controller_manager after an RT fault (non-finite feedback, effort write failure or "
+  "update exception). Reactivate it with: ros2 service call "
+  "/controller_manager/switch_controller controller_manager_msgs/srv/SwitchController "
+  "\"{activate_controllers: [ctc_controller], strictness: 2}\" -- then RECOVER.";
 constexpr double kSettleSpeedThreshold =
   lite6_interfaces::contract::kPlannerSettleSpeedRadPerSec;
 }  // namespace
@@ -127,6 +137,7 @@ void StudioSupervisor::enter_estop_unlocked(
   pause_requested_ = false;
   step_mode_ = false;
   recovery_phase_ = RecoverySubPhase::NONE;
+  fault_reset_pending_ = false;
   snap_.estop_latched = true;
   if (reason != CS::ESTOP_NONE) {
     snap_.estop_reason = reason;
@@ -153,8 +164,22 @@ void StudioSupervisor::enter_fault_unlocked(int32_t code, const std::string & de
   pause_requested_ = false;
   step_mode_ = false;
   recovery_phase_ = RecoverySubPhase::NONE;
+  fault_reset_pending_ = false;
   snap_.last_error_code = code;
   snap_.state = S::STATE_FAULT;
+  notify_unlocked(detail);
+}
+
+void StudioSupervisor::clear_fault_unlocked(const std::string & detail)
+{
+  fault_reset_pending_ = false;
+  snap_.last_error_code = 0;
+  snap_.current_block_index = 0;
+  snap_.current_line_number = 0;
+  snap_.current_statement_index = -1;
+  snap_.block_progress_percent = 0.0;
+  snap_.total_progress_percent = 0.0;
+  snap_.state = has_program_ ? S::STATE_COMPILED_READY : S::STATE_IDLE;
   notify_unlocked(detail);
 }
 
@@ -209,6 +234,7 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
     const bool was_fresh = fresh_controller_unlocked(now);
     const uint8_t prev_mode = snap_.controller_mode;
     controller_stamp_ = now;
+    controller_lost_notified_ = false;
     snap_.controller_mode = mode;
     snap_.external_joint_torque = status.external_joint_torque;
     snap_.external_cartesian_wrench = status.external_cartesian_wrench;
@@ -240,6 +266,11 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
           notify_unlocked("Controller NORMAL and joint telemetry fresh; system ready");
           changed = true;
         }
+      } else if (
+        snap_.state == S::STATE_FAULT && fault_reset_pending_ && fresh_joint_unlocked(now))
+      {
+        clear_fault_unlocked("Controller returned to MODE_NORMAL; fault cleared");
+        changed = true;
       } else if (
         snap_.state == S::STATE_RECOVERING &&
         recovery_phase_ == RecoverySubPhase::ENABLE_NORMAL)
@@ -428,14 +459,26 @@ StudioSupervisor::Effects StudioSupervisor::watchdog()
     const bool j_fresh = fresh_joint_unlocked(now);
     const bool c_fresh = fresh_controller_unlocked(now);
 
+    const bool controller_lost =
+      controller_stamp_ != Clock::time_point{} && !c_fresh;
     if ((!j_fresh || !c_fresh) &&
         (snap_.state == S::STATE_RUNNING || snap_.state == S::STATE_STEPPING ||
          snap_.state == S::STATE_STOPPING || snap_.state == S::STATE_RECOVERING))
     {
       effects.send_estop_cmd = true;
-      enter_estop_unlocked(
-        "Feedback timeout on /joint_states or /ctc_controller/status during motion",
-        CS::ESTOP_EXTERNAL, effects);
+      std::string detail =
+        "Feedback timeout on /joint_states or /ctc_controller/status during motion";
+      if (controller_lost) {
+        controller_lost_notified_ = true;
+        detail += std::string("\n\n") + kControllerLostHint;
+      }
+      enter_estop_unlocked(detail, CS::ESTOP_EXTERNAL, effects);
+      changed = true;
+    } else if (controller_lost && !controller_lost_notified_ &&
+               snap_.state != S::STATE_BOOT_INIT)
+    {
+      controller_lost_notified_ = true;
+      notify_unlocked(snap_.detail + "\n\n" + kControllerLostHint);
       changed = true;
     } else if (snap_.state == S::STATE_ESTOP && c_fresh &&
                snap_.controller_mode != CS::MODE_ESTOP)
@@ -472,6 +515,14 @@ StudioSupervisor::Effects StudioSupervisor::watchdog()
         "Controlled stop deadline exceeded; latched E-STOP",
         CS::ESTOP_EXTERNAL, effects);
       changed = true;
+    } else if (snap_.state == S::STATE_FAULT && fault_reset_pending_ &&
+               now > fault_reset_deadline_)
+    {
+      fault_reset_pending_ = false;
+      notify_unlocked(
+        "Automatic fault reset timed out: controller did not return to MODE_NORMAL; "
+        "retry RESET_FAULT");
+      changed = true;
     }
 
     if (changed) {
@@ -484,20 +535,32 @@ StudioSupervisor::Effects StudioSupervisor::watchdog()
   return effects;
 }
 
-bool StudioSupervisor::can_compile(std::string & out_reason) const
+bool StudioSupervisor::begin_compile(bool auto_load, std::string & out_reason)
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  switch (snap_.state) {
-    case S::STATE_IDLE:
-    case S::STATE_COMPILED_READY:
-    case S::STATE_FAULT:
-    case S::STATE_ESTOP:
-      return true;
-    default:
-      out_reason =
-        "Cannot compile while system state is PAUSED or active "
-        "(RUNNING/STEPPING/STOPPING/RECOVERING/BOOT_INIT); STOP program first";
-      return false;
+  if (auto_load) {
+    switch (snap_.state) {
+      case S::STATE_IDLE:
+      case S::STATE_COMPILED_READY:
+      case S::STATE_FAULT:
+      case S::STATE_ESTOP:
+        break;
+      default:
+        out_reason =
+          "Cannot compile while system state is PAUSED or active "
+          "(RUNNING/STEPPING/STOPPING/RECOVERING/BOOT_INIT); STOP program first";
+        return false;
+    }
+  }
+  ++compile_in_flight_;
+  return true;
+}
+
+void StudioSupervisor::end_compile()
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (compile_in_flight_ > 0) {
+    --compile_in_flight_;
   }
 }
 
@@ -621,6 +684,15 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
     const bool j_fresh = fresh_joint_unlocked(now);
     const bool c_fresh = fresh_controller_unlocked(now);
     const bool stationary = last_dq_valid_ && (last_max_abs_dq_ <= kSettleSpeedThreshold);
+    res.prev_state = snap_.state;
+
+    if (compile_in_flight_ > 0 &&
+        (command == C::Request::CMD_RUN || command == C::Request::CMD_RESUME ||
+         command == C::Request::CMD_STEP || command == C::Request::CMD_CLEAR_PROGRAM))
+    {
+      reject("Compilation is currently in progress; wait for completion");
+      return res;
+    }
 
     switch (command) {
       case C::Request::CMD_ESTOP: {
@@ -781,7 +853,10 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
           break;
         }
         if (!j_fresh || !c_fresh) {
-          reject("RECOVER requires fresh /joint_states and /ctc_controller/status");
+          reject(
+            !c_fresh && controller_stamp_ != Clock::time_point{} ?
+            std::string("RECOVER requires fresh /ctc_controller/status.\n") + kControllerLostHint :
+            std::string("RECOVER requires fresh /joint_states and /ctc_controller/status"));
           break;
         }
         if (snap_.controller_mode != CS::MODE_ESTOP &&
@@ -819,18 +894,18 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
           break;
         }
         if (snap_.controller_mode != CS::MODE_NORMAL) {
+          // Non-blocking: request NORMAL and clear the fault once NORMAL is observed.
           res.effects.send_enter_normal_cmd = true;
-          reject("Controller is returning to MODE_NORMAL; retry RESET_FAULT once NORMAL");
+          res.effects.controller_epoch = snap_.controller_epoch;
+          fault_reset_pending_ = true;
+          fault_reset_deadline_ = now + kFaultResetTimeout;
+          notify_unlocked(
+            "Returning controller to MODE_NORMAL; fault clears automatically once NORMAL is observed");
+          res.accepted = true;
+          changed = true;
           break;
         }
-        snap_.last_error_code = 0;
-        snap_.current_block_index = 0;
-        snap_.current_line_number = 0;
-        snap_.current_statement_index = -1;
-        snap_.block_progress_percent = 0.0;
-        snap_.total_progress_percent = 0.0;
-        snap_.state = has_program_ ? S::STATE_COMPILED_READY : S::STATE_IDLE;
-        notify_unlocked("Fault cleared");
+        clear_fault_unlocked("Fault cleared");
         res.accepted = true;
         changed = true;
         break;
@@ -1127,6 +1202,25 @@ void StudioSupervisor::on_execution_fault(
     }
     changed = true;
     notify_snap = make_snapshot_unlocked(Clock::now());
+  }
+  if (changed && on_change_) {
+    on_change_(notify_snap);
+  }
+}
+
+void StudioSupervisor::note_pause_deferred(const std::string & detail)
+{
+  bool changed = false;
+  Snapshot notify_snap;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pause_requested_ &&
+        (snap_.state == S::STATE_RUNNING || snap_.state == S::STATE_STEPPING))
+    {
+      notify_unlocked(detail);
+      changed = true;
+      notify_snap = make_snapshot_unlocked(Clock::now());
+    }
   }
   if (changed && on_change_) {
     on_change_(notify_snap);

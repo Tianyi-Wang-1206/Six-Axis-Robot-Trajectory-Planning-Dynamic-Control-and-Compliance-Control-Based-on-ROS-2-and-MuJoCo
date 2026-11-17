@@ -40,6 +40,8 @@ public:
     bool send_estop_cmd = false;
     bool send_enter_normal_cmd = false;
     bool wake_worker = false;
+    // Epoch guard for send_enter_normal_cmd (0 skips the check).
+    uint64_t controller_epoch = 0;
   };
 
   struct CommandResult
@@ -47,6 +49,8 @@ public:
     bool accepted = false;
     uint64_t revision = 0;
     uint8_t state = S::STATE_BOOT_INIT;
+    // State observed atomically with the command decision (before any transition).
+    uint8_t prev_state = S::STATE_BOOT_INIT;
     uint64_t controller_epoch = 0;
     std::string message;
     Effects effects;
@@ -92,8 +96,11 @@ public:
   void observe_gripper(uint8_t gripper_state, bool ready);
   Effects watchdog();
 
-  // Compile coordination
-  bool can_compile(std::string & out_reason) const;
+  // Compile coordination. begin_compile() atomically checks the state (auto_load only)
+  // and registers an in-flight compile; RUN/RESUME/STEP/CLEAR_PROGRAM are rejected
+  // under the same mutex until the matching end_compile().
+  bool begin_compile(bool auto_load, std::string & out_reason);
+  void end_compile();
   void on_compile_dry_run(uint64_t request_id);
   void on_compile_succeeded(
     const std::string & program_id,
@@ -155,6 +162,9 @@ public:
 
   void on_recovery_failed(uint64_t session, const std::string & reason);
 
+  // Shows why an accepted PAUSE is deferred (e.g. an active gripper command).
+  void note_pause_deferred(const std::string & detail);
+
 private:
   bool fresh_joint_unlocked(Clock::time_point now) const;
   bool fresh_controller_unlocked(Clock::time_point now) const;
@@ -165,6 +175,7 @@ private:
   void enter_estop_unlocked(const std::string & detail, uint8_t reason, Effects & effects);
   void enter_fault_unlocked(int32_t code, const std::string & detail);
   void finish_stop_unlocked(const std::string & detail);
+  void clear_fault_unlocked(const std::string & detail);
 
   static std::string describe_estop_reason(uint8_t reason);
 
@@ -177,6 +188,13 @@ private:
   bool stop_requested_ = false;
   bool pause_requested_ = false;
   bool step_mode_ = false;
+  int compile_in_flight_ = 0;
+
+  // RESET_FAULT accepted while the controller returns to NORMAL asynchronously.
+  bool fault_reset_pending_ = false;
+  Clock::time_point fault_reset_deadline_{};
+  // Latched once per controller-status outage to show the reactivation hint.
+  bool controller_lost_notified_ = false;
 
   RecoverySubPhase recovery_phase_ = RecoverySubPhase::NONE;
   Clock::time_point phase_deadline_{};
