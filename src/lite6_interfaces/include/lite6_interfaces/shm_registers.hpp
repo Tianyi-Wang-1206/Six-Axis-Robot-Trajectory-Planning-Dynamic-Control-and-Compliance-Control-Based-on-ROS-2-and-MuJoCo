@@ -19,6 +19,12 @@ inline int64_t steady_now_ns() noexcept
     std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+inline bool is_stamp_fresh(int64_t stamp_ns, int64_t now_ns, int64_t max_age_ns) noexcept
+{
+  return stamp_ns > 0 && max_age_ns >= 0 && now_ns >= stamp_ns &&
+         (now_ns - stamp_ns) <= max_age_ns;
+}
+
 inline void cpu_relax() noexcept
 {
 #if defined(__x86_64__) || defined(__i386__)
@@ -77,6 +83,11 @@ struct alignas(64) ShmSeqRegister
       words[i].store(buf[i], std::memory_order_relaxed);
     }
     seq.store(s + 1ULL, std::memory_order_release);
+  }
+
+  void clear() noexcept
+  {
+    write(T{});
   }
 
   bool read(T & out, uint64_t & out_seq, uint32_t max_retries = 64) const noexcept

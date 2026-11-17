@@ -49,6 +49,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/StudioState.msg"
   "srv/SupervisorCommand.srv"
   "srv/GripperCommand.srv"
+  "srv/ControllerCommand.srv"
   "srv/SubmitSysIdTrajectory.srv"
   "srv/CompileProgram.srv"
   "srv/StudioCommand.srv"
@@ -74,6 +75,7 @@ install(TARGETS lite6_shm_bridge
 )
 
 ament_python_install_module(python/lite6_shm_client.py)
+install(FILES python/lite6_motion_contract.py DESTINATION "${PYTHON_INSTALL_DIR}")
 
 ament_export_targets(export_lite6_shm_bridge)
 ament_export_libraries(lite6_shm_bridge)

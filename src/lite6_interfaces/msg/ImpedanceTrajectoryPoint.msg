@@ -22,3 +22,9 @@ float64[3] rotation_damping
 
 # Joint-space null damping [Nm*s/rad] relative to reference joint velocity, range [0.0, 20.0].
 float64 nullspace_damping
+
+# Optional joint-space null stiffness [Nm/rad] relative to reference configuration, range [0.0, 50.0].
+float64 nullspace_stiffness 0.0
+
+# Optional Cartesian feedforward wrench [fx, fy, fz, tx, ty, tz] in LOCAL_WORLD_ALIGNED TCP frame [N, Nm].
+float64[6] wrench_ff

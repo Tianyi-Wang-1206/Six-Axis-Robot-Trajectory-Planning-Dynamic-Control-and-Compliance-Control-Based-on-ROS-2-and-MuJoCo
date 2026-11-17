@@ -2,9 +2,13 @@
 string source_code
 bool use_current_robot_start
 float64[6] custom_start_joints
+uint64 request_id 0
+bool auto_load true
 ---
 bool success
+uint64 request_id
 string program_id
+uint64 program_revision
 uint32 total_statements
 uint32 total_blocks
 float64 estimated_duration_sec

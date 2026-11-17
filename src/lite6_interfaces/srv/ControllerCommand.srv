@@ -1,0 +1,51 @@
+# Ordered edge-triggered command gateway for Lite6CTCController (/ctc_controller/command).
+# Replaces uncoordinated Int32 system_cmd and separate ComplianceCommand topic channels.
+
+uint8 CMD_NONE=0
+uint8 CMD_ENTER_NORMAL=1                # Transition SYSID or compliance/teach to NORMAL (never clears ESTOP)
+uint8 CMD_ESTOP=2                       # Latch ESTOP immediately
+uint8 CMD_CLEAR_ESTOP=3                 # ESTOP -> NORMAL when feedback finite and max|dq| <= clear-estop speed limit
+uint8 CMD_ENTER_SYSID=4                 # NORMAL (idle & stationary) -> SYSID
+uint8 CMD_ENTER_JOINT_IMPEDANCE=5       # Enter/switch to JOINT_IMPEDANCE with validated ComplianceSettings
+uint8 CMD_ENTER_CARTESIAN_IMPEDANCE=6   # Enter/switch to CARTESIAN_IMPEDANCE with validated ComplianceSettings
+uint8 CMD_ENTER_TEACH=7                 # Enter/switch to TEACH with validated ComplianceSettings
+uint8 CMD_UPDATE_COMPLIANCE_SETTINGS=8  # Live-update settings while already in JOINT/CARTESIAN_IMPEDANCE or TEACH
+uint8 CMD_SET_PAYLOAD=9                 # Set known rigid payload mass and TCP-frame CoM offset
+uint8 CMD_TARE_GMO=10                   # Capture stationary GMO residual torque bias in a settled steady mode
+
+uint8 command
+
+# Optional optimistic controller incarnation guard: 0 skips epoch check;
+# >0 rejects with ACK_REJECTED_EPOCH if expected_epoch != ControllerStatus.controller_epoch.
+uint64 expected_epoch 0
+
+# Used by CMD_ENTER_{JOINT_IMPEDANCE,CARTESIAN_IMPEDANCE,TEACH} and CMD_UPDATE_COMPLIANCE_SETTINGS.
+ComplianceSettings compliance
+
+# Known rigid payload parameters for gravity/inertia/GMO compensation (CMD_SET_PAYLOAD).
+float64 payload_mass 0.0
+float64[3] payload_com_tcp
+
+# Non-RT diagnostic reason logged by the service callback (never copied into the RT thread).
+string reason
+---
+uint8 ACK_NONE=0
+uint8 ACK_APPLIED=1
+uint8 ACK_REJECTED_STATE=2              # Source controller mode or lifecycle state disallows command
+uint8 ACK_REJECTED_SPEED=3              # Measured joint speed exceeds mode-entry/recovery limit
+uint8 ACK_REJECTED_LIMIT=4              # Joint/safety limits prevent safe entry
+uint8 ACK_REJECTED_BUSY=5               # Active rigid/impedance trajectory or COMPLIANCE_STOPPING in progress
+uint8 ACK_REJECTED_EPOCH=6              # expected_epoch does not match active controller_epoch
+uint8 ACK_REJECTED_INVALID_ARG=7        # Unknown command code, non-finite value, or out-of-bounds parameter
+uint8 ACK_RT_TIMEOUT=8                  # 1 kHz RT loop did not consume queued command within wait budget
+
+# True iff ack_result == ACK_APPLIED.
+bool accepted
+uint8 ack_result
+
+# Monotonic sequence assigned once queued to RT (0 if rejected prior to RT handoff).
+uint64 cmd_seq
+uint64 controller_epoch
+uint64 mode_epoch
+uint8 current_mode
+string message

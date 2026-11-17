@@ -1,6 +1,16 @@
 # Goal: 1 kHz time-varying equilibrium trajectory for Cartesian impedance tracking.
+uint8 END_TRANSITION_NORMAL=0
+uint8 END_HOLD_CARTESIAN_IMPEDANCE=1
+
 string[] joint_names
 ImpedanceTrajectoryPoint[] points
+
+# Bumpless entry blend duration in seconds ([0.0, 5.0]; 0.0 selects controller default).
+float64 transition_time 0.0
+# Optional epoch guard; 0 skips check, >0 must match ControllerStatus.controller_epoch.
+uint64 expected_controller_epoch 0
+# Post-trajectory completion behavior: 0 transitions smoothly to NORMAL; 1 holds final pose in CARTESIAN_IMPEDANCE.
+uint8 end_behavior 0
 ---
 int32 SUCCESSFUL=0
 int32 INVALID_GOAL=-1
@@ -12,6 +22,8 @@ int32 GOAL_TIMEOUT=-6
 int32 MODE_CHANGED=-7
 int32 CONTROLLER_FAULT=-8
 int32 EXTERNAL_TORQUE_LIMIT_VIOLATED=-9
+int32 CONTROLLER_EPOCH_MISMATCH=-10
+int32 STOPPING_TIMEOUT=-11
 
 int32 error_code
 string error_string

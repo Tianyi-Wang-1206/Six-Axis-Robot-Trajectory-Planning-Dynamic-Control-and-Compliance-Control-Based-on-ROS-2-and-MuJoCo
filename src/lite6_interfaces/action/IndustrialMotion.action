@@ -13,7 +13,8 @@ float64 velocity_scale
 float64 acceleration_scale
 
 # NORMAL is the default for ordinary GUI/client motions.
-# SYSID and RECOVERY are supervisor-gated internal motions, not privileges.
+# SYSID is a supervisor-gated internal motion; CONTEXT_RECOVERY is DEPRECATED
+# for removal in Phase 2 once E-STOP recovery uses ControllerCommand.CMD_CLEAR_ESTOP.
 uint8 CONTEXT_NORMAL=0
 uint8 CONTEXT_SYSID=1
 uint8 CONTEXT_RECOVERY=2

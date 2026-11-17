@@ -83,3 +83,8 @@ bool contact_detected
 int32 ERROR_SYSID_ESTIMATION=-14
 int32 last_error_code
 string detail
+
+# Observed controller incarnation and active known payload parameters.
+uint64 controller_epoch
+float64 payload_mass
+float64[3] payload_com_tcp

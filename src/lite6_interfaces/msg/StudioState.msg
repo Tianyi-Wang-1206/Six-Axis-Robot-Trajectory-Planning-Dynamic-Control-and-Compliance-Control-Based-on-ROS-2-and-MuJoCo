@@ -42,3 +42,8 @@ float64[6] external_cartesian_wrench
 bool contact_detected
 
 string detail
+
+# Observed controller incarnation, loaded program revision, and latest compile request correlation.
+uint64 controller_epoch
+uint64 program_revision
+uint64 last_compile_request_id

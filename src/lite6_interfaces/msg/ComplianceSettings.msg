@@ -9,3 +9,6 @@ float64 rotation_damping 1.5
 float64 sensitivity 3.0
 # Same-mode updates preserve the equilibrium unless explicitly requested.
 bool recapture false
+# Optional null-space posture regulation gains for interactive Cartesian impedance [0.0..50.0, 0.0..20.0].
+float64 nullspace_stiffness 0.0
+float64 nullspace_damping 0.5

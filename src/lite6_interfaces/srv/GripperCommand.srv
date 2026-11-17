@@ -2,6 +2,8 @@ uint8 OPEN=1
 uint8 CLOSE=2
 uint8 STOP=3
 uint8 command
+# Optional max motor force override [N]; <= 0.0 uses gripper.yaml default.
+float64 max_force_override 0.0
 # Independent OPEN/CLOSE/STOP. Calibration is loaded from gripper.yaml at startup.
 # STOP removes motor drive; it does not impose a position lock or guarantee a grasp.
 ---

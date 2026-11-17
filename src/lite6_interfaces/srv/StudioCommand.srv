@@ -10,8 +10,12 @@ uint8 CMD_RECOVER=8
 uint8 CMD_CLEAR_PROGRAM=9
 
 uint8 command
+# Optional optimistic revision guard: 0 skips check (CMD_ESTOP always bypasses revision guard).
+uint64 expected_revision 0
 string reason
 ---
 bool accepted
 uint64 revision
+uint8 state
+uint64 controller_epoch
 string message

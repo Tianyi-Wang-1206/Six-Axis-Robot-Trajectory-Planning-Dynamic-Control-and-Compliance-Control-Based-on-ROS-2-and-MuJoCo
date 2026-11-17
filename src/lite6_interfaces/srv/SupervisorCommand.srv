@@ -13,10 +13,20 @@ uint8 CMD_JOINT_IMPEDANCE=8
 uint8 CMD_CARTESIAN_IMPEDANCE=9
 uint8 CMD_TEACH=10
 uint8 CMD_EXIT_COMPLIANCE=11
+uint8 CMD_UPDATE_COMPLIANCE=12
+uint8 CMD_SET_PAYLOAD=13
+uint8 CMD_TARE_GMO=14
 
-# Used only by the three compliance events.
+# Used by the compliance entry and CMD_UPDATE_COMPLIANCE events.
 ComplianceSettings compliance
 uint8 command
+
+# Optional optimistic state concurrency guard: 0 skips revision check.
+uint64 expected_revision 0
+
+# Known rigid payload parameters for CMD_SET_PAYLOAD.
+float64 payload_mass 0.0
+float64[3] payload_com_tcp
 
 # For session-scoped operations use the ID returned by BEGIN_*.
 # For ESTOP, BEGIN_RECOVERY, ACK_SOFT_FAULT and BEGIN_SYSID send 0.
@@ -28,4 +38,5 @@ string reason
 bool accepted
 uint64 session_id
 uint64 revision
+uint8 mode
 string message
