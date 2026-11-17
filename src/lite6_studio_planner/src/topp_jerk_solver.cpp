@@ -10,16 +10,273 @@ namespace lite6_studio_planner
 namespace
 {
 
-// Exact analytical piecewise-linear TOPP-RA velocity profile smoothed by a zero-overshoot
-// boxcar jerk filter of duration T_fir. Because boxcar integration has unit DC gain and
-// preserves non-negativity, u(t) monotonically increases from 0 to 1 with C^1 velocity
-// and continuous C^0 acceleration (zero vel/acc at both endpoints).
-struct SmoothedTOPPProfile
+constexpr double kPi = 3.14159265358979323846;
+// Sides of the inscribed polygon approximating Cartesian norm constraints.
+constexpr int kPolygonSides = 16;
+// TOPP-RA plans against this fraction of the acceleration limits; the 1 kHz check
+// accepts up to kCheckMargin, leaving headroom for the boxcar smoothing.
+constexpr double kAccMargin = 0.97;
+constexpr double kCheckMargin = 0.995;
+// Heuristic jerk-aware speed cap: |q'''| * sdot^3 <= kJerkCapShare * j_max.
+constexpr double kJerkCapShare = 0.6;
+constexpr int kFineSamples = 2048;
+constexpr int kMinGrid = 64;
+constexpr int kMaxGrid = 6000;
+constexpr int kMaxRefinePasses = 24;
+constexpr int kMaxDilationPasses = 8;
+constexpr double kMaxDurationSec = 300.0;
+
+// Grid resolution targets per stage.
+constexpr double kGridJointStep = 0.003;       // rad
+constexpr double kGridJointCurvature = 0.006;  // rad (chord sag scale)
+constexpr double kGridTransStep = 0.002;       // m
+constexpr double kGridRotStep = 0.005;         // rad
+
+struct PathPoint
 {
-  std::vector<double> t;  // TOPP timestamps [0 .. T_topp], strictly increasing
-  std::vector<double> v;  // TOPP velocity du/dt_topp at each timestamp, v[0]=v[N]=0
-  std::vector<double> U;  // Exact antiderivative int_0^t v(s) ds, U[0]=0, U[N]=1
-  std::vector<double> W;  // Exact antiderivative int_0^t U(s) ds
+  Vec6 q = Vec6::Zero(), q1 = Vec6::Zero(), q2 = Vec6::Zero(), q3 = Vec6::Zero();
+  double vs = 0.5, as = 0.5, js = 1.0;
+  bool cart = false;
+  Eigen::Vector3d p1 = Eigen::Vector3d::Zero(), p2 = Eigen::Vector3d::Zero();
+  Eigen::Vector3d w1 = Eigen::Vector3d::Zero(), w2 = Eigen::Vector3d::Zero();
+  SourceLocation loc;
+};
+
+class PathSampler
+{
+public:
+  PathSampler(
+    const JointPath & path, const CompositeCartesianPath * cart,
+    double vs, double as, double js, const SourceLocation & loc)
+  : path_(path), cart_(cart), vs_(vs), as_(as), js_(js), loc_(loc) {}
+
+  PathPoint eval(double u) const
+  {
+    PathPoint pp;
+    path_.eval(u, pp.q, pp.q1, pp.q2, pp.q3);
+    if (cart_ != nullptr) {
+      const CartesianSample cs = cart_->eval_normalized(u);
+      pp.cart = true;
+      pp.p1 = cs.p_s;
+      pp.p2 = cs.p_ss;
+      pp.w1 = cs.w_s;
+      pp.w2 = cs.w_ss;
+      pp.vs = cs.vel_scale;
+      pp.as = cs.acc_scale;
+      pp.js = cs.jerk_scale;
+      pp.loc = cs.loc;
+      return pp;
+    }
+    MotionOptions opts;
+    SourceLocation loc;
+    if (path_.options_at(u, opts, loc)) {
+      pp.vs = opts.vel_scale;
+      pp.as = opts.acc_scale;
+      pp.js = opts.jerk_scale;
+      pp.loc = loc;
+    } else {
+      pp.vs = vs_;
+      pp.as = as_;
+      pp.js = js_;
+      pp.loc = loc_;
+    }
+    return pp;
+  }
+
+private:
+  const JointPath & path_;
+  const CompositeCartesianPath * cart_;
+  double vs_, as_, js_;
+  SourceLocation loc_;
+};
+
+// a * sdd + b * x <= c, with x = sdot^2 and sdd = d2u/dt2.
+struct LinCon
+{
+  double a, b, c;
+};
+
+// Inner polygon of |d1 * sdd + d2 * x| <= limit (vectors span at most a plane).
+void add_norm_polygon(
+  const Eigen::Vector3d & d1, const Eigen::Vector3d & d2, double limit,
+  std::vector<LinCon> & out)
+{
+  const double n1 = d1.norm();
+  if (n1 < 1e-12) {
+    const double n2 = d2.norm();
+    if (n2 > 1e-12) {
+      out.push_back({0.0, n2, limit});
+    }
+    return;
+  }
+  const Eigen::Vector3d e1 = d1 / n1;
+  const double b1 = d2.dot(e1);
+  const double b2 = (d2 - b1 * e1).norm();
+  const double c = limit * std::cos(kPi / kPolygonSides);
+  for (int k = 0; k < kPolygonSides; ++k) {
+    const double phi = 2.0 * kPi * k / kPolygonSides;
+    const double cp = std::cos(phi);
+    const double sp = std::sin(phi);
+    out.push_back({cp * n1, cp * b1 + sp * b2, c});
+  }
+}
+
+struct Stage
+{
+  double x_cap = 0.0;
+  std::vector<LinCon> cons;
+};
+
+Stage build_stage(
+  const PathPoint & pp, double f_v, double f_a,
+  const std::array<lite6_planner::JointLimit, 6> & jl,
+  const lite6_planner::CartesianLimit & cl)
+{
+  Stage st;
+  double cap = 1e12;
+  const double fv2 = f_v * f_v;
+  for (int j = 0; j < 6; ++j) {
+    const auto & lim = jl[static_cast<size_t>(j)];
+    const double d1 = std::abs(pp.q1[j]);
+    const double d3 = std::abs(pp.q3[j]);
+    if (d1 > 1e-12) {
+      const double v = pp.vs * lim.max_vel / d1;
+      cap = std::min(cap, v * v * fv2);
+    }
+    if (d3 > 1e-12) {
+      cap = std::min(cap, std::pow(kJerkCapShare * pp.js * lim.max_jerk / d3, 2.0 / 3.0) * fv2);
+    }
+    const double acc = pp.as * lim.max_acc * kAccMargin * f_a;
+    if (d1 > 1e-12 || std::abs(pp.q2[j]) > 1e-12) {
+      st.cons.push_back({pp.q1[j], pp.q2[j], acc});
+      st.cons.push_back({-pp.q1[j], -pp.q2[j], acc});
+    }
+  }
+  if (pp.cart) {
+    const double np = pp.p1.norm();
+    const double nw = pp.w1.norm();
+    if (np > 1e-12) {
+      const double v = pp.vs * cl.max_trans_vel / np;
+      cap = std::min(cap, v * v * fv2);
+    }
+    if (nw > 1e-12) {
+      const double v = pp.vs * cl.max_rot_vel / nw;
+      cap = std::min(cap, v * v * fv2);
+    }
+    add_norm_polygon(pp.p1, pp.p2, pp.as * cl.max_trans_acc * kAccMargin * f_a, st.cons);
+    add_norm_polygon(pp.w1, pp.w2, pp.as * cl.max_rot_acc * kAccMargin * f_a, st.cons);
+  }
+  st.x_cap = cap;
+  return st;
+}
+
+// Exact projection onto x of {(sdd, x) : stage constraints, extra constraints,
+// lo_in <= x <= hi_in} by Fourier-Motzkin elimination of sdd.
+bool project_x(
+  const std::vector<LinCon> & cons, const LinCon * extra, size_t n_extra,
+  double lo_in, double hi_in, double & lo, double & hi)
+{
+  lo = lo_in;
+  hi = hi_in;
+  // Bounds sdd <= p + r x (upper) or sdd >= p + r x (lower).
+  static thread_local std::vector<std::pair<double, double>> uppers, lowers;
+  uppers.clear();
+  lowers.clear();
+  auto add = [&](const LinCon & k) {
+    if (k.a > 1e-14) {
+      uppers.emplace_back(k.c / k.a, -k.b / k.a);
+    } else if (k.a < -1e-14) {
+      lowers.emplace_back(k.c / k.a, -k.b / k.a);
+    } else if (k.b > 1e-14) {
+      hi = std::min(hi, k.c / k.b);
+    } else if (k.b < -1e-14) {
+      lo = std::max(lo, k.c / k.b);
+    }
+  };
+  for (const auto & k : cons) {
+    add(k);
+  }
+  for (size_t i = 0; i < n_extra; ++i) {
+    add(extra[i]);
+  }
+  for (const auto & l : lowers) {
+    for (const auto & u : uppers) {
+      const double coef = l.second - u.second;
+      const double rhs = u.first - l.first;
+      if (coef > 1e-14) {
+        hi = std::min(hi, rhs / coef);
+      } else if (coef < -1e-14) {
+        lo = std::max(lo, rhs / coef);
+      }
+    }
+  }
+  const double tol = 1e-9 * (1.0 + std::abs(hi));
+  if (lo > hi + tol) {
+    return false;
+  }
+  hi = std::max(hi, lo);
+  return true;
+}
+
+// Admissible sdd interval at a fixed x.
+void sdd_range(
+  const std::vector<LinCon> & cons, double x, double & s_lo, double & s_hi)
+{
+  s_lo = -std::numeric_limits<double>::infinity();
+  s_hi = std::numeric_limits<double>::infinity();
+  for (const auto & k : cons) {
+    if (k.a > 1e-14) {
+      s_hi = std::min(s_hi, (k.c - k.b * x) / k.a);
+    } else if (k.a < -1e-14) {
+      s_lo = std::max(s_lo, (k.c - k.b * x) / k.a);
+    }
+  }
+}
+
+// TOPP-RA: returns x_i = sdot^2 on the grid (rest at both ends).
+bool topp_ra(
+  const std::vector<double> & grid, const std::vector<Stage> & stages,
+  std::vector<double> & x, std::string & err)
+{
+  const size_t N = grid.size() - 1;
+  std::vector<double> k_lo(N + 1, 0.0), k_hi(N + 1, 0.0);
+  for (size_t ii = N; ii-- > 0;) {
+    const double delta = grid[ii + 1] - grid[ii];
+    const LinCon extra[2] = {
+      {2.0 * delta, 1.0, k_hi[ii + 1]},
+      {-2.0 * delta, -1.0, -k_lo[ii + 1]}};
+    if (!project_x(stages[ii].cons, extra, 2, 0.0, stages[ii].x_cap, k_lo[ii], k_hi[ii])) {
+      err = "TOPP-RA controllable set is empty at path parameter u=" + std::to_string(grid[ii]);
+      return false;
+    }
+  }
+  if (k_lo[0] > 1e-9) {
+    err = "TOPP-RA: path cannot start from rest";
+    return false;
+  }
+  x.assign(N + 1, 0.0);
+  for (size_t i = 0; i < N; ++i) {
+    const double delta = grid[i + 1] - grid[i];
+    double s_lo = 0.0, s_hi = 0.0;
+    sdd_range(stages[i].cons, x[i], s_lo, s_hi);
+    s_hi = std::min(s_hi, (k_hi[i + 1] - x[i]) / (2.0 * delta));
+    s_lo = std::max(s_lo, (k_lo[i + 1] - x[i]) / (2.0 * delta));
+    const double sdd = std::max(s_lo, s_hi);
+    x[i + 1] = std::clamp(x[i] + 2.0 * delta * sdd, k_lo[i + 1], k_hi[i + 1]);
+    x[i + 1] = std::max(0.0, x[i + 1]);
+  }
+  x[N] = 0.0;
+  return true;
+}
+
+// Piecewise-linear path speed v(t) from TOPP-RA (constant sdd per stage), smoothed by a
+// boxcar of length T_fir: finite jerk, unit DC gain, monotone u(t) from 0 to 1.
+struct SmoothedProfile
+{
+  std::vector<double> t;  // raw TOPP timestamps
+  std::vector<double> v;  // du/dt at t
+  std::vector<double> U;  // int_0^t v
+  std::vector<double> W;  // int_0^t U
   double T_topp = 0.0;
   double T_fir = 0.02;
 
@@ -32,12 +289,10 @@ struct SmoothedTOPPProfile
     W.assign(n, 0.0);
     for (size_t k = 0; k + 1 < n; ++k) {
       const double h = t[k + 1] - t[k];
-      const double dv = v[k + 1] - v[k];
-      const double m = (h > 1e-12) ? (dv / h) : 0.0;
+      const double m = (h > 1e-15) ? ((v[k + 1] - v[k]) / h) : 0.0;
       U[k + 1] = U[k] + v[k] * h + 0.5 * m * h * h;
       W[k + 1] = W[k] + U[k] * h + 0.5 * v[k] * h * h + (1.0 / 6.0) * m * h * h * h;
     }
-    // Renormalize U and W slightly if numerical accumulation shifted U.back() by ~1e-15
     if (U.back() > 1e-12 && std::abs(U.back() - 1.0) > 1e-12) {
       const double corr = 1.0 / U.back();
       for (size_t k = 0; k < n; ++k) {
@@ -48,75 +303,155 @@ struct SmoothedTOPPProfile
     }
   }
 
-  void eval_raw(double tau, double & V_val, double & dV_val, double & U_val, double & W_val) const
+  void eval_raw(double tau, double & V, double & dV, double & Uv, double & Wv) const
   {
     if (tau <= 0.0) {
-      V_val = 0.0;
-      dV_val = 0.0;
-      U_val = 0.0;
-      W_val = 0.0;
+      V = dV = Uv = Wv = 0.0;
       return;
     }
     if (tau >= T_topp) {
-      const double dt = tau - T_topp;
-      V_val = 0.0;
-      dV_val = 0.0;
-      U_val = U.back();
-      W_val = W.back() + U.back() * dt;
+      V = dV = 0.0;
+      Uv = U.back();
+      Wv = W.back() + U.back() * (tau - T_topp);
       return;
     }
-
     auto it = std::upper_bound(t.begin(), t.end(), tau);
     size_t k = (it == t.begin()) ? 0 : static_cast<size_t>(std::distance(t.begin(), it) - 1);
-    if (k + 1 >= t.size()) {
-      k = t.size() - 2;
-    }
+    k = std::min(k, t.size() - 2);
     const double h = t[k + 1] - t[k];
-    const double delta = std::clamp(tau - t[k], 0.0, h);
-    const double m = (h > 1e-12) ? ((v[k + 1] - v[k]) / h) : 0.0;
-
-    V_val = v[k] + m * delta;
-    dV_val = m;
-    U_val = U[k] + v[k] * delta + 0.5 * m * delta * delta;
-    W_val = W[k] + U[k] * delta + 0.5 * v[k] * delta * delta + (1.0 / 6.0) * m * delta * delta * delta;
+    const double d = std::clamp(tau - t[k], 0.0, h);
+    const double m = (h > 1e-15) ? ((v[k + 1] - v[k]) / h) : 0.0;
+    V = v[k] + m * d;
+    dV = m;
+    Uv = U[k] + v[k] * d + 0.5 * m * d * d;
+    Wv = W[k] + U[k] * d + 0.5 * v[k] * d * d + (1.0 / 6.0) * m * d * d * d;
   }
 
-  void eval_smoothed(
-    double t_eval, double & u, double & u_d, double & u_dd, double & u_ddd) const
+  void eval_smoothed(double te, double & u, double & ud, double & udd, double & uddd) const
   {
-    const double T_raw = raw_duration();
-    if (t_eval <= 0.0) {
-      u = 0.0;
-      u_d = 0.0;
-      u_dd = 0.0;
-      u_ddd = 0.0;
+    if (te <= 0.0) {
+      u = ud = udd = uddd = 0.0;
       return;
     }
-    if (t_eval >= T_raw) {
+    if (te >= raw_duration()) {
       u = 1.0;
-      u_d = 0.0;
-      u_dd = 0.0;
-      u_ddd = 0.0;
+      ud = udd = uddd = 0.0;
       return;
     }
+    double V1, dV1, U1, W1, V0, dV0, U0, W0;
+    eval_raw(te, V1, dV1, U1, W1);
+    eval_raw(te - T_fir, V0, dV0, U0, W0);
+    const double inv = 1.0 / T_fir;
+    u = std::clamp((W1 - W0) * inv, 0.0, 1.0);
+    ud = std::max(0.0, (U1 - U0) * inv);
+    udd = (V1 - V0) * inv;
+    uddd = (dV1 - dV0) * inv;
+  }
 
-    double V1, dV1, U1, W1;
-    double V0, dV0, U0, W0;
-    eval_raw(t_eval, V1, dV1, U1, W1);
-    eval_raw(t_eval - T_fir, V0, dV0, U0, W0);
-
-    const double invF = 1.0 / T_fir;
-    u = std::clamp((W1 - W0) * invF, 0.0, 1.0);
-    u_d = std::max(0.0, (U1 - U0) * invF);
-    u_dd = (V1 - V0) * invF;
-    u_ddd = (dV1 - dV0) * invF;
+  double raw_position(double tau) const
+  {
+    double V, dV, Uv, Wv;
+    eval_raw(tau, V, dV, Uv, Wv);
+    return Uv;
   }
 };
+
+struct Violation
+{
+  double tau_raw;
+  double rv, ra, rj;
+};
+
+struct EvalResult
+{
+  std::vector<Violation> violations;
+  double max_rv = 0.0, max_ra = 0.0, max_rj = 0.0;
+};
+
+// Samples the smoothed profile at 1 kHz over final_T; reports limit ratios and,
+// when out is non-null, emits the samples.
+EvalResult evaluate(
+  const SmoothedProfile & prof, double final_T, const PathSampler & sampler,
+  const std::array<lite6_planner::JointLimit, 6> & jl,
+  const lite6_planner::CartesianLimit & cl,
+  SampledTrajectory1kHz * out)
+{
+  EvalResult res;
+  const int ticks = std::max(2, static_cast<int>(std::llround(final_T * 1000.0)));
+  const double ts = prof.raw_duration() / final_T;
+  Vec6 prev_ddq = Vec6::Zero();
+  if (out != nullptr) {
+    out->samples.clear();
+    out->samples.reserve(static_cast<size_t>(ticks + 1));
+    out->duration_sec = static_cast<double>(ticks) * 0.001;
+  }
+  for (int tick = 0; tick <= ticks; ++tick) {
+    const double t = static_cast<double>(tick) * 0.001;
+    const double tau = std::min(t * ts, prof.raw_duration());
+    double u = 0.0, ud = 0.0, udd = 0.0, uddd = 0.0;
+    prof.eval_smoothed(tau, u, ud, udd, uddd);
+    ud *= ts;
+    udd *= ts * ts;
+    uddd *= ts * ts * ts;
+    if (tick == 0) {
+      u = 0.0;
+      ud = udd = uddd = 0.0;
+    } else if (tick == ticks) {
+      u = 1.0;
+      ud = udd = uddd = 0.0;
+    }
+    const PathPoint pp = sampler.eval(u);
+    const Vec6 dq = pp.q1 * ud;
+    const Vec6 ddq = pp.q2 * (ud * ud) + pp.q1 * udd;
+    const Vec6 jrk = pp.q3 * (ud * ud * ud) + 3.0 * pp.q2 * (ud * udd) + pp.q1 * uddd;
+
+    double rv = 0.0, ra = 0.0, rj = 0.0;
+    for (int j = 0; j < 6; ++j) {
+      const auto & lim = jl[static_cast<size_t>(j)];
+      rv = std::max(rv, std::abs(dq[j]) / (pp.vs * lim.max_vel * kCheckMargin));
+      ra = std::max(ra, std::abs(ddq[j]) / (pp.as * lim.max_acc * kCheckMargin));
+      double jerk = std::abs(jrk[j]);
+      if (tick > 0) {
+        jerk = std::max(jerk, std::abs(ddq[j] - prev_ddq[j]) / 0.001);
+      }
+      rj = std::max(rj, jerk / (pp.js * lim.max_jerk * kCheckMargin));
+    }
+    if (pp.cart) {
+      rv = std::max(rv, (pp.p1 * ud).norm() / (pp.vs * cl.max_trans_vel * kCheckMargin));
+      rv = std::max(rv, (pp.w1 * ud).norm() / (pp.vs * cl.max_rot_vel * kCheckMargin));
+      ra = std::max(ra, (pp.p2 * (ud * ud) + pp.p1 * udd).norm() /
+        (pp.as * cl.max_trans_acc * kCheckMargin));
+      ra = std::max(ra, (pp.w2 * (ud * ud) + pp.w1 * udd).norm() /
+        (pp.as * cl.max_rot_acc * kCheckMargin));
+    }
+    prev_ddq = ddq;
+    res.max_rv = std::max(res.max_rv, rv);
+    res.max_ra = std::max(res.max_ra, ra);
+    res.max_rj = std::max(res.max_rj, rj);
+    if (rv > 1.0 || ra > 1.0 || rj > 1.0) {
+      res.violations.push_back({tau, rv, ra, rj});
+    }
+    if (out != nullptr) {
+      SampledTrajectory1kHz::Sample smp;
+      smp.time_sec = t;
+      smp.path_u = u;
+      for (size_t i = 0; i < 6; ++i) {
+        const int k = static_cast<int>(i);
+        smp.q[i] = pp.q[k];
+        smp.dq[i] = (tick == 0 || tick == ticks) ? 0.0 : dq[k];
+        smp.ddq[i] = (tick == 0 || tick == ticks) ? 0.0 : ddq[k];
+      }
+      smp.loc = pp.loc;
+      out->samples.push_back(smp);
+    }
+  }
+  return res;
+}
 
 }  // namespace
 
 bool TOPPJerkSolver::solve(
-  const C3JointSpline & joint_spline,
+  const JointPath & path,
   const CompositeCartesianPath * cart_path,
   const std::array<lite6_planner::JointLimit, 6> & joint_limits,
   const lite6_planner::CartesianLimit & cart_limits,
@@ -129,272 +464,195 @@ bool TOPPJerkSolver::solve(
 {
   out_traj.samples.clear();
   out_traj.duration_sec = 0.0;
+  const PathSampler sampler(
+    path, cart_path, default_vel_scale, default_acc_scale, default_jerk_scale, default_loc);
 
-  // Handle degenerate zero-displacement paths cleanly without division by zero.
-  if (joint_spline.max_q1().lpNorm<Eigen::Infinity>() < 1e-10) {
-    Vec6 q0, q1, q2, q3;
-    joint_spline.eval(0.0, q0, q1, q2, q3);
+  // Fine scan: motion detection, grid density and boxcar length.
+  std::vector<double> fine_u(kFineSamples + 1), density(kFineSamples + 1);
+  double max_motion = 0.0;
+  double t_ratio = 0.0;
+  for (int k = 0; k <= kFineSamples; ++k) {
+    const double u = static_cast<double>(k) / kFineSamples;
+    const PathPoint pp = sampler.eval(u);
+    fine_u[static_cast<size_t>(k)] = u;
+    double rho = 0.0;
+    for (int j = 0; j < 6; ++j) {
+      const double d1 = std::abs(pp.q1[j]);
+      rho = std::max(rho, d1 / kGridJointStep);
+      rho = std::max(rho, std::sqrt(std::abs(pp.q2[j]) / kGridJointCurvature));
+      max_motion = std::max(max_motion, d1);
+      if (d1 > 1e-9) {
+        const auto & lim = joint_limits[static_cast<size_t>(j)];
+        t_ratio = std::max(t_ratio, (pp.as * lim.max_acc) / (pp.js * lim.max_jerk));
+      }
+    }
+    if (pp.cart) {
+      rho = std::max(rho, pp.p1.norm() / kGridTransStep);
+      rho = std::max(rho, pp.w1.norm() / kGridRotStep);
+      max_motion = std::max({max_motion, pp.p1.norm(), pp.w1.norm()});
+    }
+    density[static_cast<size_t>(k)] = rho;
+  }
+
+  if (max_motion < 1e-10) {
+    // Degenerate zero-displacement path.
+    const PathPoint p0 = sampler.eval(0.0);
     out_traj.duration_sec = 0.002;
     for (int tick = 0; tick <= 2; ++tick) {
       SampledTrajectory1kHz::Sample smp;
       smp.time_sec = static_cast<double>(tick) * 0.001;
-      smp.path_u = (tick == 0) ? 0.0 : (tick == 2 ? 1.0 : 0.5);
+      smp.path_u = 0.5 * tick;
       for (size_t i = 0; i < 6; ++i) {
-        smp.q[i] = q0[static_cast<int>(i)];
-        smp.dq[i] = 0.0;
-        smp.ddq[i] = 0.0;
+        smp.q[i] = p0.q[static_cast<int>(i)];
       }
-      smp.loc = (cart_path != nullptr) ? cart_path->eval_normalized(smp.path_u).loc : default_loc;
+      smp.loc = sampler.eval(smp.path_u).loc;
       out_traj.samples.push_back(smp);
     }
     return true;
   }
 
-  constexpr int kGridN = 400;
-  const double du = 1.0 / static_cast<double>(kGridN);
-
-  std::vector<double> u_dot_max(kGridN + 1, 100.0);
-  std::vector<double> u_ddot_max(kGridN + 1, 500.0);
-
-  double t_j_char = 0.0;
-  // Stage 1: Evaluate local kinematic + curvature + jerk bounds along u in [0, 1].
-  for (int k = 0; k <= kGridN; ++k) {
-    const double u = static_cast<double>(k) * du;
-    Vec6 q, q1, q2, q3;
-    joint_spline.eval(u, q, q1, q2, q3);
-
-    double vs = default_vel_scale;
-    double as = default_acc_scale;
-    double js = default_jerk_scale;
-
-    double v_bound = 100.0;
-    double a_bound = 500.0;
-
-    if (cart_path != nullptr) {
-      const CartesianSample cs = cart_path->eval_normalized(u);
-      vs = cs.vel_scale;
-      as = cs.acc_scale;
-      js = cs.jerk_scale;
-
-      const double ps_norm = cs.p_s.norm();
-      const double pss_norm = cs.p_ss.norm();
-      const double ws_norm = cs.w_s.norm();
-      const double wss_norm = cs.w_ss.norm();
-
-      if (ps_norm > 1e-9) {
-        v_bound = std::min(v_bound, (vs * cart_limits.max_trans_vel) / ps_norm);
-        a_bound = std::min(a_bound, (0.95 * as * cart_limits.max_trans_acc) / ps_norm);
+  // Adaptive grid: equal increments of the integrated density.
+  std::vector<double> cum(kFineSamples + 1, 0.0);
+  for (int k = 0; k < kFineSamples; ++k) {
+    const size_t i = static_cast<size_t>(k);
+    cum[i + 1] = cum[i] + 0.5 * (density[i] + density[i + 1]) / kFineSamples;
+  }
+  const int N = std::clamp(static_cast<int>(std::ceil(cum.back())), kMinGrid, kMaxGrid);
+  std::vector<double> grid(static_cast<size_t>(N) + 1, 0.0);
+  {
+    size_t k = 0;
+    for (int i = 1; i < N; ++i) {
+      const double target = cum.back() * i / N;
+      while (k + 1 < cum.size() && cum[k + 1] < target) {
+        ++k;
       }
-      if (pss_norm > 1e-9) {
-        v_bound = std::min(v_bound, std::sqrt((0.85 * as * cart_limits.max_trans_acc) / pss_norm));
-      }
-      if (ws_norm > 1e-9) {
-        v_bound = std::min(v_bound, (vs * cart_limits.max_rot_vel) / ws_norm);
-        a_bound = std::min(a_bound, (0.95 * as * cart_limits.max_rot_acc) / ws_norm);
-      }
-      if (wss_norm > 1e-9) {
-        v_bound = std::min(v_bound, std::sqrt((0.85 * as * cart_limits.max_rot_acc) / wss_norm));
-      }
+      const double span = cum[k + 1] - cum[k];
+      const double frac = span > 1e-15 ? (target - cum[k]) / span : 0.0;
+      grid[static_cast<size_t>(i)] = fine_u[k] + frac * (fine_u[k + 1] - fine_u[k]);
     }
-
-    for (size_t i = 0; i < 6; ++i) {
-      const double d1 = std::abs(q1[static_cast<int>(i)]);
-      const double d2 = std::abs(q2[static_cast<int>(i)]);
-      const double d3 = std::abs(q3[static_cast<int>(i)]);
-      const auto & lim = joint_limits[i];
-
-      if (d1 > 1e-9) {
-        v_bound = std::min(v_bound, (vs * lim.max_vel) / d1);
-        a_bound = std::min(a_bound, (0.95 * as * lim.max_acc) / d1);
-        t_j_char = std::max(t_j_char, (as * lim.max_acc) / std::max(1e-6, js * lim.max_jerk));
-      }
-      if (d2 > 1e-9) {
-        v_bound = std::min(v_bound, std::sqrt((0.80 * as * lim.max_acc) / d2));
-      }
-      if (d3 > 1e-9) {
-        v_bound = std::min(v_bound, std::cbrt((0.65 * js * lim.max_jerk) / d3));
-      }
+    grid.back() = 1.0;
+    for (size_t i = 1; i < grid.size(); ++i) {
+      grid[i] = std::max(grid[i], grid[i - 1] + 1e-9);
     }
-
-    u_dot_max[static_cast<size_t>(k)] = std::max(1e-3, v_bound);
-    u_ddot_max[static_cast<size_t>(k)] = std::max(1e-3, a_bound);
+    grid.back() = std::max(grid.back(), 1.0);
+    const double scale = 1.0 / grid.back();
+    for (auto & g : grid) {
+      g *= scale;
+    }
   }
 
-  // Stage 2: TOPP-RA Backward & Forward Reachability Pass on s_dot(u) = v_prof(u)
-  // with pinned zero velocity at both endpoints.
-  std::vector<double> v_prof = u_dot_max;
-  v_prof.front() = 0.0;
-  v_prof.back() = 0.0;
-
-  for (int k = kGridN - 1; k >= 0; --k) {
-    const double v_next = v_prof[static_cast<size_t>(k + 1)];
-    const double a_allow =
-      std::min(u_ddot_max[static_cast<size_t>(k)], u_ddot_max[static_cast<size_t>(k + 1)]);
-    const double v_reach = std::sqrt(v_next * v_next + 2.0 * du * a_allow);
-    v_prof[static_cast<size_t>(k)] = std::min(v_prof[static_cast<size_t>(k)], v_reach);
+  std::vector<PathPoint> points(grid.size());
+  for (size_t i = 0; i < grid.size(); ++i) {
+    points[i] = sampler.eval(grid[i]);
   }
-  for (int k = 0; k < kGridN; ++k) {
-    const double v_curr = v_prof[static_cast<size_t>(k)];
-    const double a_allow =
-      std::min(u_ddot_max[static_cast<size_t>(k)], u_ddot_max[static_cast<size_t>(k + 1)]);
-    const double v_reach = std::sqrt(v_curr * v_curr + 2.0 * du * a_allow);
-    v_prof[static_cast<size_t>(k + 1)] = std::min(v_prof[static_cast<size_t>(k + 1)], v_reach);
-  }
+  std::vector<double> f_v(grid.size(), 1.0), f_a(grid.size(), 1.0);
+  std::vector<Stage> stages(grid.size());
 
-  // Stage 3: Exact piecewise-linear TOPP-RA time-mapping + FIR boxcar jerk smoothing.
-  SmoothedTOPPProfile profile;
-  profile.t.resize(kGridN + 1, 0.0);
-  profile.v = v_prof;
-  for (int k = 0; k < kGridN; ++k) {
-    const double vm =
-      std::max(1e-4, 0.5 * (v_prof[static_cast<size_t>(k)] + v_prof[static_cast<size_t>(k + 1)]));
-    profile.t[static_cast<size_t>(k + 1)] = profile.t[static_cast<size_t>(k)] + du / vm;
-  }
-  profile.T_topp = profile.t.back();
-  profile.T_fir = std::clamp(std::max(t_j_char, 0.025), 0.015, std::max(0.025, 0.6 * profile.T_topp));
-  profile.precompute_integrals();
+  SmoothedProfile prof;
+  double final_T = 0.0;
+  EvalResult res;
+  bool accepted = false;
 
-  double base_T = std::max(0.004, profile.raw_duration());
-
-  // Stage 4: Closed-loop bottleneck time-dilation so that EVERY joint & Cartesian limit
-  // (including 1 kHz finite-difference jerk) hits ~99.0% of the tightest constraint
-  // without ever violating a limit.
-  auto compute_bottleneck_dilation = [&](double T_eval) -> double {
-    const double time_scale = profile.raw_duration() / T_eval;
-    const int n_steps = std::max(24, static_cast<int>(std::ceil(T_eval / 0.001)));
-    const double dt = T_eval / static_cast<double>(n_steps);
-
-    double max_vel_ratio = 0.0;
-    double max_acc_ratio = 0.0;
-    double max_jrk_ratio = 0.0;
-
-    std::array<double, 6> prev_acc{};
-    for (int k = 0; k <= n_steps; ++k) {
-      const double t = static_cast<double>(k) * dt;
-      double u = 0.0, du_dt = 0.0, d2u_dt2 = 0.0, d3u_dt3 = 0.0;
-      profile.eval_smoothed(t * time_scale, u, du_dt, d2u_dt2, d3u_dt3);
-      du_dt *= time_scale;
-      d2u_dt2 *= (time_scale * time_scale);
-      d3u_dt3 *= (time_scale * time_scale * time_scale);
-
-      Vec6 q, q1, q2, q3;
-      joint_spline.eval(u, q, q1, q2, q3);
-
-      const Vec6 dq = q1 * du_dt;
-      const Vec6 ddq = q2 * (du_dt * du_dt) + q1 * d2u_dt2;
-      const Vec6 jrk =
-        q3 * (du_dt * du_dt * du_dt) + 3.0 * q2 * du_dt * d2u_dt2 + q1 * d3u_dt3;
-
-      double vs_local = default_vel_scale;
-      double as_local = default_acc_scale;
-      double js_local = default_jerk_scale;
-
-      if (cart_path != nullptr) {
-        const CartesianSample cs = cart_path->eval_normalized(u);
-        vs_local = cs.vel_scale;
-        as_local = cs.acc_scale;
-        js_local = cs.jerk_scale;
-
-        const Eigen::Vector3d v_trans = cs.p_s * du_dt;
-        const Eigen::Vector3d a_trans = cs.p_ss * (du_dt * du_dt) + cs.p_s * d2u_dt2;
-        const Eigen::Vector3d v_rot = cs.w_s * du_dt;
-        const Eigen::Vector3d a_rot = cs.w_ss * (du_dt * du_dt) + cs.w_s * d2u_dt2;
-
-        max_vel_ratio = std::max(
-          max_vel_ratio, v_trans.norm() / (cart_limits.max_trans_vel * vs_local));
-        max_acc_ratio = std::max(
-          max_acc_ratio, a_trans.norm() / (cart_limits.max_trans_acc * as_local));
-        max_vel_ratio = std::max(
-          max_vel_ratio, v_rot.norm() / (cart_limits.max_rot_vel * vs_local));
-        max_acc_ratio = std::max(
-          max_acc_ratio, a_rot.norm() / (cart_limits.max_rot_acc * as_local));
-      }
-
-      for (size_t i = 0; i < 6; ++i) {
-        const auto & lim = joint_limits[i];
-        max_vel_ratio = std::max(
-          max_vel_ratio, std::abs(dq[static_cast<int>(i)]) / (lim.max_vel * vs_local));
-        max_acc_ratio = std::max(
-          max_acc_ratio, std::abs(ddq[static_cast<int>(i)]) / (lim.max_acc * as_local));
-        max_jrk_ratio = std::max(
-          max_jrk_ratio, std::abs(jrk[static_cast<int>(i)]) / (lim.max_jerk * js_local));
-        if (k > 0) {
-          const double disc_jrk =
-            std::abs(ddq[static_cast<int>(i)] - prev_acc[i]) / dt;
-          max_jrk_ratio = std::max(
-            max_jrk_ratio, disc_jrk / (lim.max_jerk * js_local));
-        }
-        prev_acc[i] = ddq[static_cast<int>(i)];
-      }
+  for (int pass = 0; pass < kMaxRefinePasses && !accepted; ++pass) {
+    for (size_t i = 0; i < grid.size(); ++i) {
+      stages[i] = build_stage(points[i], f_v[i], f_a[i], joint_limits, cart_limits);
     }
-
-    const double max_all = std::max({max_vel_ratio, max_acc_ratio, max_jrk_ratio});
-    if (max_all < 1e-12) {
-      return 1.0;
-    }
-    return std::max({
-      max_vel_ratio / 0.99,
-      std::sqrt(max_acc_ratio / 0.99),
-      std::cbrt(max_jrk_ratio / 0.99)});
-  };
-
-  for (int pass = 0; pass < 4; ++pass) {
-    const double dilation = compute_bottleneck_dilation(base_T);
-    if (!std::isfinite(dilation) || dilation <= 0.0) {
-      err_msg = "Non-finite time-dilation factor in TOPP-Jerk solver";
+    std::vector<double> x;
+    if (!topp_ra(grid, stages, x, err_msg)) {
       return false;
     }
-    base_T = std::max(0.002, base_T * std::max(0.1, dilation));
-    if (dilation <= 1.0 && dilation >= 0.985) {
+
+    prof = SmoothedProfile{};
+    prof.t.assign(grid.size(), 0.0);
+    prof.v.assign(grid.size(), 0.0);
+    for (size_t i = 0; i < grid.size(); ++i) {
+      prof.v[i] = std::sqrt(std::max(0.0, x[i]));
+    }
+    for (size_t i = 0; i + 1 < grid.size(); ++i) {
+      const double vsum = prof.v[i] + prof.v[i + 1];
+      if (vsum < 1e-12) {
+        err_msg = "TOPP-RA profile stalls at path parameter u=" + std::to_string(grid[i]);
+        return false;
+      }
+      prof.t[i + 1] = prof.t[i] + 2.0 * (grid[i + 1] - grid[i]) / vsum;
+    }
+    prof.T_topp = prof.t.back();
+    if (!(prof.T_topp > 0.0) || prof.T_topp > kMaxDurationSec) {
+      err_msg = "TOPP-RA duration=" + std::to_string(prof.T_topp) + " s is out of range";
+      return false;
+    }
+    // Boxcar length bounds the jerk of a full +a -> -a acceleration reversal.
+    prof.T_fir = std::clamp(2.0 * t_ratio, 0.01, std::max(0.02, 0.6 * prof.T_topp));
+    prof.precompute_integrals();
+
+    final_T = std::ceil(prof.raw_duration() * 1000.0 - 1e-9) * 0.001;
+    res = evaluate(prof, final_T, sampler, joint_limits, cart_limits, nullptr);
+    if (res.violations.empty()) {
+      accepted = true;
       break;
+    }
+
+    // Local tightening around each violation: the smoothed sample at raw time tau
+    // depends on the raw profile over [tau - T_fir, tau].
+    std::vector<double> req_v(grid.size(), 1.0), req_a(grid.size(), 1.0);
+    for (const auto & vio : res.violations) {
+      double g_v = 1.0, g_a = 1.0;
+      if (vio.rv > 1.0) {
+        g_v = std::min(g_v, 0.98 / vio.rv);
+      }
+      if (vio.ra > 1.0) {
+        g_a = std::min(g_a, 0.97 / vio.ra);
+        g_v = std::min(g_v, std::sqrt(0.98 / vio.ra));
+      }
+      if (vio.rj > 1.0) {
+        g_a = std::min(g_a, 0.97 / vio.rj);
+        g_v = std::min(g_v, std::cbrt(0.98 / vio.rj));
+      }
+      // Damped update: a single extreme ratio must not over-slow a whole region;
+      // remaining excess is removed by the following passes.
+      g_v = std::max(g_v, 0.5);
+      g_a = std::max(g_a, 0.25);
+      const double u_lo = prof.raw_position(vio.tau_raw - prof.T_fir);
+      const double u_hi = prof.raw_position(vio.tau_raw);
+      auto lo_it = std::lower_bound(grid.begin(), grid.end(), u_lo);
+      auto hi_it = std::upper_bound(grid.begin(), grid.end(), u_hi);
+      const size_t i0 = static_cast<size_t>(
+        std::max<std::ptrdiff_t>(0, std::distance(grid.begin(), lo_it) - 2));
+      const size_t i1 = std::min(grid.size() - 1, static_cast<size_t>(
+        std::distance(grid.begin(), hi_it) + 1));
+      for (size_t i = i0; i <= i1; ++i) {
+        req_v[i] = std::min(req_v[i], g_v);
+        req_a[i] = std::min(req_a[i], g_a);
+      }
+    }
+    for (size_t i = 0; i < grid.size(); ++i) {
+      f_v[i] = std::max(1e-3, f_v[i] * req_v[i]);
+      f_a[i] = std::max(1e-3, f_a[i] * req_a[i]);
     }
   }
 
-  // Round final duration up to an exact integer multiple of 1 ms (0.001 s).
-  const int total_ticks = std::max(2, static_cast<int>(std::ceil(base_T * 1000.0)));
-  const double final_T = static_cast<double>(total_ticks) * 0.001;
-  if (final_T > 300.0) {
+  // Last resort: uniform time dilation of the smoothed profile (exact scaling law).
+  for (int pass = 0; !accepted && pass < kMaxDilationPasses; ++pass) {
+    const double dil = 1.002 * std::max({1.0, res.max_rv, std::sqrt(res.max_ra), std::cbrt(res.max_rj)});
+    final_T = std::ceil(final_T * dil * 1000.0 - 1e-9) * 0.001;
+    if (final_T > kMaxDurationSec) {
+      break;
+    }
+    res = evaluate(prof, final_T, sampler, joint_limits, cart_limits, nullptr);
+    accepted = res.violations.empty();
+  }
+  if (!accepted) {
+    err_msg = "TOPP-RA could not satisfy velocity/acceleration/jerk limits (max ratios v=" +
+      std::to_string(res.max_rv) + ", a=" + std::to_string(res.max_ra) +
+      ", j=" + std::to_string(res.max_rj) + ")";
+    return false;
+  }
+  if (final_T > kMaxDurationSec) {
     err_msg = "Computed trajectory duration=" + std::to_string(final_T) + " s exceeds 300 s limit";
     return false;
   }
 
-  const double time_scale = profile.raw_duration() / final_T;
-  out_traj.duration_sec = final_T;
-  out_traj.samples.reserve(static_cast<size_t>(total_ticks + 1));
-
-  for (int tick = 0; tick <= total_ticks; ++tick) {
-    const double t = static_cast<double>(tick) * 0.001;
-    double u = 0.0, du_dt = 0.0, d2u_dt2 = 0.0, d3u_dt3 = 0.0;
-    profile.eval_smoothed(t * time_scale, u, du_dt, d2u_dt2, d3u_dt3);
-    du_dt *= time_scale;
-    d2u_dt2 *= (time_scale * time_scale);
-    if (tick == 0) {
-      u = 0.0;
-      du_dt = 0.0;
-      d2u_dt2 = 0.0;
-    } else if (tick == total_ticks) {
-      u = 1.0;
-      du_dt = 0.0;
-      d2u_dt2 = 0.0;
-    }
-
-    Vec6 q, q1, q2, q3;
-    joint_spline.eval(u, q, q1, q2, q3);
-    const Vec6 dq = q1 * du_dt;
-    const Vec6 ddq = q2 * (du_dt * du_dt) + q1 * d2u_dt2;
-
-    SampledTrajectory1kHz::Sample smp;
-    smp.time_sec = t;
-    smp.path_u = u;
-    for (size_t i = 0; i < 6; ++i) {
-      smp.q[i] = q[static_cast<int>(i)];
-      smp.dq[i] = (tick == 0 || tick == total_ticks) ? 0.0 : dq[static_cast<int>(i)];
-      smp.ddq[i] = (tick == 0 || tick == total_ticks) ? 0.0 : ddq[static_cast<int>(i)];
-    }
-    smp.loc = (cart_path != nullptr) ? cart_path->eval_normalized(u).loc : default_loc;
-    out_traj.samples.push_back(smp);
-  }
-
+  evaluate(prof, final_T, sampler, joint_limits, cart_limits, &out_traj);
   return true;
 }
 

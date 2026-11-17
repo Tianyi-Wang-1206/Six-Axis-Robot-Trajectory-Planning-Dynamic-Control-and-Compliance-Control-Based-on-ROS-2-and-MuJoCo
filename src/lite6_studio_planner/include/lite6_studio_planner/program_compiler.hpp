@@ -57,6 +57,12 @@ struct ExecutionBlock
   // Per-1kHz-sample source location mapping for live line highlighting and diagnostics
   std::vector<SourceLocation> sample_locations;
 
+  // Per-1kHz-sample normalized parameter u in [0, 1] on the block's source geometric path
+  // (the full path from path_start_joints), used to resume an interrupted block.
+  std::vector<double> sample_path_u;
+  // Joint configuration at which the source geometric path starts (u = 0).
+  std::array<double, 6> path_start_joints{};
+
   // Populated when type == GRIPPER_CMD
   GripperStatement gripper_cmd;
 
@@ -143,6 +149,39 @@ private:
     const std::array<double, 6> & start_q,
     ExecutionBlock & out_block,
     std::vector<Diagnostic> & out_diagnostics) const;
+
+  // Joint-space Hermite path through IK knots of a Cartesian path; nodal derivatives
+  // dq/du, d2q/du2 come from differential kinematics on the analytic Cartesian path
+  // derivatives (d3q/du3 by central difference of the analytic d2q/du2).
+  bool build_cartesian_joint_path(
+    const CompositeCartesianPath & cart_path,
+    const std::array<double, 6> & start_q,
+    C3JointSpline & out_path,
+    std::vector<Diagnostic> & out_diagnostics) const;
+
+  // Cartesian path -> joint path -> TOPP-RA -> 1 kHz verification.
+  bool plan_cartesian_path(
+    const CompositeCartesianPath & cart_path,
+    const std::array<double, 6> & start_q,
+    const MotionOptions & default_options,
+    const SourceLocation & default_loc,
+    SampledTrajectory1kHz & out_sampled,
+    std::vector<Diagnostic> & out_diagnostics) const;
+
+  // Resolves joint-group waypoints and builds the blended joint path (>= 2 statements).
+  bool build_joint_group_path(
+    const std::vector<MotionStatement> & group,
+    const std::array<double, 6> & start_q,
+    std::vector<std::array<double, 6>> & out_waypoints,
+    JointCompositePath & out_path,
+    std::vector<Diagnostic> & out_diagnostics) const;
+
+  // Joint-space length removed on the segment from corner_q towards neighbor_q so the
+  // TCP lies blend_radius away from its position at corner_q (capped at 45 % of the segment).
+  double tcp_blend_trim(
+    const std::array<double, 6> & corner_q,
+    const std::array<double, 6> & neighbor_q,
+    double blend_radius) const;
 
   bool compile_pva_statement(
     const MovePVAStatement & pva,

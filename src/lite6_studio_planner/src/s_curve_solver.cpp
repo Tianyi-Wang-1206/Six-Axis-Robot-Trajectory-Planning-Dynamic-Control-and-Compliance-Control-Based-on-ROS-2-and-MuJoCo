@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace lite6_studio_planner
 {
@@ -147,41 +148,51 @@ void MultiAxisSCurve::build(
   double acc_scale,
   double jerk_scale)
 {
-  // Use a 0.995 safety margin inside the physical limits so discrete 1 kHz finite differences
-  // never exceed exact bounds due to floating-point rounding.
+  // Safety margin inside the physical limits so 1 kHz finite differences never
+  // exceed exact bounds due to floating-point rounding.
   constexpr double kSafety = 0.992;
-  std::array<double, 6> min_times{};
-  sync_duration_ = 0.0;
-
+  q0_ = q0;
+  double v_n = std::numeric_limits<double>::infinity();
+  double a_n = std::numeric_limits<double>::infinity();
+  double j_n = std::numeric_limits<double>::infinity();
   for (size_t i = 0; i < 6; ++i) {
-    const double v_lim = limits[i].max_vel * vel_scale * kSafety;
-    const double a_lim = limits[i].max_acc * acc_scale * kSafety;
-    const double j_lim = limits[i].max_jerk * jerk_scale * kSafety;
-    axes_[i].build(q0[i], q1[i], v_lim, a_lim, j_lim);
-    min_times[i] = axes_[i].duration();
-    sync_duration_ = std::max(sync_duration_, min_times[i]);
+    delta_[i] = q1[i] - q0[i];
+    const double d = std::abs(delta_[i]);
+    if (d < 1e-11) {
+      continue;
+    }
+    // Joint i moves |delta_i| * s(t): map its limits onto the normalized stroke.
+    v_n = std::min(v_n, limits[i].max_vel * vel_scale * kSafety / d);
+    a_n = std::min(a_n, limits[i].max_acc * acc_scale * kSafety / d);
+    j_n = std::min(j_n, limits[i].max_jerk * jerk_scale * kSafety / d);
   }
 
-  if (sync_duration_ <= 1e-6) {
+  if (!std::isfinite(v_n)) {
+    delta_.fill(0.0);
+    profile_.build(0.0, 1.0, 1.0, 1.0, 1.0);
     sync_duration_ = 0.001;
     return;
   }
 
-  // Round sync_duration_ up to an integer multiple of 1 ms (0.001 s) so the endpoint lands
-  // exactly on the 1 kHz control grid.
-  sync_duration_ = std::ceil(sync_duration_ * 1000.0) * 0.001;
-
-  // Analytically synchronize all 6 axes to sync_duration_ via exact time-dilation scaling:
-  // scaling (V, A, J) -> (eta*V, eta^2*A, eta^3*J) dilates duration by 1/eta = sync_duration_/min_times[i].
-  for (size_t i = 0; i < 6; ++i) {
-    if (min_times[i] > 1e-11) {
-      const double eta = std::clamp(min_times[i] / sync_duration_, 1e-6, 1.0);
-      const double v_lim = limits[i].max_vel * vel_scale * kSafety * eta;
-      const double a_lim = limits[i].max_acc * acc_scale * kSafety * (eta * eta);
-      const double j_lim = limits[i].max_jerk * jerk_scale * kSafety * (eta * eta * eta);
-      axes_[i].build(q0[i], q1[i], v_lim, a_lim, j_lim);
-    }
+  profile_.build(0.0, 1.0, v_n, a_n, j_n);
+  const double t_min = profile_.duration();
+  // Round up to an integer multiple of 1 ms so the endpoint lands on the control grid,
+  // using exact time dilation (V, A, J) -> (eta V, eta^2 A, eta^3 J).
+  sync_duration_ = std::max(0.001, std::ceil(t_min * 1000.0 - 1e-9) * 0.001);
+  if (t_min > 1e-11) {
+    const double eta = std::clamp(t_min / sync_duration_, 1e-6, 1.0);
+    profile_.build(0.0, 1.0, v_n * eta, a_n * eta * eta, j_n * eta * eta * eta);
   }
+}
+
+double MultiAxisSCurve::progress(double t) const
+{
+  if (t >= sync_duration_) {
+    return 1.0;
+  }
+  double s = 0.0, sd = 0.0, sdd = 0.0, sddd = 0.0;
+  profile_.eval(t, s, sd, sdd, sddd);
+  return std::clamp(s, 0.0, 1.0);
 }
 
 void MultiAxisSCurve::eval(
@@ -191,8 +202,17 @@ void MultiAxisSCurve::eval(
   std::array<double, 6> & ddq,
   std::array<double, 6> & jrk) const
 {
+  double s = 0.0, sd = 0.0, sdd = 0.0, sddd = 0.0;
+  if (t >= sync_duration_) {
+    s = 1.0;
+  } else {
+    profile_.eval(t, s, sd, sdd, sddd);
+  }
   for (size_t i = 0; i < 6; ++i) {
-    axes_[i].eval(t, q[i], dq[i], ddq[i], jrk[i]);
+    q[i] = q0_[i] + delta_[i] * s;
+    dq[i] = delta_[i] * sd;
+    ddq[i] = delta_[i] * sdd;
+    jrk[i] = delta_[i] * sddd;
   }
 }
 

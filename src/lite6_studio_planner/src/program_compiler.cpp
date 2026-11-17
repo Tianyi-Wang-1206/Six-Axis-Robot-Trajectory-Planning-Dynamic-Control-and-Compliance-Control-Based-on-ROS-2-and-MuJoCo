@@ -4,12 +4,14 @@
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/jacobian.hpp>
 #include <pinocchio/algorithm/kinematics.hpp>
+#include <pinocchio/spatial/explog.hpp>
 #include <rclcpp/duration.hpp>
 #include <Eigen/SVD>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 namespace lite6_studio_planner
@@ -81,6 +83,11 @@ void populate_execution_block(
   blk.duration_sec = sampled.duration_sec;
   blk.sample_locations.clear();
   blk.sample_locations.reserve(sampled.samples.size());
+  blk.sample_path_u.clear();
+  blk.sample_path_u.reserve(sampled.samples.size());
+  for (const auto & smp : sampled.samples) {
+    blk.sample_path_u.push_back(smp.path_u);
+  }
 
   if (is_impedance) {
     blk.impedance_params = imp_params;
@@ -115,6 +122,134 @@ void populate_execution_block(
       blk.sample_locations.push_back(s.loc);
     }
   }
+}
+
+using Mat6 = Eigen::Matrix<double, 6, 6>;
+
+Vec6 to_vec6(const std::array<double, 6> & a)
+{
+  Vec6 v;
+  for (int i = 0; i < 6; ++i) {
+    v[i] = a[static_cast<size_t>(i)];
+  }
+  return v;
+}
+
+std::array<double, 6> to_array(const Vec6 & v)
+{
+  std::array<double, 6> a{};
+  for (int i = 0; i < 6; ++i) {
+    a[static_cast<size_t>(i)] = v[i];
+  }
+  return a;
+}
+
+// Twist derivatives [p; w] of a Cartesian sample with respect to the path parameter.
+void cartesian_derivatives(const CartesianSample & cs, Vec6 & v1, Vec6 & v2)
+{
+  v1.head<3>() = cs.p_s;
+  v1.tail<3>() = cs.w_s;
+  v2.head<3>() = cs.p_ss;
+  v2.tail<3>() = cs.w_ss;
+}
+
+// Differential kinematics on the LOCAL_WORLD_ALIGNED TCP Jacobian:
+//   J q1 = V1,   J q2 = V2 - dJ(q, q1) q1.
+bool differential_kinematics(
+  const pinocchio::Model & model, pinocchio::Data & data, pinocchio::FrameIndex tcp,
+  const Vec6 & q, const Vec6 & v1, const Vec6 & v2, Vec6 & q1, Vec6 & q2)
+{
+  pinocchio::Data::Matrix6x J(6, 6), dJ(6, 6);
+  J.setZero();
+  dJ.setZero();
+  pinocchio::computeFrameJacobian(model, data, q, tcp, pinocchio::LOCAL_WORLD_ALIGNED, J);
+  const Mat6 J6 = J;
+  const Eigen::FullPivLU<Mat6> lu(J6);
+  if (!lu.isInvertible()) {
+    return false;
+  }
+  q1 = lu.solve(v1);
+  pinocchio::computeJointJacobiansTimeVariation(model, data, q, q1);
+  pinocchio::updateFramePlacement(model, data, tcp);
+  pinocchio::getFrameJacobianTimeVariation(model, data, tcp, pinocchio::LOCAL_WORLD_ALIGNED, dJ);
+  q2 = lu.solve(v2 - dJ * q1);
+  return q1.allFinite() && q2.allFinite();
+}
+
+// Newton refinement of an IK solution onto the exact target pose (keeps the branch).
+bool newton_ik(
+  const pinocchio::Model & model, pinocchio::Data & data, pinocchio::FrameIndex tcp,
+  const Eigen::Matrix4d & target, const Vec6 & q_guess, Vec6 & q_out)
+{
+  const Eigen::Vector3d p_t = target.topRightCorner<3, 1>();
+  const Eigen::Matrix3d r_t = target.topLeftCorner<3, 3>();
+  Vec6 q = q_guess;
+  pinocchio::Data::Matrix6x J(6, 6);
+  for (int it = 0; it < 8; ++it) {
+    pinocchio::forwardKinematics(model, data, q);
+    const auto & frame = pinocchio::updateFramePlacement(model, data, tcp);
+    Vec6 e;
+    e.head<3>() = p_t - frame.translation();
+    e.tail<3>() = pinocchio::log3(Eigen::Matrix3d(r_t * frame.rotation().transpose()));
+    if (e.norm() < 1e-13) {
+      break;
+    }
+    J.setZero();
+    pinocchio::computeFrameJacobian(model, data, q, tcp, pinocchio::LOCAL_WORLD_ALIGNED, J);
+    q += Mat6(J).fullPivLu().solve(e);
+    if (!q.allFinite()) {
+      return false;
+    }
+  }
+  pinocchio::forwardKinematics(model, data, q);
+  const auto & frame = pinocchio::updateFramePlacement(model, data, tcp);
+  const double p_err = (p_t - frame.translation()).norm();
+  const double r_err = pinocchio::log3(Eigen::Matrix3d(r_t * frame.rotation().transpose())).norm();
+  q_out = q;
+  return p_err < 1e-9 && r_err < 1e-8 && (q - q_guess).cwiseAbs().maxCoeff() < 0.05;
+}
+
+// Samples a phase-synchronized S-curve; path_u maps the normalized progress s in [0, 1].
+SampledTrajectory1kHz scurve_samples(
+  const MultiAxisSCurve & scurve, const SourceLocation & loc,
+  double path_u_start, double path_u_end)
+{
+  SampledTrajectory1kHz sampled;
+  const int total_ticks = std::max(1, static_cast<int>(std::llround(scurve.duration() * 1000.0)));
+  sampled.duration_sec = static_cast<double>(total_ticks) * 0.001;
+  sampled.samples.reserve(static_cast<size_t>(total_ticks + 1));
+  for (int tick = 0; tick <= total_ticks; ++tick) {
+    const double t = static_cast<double>(tick) * 0.001;
+    SampledTrajectory1kHz::Sample smp;
+    smp.time_sec = t;
+    const double prog = (tick == total_ticks) ? 1.0 : scurve.progress(t);
+    smp.path_u = path_u_start + prog * (path_u_end - path_u_start);
+    std::array<double, 6> jrk{};
+    scurve.eval(t, smp.q, smp.dq, smp.ddq, jrk);
+    if (tick == 0 || tick == total_ticks) {
+      smp.dq.fill(0.0);
+      smp.ddq.fill(0.0);
+    }
+    smp.loc = loc;
+    sampled.samples.push_back(smp);
+  }
+  return sampled;
+}
+
+// Appends b after a; both must meet at rest at the same configuration.
+void append_at_rest(SampledTrajectory1kHz & a, const SampledTrajectory1kHz & b)
+{
+  if (a.samples.empty()) {
+    a = b;
+    return;
+  }
+  const double t0 = a.samples.back().time_sec;
+  for (size_t k = 1; k < b.samples.size(); ++k) {
+    auto smp = b.samples[k];
+    smp.time_sec += t0;
+    a.samples.push_back(smp);
+  }
+  a.duration_sec = a.samples.back().time_sec;
 }
 
 // Map a desired Cartesian spatial twist V=[vx,vy,vz,wx,wy,wz] and optional spatial acceleration
@@ -375,102 +510,267 @@ bool ProgramCompiler::compile_cartesian_group(
     return false;
   }
 
-  size_t n_knots = std::max<size_t>(
-    12, static_cast<size_t>(std::ceil(cart_path.total_length() / 0.004)));
-  n_knots = std::min<size_t>(n_knots, 4000);
-
-  C3JointSpline spline;
-  bool spline_accurate = false;
-  for (int refine = 0; refine < 3; ++refine) {
-    std::vector<std::array<double, 6>> knots(n_knots + 1);
-    knots[0] = start_q;
-    for (size_t k = 1; k <= n_knots; ++k) {
-      const double u = static_cast<double>(k) / static_cast<double>(n_knots);
-      const CartesianSample cs = cart_path.eval_normalized(u);
-      std::vector<std::array<double, 6>> sols;
-      lite6_planner::IKDiagnostics ik_diag;
-      const auto status = engine_.solve_optimal_ik(
-        cs.pose, knots[k - 1], sols, /*continuous=*/true, workspace, &ik_diag);
-      if (status != IKResult::SUCCESS) {
-        std::ostringstream oss;
-        oss << std::fixed << std::setprecision(4)
-            << "Cartesian IK failed at path progress " << (100.0 * u) << "% (xyz=["
-            << cs.pose(0, 3) << ", " << cs.pose(1, 3) << ", " << cs.pose(2, 3)
-            << "] m): " << ik_diag.summary();
-        add_diag(
-          out_diagnostics, D::STAGE_PLANNING, cs.loc, ik_error_code(status), oss.str());
-        return false;
-      }
-      knots[k] = sols.front();
-    }
-
-    spline.build(knots);
-    spline_accurate = true;
-    for (size_t k = 0; k < n_knots; ++k) {
-      const double u_mid = (static_cast<double>(k) + 0.5) / static_cast<double>(n_knots);
-      Vec6 qm, q1, q2, q3;
-      spline.eval(u_mid, qm, q1, q2, q3);
-      std::array<double, 6> q_arr{};
-      for (int j = 0; j < 6; ++j) {
-        q_arr[static_cast<size_t>(j)] = qm[j];
-      }
-      const Eigen::Matrix4d fk = engine_.forward_pose(q_arr, workspace.data);
-      const CartesianSample ref = cart_path.eval_normalized(u_mid);
-      const double p_err = (fk.topRightCorner<3, 1>() - ref.pose.topRightCorner<3, 1>()).norm();
-      const double r_err = rot_diff(fk.topLeftCorner<3, 3>(), ref.pose.topLeftCorner<3, 3>());
-      if (p_err > 7e-4 || r_err > 7e-3) {
-        spline_accurate = false;
-        if (refine == 2) {
-          std::ostringstream oss;
-          oss << std::fixed << std::setprecision(5)
-              << "Cartesian spline tracking residual exceeded tolerance at "
-              << (100.0 * u_mid) << "% (pos_err=" << p_err << " m, rot_err=" << r_err << " rad)";
-          add_diag(
-            out_diagnostics, D::STAGE_PLANNING, ref.loc, "ERR_SPLINE_RESIDUAL", oss.str());
-          return false;
-        }
-        break;
-      }
-    }
-    if (spline_accurate) {
-      break;
-    }
-    n_knots = std::min<size_t>(n_knots * 2, 8000);
-  }
-
   SampledTrajectory1kHz sampled;
-  std::string topp_err;
-  if (!TOPPJerkSolver::solve(
-        spline, &cart_path, engine_.get_joint_limits(), engine_.get_cartesian_limits(),
-        group.front().options.vel_scale, group.front().options.acc_scale,
-        group.front().options.jerk_scale, group.front().loc, sampled, topp_err)) {
-    add_diag(
-      out_diagnostics, D::STAGE_PLANNING, group.front().loc, "ERR_TOPP_SOLVER", topp_err);
-    return false;
-  }
-
-  if (!verify_sampled_trajectory_1khz(sampled, /*check_singularity=*/true, out_diagnostics)) {
+  if (!plan_cartesian_path(
+        cart_path, start_q, group.front().options, group.front().loc, sampled, out_diagnostics))
+  {
     return false;
   }
 
   out_block = ExecutionBlock();
   out_block.source_kind = BlockSourceKind::CARTESIAN_GROUP;
   out_block.source_motions = group;
+  out_block.path_start_joints = start_q;
   populate_execution_block(sampled, is_impedance, imp_params, out_block);
   return true;
 }
 
-bool ProgramCompiler::compile_joint_group(
+bool ProgramCompiler::build_cartesian_joint_path(
+  const CompositeCartesianPath & cart_path,
+  const std::array<double, 6> & start_q,
+  C3JointSpline & out_path,
+  std::vector<Diagnostic> & out_diagnostics) const
+{
+  const auto & model = engine_.get_pin_model();
+  const auto tcp = engine_.tcp_frame_id();
+  auto workspace = engine_.collision_workspace();
+  auto & data = workspace.data;
+  const double S = cart_path.total_length();
+  const double sing_thresh = engine_.get_singularity_threshold();
+
+  // Knots always include the piece boundaries, where higher path derivatives may jump.
+  std::vector<double> breaks{0.0};
+  for (double b : cart_path.piece_boundaries()) {
+    breaks.push_back(b);
+  }
+  breaks.push_back(1.0);
+
+  // Septic Hermite interpolation with exact derivatives converges as O(h^8): start from
+  // 5 mm knots and split only the intervals whose residual check fails.
+  constexpr double kKnotStep = 0.005;          // m of pseudo arc length
+  constexpr double kResidualPos = 5e-6;        // m
+  constexpr double kResidualRot = 5e-5;        // rad
+  constexpr size_t kMaxKnots = 8000;
+  std::vector<double> u;
+  for (size_t b = 0; b + 1 < breaks.size(); ++b) {
+    const double span = breaks[b + 1] - breaks[b];
+    const int n_sub = std::max(2, static_cast<int>(std::ceil(span * S / kKnotStep)));
+    for (int k = 0; k < n_sub; ++k) {
+      u.push_back(breaks[b] + span * k / n_sub);
+    }
+  }
+  u.push_back(1.0);
+
+  double worst_p = 0.0, worst_r = 0.0, worst_u = 0.0;
+  for (int refine = 0; refine < 6; ++refine) {
+    if (u.size() > kMaxKnots) {
+      add_diag(
+        out_diagnostics, D::STAGE_PLANNING, cart_path.eval_normalized(0.0).loc,
+        "ERR_PATH_TOO_LONG", "Cartesian path requires too many IK knots");
+      return false;
+    }
+    const size_t n = u.size();
+    std::vector<Vec6> q(n), m1(n), m2(n), m3(n);
+    for (size_t k = 0; k < n; ++k) {
+      const CartesianSample cs = cart_path.eval_normalized(u[k]);
+      Vec6 v1, v2;
+      cartesian_derivatives(cs, v1, v2);
+      if (k == 0) {
+        // The path starts at the given configuration; refine onto the exact pose.
+        if (!newton_ik(model, data, tcp, cs.pose, to_vec6(start_q), q[k])) {
+          add_diag(
+            out_diagnostics, D::STAGE_PLANNING, cs.loc, "ERR_NO_IK_SOLUTION",
+            "Path start pose is not reachable from the start configuration");
+          return false;
+        }
+      } else {
+        const double du = u[k] - u[k - 1];
+        const Vec6 predicted = q[k - 1] + du * (m1[k - 1] + 0.5 * du * m2[k - 1]);
+        std::vector<std::array<double, 6>> sols;
+        lite6_planner::IKDiagnostics ik_diag;
+        const auto status = engine_.solve_optimal_ik(
+          cs.pose, to_array(predicted), sols, /*continuous=*/true, workspace, &ik_diag);
+        if (status != IKResult::SUCCESS) {
+          std::ostringstream oss;
+          oss << std::fixed << std::setprecision(4)
+              << "Cartesian IK failed at path progress " << (100.0 * u[k]) << "% (xyz=["
+              << cs.pose(0, 3) << ", " << cs.pose(1, 3) << ", " << cs.pose(2, 3)
+              << "] m): " << ik_diag.summary();
+          add_diag(
+            out_diagnostics, D::STAGE_PLANNING, cs.loc, ik_error_code(status), oss.str());
+          return false;
+        }
+        // The closed-form IK is accurate to ~1e-5; Newton refinement removes that floor.
+        if (!newton_ik(model, data, tcp, cs.pose, to_vec6(sols.front()), q[k])) {
+          q[k] = to_vec6(sols.front());
+        }
+        if ((q[k] - predicted).cwiseAbs().maxCoeff() > 0.05 + 0.5 * (q[k] - q[k - 1]).cwiseAbs().maxCoeff()) {
+          add_diag(
+            out_diagnostics, D::STAGE_PLANNING, cs.loc, "ERR_QUADRANT_JUMP",
+            "IK branch discontinuity along Cartesian path at progress " +
+              std::to_string(100.0 * u[k]) + "%");
+          return false;
+        }
+      }
+      if (engine_.check_singularity(to_array(q[k]), data) < sing_thresh ||
+          !differential_kinematics(model, data, tcp, q[k], v1, v2, m1[k], m2[k]))
+      {
+        add_diag(
+          out_diagnostics, D::STAGE_KINEMATIC_LIMIT, cs.loc, "ERR_SINGULARITY",
+          "Kinematic singularity on Cartesian path at progress " +
+            std::to_string(100.0 * u[k]) + "%");
+        return false;
+      }
+    }
+
+    // d3q/du3 by central difference of the analytic d2q/du2 (one-sided at the ends);
+    // neighbour configurations are Newton-refined onto the exact path poses.
+    auto q2_at = [&](size_t k, double uu, Vec6 & out) -> bool {
+      const double du = uu - u[k];
+      const Vec6 guess = q[k] + du * (m1[k] + 0.5 * du * m2[k]);
+      const CartesianSample cs = cart_path.eval_normalized(uu);
+      Vec6 qq, v1, v2, q1;
+      cartesian_derivatives(cs, v1, v2);
+      return newton_ik(model, data, tcp, cs.pose, guess, qq) &&
+             differential_kinematics(model, data, tcp, qq, v1, v2, q1, out);
+    };
+    for (size_t k = 0; k < n; ++k) {
+      const double gap_l = k > 0 ? u[k] - u[k - 1] : 1.0;
+      const double gap_r = k + 1 < n ? u[k + 1] - u[k] : 1.0;
+      const double h = std::min({2e-4 / S, 0.25 * gap_l, 0.25 * gap_r});
+      Vec6 a, b;
+      bool ok = false;
+      if (k == 0) {
+        ok = q2_at(k, u[k] + h, a) && q2_at(k, u[k] + 2.0 * h, b);
+        m3[k] = (-3.0 * m2[k] + 4.0 * a - b) / (2.0 * h);
+      } else if (k + 1 == n) {
+        ok = q2_at(k, u[k] - h, a) && q2_at(k, u[k] - 2.0 * h, b);
+        m3[k] = (3.0 * m2[k] - 4.0 * a + b) / (2.0 * h);
+      } else {
+        ok = q2_at(k, u[k] + h, a) && q2_at(k, u[k] - h, b);
+        m3[k] = (a - b) / (2.0 * h);
+      }
+      if (!ok || !m3[k].allFinite()) {
+        add_diag(
+          out_diagnostics, D::STAGE_PLANNING, cart_path.eval_normalized(u[k]).loc,
+          "ERR_SINGULARITY", "Differential kinematics failed near path progress " +
+            std::to_string(100.0 * u[k]) + "%");
+        return false;
+      }
+    }
+
+    out_path.build_hermite(q, m1, m2, m3, u);
+
+    // Residual of the joint path against the exact Cartesian path between knots.
+    std::vector<double> refined{u.front()};
+    bool accurate = true;
+    worst_p = worst_r = 0.0;
+    for (size_t k = 0; k + 1 < n; ++k) {
+      bool interval_ok = true;
+      for (double frac : {0.25, 0.5, 0.75}) {
+        const double um = u[k] + frac * (u[k + 1] - u[k]);
+        Vec6 qm, q1, q2, q3;
+        out_path.eval(um, qm, q1, q2, q3);
+        const Eigen::Matrix4d fk = engine_.forward_pose(to_array(qm), data);
+        const CartesianSample ref = cart_path.eval_normalized(um);
+        const double p_err = (fk.topRightCorner<3, 1>() - ref.pose.topRightCorner<3, 1>()).norm();
+        const double r_err = rot_diff(fk.topLeftCorner<3, 3>(), ref.pose.topLeftCorner<3, 3>());
+        if (p_err > kResidualPos || r_err > kResidualRot) {
+          interval_ok = false;
+          if (p_err / kResidualPos + r_err / kResidualRot > worst_p / kResidualPos + worst_r / kResidualRot) {
+            worst_p = p_err;
+            worst_r = r_err;
+            worst_u = um;
+          }
+        }
+      }
+      if (!interval_ok) {
+        accurate = false;
+        refined.push_back(0.5 * (u[k] + u[k + 1]));
+      }
+      refined.push_back(u[k + 1]);
+    }
+    if (accurate) {
+      return true;
+    }
+    u.swap(refined);
+  }
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(6)
+      << "Joint path deviates from the Cartesian path at " << (100.0 * worst_u)
+      << "% (pos_err=" << worst_p << " m, rot_err=" << worst_r << " rad) after knot refinement";
+  add_diag(
+    out_diagnostics, D::STAGE_PLANNING, cart_path.eval_normalized(worst_u).loc,
+    "ERR_SPLINE_RESIDUAL", oss.str());
+  return false;
+}
+
+bool ProgramCompiler::plan_cartesian_path(
+  const CompositeCartesianPath & cart_path,
+  const std::array<double, 6> & start_q,
+  const MotionOptions & default_options,
+  const SourceLocation & default_loc,
+  SampledTrajectory1kHz & out_sampled,
+  std::vector<Diagnostic> & out_diagnostics) const
+{
+  C3JointSpline joint_path;
+  if (!build_cartesian_joint_path(cart_path, start_q, joint_path, out_diagnostics)) {
+    return false;
+  }
+  std::string topp_err;
+  if (!TOPPJerkSolver::solve(
+        joint_path, &cart_path, engine_.get_joint_limits(), engine_.get_cartesian_limits(),
+        default_options.vel_scale, default_options.acc_scale, default_options.jerk_scale,
+        default_loc, out_sampled, topp_err))
+  {
+    add_diag(out_diagnostics, D::STAGE_PLANNING, default_loc, "ERR_TOPP_SOLVER", topp_err);
+    return false;
+  }
+  return verify_sampled_trajectory_1khz(out_sampled, /*check_singularity=*/true, out_diagnostics);
+}
+
+double ProgramCompiler::tcp_blend_trim(
+  const std::array<double, 6> & corner_q,
+  const std::array<double, 6> & neighbor_q,
+  double blend_radius) const
+{
+  auto workspace = engine_.collision_workspace();
+  const Vec6 c = to_vec6(corner_q);
+  const Vec6 d = to_vec6(neighbor_q) - c;
+  const double len = d.norm();
+  if (len < 1e-12) {
+    return 0.0;
+  }
+  const Vec6 e = d / len;
+  const Eigen::Vector3d p_corner = engine_.forward_pose(corner_q, workspace.data).topRightCorner<3, 1>();
+  auto tcp_dist = [&](double dist) {
+    const Eigen::Matrix4d fk = engine_.forward_pose(to_array(c + dist * e), workspace.data);
+    return (fk.topRightCorner<3, 1>() - p_corner).norm();
+  };
+  const double d_max = 0.45 * len;
+  if (tcp_dist(d_max) <= blend_radius) {
+    return d_max;
+  }
+  double lo = 0.0, hi = d_max;
+  for (int it = 0; it < 50; ++it) {
+    const double mid = 0.5 * (lo + hi);
+    (tcp_dist(mid) < blend_radius ? lo : hi) = mid;
+  }
+  return 0.5 * (lo + hi);
+}
+
+bool ProgramCompiler::build_joint_group_path(
   const std::vector<MotionStatement> & group,
   const std::array<double, 6> & start_q,
-  ExecutionBlock & out_block,
+  std::vector<std::array<double, 6>> & out_waypoints,
+  JointCompositePath & out_path,
   std::vector<Diagnostic> & out_diagnostics) const
 {
   const auto & limits = engine_.get_joint_limits();
   auto workspace = engine_.collision_workspace();
-  std::vector<std::array<double, 6>> target_waypoints;
-  target_waypoints.reserve(group.size() + 1);
-  target_waypoints.push_back(start_q);
+  out_waypoints.clear();
+  out_waypoints.reserve(group.size() + 1);
+  out_waypoints.push_back(start_q);
 
   for (const auto & st : group) {
     if (st.type == MotionCommandType::MOVE_J) {
@@ -494,93 +794,80 @@ bool ProgramCompiler::compile_joint_group(
           "MoveJ target configuration is in collision: " + col_detail);
         return false;
       }
-      target_waypoints.push_back(st.joint_target);
+      out_waypoints.push_back(st.joint_target);
     } else {
       // MoveP: resolve Cartesian target via optimal IK relative to previous waypoint
       std::vector<std::array<double, 6>> sols;
       lite6_planner::IKDiagnostics ik_diag;
       const auto status = engine_.solve_optimal_ik(
-        st.pose_target, target_waypoints.back(), sols, /*continuous=*/false, workspace, &ik_diag);
+        st.pose_target, out_waypoints.back(), sols, /*continuous=*/false, workspace, &ik_diag);
       if (status != IKResult::SUCCESS) {
         add_diag(
           out_diagnostics, D::STAGE_PLANNING, st.loc, ik_error_code(status),
           "MoveP target IK failed: " + ik_diag.summary());
         return false;
       }
-      target_waypoints.push_back(sols.front());
+      out_waypoints.push_back(sols.front());
     }
+  }
+  if (group.size() < 2) {
+    return true;
+  }
+
+  // Explicit corner blends sized by the TCP blend radius of the statement ending there.
+  std::vector<MotionOptions> opts;
+  std::vector<SourceLocation> locs;
+  std::vector<JointCompositePath::Corner> corners;
+  for (const auto & st : group) {
+    opts.push_back(st.options);
+    locs.push_back(st.loc);
+  }
+  for (size_t k = 1; k < group.size(); ++k) {
+    const double r = group[k - 1].options.blend_radius;
+    JointCompositePath::Corner c;
+    c.trim_in = tcp_blend_trim(out_waypoints[k], out_waypoints[k - 1], r);
+    c.trim_out = tcp_blend_trim(out_waypoints[k], out_waypoints[k + 1], r);
+    corners.push_back(c);
+  }
+  std::string err;
+  if (!out_path.build(out_waypoints, opts, locs, corners, err)) {
+    add_diag(out_diagnostics, D::STAGE_PLANNING, group.front().loc, "ERR_JOINT_PATH", err);
+    return false;
+  }
+  return true;
+}
+
+bool ProgramCompiler::compile_joint_group(
+  const std::vector<MotionStatement> & group,
+  const std::array<double, 6> & start_q,
+  ExecutionBlock & out_block,
+  std::vector<Diagnostic> & out_diagnostics) const
+{
+  std::vector<std::array<double, 6>> waypoints;
+  JointCompositePath path;
+  if (!build_joint_group_path(group, start_q, waypoints, path, out_diagnostics)) {
+    return false;
   }
 
   SampledTrajectory1kHz sampled;
   if (group.size() == 1) {
+    // Single PTP motion: phase-synchronized (straight-line) time-optimal S-curve.
     const auto & st = group.front();
     MultiAxisSCurve scurve;
     scurve.build(
-      start_q, target_waypoints.back(), limits,
+      start_q, waypoints.back(), engine_.get_joint_limits(),
       st.options.vel_scale, st.options.acc_scale, st.options.jerk_scale);
-    const double dur = scurve.duration();
-    const int total_ticks = std::max(1, static_cast<int>(std::llround(dur * 1000.0)));
-    sampled.duration_sec = static_cast<double>(total_ticks) * 0.001;
-    sampled.samples.reserve(static_cast<size_t>(total_ticks + 1));
-
-    for (int tick = 0; tick <= total_ticks; ++tick) {
-      const double t = static_cast<double>(tick) * 0.001;
-      SampledTrajectory1kHz::Sample smp;
-      smp.time_sec = t;
-      smp.path_u = (total_ticks > 0) ? (static_cast<double>(tick) / total_ticks) : 1.0;
-      std::array<double, 6> jrk{};
-      scurve.eval(t, smp.q, smp.dq, smp.ddq, jrk);
-      if (tick == 0 || tick == total_ticks) {
-        smp.dq.fill(0.0);
-        smp.ddq.fill(0.0);
-      }
-      smp.loc = st.loc;
-      sampled.samples.push_back(smp);
-    }
+    sampled = scurve_samples(scurve, st.loc, 0.0, 1.0);
   } else {
-    // Multi-segment blended joint-space trajectory via C^3 spline + TOPP-Jerk solver
-    std::vector<std::array<double, 6>> dense_knots;
-    dense_knots.push_back(target_waypoints[0]);
-
-    for (size_t seg = 0; seg < group.size(); ++seg) {
-      const auto & q_a = target_waypoints[seg];
-      const auto & q_b = target_waypoints[seg + 1];
-      constexpr int kSubKnots = 6;
-      for (int sub = 1; sub <= kSubKnots; ++sub) {
-        const double s = static_cast<double>(sub) / kSubKnots;
-        // If this corner is blended, stop slightly before the sharp vertex so C^3 spline rounds it
-        if (sub == kSubKnots && seg + 1 < group.size() && group[seg].options.blend_radius > 1e-4) {
-          continue;
-        }
-        std::array<double, 6> qm{};
-        for (size_t j = 0; j < 6; ++j) {
-          qm[j] = (1.0 - s) * q_a[j] + s * q_b[j];
-        }
-        dense_knots.push_back(qm);
-      }
-    }
-
-    C3JointSpline spline;
-    spline.build(dense_knots);
-    double min_vs = 1.0, min_as = 1.0, min_js = 1.0;
-    for (const auto & st : group) {
-      min_vs = std::min(min_vs, st.options.vel_scale);
-      min_as = std::min(min_as, st.options.acc_scale);
-      min_js = std::min(min_js, st.options.jerk_scale);
-    }
     std::string topp_err;
     if (!TOPPJerkSolver::solve(
-          spline, nullptr, limits, engine_.get_cartesian_limits(),
-          min_vs, min_as, min_js, group.front().loc, sampled, topp_err)) {
+          path, nullptr, engine_.get_joint_limits(), engine_.get_cartesian_limits(),
+          group.front().options.vel_scale, group.front().options.acc_scale,
+          group.front().options.jerk_scale, group.front().loc, sampled, topp_err))
+    {
       add_diag(
         out_diagnostics, D::STAGE_PLANNING, group.front().loc, "ERR_TOPP_SOLVER", topp_err);
       return false;
-    }
-    for (auto & s : sampled.samples) {
-      const size_t seg_idx = std::min(
-        group.size() - 1,
-        static_cast<size_t>(std::floor(s.path_u * static_cast<double>(group.size()))));
-      s.loc = group[seg_idx].loc;
     }
   }
 
@@ -591,6 +878,7 @@ bool ProgramCompiler::compile_joint_group(
   out_block = ExecutionBlock();
   out_block.source_kind = BlockSourceKind::JOINT_GROUP;
   out_block.source_motions = group;
+  out_block.path_start_joints = start_q;
   populate_execution_block(sampled, false, ImpedanceParams{}, out_block);
   return true;
 }
@@ -659,9 +947,12 @@ bool ProgramCompiler::compile_pva_statement(
       add_diag(out_diagnostics, D::STAGE_PLANNING, pva.loc, "ERR_TOPP_SOLVER", topp_err);
       return false;
     }
+    // Chord-length knot parameters: segment k ends at waypoint k.
+    const std::vector<double> knot_u = C3JointSpline::chord_length_parameters(q_nodes);
     for (auto & s : sampled.samples) {
+      const auto it = std::upper_bound(knot_u.begin() + 1, knot_u.end() - 1, s.path_u);
       const size_t wp_idx = std::min(
-        M - 1, static_cast<size_t>(std::floor(s.path_u * static_cast<double>(M))));
+        M - 1, static_cast<size_t>(std::distance(knot_u.begin() + 1, it)));
       s.loc = pva.waypoints[wp_idx].loc;
     }
   } else {
@@ -741,6 +1032,7 @@ bool ProgramCompiler::compile_pva_statement(
   out_block = ExecutionBlock();
   out_block.source_kind = BlockSourceKind::MOVE_PVA;
   out_block.source_pva = pva;
+  out_block.path_start_joints = start_q;
   populate_execution_block(sampled, is_impedance, imp_params, out_block);
   return true;
 }
@@ -902,27 +1194,8 @@ bool ProgramCompiler::plan_alignment_bridge(
 
   MultiAxisSCurve scurve;
   scurve.build(q0, q1, limits, std::clamp(vel_scale, 0.05, 1.0), std::clamp(acc_scale, 0.05, 1.0));
-  const int total_ticks = std::max(1, static_cast<int>(std::llround(scurve.duration() * 1000.0)));
-
-  SampledTrajectory1kHz sampled;
-  sampled.duration_sec = static_cast<double>(total_ticks) * 0.001;
-  sampled.samples.reserve(static_cast<size_t>(total_ticks + 1));
-
-  SourceLocation bridge_loc{0, 0, -1, "<alignment_bridge>"};
-  for (int tick = 0; tick <= total_ticks; ++tick) {
-    const double t = static_cast<double>(tick) * 0.001;
-    SampledTrajectory1kHz::Sample smp;
-    smp.time_sec = t;
-    smp.path_u = static_cast<double>(tick) / total_ticks;
-    std::array<double, 6> jrk{};
-    scurve.eval(t, smp.q, smp.dq, smp.ddq, jrk);
-    if (tick == 0 || tick == total_ticks) {
-      smp.dq.fill(0.0);
-      smp.ddq.fill(0.0);
-    }
-    smp.loc = bridge_loc;
-    sampled.samples.push_back(smp);
-  }
+  const SourceLocation bridge_loc{0, 0, -1, "<alignment_bridge>"};
+  const SampledTrajectory1kHz sampled = scurve_samples(scurve, bridge_loc, 0.0, 1.0);
 
   std::vector<Diagnostic> diags;
   if (!verify_sampled_trajectory_1khz(sampled, false, diags)) {
@@ -951,8 +1224,6 @@ bool ProgramCompiler::replan_remaining_block(
     out_error = "Original trajectory block is empty";
     return false;
   }
-
-  const size_t resume_idx = std::min(pause_sample_idx, total_pts - 1);
   auto get_pt_q = [&](size_t idx) -> std::array<double, 6> {
     std::array<double, 6> q{};
     if (is_imp) {
@@ -964,71 +1235,218 @@ bool ProgramCompiler::replan_remaining_block(
     }
     return q;
   };
+  auto path_u_at = [&](size_t idx) {
+    return original_block.sample_path_u.size() == total_pts ?
+      original_block.sample_path_u[idx] :
+      static_cast<double>(idx) / static_cast<double>(total_pts - 1);
+  };
+  auto loc_at = [&](size_t idx) {
+    return idx < original_block.sample_locations.size() ?
+      original_block.sample_locations[idx] : original_block.loc;
+  };
 
-  const size_t remaining_ticks = total_pts - 1 - resume_idx;
-  if (remaining_ticks <= 5) {
-    // Near the very end of the block: simple S-curve to block endpoint
-    trajectory_msgs::msg::JointTrajectory bridge;
-    if (!plan_alignment_bridge(q_actual, original_block.end_joints, 0.3, 0.3, bridge, out_error)) {
-      return false;
+  // 1. Resume point: the reference sample closest to the actual configuration. The
+  //    reported pause sample lags (50 Hz feedback) and the arm brakes past it, so search
+  //    a window around it instead of trusting the index.
+  const size_t pause_idx = std::min(pause_sample_idx, total_pts - 1);
+  const size_t lo = pause_idx > 500 ? pause_idx - 500 : 0;
+  const size_t hi = std::min(total_pts - 1, pause_idx + 2500);
+  size_t resume_idx = pause_idx;
+  double best = std::numeric_limits<double>::infinity();
+  for (size_t idx = lo; idx <= hi; ++idx) {
+    const auto q = get_pt_q(idx);
+    double d2 = 0.0;
+    for (size_t i = 0; i < 6; ++i) {
+      d2 += (q[i] - q_actual[i]) * (q[i] - q_actual[i]);
     }
-    SampledTrajectory1kHz sampled;
-    sampled.duration_sec =
-      static_cast<double>(bridge.points.size() - 1) * 0.001;
-    for (size_t k = 0; k < bridge.points.size(); ++k) {
-      SampledTrajectory1kHz::Sample smp;
-      smp.time_sec = static_cast<double>(k) * 0.001;
-      for (size_t i = 0; i < 6; ++i) {
-        smp.q[i] = bridge.points[k].positions[i];
-        smp.dq[i] = bridge.points[k].velocities[i];
-        smp.ddq[i] = bridge.points[k].accelerations[i];
-      }
-      smp.loc = original_block.sample_locations.back();
-      sampled.samples.push_back(smp);
+    if (d2 < best) {
+      best = d2;
+      resume_idx = idx;
     }
-    populate_execution_block(
-      sampled, is_imp, original_block.impedance_params, out_resumed_block);
-    return true;
   }
+  const double u_r = path_u_at(resume_idx);
+  const SourceLocation loc_r = loc_at(resume_idx);
 
-  // Subsample the remaining trajectory knots and build a C^3 spline starting at q_actual
-  const size_t stride = std::max<size_t>(1, remaining_ticks / 40);
-  std::vector<std::array<double, 6>> knots;
-  std::vector<SourceLocation> knot_locs;
-  knots.push_back(q_actual);
-  knot_locs.push_back(original_block.sample_locations[resume_idx]);
-
-  for (size_t idx = resume_idx + stride; idx < total_pts - 1; idx += stride) {
-    knots.push_back(get_pt_q(idx));
-    knot_locs.push_back(original_block.sample_locations[idx]);
+  // 2. Programmed options of the interrupted motion (never exceeded on resume).
+  MotionOptions opts;
+  opts.vel_scale = 0.3;
+  opts.acc_scale = 0.3;
+  if ((original_block.source_kind == BlockSourceKind::CARTESIAN_GROUP ||
+       original_block.source_kind == BlockSourceKind::JOINT_GROUP) &&
+      !original_block.source_motions.empty())
+  {
+    opts = original_block.source_motions.front().options;
+    for (const auto & m : original_block.source_motions) {
+      opts.vel_scale = std::min(opts.vel_scale, m.options.vel_scale);
+      opts.acc_scale = std::min(opts.acc_scale, m.options.acc_scale);
+      opts.jerk_scale = std::min(opts.jerk_scale, m.options.jerk_scale);
+    }
+  } else if (original_block.source_kind == BlockSourceKind::MOVE_PVA) {
+    opts = original_block.source_pva.options;
   }
-  knots.push_back(original_block.end_joints);
-  knot_locs.push_back(original_block.sample_locations.back());
-
-  C3JointSpline spline;
-  spline.build(knots);
-
-  SampledTrajectory1kHz sampled;
-  if (!TOPPJerkSolver::solve(
-        spline, nullptr, engine_.get_joint_limits(), engine_.get_cartesian_limits(),
-        0.5, 0.5, 1.0, knot_locs.front(), sampled, out_error)) {
+  const auto & limits = engine_.get_joint_limits();
+  auto diag_error = [&](const std::vector<Diagnostic> & diags, const std::string & fallback) {
+    out_error = diags.empty() ? fallback : diags.front().message;
     return false;
+  };
+  auto map_path_u = [u_r](SampledTrajectory1kHz & traj) {
+    for (auto & smp : traj.samples) {
+      smp.path_u = u_r + smp.path_u * (1.0 - u_r);
+    }
+  };
+
+  // 3. Remaining geometric path from u_r, re-parameterized with the programmed options.
+  SampledTrajectory1kHz rest;
+  bool check_singularity = false;
+  bool straight_to_end = (total_pts - 1 - resume_idx) <= 5;
+  if (!straight_to_end) {
+    std::vector<Diagnostic> diags;
+    switch (original_block.source_kind) {
+      case BlockSourceKind::CARTESIAN_GROUP: {
+        auto workspace = engine_.collision_workspace();
+        CompositeCartesianPath full;
+        SourceLocation err_loc;
+        std::string err_code, err_msg;
+        if (!full.build(
+              engine_.forward_pose(original_block.path_start_joints, workspace.data),
+              original_block.source_motions, err_loc, err_code, err_msg))
+        {
+          out_error = "Cannot rebuild Cartesian path for resume: " + err_msg;
+          return false;
+        }
+        const CompositeCartesianPath sub = full.restricted(u_r);
+        if (!plan_cartesian_path(sub, get_pt_q(resume_idx), opts, loc_r, rest, diags)) {
+          return diag_error(diags, "Resumed Cartesian path planning failed");
+        }
+        map_path_u(rest);
+        check_singularity = true;
+        break;
+      }
+      case BlockSourceKind::JOINT_GROUP: {
+        if (original_block.source_motions.size() < 2) {
+          // A single PTP motion stays a straight joint line to its target.
+          straight_to_end = true;
+          break;
+        }
+        std::vector<std::array<double, 6>> waypoints;
+        JointCompositePath full;
+        if (!build_joint_group_path(
+              original_block.source_motions, original_block.path_start_joints,
+              waypoints, full, diags))
+        {
+          return diag_error(diags, "Cannot rebuild joint path for resume");
+        }
+        const JointCompositePath sub = full.restricted(u_r);
+        std::string topp_err;
+        if (!TOPPJerkSolver::solve(
+              sub, nullptr, limits, engine_.get_cartesian_limits(),
+              opts.vel_scale, opts.acc_scale, opts.jerk_scale, loc_r, rest, topp_err))
+        {
+          out_error = "Resumed joint path planning failed: " + topp_err;
+          return false;
+        }
+        map_path_u(rest);
+        break;
+      }
+      default: {
+        // Timed (MovePVA) or source-less blocks: follow the remaining reference geometry
+        // through a chord-length spline, re-timed with the programmed scales.
+        // Knots at uniform joint-space arc length: sample strides would crowd knots where
+        // the reference decelerates and create spurious kinks.
+        std::vector<double> arc(total_pts, 0.0);
+        for (size_t idx = resume_idx + 1; idx < total_pts; ++idx) {
+          const auto qa = get_pt_q(idx - 1);
+          const auto qb = get_pt_q(idx);
+          double d2 = 0.0;
+          for (size_t i = 0; i < 6; ++i) {
+            d2 += (qb[i] - qa[i]) * (qb[i] - qa[i]);
+          }
+          arc[idx] = arc[idx - 1] + std::sqrt(d2);
+        }
+        const double total_arc = arc[total_pts - 1];
+        const double spacing = std::max(total_arc / 60.0, 0.01);
+        std::vector<std::array<double, 6>> knots{get_pt_q(resume_idx)};
+        std::vector<size_t> knot_idx{resume_idx};
+        for (size_t idx = resume_idx + 1; idx + 1 < total_pts; ++idx) {
+          if (arc[idx] - arc[knot_idx.back()] >= spacing &&
+              total_arc - arc[idx] >= 0.5 * spacing)
+          {
+            knots.push_back(get_pt_q(idx));
+            knot_idx.push_back(idx);
+          }
+        }
+        knots.push_back(original_block.end_joints);
+        knot_idx.push_back(total_pts - 1);
+        C3JointSpline spline;
+        spline.build(knots);
+        std::string topp_err;
+        if (!TOPPJerkSolver::solve(
+              spline, nullptr, limits, engine_.get_cartesian_limits(),
+              opts.vel_scale, opts.acc_scale, opts.jerk_scale, loc_r, rest, topp_err))
+        {
+          out_error = "Resumed trajectory planning failed: " + topp_err;
+          return false;
+        }
+        const std::vector<double> knot_u = C3JointSpline::chord_length_parameters(knots);
+        for (auto & smp : rest.samples) {
+          const auto it = std::upper_bound(knot_u.begin() + 1, knot_u.end() - 1, smp.path_u);
+          const size_t k = static_cast<size_t>(std::distance(knot_u.begin() + 1, it));
+          const double span = knot_u[k + 1] - knot_u[k];
+          const double frac = span > 1e-12 ? std::clamp((smp.path_u - knot_u[k]) / span, 0.0, 1.0) : 0.0;
+          const size_t idx = knot_idx[k] + static_cast<size_t>(std::llround(
+            frac * static_cast<double>(knot_idx[k + 1] - knot_idx[k])));
+          smp.path_u = path_u_at(idx);
+          smp.loc = loc_at(idx);
+        }
+        break;
+      }
+    }
   }
-  for (auto & s : sampled.samples) {
-    const size_t k_idx = std::min(
-      knot_locs.size() - 1,
-      static_cast<size_t>(std::floor(s.path_u * static_cast<double>(knot_locs.size()))));
-    s.loc = knot_locs[k_idx];
+
+  // 4. Rejoin: rest-to-rest straight joint motion from the actual configuration.
+  SampledTrajectory1kHz combined;
+  const std::array<double, 6> join_q =
+    straight_to_end ? original_block.end_joints : rest.samples.front().q;
+  double join_dist = 0.0;
+  for (size_t i = 0; i < 6; ++i) {
+    join_dist = std::max(join_dist, std::abs(join_q[i] - q_actual[i]));
+  }
+  if (straight_to_end || join_dist > 1e-5) {
+    // A pure correction never runs faster than 30 % nor faster than the programmed motion;
+    // the remaining stroke of a single PTP motion keeps its programmed scales.
+    const bool full_motion = straight_to_end && (total_pts - 1 - resume_idx) > 5;
+    const double vs = full_motion ? opts.vel_scale : std::min(opts.vel_scale, 0.3);
+    const double as = full_motion ? opts.acc_scale : std::min(opts.acc_scale, 0.3);
+    std::array<double, 6> q_from = q_actual;
+    for (size_t i = 0; i < 6; ++i) {
+      if (q_from[i] < limits[i].min_pos - lite6_planner::tolerance::kObservedPosition ||
+          q_from[i] > limits[i].max_pos + lite6_planner::tolerance::kObservedPosition)
+      {
+        out_error = "Actual configuration is outside joint limits; cannot resume";
+        return false;
+      }
+      q_from[i] = std::clamp(q_from[i], limits[i].min_pos, limits[i].max_pos);
+    }
+    MultiAxisSCurve scurve;
+    scurve.build(q_from, join_q, limits, vs, as, opts.jerk_scale);
+    combined = scurve_samples(
+      scurve, loc_r, u_r, straight_to_end ? 1.0 : u_r);
+  }
+  if (!straight_to_end) {
+    append_at_rest(combined, rest);
   }
 
   std::vector<Diagnostic> diags;
-  if (!verify_sampled_trajectory_1khz(sampled, false, diags)) {
-    out_error = diags.empty() ? "Resumed trajectory failed verification" : diags.front().message;
-    return false;
+  if (!verify_sampled_trajectory_1khz(combined, check_singularity, diags)) {
+    return diag_error(diags, "Resumed trajectory failed verification");
   }
 
   populate_execution_block(
-    sampled, is_imp, original_block.impedance_params, out_resumed_block);
+    combined, is_imp, original_block.impedance_params, out_resumed_block);
+  out_resumed_block.source_kind = original_block.source_kind;
+  out_resumed_block.source_motions = original_block.source_motions;
+  out_resumed_block.source_pva = original_block.source_pva;
+  out_resumed_block.path_start_joints = original_block.path_start_joints;
   return true;
 }
 

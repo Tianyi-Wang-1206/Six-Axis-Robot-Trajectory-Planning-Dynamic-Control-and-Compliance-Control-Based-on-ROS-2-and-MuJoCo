@@ -6,6 +6,7 @@
 #include "lite6_planner/kinematics_engine.hpp"
 
 #include <array>
+#include <string>
 #include <vector>
 
 namespace lite6_studio_planner
@@ -26,16 +27,27 @@ struct SampledTrajectory1kHz
   double duration_sec = 0.0;
 };
 
-// Self-developed TOPP-RA Phase-Plane Reachability + Jerk-Constrained S-Curve Time Parameterizer.
+// Time-optimal path parameterization by reachability analysis (TOPP-RA) with jerk limiting.
+//
+// 1. Adaptive grid on u in [0, 1] (density from joint/Cartesian rates and path curvature).
+// 2. TOPP-RA on (x = du/dt^2, a = d2u/dt2): backward pass builds the controllable sets
+//    K_i from the exact 2-D projection of the per-stage linear constraints (joint velocity
+//    and acceleration, polygonal inner approximations of the Cartesian translational and
+//    rotational speed/acceleration norms); a greedy forward pass then picks the maximal
+//    admissible acceleration, which is time-optimal for the discretized problem.
+// 3. A boxcar filter on the path speed makes the acceleration continuous (finite jerk).
+// 4. The 1 kHz trajectory is checked against velocity, acceleration and (discrete) jerk
+//    limits; violations tighten the speed / acceleration limits only near the offending
+//    path region and TOPP-RA is re-run. A uniform time dilation is a last-resort fallback.
 class TOPPJerkSolver
 {
 public:
   TOPPJerkSolver() = default;
 
-  // Solves the time-optimal 1 kHz trajectory along a C^3 joint spline q(u), u in [0, 1],
-  // respecting all 6-axis joint (vel, acc, jerk) limits and optional Cartesian path limits.
+  // Per-u motion options come from cart_path when given, else from path.options_at(),
+  // else from the default scales and location.
   static bool solve(
-    const C3JointSpline & joint_spline,
+    const JointPath & path,
     const CompositeCartesianPath * cart_path,
     const std::array<lite6_planner::JointLimit, 6> & joint_limits,
     const lite6_planner::CartesianLimit & cart_limits,

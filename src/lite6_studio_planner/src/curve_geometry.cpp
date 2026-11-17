@@ -192,12 +192,25 @@ private:
   SourceLocation loc_;
 };
 
-// Septic C^3 / G^2 corner blend curve connecting CartesianSample A and CartesianSample B.
+// Septic smoothstep: 0 -> 1 with vanishing 1st..3rd derivatives at both ends.
+double septic_smoothstep(double tau)
+{
+  const double t = std::clamp(tau, 0.0, 1.0);
+  const double t4 = t * t * t * t;
+  return t4 * (35.0 + t * (-84.0 + t * (70.0 - 20.0 * t)));
+}
+
+// C^3 corner blend between the end of one piece (s0) and the start of the next (s1).
+// Position: septic Hermite polynomial matching p, p_s, p_ss, p_sss at both ends.
+// Orientation: R(s) = R_in(s) * Exp(alpha(s) * Log(R_in(s)^T R_out(s))), where R_in / R_out
+// extrapolate the neighbouring pieces at their constant angular rates and alpha is a septic
+// smoothstep. R therefore matches both neighbours up to the third derivative; its angular
+// rate derivatives are evaluated numerically from this exact rotation function.
 class SepticBlendPiece final : public CartesianCurvePiece
 {
 public:
   SepticBlendPiece(const CartesianSample & s0, const CartesianSample & s1)
-  : R0_(s0.pose.topLeftCorner<3, 3>()), loc_(s0.loc)
+  : Ra_(s0.pose.topLeftCorner<3, 3>()), Rb_(s1.pose.topLeftCorner<3, 3>()), loc_(s0.loc)
   {
     opts_.vel_scale = std::min(s0.vel_scale, s1.vel_scale);
     opts_.acc_scale = std::min(s0.acc_scale, s1.acc_scale);
@@ -205,10 +218,8 @@ public:
 
     const Eigen::Vector3d p0 = s0.pose.topRightCorner<3, 1>();
     const Eigen::Vector3d p1 = s1.pose.topRightCorner<3, 1>();
-    rot_end_ = so3_log(R0_.transpose() * s1.pose.topLeftCorner<3, 3>());
-
     const double chord = (p1 - p0).norm();
-    const double rot_chord = kCharLength * rot_end_.norm();
+    const double rot_chord = kCharLength * so3_log(Ra_.transpose() * Rb_).norm();
     L_ = std::max({1e-4, 1.15 * chord, 1.15 * rot_chord});
     const double L2 = L_ * L_;
     const double L3 = L2 * L_;
@@ -231,31 +242,26 @@ public:
       pos_coeffs_[axis] = {{c0, c1, c2, c3, c4, c5, c6, c7}};
     }
 
-    // Smooth C^3 orientation blend in local tangent space of R0_
-    const Eigen::Vector3d w0_local = R0_.transpose() * s0.w_s;
-    const Eigen::Vector3d w1_local = R0_.transpose() * s1.w_s;
-    for (int axis = 0; axis < 3; ++axis) {
-      const double c0 = 0.0;
-      const double c1 = w0_local[axis] * L_;
-      const double c2 = 0.0;
-      const double c3 = 0.0;
-      const double d0 = rot_end_[axis] - c1;
-      const double d1 = w1_local[axis] * L_ - c1;
-      const double c4 = 35.0 * d0 - 15.0 * d1;
-      const double c5 = -84.0 * d0 + 39.0 * d1;
-      const double c6 = 70.0 * d0 - 34.0 * d1;
-      const double c7 = -20.0 * d0 + 10.0 * d1;
-      rot_coeffs_[axis] = {{c0, c1, c2, c3, c4, c5, c6, c7}};
+    // Body-frame constant angular rates of the neighbouring pieces (per unit s).
+    wa_body_ = Ra_.transpose() * s0.w_s;
+    wb_body_ = Rb_.transpose() * s1.w_s;
+
+    double max_delta = 0.0;
+    for (int k = 0; k <= 32; ++k) {
+      max_delta = std::max(max_delta, delta(L_ * k / 32.0).norm());
     }
+    valid_ = std::isfinite(max_delta) && max_delta < 2.6;
   }
 
+  bool valid() const { return valid_; }
   double length() const override { return L_; }
   SourceLocation location() const override { return loc_; }
   MotionOptions options() const override { return opts_; }
 
   CartesianSample eval(double s_local) const override
   {
-    const double tau = std::clamp(s_local / L_, 0.0, 1.0);
+    const double sigma = std::clamp(s_local, 0.0, L_);
+    const double tau = sigma / L_;
     const double t2 = tau * tau;
     const double t3 = t2 * tau;
     const double t4 = t3 * tau;
@@ -270,8 +276,6 @@ public:
     CartesianSample out;
     out.pose = Eigen::Matrix4d::Identity();
     Eigen::Vector3d p, ps, pss, psss;
-    Eigen::Vector3d rvec, rvec_s, rvec_ss;
-
     for (int i = 0; i < 3; ++i) {
       const auto & c = pos_coeffs_[i];
       p[i] = c[0] + c[1] * tau + c[2] * t2 + c[3] * t3 + c[4] * t4 + c[5] * t5 + c[6] * t6 + c[7] * t7;
@@ -281,22 +285,22 @@ public:
                 20.0 * c[5] * t3 + 30.0 * c[6] * t4 + 42.0 * c[7] * t5) * invL2;
       psss[i] = (6.0 * c[3] + 24.0 * c[4] * tau + 60.0 * c[5] * t2 +
                  120.0 * c[6] * t3 + 210.0 * c[7] * t4) * invL3;
-
-      const auto & rc = rot_coeffs_[i];
-      rvec[i] = rc[0] + rc[1] * tau + rc[2] * t2 + rc[3] * t3 + rc[4] * t4 + rc[5] * t5 + rc[6] * t6 + rc[7] * t7;
-      rvec_s[i] = (rc[1] + 2.0 * rc[2] * tau + 3.0 * rc[3] * t2 + 4.0 * rc[4] * t3 +
-                   5.0 * rc[5] * t4 + 6.0 * rc[6] * t5 + 7.0 * rc[7] * t6) * invL;
-      rvec_ss[i] = (2.0 * rc[2] + 6.0 * rc[3] * tau + 12.0 * rc[4] * t2 +
-                    20.0 * rc[5] * t3 + 30.0 * rc[6] * t4 + 42.0 * rc[7] * t5) * invL2;
     }
 
     out.pose.topRightCorner<3, 1>() = p;
-    out.pose.topLeftCorner<3, 3>() = R0_ * so3_exp(rvec);
+    out.pose.topLeftCorner<3, 3>() = rotation(sigma);
     out.p_s = ps;
     out.p_ss = pss;
     out.p_sss = psss;
-    out.w_s = R0_ * rvec_s;
-    out.w_ss = R0_ * rvec_ss;
+    // Five-point central stencil on the exact angular rate; the rotation function is
+    // C^3 across the blend ends, so the stencil may straddle them.
+    const double h = 2e-3 * L_;
+    const Eigen::Vector3d wp2 = omega(sigma + 2.0 * h);
+    const Eigen::Vector3d wp1 = omega(sigma + h);
+    const Eigen::Vector3d wm1 = omega(sigma - h);
+    const Eigen::Vector3d wm2 = omega(sigma - 2.0 * h);
+    out.w_s = omega(sigma);
+    out.w_ss = (-wp2 + 8.0 * wp1 - 8.0 * wm1 + wm2) / (12.0 * h);
     out.vel_scale = opts_.vel_scale;
     out.acc_scale = opts_.acc_scale;
     out.jerk_scale = opts_.jerk_scale;
@@ -305,11 +309,35 @@ public:
   }
 
 private:
-  Eigen::Matrix3d R0_;
-  Eigen::Vector3d rot_end_;
+  Eigen::Vector3d delta(double sigma) const
+  {
+    const Eigen::Matrix3d r_in = Ra_ * so3_exp(sigma * wa_body_);
+    const Eigen::Matrix3d r_out = Rb_ * so3_exp((sigma - L_) * wb_body_);
+    return so3_log(r_in.transpose() * r_out);
+  }
+
+  // Defined for any sigma; outside [0, L] it continues the neighbouring piece.
+  Eigen::Matrix3d rotation(double sigma) const
+  {
+    const Eigen::Matrix3d r_in = Ra_ * so3_exp(sigma * wa_body_);
+    const Eigen::Matrix3d r_out = Rb_ * so3_exp((sigma - L_) * wb_body_);
+    const Eigen::Vector3d d = so3_log(r_in.transpose() * r_out);
+    return r_in * so3_exp(septic_smoothstep(sigma / L_) * d);
+  }
+
+  // World-frame angular rate per unit s by a central difference of the rotation.
+  Eigen::Vector3d omega(double sigma) const
+  {
+    const double h = 1e-4 * L_;
+    return so3_log(rotation(sigma + h) * rotation(sigma - h).transpose()) / (2.0 * h);
+  }
+
+  Eigen::Matrix3d Ra_, Rb_;
+  Eigen::Vector3d wa_body_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d wb_body_ = Eigen::Vector3d::Zero();
   std::array<std::array<double, 8>, 3> pos_coeffs_{};
-  std::array<std::array<double, 8>, 3> rot_coeffs_{};
   double L_ = 1e-3;
+  bool valid_ = true;
   MotionOptions opts_;
   SourceLocation loc_;
 };
@@ -499,7 +527,14 @@ bool CompositeCartesianPath::build(
     if (i + 1 < raw_prims.size() && trim_len[i] > 1e-5) {
       const CartesianSample s_in = raw_prims[i].eval_untrimmed(raw_prims[i].trim_end);
       const CartesianSample s_out = raw_prims[i + 1].eval_untrimmed(raw_prims[i + 1].trim_start);
-      pieces_.push_back(std::make_shared<SepticBlendPiece>(s_in, s_out));
+      auto blend = std::make_shared<SepticBlendPiece>(s_in, s_out);
+      if (!blend->valid()) {
+        err_loc = statements[i + 1].loc;
+        err_code = "ERR_BLEND_ORIENTATION";
+        err_msg = "Corner blend orientation change is too large to blend smoothly";
+        return false;
+      }
+      pieces_.push_back(blend);
     }
   }
 
@@ -507,22 +542,39 @@ bool CompositeCartesianPath::build(
   for (size_t i = 0; i < pieces_.size(); ++i) {
     s_cum_[i + 1] = s_cum_[i] + pieces_[i]->length();
   }
+  s_begin_ = 0.0;
   total_length_ = std::max(1e-6, s_cum_.back());
   return true;
+}
+
+std::vector<double> CompositeCartesianPath::piece_boundaries() const
+{
+  std::vector<double> out;
+  for (size_t i = 1; i + 1 < s_cum_.size(); ++i) {
+    const double u = (s_cum_[i] - s_begin_) / total_length_;
+    if (u > 1e-9 && u < 1.0 - 1e-9) {
+      out.push_back(u);
+    }
+  }
+  return out;
+}
+
+CompositeCartesianPath CompositeCartesianPath::restricted(double u_start) const
+{
+  CompositeCartesianPath sub = *this;
+  const double u0 = std::clamp(u_start, 0.0, 1.0);
+  sub.s_begin_ = s_begin_ + u0 * total_length_;
+  sub.total_length_ = std::max(1e-9, total_length_ * (1.0 - u0));
+  return sub;
 }
 
 CartesianSample CompositeCartesianPath::eval_normalized(double u) const
 {
   const double u_clamped = std::clamp(u, 0.0, 1.0);
-  const double s = u_clamped * total_length_;
+  const double s = s_begin_ + u_clamped * total_length_;
 
-  size_t idx = pieces_.size() - 1;
-  for (size_t i = 0; i < pieces_.size(); ++i) {
-    if (s <= s_cum_[i + 1] || i + 1 == pieces_.size()) {
-      idx = i;
-      break;
-    }
-  }
+  const auto it = std::upper_bound(s_cum_.begin() + 1, s_cum_.end() - 1, s);
+  const size_t idx = static_cast<size_t>(std::distance(s_cum_.begin() + 1, it));
   const double s_local = std::clamp(s - s_cum_[idx], 0.0, pieces_[idx]->length());
   CartesianSample sample = pieces_[idx]->eval(s_local);
 
@@ -538,23 +590,57 @@ CartesianSample CompositeCartesianPath::eval_normalized(double u) const
   return sample;
 }
 
+std::vector<double> C3JointSpline::chord_length_parameters(
+  const std::vector<std::array<double, 6>> & knots)
+{
+  const size_t n = knots.size();
+  std::vector<double> u(n, 0.0);
+  if (n < 2) {
+    return u;
+  }
+  std::vector<double> d(n - 1, 0.0);
+  double total = 0.0;
+  for (size_t i = 0; i + 1 < n; ++i) {
+    double sq = 0.0;
+    for (size_t j = 0; j < 6; ++j) {
+      const double diff = knots[i + 1][j] - knots[i][j];
+      sq += diff * diff;
+    }
+    d[i] = std::sqrt(sq);
+    total += d[i];
+  }
+  if (total < 1e-12) {
+    for (size_t i = 0; i < n; ++i) {
+      u[i] = static_cast<double>(i) / static_cast<double>(n - 1);
+    }
+    return u;
+  }
+  // Keep coincident knots strictly ordered.
+  const double floor = 1e-6 * total;
+  double acc = 0.0;
+  for (size_t i = 0; i + 1 < n; ++i) {
+    acc += std::max(d[i], floor);
+    u[i + 1] = acc;
+  }
+  for (auto & v : u) {
+    v /= acc;
+  }
+  u.back() = 1.0;
+  return u;
+}
+
 void C3JointSpline::build(
   const std::vector<std::array<double, 6>> & knots,
   const std::vector<double> & u_knots)
 {
   const int n = static_cast<int>(knots.size()) - 1;
   if (n < 1) {
+    segments_.clear();
     return;
   }
 
-  std::vector<double> u(static_cast<size_t>(n + 1), 0.0);
-  if (u_knots.size() == knots.size()) {
-    u = u_knots;
-  } else {
-    for (int i = 0; i <= n; ++i) {
-      u[static_cast<size_t>(i)] = static_cast<double>(i) / static_cast<double>(n);
-    }
-  }
+  const std::vector<double> u =
+    (u_knots.size() == knots.size()) ? u_knots : chord_length_parameters(knots);
 
   std::vector<Vec6> q(static_cast<size_t>(n + 1));
   for (int i = 0; i <= n; ++i) {
@@ -627,15 +713,24 @@ void C3JointSpline::build(
       (u[static_cast<size_t>(n)] - u[static_cast<size_t>(n - 1)]);
   }
 
-  // 3. Construct degree-7 C^3 Hermite segments matching (q, m1, m2, m3) at every knot.
-  segments_.clear();
-  segments_.reserve(static_cast<size_t>(n));
-  max_q1_.setZero();
-  max_q2_.setZero();
-  max_q3_.setZero();
+  std::vector<Vec6> qv(q.begin(), q.end());
+  build_hermite(qv, m1, m2, m3, u);
+}
 
-  for (int i = 0; i < n; ++i) {
-    const size_t idx = static_cast<size_t>(i);
+void C3JointSpline::build_hermite(
+  const std::vector<Vec6> & q,
+  const std::vector<Vec6> & m1,
+  const std::vector<Vec6> & m2,
+  const std::vector<Vec6> & m3,
+  const std::vector<double> & u)
+{
+  segments_.clear();
+  const size_t n = q.size();
+  if (n < 2 || m1.size() != n || m2.size() != n || m3.size() != n || u.size() != n) {
+    return;
+  }
+  segments_.reserve(n - 1);
+  for (size_t idx = 0; idx + 1 < n; ++idx) {
     const double h = u[idx + 1] - u[idx];
     const double h2 = h * h;
     const double h3 = h2 * h;
@@ -659,10 +754,17 @@ void C3JointSpline::build(
     seg.c[7] = -20.0 * d0 + 10.0 * d1 - 2.0 * d2 + (1.0 / 6.0) * d3;
     segments_.push_back(seg);
   }
+  finalize_bounds();
+}
 
-  constexpr int kBoundSamples = 200;
-  for (int k = 0; k <= kBoundSamples; ++k) {
-    const double uk = static_cast<double>(k) / kBoundSamples;
+void C3JointSpline::finalize_bounds()
+{
+  max_q1_.setZero();
+  max_q2_.setZero();
+  max_q3_.setZero();
+  const int samples = std::max<int>(200, static_cast<int>(4 * segments_.size()));
+  for (int k = 0; k <= samples; ++k) {
+    const double uk = static_cast<double>(k) / samples;
     Vec6 qv, q1, q2, q3;
     eval(uk, qv, q1, q2, q3);
     max_q1_ = max_q1_.cwiseMax(q1.cwiseAbs());
@@ -670,6 +772,30 @@ void C3JointSpline::build(
     max_q3_ = max_q3_.cwiseMax(q3.cwiseAbs());
   }
 }
+
+namespace
+{
+template <typename Coeffs, typename Out>
+void eval_septic(
+  const Coeffs & c, double tau, double inv_h, Out & q, Out & q1, Out & q2, Out & q3)
+{
+  const double t2 = tau * tau;
+  const double t3 = t2 * tau;
+  const double t4 = t3 * tau;
+  const double t5 = t4 * tau;
+  const double t6 = t5 * tau;
+  const double t7 = t6 * tau;
+  const double inv_h2 = inv_h * inv_h;
+  const double inv_h3 = inv_h2 * inv_h;
+  q = c[0] + c[1] * tau + c[2] * t2 + c[3] * t3 + c[4] * t4 + c[5] * t5 + c[6] * t6 + c[7] * t7;
+  q1 = (c[1] + 2.0 * c[2] * tau + 3.0 * c[3] * t2 + 4.0 * c[4] * t3 +
+    5.0 * c[5] * t4 + 6.0 * c[6] * t5 + 7.0 * c[7] * t6) * inv_h;
+  q2 = (2.0 * c[2] + 6.0 * c[3] * tau + 12.0 * c[4] * t2 +
+    20.0 * c[5] * t3 + 30.0 * c[6] * t4 + 42.0 * c[7] * t5) * inv_h2;
+  q3 = (6.0 * c[3] + 24.0 * c[4] * tau + 60.0 * c[5] * t2 +
+    120.0 * c[6] * t3 + 210.0 * c[7] * t4) * inv_h3;
+}
+}  // namespace
 
 void C3JointSpline::eval(
   double u,
@@ -687,35 +813,167 @@ void C3JointSpline::eval(
   }
 
   const double uc = std::clamp(u, 0.0, 1.0);
-  size_t idx = segments_.size() - 1;
-  for (size_t i = 0; i < segments_.size(); ++i) {
-    if (uc <= segments_[i].u0 + segments_[i].h || i + 1 == segments_.size()) {
-      idx = i;
-      break;
-    }
+  const auto it = std::upper_bound(
+    segments_.begin() + 1, segments_.end(), uc,
+    [](double value, const Segment & seg) { return value < seg.u0; });
+  const auto & seg = *(it - 1);
+  const double tau = std::clamp((uc - seg.u0) / seg.h, 0.0, 1.0);
+  eval_septic(seg.c, tau, 1.0 / seg.h, q, q_u, q_uu, q_uuu);
+}
+
+bool JointCompositePath::build(
+  const std::vector<std::array<double, 6>> & waypoints,
+  const std::vector<MotionOptions> & segment_opts,
+  const std::vector<SourceLocation> & segment_locs,
+  const std::vector<Corner> & corners,
+  std::string & err_msg)
+{
+  pieces_.clear();
+  s_cum_.clear();
+  s_begin_ = 0.0;
+  total_length_ = 0.0;
+  if (waypoints.size() < 2) {
+    err_msg = "Joint path requires at least two waypoints";
+    return false;
+  }
+  const size_t n = waypoints.size() - 1;
+  if (segment_opts.size() != n || segment_locs.size() != n ||
+      corners.size() + 1 != n)
+  {
+    err_msg = "Joint path segment metadata size mismatch";
+    return false;
   }
 
-  const auto & seg = segments_[idx];
-  const double tau = std::clamp((uc - seg.u0) / seg.h, 0.0, 1.0);
-  const double t2 = tau * tau;
-  const double t3 = t2 * tau;
-  const double t4 = t3 * tau;
-  const double t5 = t4 * tau;
-  const double t6 = t5 * tau;
-  const double t7 = t6 * tau;
+  std::vector<Vec6> w(waypoints.size());
+  for (size_t k = 0; k < waypoints.size(); ++k) {
+    for (int j = 0; j < 6; ++j) {
+      w[k][j] = waypoints[k][static_cast<size_t>(j)];
+    }
+  }
+  std::vector<double> len(n);
+  std::vector<Vec6> dir(n);
+  for (size_t i = 0; i < n; ++i) {
+    const Vec6 d = w[i + 1] - w[i];
+    len[i] = d.norm();
+    if (len[i] < 1e-9) {
+      err_msg = "Blended joint motion contains a zero-length segment";
+      return false;
+    }
+    dir[i] = d / len[i];
+  }
 
-  const double invH = 1.0 / seg.h;
-  const double invH2 = invH * invH;
-  const double invH3 = invH2 * invH;
+  // Trims removed at the start (after corner i-1) and end (before corner i) of segment i.
+  std::vector<double> trim_start(n, 0.0), trim_end(n, 0.0);
+  for (size_t k = 0; k + 1 < n; ++k) {
+    trim_end[k] = std::clamp(corners[k].trim_in, 0.0, 0.45 * len[k]);
+    trim_start[k + 1] = std::clamp(corners[k].trim_out, 0.0, 0.45 * len[k + 1]);
+  }
 
-  q = seg.c[0] + seg.c[1] * tau + seg.c[2] * t2 + seg.c[3] * t3 +
-      seg.c[4] * t4 + seg.c[5] * t5 + seg.c[6] * t6 + seg.c[7] * t7;
-  q_u = (seg.c[1] + 2.0 * seg.c[2] * tau + 3.0 * seg.c[3] * t2 + 4.0 * seg.c[4] * t3 +
-         5.0 * seg.c[5] * t4 + 6.0 * seg.c[6] * t5 + 7.0 * seg.c[7] * t6) * invH;
-  q_uu = (2.0 * seg.c[2] + 6.0 * seg.c[3] * tau + 12.0 * seg.c[4] * t2 +
-          20.0 * seg.c[5] * t3 + 30.0 * seg.c[6] * t4 + 42.0 * seg.c[7] * t5) * invH2;
-  q_uuu = (6.0 * seg.c[3] + 24.0 * seg.c[4] * tau + 60.0 * seg.c[5] * t2 +
-           120.0 * seg.c[6] * t3 + 210.0 * seg.c[7] * t4) * invH3;
+  for (size_t i = 0; i < n; ++i) {
+    const double line_len = len[i] - trim_start[i] - trim_end[i];
+    if (line_len > 1e-12) {
+      Piece line;
+      line.blend = false;
+      line.length = line_len;
+      line.start = w[i] + trim_start[i] * dir[i];
+      line.dir = dir[i];
+      line.opts = segment_opts[i];
+      line.loc = segment_locs[i];
+      pieces_.push_back(line);
+    }
+    if (i + 1 < n && (trim_end[i] > 1e-12 || trim_start[i + 1] > 1e-12)) {
+      const Vec6 a = w[i + 1] - trim_end[i] * dir[i];
+      const Vec6 b = w[i + 1] + trim_start[i + 1] * dir[i + 1];
+      Piece blend;
+      blend.blend = true;
+      blend.length = std::max(
+        1e-9, 0.5 * (trim_end[i] + trim_start[i + 1]) + 0.5 * (b - a).norm());
+      const double L = blend.length;
+      // Septic Hermite: unit tangents at both ends, zero 2nd/3rd derivatives.
+      blend.c[0] = a;
+      blend.c[1] = dir[i] * L;
+      blend.c[2].setZero();
+      blend.c[3].setZero();
+      const Vec6 d0 = b - (blend.c[0] + blend.c[1]);
+      const Vec6 d1 = dir[i + 1] * L - blend.c[1];
+      blend.c[4] = 35.0 * d0 - 15.0 * d1;
+      blend.c[5] = -84.0 * d0 + 39.0 * d1;
+      blend.c[6] = 70.0 * d0 - 34.0 * d1;
+      blend.c[7] = -20.0 * d0 + 10.0 * d1;
+      blend.opts.vel_scale = std::min(segment_opts[i].vel_scale, segment_opts[i + 1].vel_scale);
+      blend.opts.acc_scale = std::min(segment_opts[i].acc_scale, segment_opts[i + 1].acc_scale);
+      blend.opts.jerk_scale = std::min(segment_opts[i].jerk_scale, segment_opts[i + 1].jerk_scale);
+      blend.loc = segment_locs[i];
+      pieces_.push_back(blend);
+    }
+  }
+  if (pieces_.empty()) {
+    err_msg = "Joint path has no motion";
+    return false;
+  }
+  s_cum_.assign(pieces_.size() + 1, 0.0);
+  for (size_t i = 0; i < pieces_.size(); ++i) {
+    s_cum_[i + 1] = s_cum_[i] + pieces_[i].length;
+  }
+  total_length_ = s_cum_.back();
+  return true;
+}
+
+size_t JointCompositePath::locate(double s, double & s_local) const
+{
+  const auto it = std::upper_bound(s_cum_.begin() + 1, s_cum_.end() - 1, s);
+  const size_t idx = static_cast<size_t>(std::distance(s_cum_.begin() + 1, it));
+  s_local = std::clamp(s - s_cum_[idx], 0.0, pieces_[idx].length);
+  return idx;
+}
+
+void JointCompositePath::eval(
+  double u, Vec6 & q, Vec6 & q_u, Vec6 & q_uu, Vec6 & q_uuu) const
+{
+  if (pieces_.empty()) {
+    q.setZero();
+    q_u.setZero();
+    q_uu.setZero();
+    q_uuu.setZero();
+    return;
+  }
+  double s_local = 0.0;
+  const auto & piece = pieces_[locate(s_begin_ + std::clamp(u, 0.0, 1.0) * total_length_, s_local)];
+  Vec6 q_s, q_ss, q_sss;
+  if (piece.blend) {
+    eval_septic(piece.c, s_local / piece.length, 1.0 / piece.length, q, q_s, q_ss, q_sss);
+  } else {
+    q = piece.start + s_local * piece.dir;
+    q_s = piece.dir;
+    q_ss.setZero();
+    q_sss.setZero();
+  }
+  // Chain rule from joint arc length s to u in [0, 1]: ds/du = S.
+  const double S = total_length_;
+  q_u = q_s * S;
+  q_uu = q_ss * (S * S);
+  q_uuu = q_sss * (S * S * S);
+}
+
+bool JointCompositePath::options_at(double u, MotionOptions & opts, SourceLocation & loc) const
+{
+  if (pieces_.empty()) {
+    return false;
+  }
+  double s_local = 0.0;
+  const auto & piece = pieces_[locate(s_begin_ + std::clamp(u, 0.0, 1.0) * total_length_, s_local)];
+  opts = piece.opts;
+  loc = piece.loc;
+  return true;
+}
+
+JointCompositePath JointCompositePath::restricted(double u_start) const
+{
+  JointCompositePath sub = *this;
+  const double u0 = std::clamp(u_start, 0.0, 1.0);
+  sub.s_begin_ = s_begin_ + u0 * total_length_;
+  sub.total_length_ = std::max(1e-12, total_length_ * (1.0 - u0));
+  return sub;
 }
 
 }  // namespace lite6_studio_planner

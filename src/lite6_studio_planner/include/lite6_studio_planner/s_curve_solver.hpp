@@ -37,7 +37,10 @@ private:
   double total_time_ = 0.0;
 };
 
-// Synchronized 6-axis time-optimal S-curve profile.
+// Phase-synchronized 6-axis S-curve: every joint follows q(t) = q0 + (q1 - q0) * s(t) with
+// one shared normalized jerk-limited profile s(t) in [0, 1], so the motion is a straight line
+// in joint space. s(t) uses the tightest per-joint (v, a, j) limit mapped to the normalized
+// stroke, so it is the time-optimal straight-line profile. Duration is rounded up to 1 ms.
 class MultiAxisSCurve
 {
 public:
@@ -53,6 +56,9 @@ public:
 
   double duration() const { return sync_duration_; }
 
+  // Normalized path progress s(t) in [0, 1].
+  double progress(double t) const;
+
   void eval(
     double t,
     std::array<double, 6> & q,
@@ -61,7 +67,9 @@ public:
     std::array<double, 6> & jrk) const;
 
 private:
-  std::array<SingleAxisSCurve, 6> axes_{};
+  SingleAxisSCurve profile_{};
+  std::array<double, 6> q0_{};
+  std::array<double, 6> delta_{};
   double sync_duration_ = 0.0;
 };
 
