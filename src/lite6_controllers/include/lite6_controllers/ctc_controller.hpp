@@ -222,6 +222,11 @@ private:
   Eigen::Matrix<double, 6, 1> q_imp_ref_ = Eigen::Matrix<double, 6, 1>::Zero();
   Eigen::Matrix<double, 6, 1> dq_imp_ref_ = Eigen::Matrix<double, 6, 1>::Zero();
   Eigen::Matrix<double, 6, 1> ddq_imp_ref_ = Eigen::Matrix<double, 6, 1>::Zero();
+  bool imp_ref_kinematics_cached_ = false;
+  Vec6d imp_ref_cached_q_ = Vec6d::Zero();
+  Vec6d imp_ref_cached_dq_ = Vec6d::Zero();
+  pinocchio::SE3 imp_ref_pose_cached_ = pinocchio::SE3::Identity();
+  Vec6d imp_ref_vel_cached_ = Vec6d::Zero();
   Eigen::Vector3d imp_kt_target_ = Eigen::Vector3d::Constant(200.0);
   Eigen::Vector3d imp_dt_target_ = Eigen::Vector3d::Constant(25.0);
   Eigen::Vector3d imp_kr_target_ = Eigen::Vector3d::Constant(8.0);
@@ -289,7 +294,8 @@ private:
 
   bool gmo_enabled_ = true;
   bool gmo_initialized_ = false;
-  bool gmo_state_cached_this_cycle_ = false;
+  bool gmo_gravity_cached_this_cycle_ = false;
+  bool gmo_tcp_cached_this_cycle_ = false;
   std::array<double, 6> gmo_gains_{25.0, 25.0, 25.0, 30.0, 30.0, 30.0};
   double gmo_jacobian_damping_ = 0.04;
   double gmo_fric_trans_speed_ = 0.03;

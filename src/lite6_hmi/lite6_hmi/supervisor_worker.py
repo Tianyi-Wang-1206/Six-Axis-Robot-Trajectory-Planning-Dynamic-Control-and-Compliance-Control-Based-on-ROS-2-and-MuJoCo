@@ -126,6 +126,8 @@ class ROS2Worker(QThread):
         self.last_state_rx_time = 0.0  # joint feedback receipt time, monotonic
         self.last_ui_update_time = 0.0
         self._stopping = False
+        self._bg_threads_lock = threading.Lock()
+        self._bg_threads = set()
 
         self.joint_names = [f"joint{i}" for i in range(1, 7)]
         self.teaching = TeachingRecording()
@@ -242,19 +244,41 @@ class ROS2Worker(QThread):
             pass
         return True
 
+    def _spawn_bg_thread(self, target, args=()):
+        if self._stopping:
+            return
+        def _runner():
+            try:
+                target(*args)
+            finally:
+                with self._bg_threads_lock:
+                    self._bg_threads.discard(threading.current_thread())
+        thread = threading.Thread(target=_runner, daemon=True)
+        with self._bg_threads_lock:
+            if self._stopping:
+                return
+            self._bg_threads.add(thread)
+        thread.start()
+
     def command_gripper(self, command):
+        err = None
         with self.state_lock:
             if not self.gripper_ready():
-                self._report_error("Gripper hardware is inactive or feedback is stale")
-                return
+                err = "Gripper hardware is inactive or feedback is stale"
+        if err is not None:
+            self._report_error(err)
+            return
         if not self._run_on_executor(lambda cmd=command: self._send_gripper_on_executor(cmd)):
             self._report_error("Gripper request canceled while stopping")
 
     def _send_gripper_on_executor(self, command):
+        err = None
         with self.state_lock:
             if not self.gripper_ready():
-                self._report_error("Gripper hardware is inactive or feedback is stale")
-                return
+                err = "Gripper hardware is inactive or feedback is stale"
+        if err is not None:
+            self._report_error(err)
+            return
         if not self.gripper_client.service_is_ready():
             self._report_error("Gripper service unavailable")
             return
@@ -290,6 +314,13 @@ class ROS2Worker(QThread):
             pass
         self.executor.shutdown(timeout_sec=2.0)
         self.wait(2500)
+        with self._bg_threads_lock:
+            bg_threads = list(self._bg_threads)
+        deadline = time.monotonic() + 2.0
+        for thread in bg_threads:
+            remaining = deadline - time.monotonic()
+            if remaining > 0.0:
+                thread.join(timeout=remaining)
         self._sysid_shm.close()
         self._state_shm.close()
         try:
@@ -299,8 +330,8 @@ class ROS2Worker(QThread):
         self.node.destroy_node()
 
     def _report_error(self, message):
-        self.node.get_logger().warn(message)
         if not self._stopping:
+            self.node.get_logger().warn(message)
             self.command_error_signal.emit(message)
 
     def _motion_rejection_cb(self, msg):
@@ -492,7 +523,7 @@ class ROS2Worker(QThread):
                     context=IndustrialMotion.Goal.CONTEXT_SYSID, session_id=sid):
                 self._abort_sysid(sid, "Could not dispatch pre-alignment")
         elif phase == SupervisorState.SYSID_READY_FOR_EXCITATION:
-            threading.Thread(target=self._submit_sysid_trajectory, args=(sid,), daemon=True).start()
+            self._spawn_bg_thread(self._submit_sysid_trajectory, (sid,))
         elif phase == SupervisorState.SYSID_CALCULATING:
             self.run_sysid_calculation(sid)
         elif phase == SupervisorState.SYSID_POST_ALIGN:
@@ -625,32 +656,45 @@ class ROS2Worker(QThread):
             return self._dispatch_motion_on_executor(goal)
         return self._run_on_executor(lambda: self._dispatch_motion_on_executor(goal))
 
+    def _validate_motion_unlocked(self, goal):
+        snap = self.supervisor_state
+        if self._motion_pending:
+            return "A motion request is already awaiting an Action response"
+        if goal.context == IndustrialMotion.Goal.CONTEXT_NORMAL:
+            if self._begin_pending:
+                return "Wait for SysID preparation before requesting manual motion"
+            if snap is None or not snap.motion_allowed:
+                return "Supervisor does not currently permit manual motion"
+            return None
+        if snap is None or snap.session_id != goal.session_id:
+            return "Session-scoped motion is not authorized"
+        return None
+
     def _dispatch_motion_on_executor(self, goal):
         with self.state_lock:
-            snap = self.supervisor_state
-            if self._motion_pending:
-                self._report_error("A motion request is already awaiting an Action response")
-                return False
-            if goal.context == IndustrialMotion.Goal.CONTEXT_NORMAL:
-                if self._begin_pending:
-                    self._report_error("Wait for SysID preparation before requesting manual motion")
-                    return False
-                if snap is None or not snap.motion_allowed:
-                    self._report_error("Supervisor does not currently permit manual motion")
-                    return False
-            elif snap is None or snap.session_id != goal.session_id:
-                self._report_error("Session-scoped motion is not authorized")
-                return False
-            if not self.move_client.server_is_ready():
-                self._report_error("IndustrialMotion Action server unavailable")
-                return False
-            self._motion_pending = True
-            self._goal_epoch += 1
-            epoch = self._goal_epoch
-            goal_id = uuid.uuid4()
-            key = goal_id.hex
-            self._motion_requests[key] = {
-                'created': time.monotonic(), 'rejected_at': None, 'detail': None}
+            err = self._validate_motion_unlocked(goal)
+        if err is not None:
+            self._report_error(err)
+            return False
+        if not self.move_client.server_is_ready():
+            self._report_error("IndustrialMotion Action server unavailable")
+            return False
+        epoch = 0
+        goal_id = None
+        key = None
+        with self.state_lock:
+            err = self._validate_motion_unlocked(goal)
+            if err is None:
+                self._motion_pending = True
+                self._goal_epoch += 1
+                epoch = self._goal_epoch
+                goal_id = uuid.uuid4()
+                key = goal_id.hex
+                self._motion_requests[key] = {
+                    'created': time.monotonic(), 'rejected_at': None, 'detail': None}
+        if err is not None:
+            self._report_error(err)
+            return False
         try:
             fut = self.move_client.send_goal_async(goal, goal_uuid=UUID(uuid=list(goal_id.bytes)))
             fut.add_done_callback(lambda f: self._goal_response(
@@ -708,23 +752,35 @@ class ROS2Worker(QThread):
     def _goal_response(self, future, epoch, context, session, key):
         try:
             handle = future.result()
+            cancel_handle = None
+            stale = False
+            rejected = False
             with self.state_lock:
                 if epoch != self._goal_epoch:
+                    stale = True
                     self._motion_requests.pop(key, None)
                     if handle is not None and handle.accepted:
-                        handle.cancel_goal_async()
-                    return
-                self._motion_pending = False
-                if not handle.accepted:
-                    request = self._motion_requests.setdefault(key, {
-                        'created': time.monotonic(), 'detail': None})
-                    request['rejected_at'] = time.monotonic()
-                    self._flush_motion_rejections()
-                    self._scoped_dispatch_failed(
-                        context, session, "Supervisor rejected internal motion")
-                    return
-                self._motion_requests.pop(key, None)
-                self.current_goal_handle = handle
+                        cancel_handle = handle
+                else:
+                    self._motion_pending = False
+                    if not handle.accepted:
+                        request = self._motion_requests.setdefault(key, {
+                            'created': time.monotonic(), 'detail': None})
+                        request['rejected_at'] = time.monotonic()
+                        rejected = True
+                    else:
+                        self._motion_requests.pop(key, None)
+                        self.current_goal_handle = handle
+            if cancel_handle is not None:
+                cancel_handle.cancel_goal_async()
+                return
+            if stale:
+                return
+            if rejected:
+                self._flush_motion_rejections()
+                self._scoped_dispatch_failed(
+                    context, session, "Supervisor rejected internal motion")
+                return
             handle.get_result_async().add_done_callback(
                 lambda f: self._goal_result(f, epoch, context, session))
         except Exception as exc:
@@ -814,11 +870,14 @@ class ROS2Worker(QThread):
         return False
 
     def begin_recovery(self):
+        not_ready = False
         with self.state_lock:
             s = self.supervisor_state
             if s is None or s.mode != SupervisorState.MODE_ESTOP:
-                self._report_error("Recovery requires Supervisor ESTOP mode")
-                return
+                not_ready = True
+        if not_ready:
+            self._report_error("Recovery requires Supervisor ESTOP mode")
+            return
         self._send_command(SupervisorCommand.Request.CMD_BEGIN_RECOVERY,
                            done=self._recovery_reply)
 
@@ -839,20 +898,24 @@ class ROS2Worker(QThread):
         if self.sysid_calc is None:
             self._report_error("System identification engine is unavailable")
             return
+        not_ready = False
         with self.state_lock:
             snap = self.supervisor_state
             if (self._begin_pending or self._calculation_active or self._motion_pending or
                     snap is None or not snap.motion_allowed):
-                self._report_error("Supervisor or identification worker is not ready")
-                return
-            self._set_sysid_preparation_status("Loading robot model...")
-            self._prepare_epoch += 1
-            epoch = self._prepare_epoch
-            revision = snap.revision
+                not_ready = True
+            else:
+                self._set_sysid_preparation_status("Loading robot model...")
+                self._prepare_epoch += 1
+                epoch = self._prepare_epoch
+                revision = snap.revision
+        if not_ready:
+            self._report_error("Supervisor or identification worker is not ready")
+            return
         # At 1 ms the full trajectory has tens of thousands of points. Preflight
         # and ROS message construction must block neither Qt nor ROS callbacks.
-        threading.Thread(target=self._prepare_sysid,
-                         args=(epoch, revision, list(prep_pose), list(max_limits)), daemon=True).start()
+        self._spawn_bg_thread(
+            self._prepare_sysid, (epoch, revision, list(prep_pose), list(max_limits)))
 
     def _set_sysid_preparation_status(self, status):
         # Caller holds state_lock. This is local work feedback, not a robot mode.
@@ -889,30 +952,41 @@ class ROS2Worker(QThread):
                 sec, nanosec = divmod(tick * 1_000_000, 1_000_000_000)
                 point.time_from_start = Duration(sec=sec, nanosec=nanosec)
                 trajectory.points.append(point)
+            state_changed_err = False
+            proceed_send = False
             with self.state_lock:
                 snap = self.supervisor_state
                 if self._stopping or epoch != self._prepare_epoch:
                     return
                 if snap is None or snap.revision != revision or not snap.motion_allowed:
                     self._set_sysid_preparation_status("")
-                    self._report_error("System state changed during SysID preparation; start again when ready")
-                    return
-                self.sysid_calc = engine
-                self._prepared_trajectory = trajectory
-                self._sysid_session = 0
-                self._phase_actions.clear()
-                self.sysid_record_data.clear()
-                self.sysid_start_ros_time = None
-                self.sysid_q0_locked = prep_pose
-                self.node.get_logger().info(engine.trajectory_summary + '; reference period 1 ms')
-                self.node.get_logger().info(
-                    f'SysID preparation: model/validation {generated - started:.3f} s, '
-                    f'samples/message {time.monotonic() - generated:.3f} s, '
-                    f'{len(trajectory.points)} points')
-                self._set_sysid_preparation_status("Waiting for Supervisor acceptance...")
+                    state_changed_err = True
+                else:
+                    self.sysid_calc = engine
+                    self._prepared_trajectory = trajectory
+                    self._sysid_session = 0
+                    self._phase_actions.clear()
+                    self.sysid_record_data.clear()
+                    self.sysid_start_ros_time = None
+                    self.sysid_q0_locked = prep_pose
+                    self._set_sysid_preparation_status("Waiting for Supervisor acceptance...")
+                    proceed_send = True
+            if state_changed_err:
+                self._report_error("System state changed during SysID preparation; start again when ready")
+                return
+            if proceed_send:
+                if not self._stopping:
+                    self.node.get_logger().info(engine.trajectory_summary + '; reference period 1 ms')
+                    self.node.get_logger().info(
+                        f'SysID preparation: model/validation {generated - started:.3f} s, '
+                        f'samples/message {time.monotonic() - generated:.3f} s, '
+                        f'{len(trajectory.points)} points')
                 if not self._send_command(SupervisorCommand.Request.CMD_BEGIN_SYSID,
                                           done=lambda resp: self._begin_sysid_reply(resp, epoch)):
-                    self._set_sysid_preparation_status("")
+                    with self.state_lock:
+                        if (not self._stopping and epoch == self._prepare_epoch and
+                                self.sysid_preparation_status == "Waiting for Supervisor acceptance..."):
+                            self._set_sysid_preparation_status("")
         except Exception as exc:
             with self.state_lock:
                 if self._stopping or epoch != self._prepare_epoch:
@@ -996,8 +1070,7 @@ class ROS2Worker(QThread):
                         for sample in self.sysid_record_data]
         # Numerical estimation can be CPU-heavy; never block ROS heartbeat
         # subscriptions while waiting for the LS solve.
-        threading.Thread(target=self._calculate_sysid,
-                         args=(session, engine, recorded, origin), daemon=True).start()
+        self._spawn_bg_thread(self._calculate_sysid, (session, engine, recorded, origin))
 
     def _calculate_sysid(self, session, engine, recorded, origin):
         archive = None
@@ -1008,9 +1081,11 @@ class ROS2Worker(QThread):
             # quality-check failures. An I/O failure must not alter mode recovery.
             try:
                 archive = engine.save_recording(session, origin)
-                self.node.get_logger().info(f'SysID raw recording: {archive}')
+                if not self._stopping:
+                    self.node.get_logger().info(f'SysID raw recording: {archive}')
             except Exception as exc:
-                self.node.get_logger().warn(f'Could not archive SysID recording: {exc}')
+                if not self._stopping:
+                    self.node.get_logger().warn(f'Could not archive SysID recording: {exc}')
             if origin is None:
                 raise ValueError("No CTC excitation start timestamp received")
             if not recorded:
@@ -1043,7 +1118,8 @@ class ROS2Worker(QThread):
                 try:
                     archive.with_suffix('.txt').write_text(outcome, encoding='utf-8')
                 except OSError as exc:
-                    self.node.get_logger().warn(f'Could not save SysID result: {exc}')
+                    if not self._stopping:
+                        self.node.get_logger().warn(f'Could not save SysID result: {exc}')
             with self.state_lock:
                 self._calculation_active = False
 

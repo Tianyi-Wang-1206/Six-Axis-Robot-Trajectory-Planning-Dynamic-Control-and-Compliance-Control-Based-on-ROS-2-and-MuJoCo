@@ -86,7 +86,7 @@ private:
   static int64_t steady_now_ns();
   void physics_loop();
   bool advance_physics(int64_t boundary_ns, EffortCommand & applied);
-  void publish_snapshot(StateSnapshot & snapshot);
+  void publish_snapshot(StateSnapshot & snapshot, bool publish_telemetry = true);
   void write_visual_shm(const StateSnapshot & snapshot, bool physics_active);
   void write_joint_state_shm(
     const StateSnapshot & snapshot, int64_t ros_stamp_ns, int64_t steady_stamp_ns);

@@ -23,6 +23,8 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
 #include <iomanip>
 #include <memory>
 #include <mutex>
@@ -126,11 +128,17 @@ public:
              std::shared_ptr<lite6_interfaces::srv::SubmitSysIdTrajectory::Response> resp){
         on_sysid_trajectory(*req,*resp);
       },rmw_qos_profile_services_default,validation_group_);
+    planner_thread_=std::thread([this]{planner_worker_loop();});
     heartbeat_=create_wall_timer(100ms,[this]{on_heartbeat();},io_group_);
     RCLCPP_INFO(get_logger(),"Supervisor-owned Robot planner created (awaiting CTC status)");
   }
   ~IndustrialPlannerNode() override {
     shutdown_.store(true);
+    {
+      std::lock_guard<std::mutex> lock(planner_queue_mutex_);
+      planner_exit_=true;
+    }
+    planner_cv_.notify_all();
     if(planner_thread_.joinable()) planner_thread_.join();
   }
 
@@ -147,7 +155,7 @@ private:
   KinematicsEngine kinematics_;
   MotionPlanner planner_;
   Supervisor supervisor_;
-  std::mutex joints_mutex_,ctc_mutex_,planning_model_mutex_;
+  std::mutex joints_mutex_,ctc_mutex_;
   // Serialize a state transition with its mode-command publication. Otherwise
   // a pending NORMAL command could be published after a concurrent ESTOP.
   std::mutex transition_mutex_;
@@ -156,6 +164,10 @@ private:
   int64_t last_joint_steady_ns_=0;
   MotionPlanner::InitialState actual_{};
   std::unique_ptr<CTCOperation> operation_;
+  std::mutex planner_queue_mutex_;
+  std::condition_variable planner_cv_;
+  std::deque<std::shared_ptr<MotionHandle>> planner_queue_;
+  bool planner_exit_=false;
   std::thread planner_thread_;
   rclcpp::CallbackGroup::SharedPtr io_group_;
   rclcpp::CallbackGroup::SharedPtr validation_group_;
@@ -271,13 +283,35 @@ private:
     return rclcpp_action::CancelResponse::ACCEPT;
   }
   void on_accepted(const std::shared_ptr<MotionHandle>& gh) {
-    // There is only one admitted goal, hence the previous planning thread has
-    // finished before a new admission. Thread is joined, not detached.
-    if(planner_thread_.joinable()) planner_thread_.join();
-    planner_thread_=std::thread([this,gh]{compute_and_dispatch(gh);});
+    {
+      std::lock_guard<std::mutex> lock(planner_queue_mutex_);
+      planner_queue_.push_back(gh);
+    }
+    planner_cv_.notify_one();
+  }
+  void planner_worker_loop() {
+    pthread_setname_np(pthread_self(), "lite6_planner");
+    while(true) {
+      std::shared_ptr<MotionHandle> gh;
+      {
+        std::unique_lock<std::mutex> lock(planner_queue_mutex_);
+        planner_cv_.wait(lock,[this]{
+          return planner_exit_||shutdown_.load()||!planner_queue_.empty();
+        });
+        if((planner_exit_||shutdown_.load())&&planner_queue_.empty()) return;
+        if(planner_queue_.empty()) continue;
+        gh=std::move(planner_queue_.front());
+        planner_queue_.pop_front();
+      }
+      if(!shutdown_.load()) {
+        compute_and_dispatch(gh);
+      } else if(gh) {
+        finish_upper(hex_uuid(gh->get_goal_id()),gh,
+          Motion::Result::ERR_CANCELLED,"Planner shutting down",0);
+      }
+    }
   }
   void compute_and_dispatch(const std::shared_ptr<MotionHandle>& gh) {
-    pthread_setname_np(pthread_self(), "lite6_planner");
     const auto key=hex_uuid(gh->get_goal_id());
     try {
       MotionPlanner::InitialState start;
@@ -288,13 +322,9 @@ private:
       }
       if(shutdown_.load()||!supervisor_.permitted(key))
         throw MotionError(Motion::Result::ERR_CANCELLED,"Supervisor withdrew authorization");
-      trajectory_msgs::msg::JointTrajectory traj;
-      {
-        std::lock_guard<std::mutex> lock(planning_model_mutex_);
-        traj=planner_.plan(*gh->get_goal(),start,[this,key]{
-          return shutdown_.load()||!supervisor_.permitted(key);
-        });
-      }
+      const trajectory_msgs::msg::JointTrajectory traj=planner_.plan(*gh->get_goal(),start,[this,key]{
+        return shutdown_.load()||!supervisor_.permitted(key);
+      });
       if(!supervisor_.permitted(key))
         throw MotionError(Motion::Result::ERR_CANCELLED,"Goal cancelled during planning");
       const auto feedback=std::make_shared<Motion::Feedback>();
@@ -456,7 +486,6 @@ private:
             !state.waiting_for_settle;
       };
       if(!authorized()) throw std::runtime_error("SysID session is no longer ready");
-      std::lock_guard<std::mutex> lock(planning_model_mutex_);
       planner_.verify_trajectory(req.trajectory,true,[&authorized]{return !authorized();});
       for(size_t tick=0;tick<req.trajectory.points.size();++tick) {
         const auto& t=req.trajectory.points[tick].time_from_start;

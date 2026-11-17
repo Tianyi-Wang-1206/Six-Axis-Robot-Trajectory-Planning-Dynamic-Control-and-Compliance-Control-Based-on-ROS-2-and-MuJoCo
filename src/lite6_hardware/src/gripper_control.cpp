@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <stdexcept>
+#include <thread>
 
 namespace lite6_hardware
 {
@@ -79,17 +80,22 @@ void GripperControl::initialize(mjModel * model, mjData * data)
 
 void GripperControl::activate()
 {
+  channel_->active.store(false, std::memory_order_seq_cst);
+  channel_->epoch.fetch_add(1, std::memory_order_acq_rel);
+  // Drain any in-flight service callbacks before resetting the SPSC queue.
+  while (channel_->inflight_callbacks.load(std::memory_order_acquire) != 0U) {
+    std::this_thread::yield();
+  }
   channel_->commands.reset();
-  channel_->epoch.fetch_add(1);
   channel_->physics_stamp.store(0);
   stop_drive(State::STOPPED);
-  channel_->active.store(true);
+  channel_->active.store(true, std::memory_order_release);
 }
 
 void GripperControl::deactivate()
 {
-  channel_->active.store(false);
-  channel_->epoch.fetch_add(1);
+  channel_->active.store(false, std::memory_order_seq_cst);
+  channel_->epoch.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void GripperControl::configure(const rclcpp::Node::SharedPtr & node)
@@ -99,8 +105,18 @@ void GripperControl::configure(const rclcpp::Node::SharedPtr & node)
   service_ = node->create_service<Service>("/gripper/command",
     [channel](const std::shared_ptr<Service::Request> request,
               std::shared_ptr<Service::Response> response) {
+      struct InflightGuard
+      {
+        std::atomic<uint32_t> & count;
+        ~InflightGuard() { count.fetch_sub(1U, std::memory_order_release); }
+      };
+      channel->inflight_callbacks.fetch_add(1U, std::memory_order_acq_rel);
+      InflightGuard guard{channel->inflight_callbacks};
+
       const auto now = steady_ns();
-      if (!channel->active.load() || now - channel->physics_stamp.load() > kPhysicsFreshNs) {
+      if (!channel->active.load(std::memory_order_acquire) ||
+          now - channel->physics_stamp.load() > kPhysicsFreshNs)
+      {
         response->detail = "Gripper hardware inactive or physics feedback stale";
         return;
       }
@@ -112,8 +128,8 @@ void GripperControl::configure(const rclcpp::Node::SharedPtr & node)
       Command command;
       command.action = request->command;
       command.issued_ns = now;
-      command.sequence = ++channel->sequence;
-      command.epoch = channel->epoch.load();
+      command.sequence = channel->sequence.fetch_add(1ULL, std::memory_order_acq_rel) + 1ULL;
+      command.epoch = channel->epoch.load(std::memory_order_acquire);
       if (command.action == Service::Request::STOP) {
         channel->stops.publish(command);
       } else if (!channel->commands.push(command)) {

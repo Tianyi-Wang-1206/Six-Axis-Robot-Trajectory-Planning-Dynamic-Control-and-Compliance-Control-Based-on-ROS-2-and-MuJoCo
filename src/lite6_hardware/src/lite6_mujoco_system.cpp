@@ -17,6 +17,19 @@
 
 namespace lite6_hardware
 {
+namespace
+{
+[[gnu::noinline]] void prefault_physics_stack()
+{
+  constexpr size_t kStackPrefaultBytes = 64 * 1024;
+  volatile unsigned char stack_pages[kStackPrefaultBytes];
+  for (size_t i = 0; i < kStackPrefaultBytes; i += 4096) {
+    stack_pages[i] = 0;
+  }
+  const volatile unsigned char touch = stack_pages[0];
+  (void)touch;
+}
+}  // namespace
 
 Lite6MujocoSystem::~Lite6MujocoSystem()
 {
@@ -550,7 +563,7 @@ void Lite6MujocoSystem::write_joint_state_shm(
   state_shm_->get()->joint_state.write(pod);
 }
 
-void Lite6MujocoSystem::publish_snapshot(StateSnapshot & snapshot)
+void Lite6MujocoSystem::publish_snapshot(StateSnapshot & snapshot, bool publish_telemetry)
 {
   for (size_t i = 0; i < kJoints; ++i) {
     snapshot.position[i] = m_data->qpos[qpos_indices_[i]];
@@ -569,10 +582,12 @@ void Lite6MujocoSystem::publish_snapshot(StateSnapshot & snapshot)
       std::max(0.0, 1e-9 * (snapshot.published_ns - snapshot.boundary_ns)));
   }
   states_.publish(snapshot);
-  diagnostics_->snapshots.publish(snapshot);
-  const bool vis_active = diagnostics_->active.load() && snapshot.started &&
-    diagnostics_->fault.load() == Fault::NONE;
-  write_visual_shm(snapshot, vis_active);
+  if (publish_telemetry) {
+    diagnostics_->snapshots.publish(snapshot);
+    const bool vis_active = diagnostics_->active.load() && snapshot.started &&
+      diagnostics_->fault.load() == Fault::NONE;
+    write_visual_shm(snapshot, vis_active);
+  }
 }
 
 void Lite6MujocoSystem::physics_loop()
@@ -581,6 +596,8 @@ void Lite6MujocoSystem::physics_loop()
   // Reduce Linux timer coalescing slack so 100 us substeps wake closer to
   // their deadline even on standard kernels without PREEMPT_RT.
   (void)prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
+  // Pre-fault physics thread stack pages before entering the 10 kHz RT loop.
+  prefault_physics_stack();
   try {
     StateSnapshot snapshot;
     EffortCommand applied;
@@ -617,7 +634,9 @@ void Lite6MujocoSystem::physics_loop()
       snapshot.boundary_ns = end_ns;
       snapshot.command_ns = applied.issued_ns;
       snapshot.command_sequence = applied.sequence;
-      publish_snapshot(snapshot);
+      // Publish visual SHM and diagnostics snapshots at 1 kHz instead of 10 kHz.
+      const bool publish_telemetry = (snapshot.steps == 1) || (snapshot.steps % 10 == 0);
+      publish_snapshot(snapshot, publish_telemetry);
       // Keep shutdown/other work responsive during prolonged overload. The
       // outstanding simulation time is retained and visible in diagnostics.
       const uint64_t yield_stride =

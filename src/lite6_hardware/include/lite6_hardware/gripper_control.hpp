@@ -57,8 +57,8 @@ private:
     std::atomic<int64_t> physics_stamp{0};
     std::atomic<uint64_t> epoch{0};
     std::atomic<bool> active{false};
-    // Only mutually exclusive ROS callbacks access these fields.
-    uint64_t sequence = 0;
+    std::atomic<uint32_t> inflight_callbacks{0};
+    std::atomic<uint64_t> sequence{0};
   };
   void stop_drive(uint8_t state);
   int grasp_contact();

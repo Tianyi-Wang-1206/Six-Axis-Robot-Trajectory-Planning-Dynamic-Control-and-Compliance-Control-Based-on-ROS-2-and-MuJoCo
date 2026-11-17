@@ -114,7 +114,7 @@ void Lite6CTCController::process_compliance_command(double dt, int32_t command,
       compliance_settings_=settings;
       if(entering||settings.recapture) {
         compliance_q_=q_;
-        if(gmo_state_cached_this_cycle_) {
+        if(gmo_tcp_cached_this_cycle_) {
           compliance_pose_=pin_data_gmo_.oMf[compliance_frame_];
         } else {
           pinocchio::forwardKinematics(pin_model_,pin_data_,dynamics_q_);
@@ -184,7 +184,7 @@ void Lite6CTCController::compute_compliance(double dt) {
   smooth(s.rotation_stiffness,compliance_settings_.rotation_stiffness);
   smooth(s.rotation_damping,compliance_settings_.rotation_damping);
   smooth(s.sensitivity,compliance_settings_.sensitivity);
-  tau_cmd_=(gmo_state_cached_this_cycle_
+  tau_cmd_=(gmo_gravity_cached_this_cycle_
     ? pin_data_gmo_.g
     : pinocchio::computeGeneralizedGravity(pin_model_,pin_data_,dynamics_q_)).head<6>();
   a_d_.setZero();integral_effort_.setZero();

@@ -80,11 +80,11 @@ public:
 
   Snapshot snapshot() const;
 
-  // Sensor & controller observers
-  Effects observe_controller(Clock::time_point now, const CS & status);
-  Effects observe_joint_state(Clock::time_point now, bool positions_valid, double max_abs_dq, bool dq_valid);
-  void observe_gripper(Clock::time_point now, uint8_t gripper_state, bool ready);
-  Effects watchdog(Clock::time_point now);
+  // Sensor & controller observers (capture Clock::now() under mutex_ for monotonic ordering)
+  Effects observe_controller(const CS & status);
+  Effects observe_joint_state(bool positions_valid, double max_abs_dq, bool dq_valid);
+  void observe_gripper(uint8_t gripper_state, bool ready);
+  Effects watchdog();
 
   // Compile coordination
   bool can_compile(std::string & out_reason) const;

@@ -3,7 +3,7 @@ import json
 import math
 import time
 from pathlib import Path
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QTimer, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
                              QComboBox, QDoubleSpinBox, QCheckBox, QPushButton,
@@ -13,10 +13,13 @@ from lite6_interfaces.srv import SupervisorCommand as C
 
 
 class ComplianceTab(QWidget):
+    _command_done_signal = pyqtSignal()
+
     def __init__(self, worker, parent=None):
         super().__init__(parent)
         self.worker = worker
         self.pending = False
+        self._command_done_signal.connect(self._on_command_done)
         layout = QVBoxLayout(self)
         info = QLabel("Encoder-based compliance + passive friction feedforward + sensorless GMO load observer at link_eef. "
                       "Entering a mode captures the current equilibrium.\n"
@@ -128,11 +131,15 @@ class ComplianceTab(QWidget):
     def leave(self):
         self.request(C.Request.CMD_EXIT_COMPLIANCE)
 
+    def _on_command_done(self):
+        self.pending = False
+        self.refresh()
+
     def request(self, event, settings=None):
         self.pending = True
-        # Reply callback runs on the ROS thread: only mutate this plain flag.
         def done(_):
-            self.pending = False
+            # ROS callback runs on the executor thread; marshal completion to Qt thread.
+            self._command_done_signal.emit()
         if not self.worker._send_command(event, compliance=settings, done=done):
             self.pending = False
         self.refresh()

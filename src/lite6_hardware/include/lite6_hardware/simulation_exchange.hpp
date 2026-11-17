@@ -17,49 +17,50 @@ class SpscQueue
 public:
   bool push(const T & value)
   {
-    const size_t head = head_.load(std::memory_order_relaxed);
-    const size_t next = (head + 1) % (Capacity + 1);
-    if (next == tail_.load(std::memory_order_acquire)) {return false;}
-    entries_[head] = value;
-    head_.store(next, std::memory_order_release);
+    const uint64_t head = head_.load(std::memory_order_relaxed);
+    const uint64_t tail = tail_.load(std::memory_order_acquire);
+    if (head - tail >= Capacity) {return false;}
+    entries_[head & kMask] = value;
+    head_.store(head + 1ULL, std::memory_order_release);
     return true;
   }
 
   bool pop(T & value)
   {
-    const size_t tail = tail_.load(std::memory_order_relaxed);
-    if (tail == head_.load(std::memory_order_acquire)) {return false;}
-    value = entries_[tail];
-    tail_.store((tail + 1) % (Capacity + 1), std::memory_order_release);
+    const uint64_t tail = tail_.load(std::memory_order_relaxed);
+    const uint64_t head = head_.load(std::memory_order_acquire);
+    if (tail == head) {return false;}
+    value = entries_[tail & kMask];
+    tail_.store(tail + 1ULL, std::memory_order_release);
     return true;
   }
 
   bool pop_due(int64_t boundary_ns, T & value)
   {
-    const size_t tail = tail_.load(std::memory_order_relaxed);
-    if (tail == head_.load(std::memory_order_acquire) ||
-      entries_[tail].issued_ns > boundary_ns)
-    {
+    const uint64_t tail = tail_.load(std::memory_order_relaxed);
+    const uint64_t head = head_.load(std::memory_order_acquire);
+    if (tail == head || entries_[tail & kMask].issued_ns > boundary_ns) {
       return false;
     }
-    value = entries_[tail];
-    tail_.store((tail + 1) % (Capacity + 1), std::memory_order_release);
+    value = entries_[tail & kMask];
+    tail_.store(tail + 1ULL, std::memory_order_release);
     return true;
   }
 
   // Lifecycle only: neither producer nor consumer may be running.
   void reset()
   {
-    head_.store(0, std::memory_order_relaxed);
-    tail_.store(0, std::memory_order_relaxed);
+    head_.store(0ULL, std::memory_order_relaxed);
+    tail_.store(0ULL, std::memory_order_relaxed);
   }
 
 private:
-  static_assert(Capacity > 0);
-  static_assert(std::atomic<size_t>::is_always_lock_free);
-  std::array<T, Capacity + 1> entries_{};
-  alignas(64) std::atomic<size_t> head_{0};
-  alignas(64) std::atomic<size_t> tail_{0};
+  static_assert(Capacity >= 2 && (Capacity & (Capacity - 1)) == 0, "Capacity must be a power of 2");
+  static_assert(std::atomic<uint64_t>::is_always_lock_free);
+  static constexpr uint64_t kMask = Capacity - 1;
+  alignas(64) std::atomic<uint64_t> head_{0};
+  alignas(64) std::atomic<uint64_t> tail_{0};
+  alignas(64) std::array<T, Capacity> entries_{};
 };
 
 // Latest complete snapshot, with independent front/back ownership. Exchanging
@@ -72,7 +73,7 @@ class LatestSnapshot
 public:
   void publish(const T & value)
   {
-    slots_[back_] = value;
+    slots_[back_].value = value;
     back_ = middle_.exchange(back_ | kDirty, std::memory_order_acq_rel) & kIndex;
   }
 
@@ -81,17 +82,21 @@ public:
     if (middle_.load(std::memory_order_acquire) & kDirty) {
       front_ = middle_.exchange(front_, std::memory_order_acq_rel) & kIndex;
     }
-    return slots_[front_];
+    return slots_[front_].value;
   }
 
 private:
+  struct alignas(64) Slot
+  {
+    T value{};
+  };
   static_assert(std::atomic<unsigned>::is_always_lock_free);
   static constexpr unsigned kDirty = 4;
   static constexpr unsigned kIndex = 3;
-  std::array<T, 3> slots_{};
-  unsigned front_ = 0;  // Consumer only.
-  unsigned back_ = 2;   // Producer only.
-  std::atomic<unsigned> middle_{1};
+  alignas(64) std::array<Slot, 3> slots_{};
+  alignas(64) unsigned front_ = 0;  // Consumer only.
+  alignas(64) unsigned back_ = 2;   // Producer only.
+  alignas(64) std::atomic<unsigned> middle_{1};
 };
 
 }  // namespace lite6_hardware::detail

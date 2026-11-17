@@ -381,26 +381,38 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
   imp_null_damping_filtered_ += alpha * (imp_null_damping_target_ - imp_null_damping_filtered_);
 
   // Gravity compensation on the measured configuration.
-  tau_cmd_ = (gmo_state_cached_this_cycle_
+  tau_cmd_ = (gmo_gravity_cached_this_cycle_
     ? pin_data_gmo_.g
     : pinocchio::computeGeneralizedGravity(pin_model_, pin_data_, dynamics_q_)).head<6>();
   a_d_.setZero();
   integral_effort_.setZero();
 
   // 1. Evaluate time-varying equilibrium pose T_d(t) and twist v_d(t) from (q_imp_ref_, dq_imp_ref_).
-  dynamics_q_ref_.head(6) = q_imp_ref_;
-  dynamics_q_ref_.tail(2) = dynamics_q_.tail(2);
-  dynamics_dq_ref_.head(6) = dq_imp_ref_;
-  dynamics_dq_ref_.tail(2).setZero();
+  // link_eef is rigidly mounted on link6, so reference TCP kinematics depend only on the 6 arm joints.
+  const bool ref_unchanged =
+    imp_ref_kinematics_cached_ &&
+    q_imp_ref_ == imp_ref_cached_q_ &&
+    dq_imp_ref_ == imp_ref_cached_dq_;
+  if (!ref_unchanged) {
+    dynamics_q_ref_.head(6) = q_imp_ref_;
+    dynamics_q_ref_.tail(2) = dynamics_q_.tail(2);
+    dynamics_dq_ref_.head(6) = dq_imp_ref_;
+    dynamics_dq_ref_.tail(2).setZero();
 
-  pinocchio::computeJointJacobians(pin_model_, pin_data_ref_, dynamics_q_ref_);
-  pinocchio::updateFramePlacement(pin_model_, pin_data_ref_, compliance_frame_);
-  imp_ref_jacobian_.setZero();
-  pinocchio::getFrameJacobian(
-    pin_model_, pin_data_ref_, compliance_frame_,
-    pinocchio::LOCAL_WORLD_ALIGNED, imp_ref_jacobian_);
-  const auto & ref_pose = pin_data_ref_.oMf[compliance_frame_];
-  const Vec6d ref_velocity = imp_ref_jacobian_ * dynamics_dq_ref_;
+    pinocchio::computeJointJacobians(pin_model_, pin_data_ref_, dynamics_q_ref_);
+    pinocchio::updateFramePlacement(pin_model_, pin_data_ref_, compliance_frame_);
+    imp_ref_jacobian_.setZero();
+    pinocchio::getFrameJacobian(
+      pin_model_, pin_data_ref_, compliance_frame_,
+      pinocchio::LOCAL_WORLD_ALIGNED, imp_ref_jacobian_);
+    imp_ref_cached_q_ = q_imp_ref_;
+    imp_ref_cached_dq_ = dq_imp_ref_;
+    imp_ref_pose_cached_ = pin_data_ref_.oMf[compliance_frame_];
+    imp_ref_vel_cached_ = imp_ref_jacobian_ * dynamics_dq_ref_;
+    imp_ref_kinematics_cached_ = true;
+  }
+  const auto & ref_pose = imp_ref_pose_cached_;
+  const Vec6d & ref_velocity = imp_ref_vel_cached_;
 
   // 2. Evaluate measured pose T(q) and twist v(q, dq), reusing GMO cache if valid this cycle.
   const pinocchio::SE3 * meas_pose_ptr = nullptr;

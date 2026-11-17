@@ -82,9 +82,10 @@ public:
     }
     compiler_ = std::make_unique<ProgramCompiler>(kinematics_);
 
-    telemetry_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    telemetry_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     shm_poll_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-    service_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    compile_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    service_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     client_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
 
     if (!state_shm_.open(false)) {
@@ -130,7 +131,7 @@ public:
       [this](
         const std::shared_ptr<CompileProgram::Request> req,
         std::shared_ptr<CompileProgram::Response> resp) { handle_compile(req, resp); },
-      rclcpp::ServicesQoS(), service_group_);
+      rclcpp::ServicesQoS(), compile_group_);
 
     command_srv_ = create_service<StudioCommand>(
       "/studio/command",
@@ -200,6 +201,10 @@ private:
     msg.detail = snap.detail;
 
     std::lock_guard<std::mutex> pub_lock(pub_mutex_);
+    if (msg.revision < last_published_revision_) {
+      return;
+    }
+    last_published_revision_ = msg.revision;
     if (state_pub_) {
       state_pub_->publish(msg);
     }
@@ -296,14 +301,13 @@ private:
       has_latest_joint_ = true;
     }
 
-    const auto effects = supervisor_->observe_joint_state(
-      StudioSupervisor::Clock::now(), pos_valid, max_abs_dq, dq_valid);
+    const auto effects = supervisor_->observe_joint_state(pos_valid, max_abs_dq, dq_valid);
     apply_effects(effects);
   }
 
   void on_controller_status(const ControllerStatus & msg)
   {
-    const auto effects = supervisor_->observe_controller(StudioSupervisor::Clock::now(), msg);
+    const auto effects = supervisor_->observe_controller(msg);
     apply_effects(effects);
   }
 
@@ -314,13 +318,12 @@ private:
       latest_gripper_ = msg;
       has_latest_gripper_ = true;
     }
-    supervisor_->observe_gripper(StudioSupervisor::Clock::now(), msg.state, msg.ready);
+    supervisor_->observe_gripper(msg.state, msg.ready);
   }
 
   void on_watchdog_timer()
   {
-    const auto now_tp = StudioSupervisor::Clock::now();
-    const auto effects = supervisor_->watchdog(now_tp);
+    const auto effects = supervisor_->watchdog();
     apply_effects(effects);
     publish_snapshot(supervisor_->snapshot());
   }
@@ -655,13 +658,7 @@ private:
       {
         std::unique_lock<std::mutex> lock(worker_wake_mutex_);
         worker_cv_.wait(lock, [this]() {
-          if (worker_exit_ || worker_wake_pending_) {
-            return true;
-          }
-          const uint8_t st = supervisor_->current_state();
-          return st == StudioState::STATE_RUNNING ||
-                 st == StudioState::STATE_STEPPING ||
-                 st == StudioState::STATE_RECOVERING;
+          return worker_exit_ || worker_wake_pending_;
         });
         worker_wake_pending_ = false;
         if (worker_exit_) {
@@ -1360,6 +1357,7 @@ private:
 
   rclcpp::CallbackGroup::SharedPtr telemetry_group_;
   rclcpp::CallbackGroup::SharedPtr shm_poll_group_;
+  rclcpp::CallbackGroup::SharedPtr compile_group_;
   rclcpp::CallbackGroup::SharedPtr service_group_;
   rclcpp::CallbackGroup::SharedPtr client_group_;
 
@@ -1380,6 +1378,7 @@ private:
   rclcpp::TimerBase::SharedPtr watchdog_timer_;
 
   std::mutex pub_mutex_;
+  uint64_t last_published_revision_ = 0;
   std::mutex command_mutex_;
   std::mutex compile_mutex_;
   std::atomic<int> compile_in_flight_{0};

@@ -290,6 +290,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
     dynamics_ddq_.setZero();
     dynamics_q_ref_.setZero();
     dynamics_dq_ref_.setZero();
+    imp_ref_kinematics_cached_ = false;
   } catch (const std::exception& e) {
     RCLCPP_ERROR(get_node()->get_logger(), "Failed to load URDF");
     return controller_interface::CallbackReturn::ERROR;
@@ -353,6 +354,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   
   system_state_ = SystemState::NORMAL;
   tau_applied_prev_.setZero();
+  imp_ref_kinematics_cached_ = false;
   reset_momentum_observer();
   {
     std::lock_guard<std::mutex> lock(cmd_write_mutex_);
@@ -424,7 +426,8 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
 
   // Update the sensorless Generalized Momentum Observer using the torque applied in the
   // previous cycle before generating this cycle's new reference or control command.
-  gmo_state_cached_this_cycle_ = false;
+  gmo_gravity_cached_this_cycle_ = false;
+  gmo_tcp_cached_this_cycle_ = false;
   update_momentum_observer(dt);
 
   update_trajectory_reference(time, period);
@@ -694,6 +697,8 @@ bool Lite6CTCController::configure_momentum_observer()
 void Lite6CTCController::reset_momentum_observer()
 {
   gmo_initialized_ = false;
+  gmo_gravity_cached_this_cycle_ = false;
+  gmo_tcp_cached_this_cycle_ = false;
   gmo_p_integral_.setZero();
   gmo_residual_tau_.setZero();
   gmo_external_wrench_.setZero();
@@ -751,6 +756,24 @@ void Lite6CTCController::update_momentum_observer(double dt)
     gmo_p_integral_[i] += dt * (beta[i] + r_i);
   }
 
+  if (!gmo_residual_tau_.allFinite()) {
+    reset_momentum_observer();
+    return;
+  }
+  gmo_gravity_cached_this_cycle_ = true;
+
+  // Only compute the 6x8 TCP Jacobian, 6x6 LDLT wrench solve, and contact flag
+  // when Cartesian compliance/trajectory needs them or this cycle will publish status.
+  const bool need_tcp_wrench =
+    system_state_ == SystemState::CARTESIAN_IMPEDANCE ||
+    system_state_ == SystemState::CARTESIAN_IMPEDANCE_TRAJECTORY ||
+    status_publish_pending_ ||
+    system_state_ != last_reported_state_ ||
+    (status_publish_counter_ + 1 >= status_publish_rate_divider_);
+  if (!need_tcp_wrench) {
+    return;
+  }
+
   pinocchio::computeJointJacobians(pin_model_, pin_data_gmo_, dynamics_q_);
   pinocchio::updateFramePlacement(pin_model_, pin_data_gmo_, compliance_frame_);
   gmo_jacobian_.setZero();
@@ -762,19 +785,19 @@ void Lite6CTCController::update_momentum_observer(double dt)
   jj_t.diagonal().array() += gmo_jacobian_damping_ * gmo_jacobian_damping_;
   gmo_external_wrench_ = jj_t.ldlt().solve(j_arm * gmo_residual_tau_);
 
-  if (!gmo_residual_tau_.allFinite() || !gmo_external_wrench_.allFinite()) {
+  if (!gmo_external_wrench_.allFinite()) {
     reset_momentum_observer();
     return;
   }
   gmo_contact_detected_ =
     gmo_external_wrench_.head<3>().norm() >= gmo_contact_force_threshold_;
-  gmo_state_cached_this_cycle_ = true;
+  gmo_tcp_cached_this_cycle_ = true;
 }
 
 void Lite6CTCController::read_cached_tcp_kinematics(
   const pinocchio::SE3 * & out_pose, const Mat6x8d * & out_jacobian)
 {
-  if (gmo_state_cached_this_cycle_) {
+  if (gmo_tcp_cached_this_cycle_) {
     out_pose = &pin_data_gmo_.oMf[compliance_frame_];
     out_jacobian = &gmo_jacobian_;
     return;

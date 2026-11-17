@@ -3,6 +3,7 @@
 import math
 import os
 import queue
+import threading
 import time
 
 from ament_index_python.packages import get_package_share_directory
@@ -15,7 +16,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
-from lite6_interfaces.msg import GripperState, StudioState
+from lite6_interfaces.msg import CompileDiagnostic, GripperState, StudioState
 from lite6_interfaces.srv import CompileProgram, GripperCommand, StudioCommand
 
 
@@ -34,8 +35,11 @@ class StudioRosWorker(QThread):
         super().__init__(parent)
         self._stop_requested = False
         self._req_queue = queue.Queue()
-        self._last_telemetry_emit = 0.0
+        self._executor_lock = threading.Lock()
+        self._executor = None
         self._wake_gc = None
+        self._pending = {}
+        self._req_seq = 0
 
     def _trigger_wake(self):
         gc = self._wake_gc
@@ -69,6 +73,13 @@ class StudioRosWorker(QThread):
     def shutdown(self):
         self._stop_requested = True
         self._trigger_wake()
+        with self._executor_lock:
+            executor = self._executor
+        if executor is not None:
+            try:
+                executor.shutdown(timeout_sec=2.0)
+            except Exception:
+                pass
         self.wait(3000)
 
     def run(self):
@@ -82,13 +93,13 @@ class StudioRosWorker(QThread):
         node.create_subscription(
             StudioState,
             "/studio/state",
-            lambda msg: self.studio_state_updated.emit(msg),
+            lambda msg: None if self._stop_requested else self.studio_state_updated.emit(msg),
             state_qos,
         )
         node.create_subscription(
             GripperState,
             "/gripper/state",
-            lambda msg: self.gripper_state_updated.emit(msg),
+            lambda msg: None if self._stop_requested else self.gripper_state_updated.emit(msg),
             10,
         )
 
@@ -113,41 +124,58 @@ class StudioRosWorker(QThread):
         command_cli = node.create_client(StudioCommand, "/studio/command")
         gripper_cli = node.create_client(GripperCommand, "/gripper/command")
 
+        def on_wake():
+            self._drain_requests(compile_cli, command_cli, gripper_cli)
+
+        def on_housekeeping():
+            if self._stop_requested:
+                return
+            self._sweep_pending_timeouts()
+            self._emit_telemetry(shm_reader, pin_model, pin_data, eef_frame_id)
+
         executor = SingleThreadedExecutor()
         executor.add_node(node)
-        wake_gc = node.create_guard_condition(lambda: None)
-        self._wake_gc = wake_gc
+        wake_gc = node.create_guard_condition(on_wake)
+        housekeeping_timer = node.create_timer(0.05, on_housekeeping)
 
-        pending = []  # list of (kind, meta, future, deadline)
+        should_spin = False
+        with self._executor_lock:
+            if not self._stop_requested:
+                self._wake_gc = wake_gc
+                self._executor = executor
+                should_spin = True
 
         try:
-            if not self._req_queue.empty():
-                wake_gc.trigger()
-            while not self._stop_requested and rclpy.ok():
-                self._drain_requests(node, compile_cli, command_cli, gripper_cli, pending)
-                wait_sec = 0.0 if not self._req_queue.empty() else 0.02
-                executor.spin_once(timeout_sec=wait_sec)
-                for _ in range(8):
-                    executor.spin_once(timeout_sec=0.0)
-                self._poll_pending(pending)
-                self._maybe_emit_telemetry(shm_reader, pin_model, pin_data, eef_frame_id)
+            if should_spin and rclpy.ok():
+                on_wake()
+                executor.spin()
+        except Exception as exc:
+            if not self._stop_requested:
+                self.ros_log.emit(f"ROS executor error: {exc}")
         finally:
             self._wake_gc = None
+            with self._executor_lock:
+                self._executor = None
+            try:
+                node.destroy_timer(housekeeping_timer)
+            except Exception:
+                pass
             try:
                 node.destroy_guard_condition(wake_gc)
             except Exception:
                 pass
-            executor.remove_node(node)
-            executor.shutdown()
+            try:
+                executor.remove_node(node)
+            except Exception:
+                pass
+            try:
+                executor.shutdown()
+            except Exception:
+                pass
             shm_reader.close()
             node.destroy_node()
 
-    def _maybe_emit_telemetry(self, shm_reader, pin_model, pin_data, eef_frame_id):
-        now = time.monotonic()
-        if now - self._last_telemetry_emit < 0.05:  # 20 Hz UI throttle
-            return
-        self._last_telemetry_emit = now
-
+    def _emit_telemetry(self, shm_reader, pin_model, pin_data, eef_frame_id):
         pod, _ = shm_reader.read_joint_state()
         if pod is None or pod.steady_stamp_ns <= 0:
             return
@@ -172,8 +200,78 @@ class StudioRosWorker(QThread):
 
         self.telemetry_updated.emit(q_list, dq_list, tcp6)
 
-    def _drain_requests(self, _node, compile_cli, command_cli, gripper_cli, pending):
-        while True:
+    def _emit_compile_error(self, stage, code, message):
+        resp = CompileProgram.Response()
+        resp.success = False
+        diag = CompileDiagnostic()
+        diag.severity = CompileDiagnostic.SEVERITY_ERROR
+        diag.stage = stage
+        diag.line_number = 1
+        diag.column_number = 1
+        diag.statement_index = -1
+        diag.code = code
+        diag.message = message
+        resp.diagnostics.append(diag)
+        self.compile_finished.emit(resp)
+
+    def _register_pending(self, kind, meta, fut, timeout_sec):
+        self._req_seq += 1
+        req_id = self._req_seq
+        self._pending[req_id] = (kind, meta, fut, time.monotonic() + timeout_sec)
+        fut.add_done_callback(lambda completed_fut, rid=req_id: self._on_future_done(rid, completed_fut))
+
+    def _on_future_done(self, req_id, fut):
+        entry = self._pending.pop(req_id, None)
+        if entry is None or self._stop_requested:
+            return
+        kind, meta, _, _ = entry
+        try:
+            res = fut.result()
+        except Exception as exc:
+            if kind == "compile":
+                resp = CompileProgram.Response()
+                resp.success = False
+                self.compile_finished.emit(resp)
+            elif kind == "command":
+                self.command_finished.emit(meta["code"], False, str(exc))
+            else:
+                self.gripper_finished.emit(meta["action"], False, str(exc))
+            return
+
+        if kind == "compile":
+            self.compile_finished.emit(res)
+        elif kind == "command":
+            self.command_finished.emit(meta["code"], bool(res.accepted), str(res.message))
+        else:
+            self.gripper_finished.emit(meta["action"], bool(res.accepted), str(res.detail))
+
+    def _sweep_pending_timeouts(self):
+        now = time.monotonic()
+        expired = [
+            req_id for req_id, (_, _, _, deadline) in self._pending.items() if now > deadline
+        ]
+        for req_id in expired:
+            entry = self._pending.pop(req_id, None)
+            if entry is None:
+                continue
+            kind, meta, fut, _ = entry
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+            if kind == "compile":
+                self._emit_compile_error(
+                    CompileDiagnostic.STAGE_PLANNING,
+                    "ERR_COMPILE_TIMEOUT",
+                    "Compilation service call timed out",
+                )
+            elif kind == "command":
+                self.command_finished.emit(meta["code"], False, "StudioCommand call timed out")
+            else:
+                self.gripper_finished.emit(meta["action"], False, "GripperCommand call timed out")
+
+    def _drain_requests(self, compile_cli, command_cli, gripper_cli):
+        while not self._stop_requested:
             try:
                 kind, payload = self._req_queue.get_nowait()
             except queue.Empty:
@@ -181,27 +279,18 @@ class StudioRosWorker(QThread):
 
             if kind == "compile":
                 if not compile_cli.service_is_ready():
-                    resp = CompileProgram.Response()
-                    resp.success = False
-                    from lite6_interfaces.msg import CompileDiagnostic
-
-                    d = CompileDiagnostic()
-                    d.severity = CompileDiagnostic.SEVERITY_ERROR
-                    d.stage = CompileDiagnostic.STAGE_SEMANTIC
-                    d.line_number = 1
-                    d.column_number = 1
-                    d.statement_index = -1
-                    d.code = "ERR_SERVICE_OFFLINE"
-                    d.message = "Service /studio/compile is unavailable (is lite6_studio_planner_node running?)"
-                    resp.diagnostics.append(d)
-                    self.compile_finished.emit(resp)
+                    self._emit_compile_error(
+                        CompileDiagnostic.STAGE_SEMANTIC,
+                        "ERR_SERVICE_OFFLINE",
+                        "Service /studio/compile is unavailable (is lite6_studio_planner_node running?)",
+                    )
                     continue
                 req = CompileProgram.Request()
                 req.source_code = payload["source_code"]
                 req.use_current_robot_start = payload["use_current"]
                 req.custom_start_joints = payload["custom_start"]
                 fut = compile_cli.call_async(req)
-                pending.append(("compile", {}, fut, time.monotonic() + 20.0))
+                self._register_pending("compile", {}, fut, 20.0)
 
             elif kind == "command":
                 code = payload["code"]
@@ -214,7 +303,7 @@ class StudioRosWorker(QThread):
                 req.command = code
                 req.reason = payload["reason"]
                 fut = command_cli.call_async(req)
-                pending.append(("command", {"code": code}, fut, time.monotonic() + 8.0))
+                self._register_pending("command", {"code": code}, fut, 8.0)
 
             elif kind == "gripper":
                 action = payload["action"]
@@ -226,52 +315,4 @@ class StudioRosWorker(QThread):
                 req = GripperCommand.Request()
                 req.command = action
                 fut = gripper_cli.call_async(req)
-                pending.append(("gripper", {"action": action}, fut, time.monotonic() + 5.0))
-
-    def _poll_pending(self, pending):
-        now = time.monotonic()
-        still_pending = []
-        for kind, meta, fut, deadline in pending:
-            if fut.done():
-                try:
-                    res = fut.result()
-                except Exception as exc:
-                    if kind == "compile":
-                        resp = CompileProgram.Response()
-                        resp.success = False
-                        self.compile_finished.emit(resp)
-                    elif kind == "command":
-                        self.command_finished.emit(meta["code"], False, str(exc))
-                    else:
-                        self.gripper_finished.emit(meta["action"], False, str(exc))
-                    continue
-
-                if kind == "compile":
-                    self.compile_finished.emit(res)
-                elif kind == "command":
-                    self.command_finished.emit(meta["code"], bool(res.accepted), str(res.message))
-                else:
-                    self.gripper_finished.emit(meta["action"], bool(res.accepted), str(res.detail))
-            elif now > deadline:
-                if kind == "compile":
-                    resp = CompileProgram.Response()
-                    resp.success = False
-                    from lite6_interfaces.msg import CompileDiagnostic
-
-                    d = CompileDiagnostic()
-                    d.severity = CompileDiagnostic.SEVERITY_ERROR
-                    d.stage = CompileDiagnostic.STAGE_PLANNING
-                    d.line_number = 1
-                    d.column_number = 1
-                    d.statement_index = -1
-                    d.code = "ERR_COMPILE_TIMEOUT"
-                    d.message = "Compilation service call timed out"
-                    resp.diagnostics.append(d)
-                    self.compile_finished.emit(resp)
-                elif kind == "command":
-                    self.command_finished.emit(meta["code"], False, "StudioCommand call timed out")
-                else:
-                    self.gripper_finished.emit(meta["action"], False, "GripperCommand call timed out")
-            else:
-                still_pending.append((kind, meta, fut, deadline))
-        pending[:] = still_pending
+                self._register_pending("gripper", {"action": action}, fut, 5.0)

@@ -139,8 +139,7 @@ StudioSupervisor::Snapshot StudioSupervisor::snapshot() const
   return make_snapshot_unlocked(Clock::now());
 }
 
-StudioSupervisor::Effects StudioSupervisor::observe_controller(
-  Clock::time_point now, const CS & status)
+StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status)
 {
   const uint8_t mode = status.mode;
   const uint8_t estop_reason = status.estop_reason;
@@ -149,6 +148,7 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(
   Snapshot notify_snap;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    const auto now = Clock::now();
     const bool was_fresh = fresh_controller_unlocked(now);
     const uint8_t prev_mode = snap_.controller_mode;
     controller_stamp_ = now;
@@ -235,13 +235,14 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(
 }
 
 StudioSupervisor::Effects StudioSupervisor::observe_joint_state(
-  Clock::time_point now, bool positions_valid, double max_abs_dq, bool dq_valid)
+  bool positions_valid, double max_abs_dq, bool dq_valid)
 {
   Effects effects;
   bool changed = false;
   Snapshot notify_snap;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    const auto now = Clock::now();
     if (!positions_valid || !dq_valid || !std::isfinite(max_abs_dq)) {
       reset_settle_unlocked();
       if (snap_.state == S::STATE_RUNNING || snap_.state == S::STATE_STEPPING ||
@@ -333,12 +334,13 @@ StudioSupervisor::Effects StudioSupervisor::observe_joint_state(
   return effects;
 }
 
-void StudioSupervisor::observe_gripper(Clock::time_point now, uint8_t gripper_state, bool ready)
+void StudioSupervisor::observe_gripper(uint8_t gripper_state, bool ready)
 {
   bool changed = false;
   Snapshot notify_snap;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    const auto now = Clock::now();
     gripper_stamp_ = now;
     if (snap_.gripper_state != gripper_state || snap_.gripper_ready != ready) {
       snap_.gripper_state = gripper_state;
@@ -352,13 +354,14 @@ void StudioSupervisor::observe_gripper(Clock::time_point now, uint8_t gripper_st
   }
 }
 
-StudioSupervisor::Effects StudioSupervisor::watchdog(Clock::time_point now)
+StudioSupervisor::Effects StudioSupervisor::watchdog()
 {
   Effects effects;
   bool changed = false;
   Snapshot notify_snap;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    const auto now = Clock::now();
     const bool j_fresh = fresh_joint_unlocked(now);
     const bool c_fresh = fresh_controller_unlocked(now);
 
