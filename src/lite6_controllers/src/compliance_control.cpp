@@ -7,106 +7,230 @@
 #include <algorithm>
 #include <cmath>
 
-namespace lite6_controllers {
-namespace {
-double interpolate_teach_level(const std::array<double, 5>& levels, double sensitivity) {
-  const double pos=std::clamp(sensitivity,1.0,5.0)-1.0;
-  const size_t idx=std::min<size_t>(3,static_cast<size_t>(std::floor(pos)));
-  const double frac=pos-static_cast<double>(idx);
-  return levels[idx]+frac*(levels[idx+1]-levels[idx]);
+namespace lite6_controllers
+{
+namespace
+{
+double interpolate_teach_level(const std::array<double, 5> & levels, double sensitivity)
+{
+  const double pos = std::clamp(sensitivity, 1.0, 5.0) - 1.0;
+  const size_t idx = std::min<size_t>(3, static_cast<size_t>(std::floor(pos)));
+  const double frac = pos - static_cast<double>(idx);
+  return levels[idx] + frac * (levels[idx + 1] - levels[idx]);
 }
 
-bool load_teach_levels(const rclcpp_lifecycle::LifecycleNode::SharedPtr& node,
-    const std::string& name,double min_val,bool strict_positive,double max_val,
-    std::array<double,5>& out) {
-  const auto values=node->get_parameter(name).as_double_array();
-  if(values.size()!=5) {
-    RCLCPP_ERROR(node->get_logger(),"%s must contain exactly five values (levels 1..5)",name.c_str());
+bool load_teach_levels(
+  const rclcpp_lifecycle::LifecycleNode::SharedPtr & node,
+  const std::string & name, double min_val, bool strict_positive, double max_val,
+  std::array<double, 5> & out)
+{
+  const auto values = node->get_parameter(name).as_double_array();
+  if (values.size() != 5) {
+    RCLCPP_ERROR(node->get_logger(), "%s must contain exactly five values (levels 1..5)", name.c_str());
     return false;
   }
-  for(size_t i=0;i<5;++i) {
-    const bool ok=std::isfinite(values[i])&&
-      (strict_positive?values[i]>min_val:values[i]>=min_val)&&values[i]<=max_val;
-    if(!ok) {
-      RCLCPP_ERROR(node->get_logger(),"%s[%zu] out of valid range",name.c_str(),i);
+  for (size_t i = 0; i < 5; ++i) {
+    const bool ok = std::isfinite(values[i]) &&
+      (strict_positive ? values[i] > min_val : values[i] >= min_val) && values[i] <= max_val;
+    if (!ok) {
+      RCLCPP_ERROR(node->get_logger(), "%s[%zu] out of valid range", name.c_str(), i);
       return false;
     }
-    out[i]=values[i];
+    out[i] = values[i];
   }
   return true;
 }
 }  // namespace
 
-bool Lite6CTCController::compliance_active() const {
-  return system_state_==SystemState::JOINT_IMPEDANCE||
-    system_state_==SystemState::CARTESIAN_IMPEDANCE||system_state_==SystemState::TEACH;
+bool Lite6CTCController::compliance_active() const
+{
+  return system_state_ == SystemState::JOINT_IMPEDANCE ||
+    system_state_ == SystemState::CARTESIAN_IMPEDANCE ||
+    system_state_ == SystemState::TEACH;
 }
-bool Lite6CTCController::configure_compliance() {
-  const auto node=get_node();
-  compliance_max_joint_velocity_=node->get_parameter("compliance.max_joint_velocity").as_double();
-  compliance_hard_limit_tolerance_=node->get_parameter("compliance.hard_limit_tolerance").as_double();
-  compliance_saturation_timeout_=node->get_parameter("compliance.saturation_timeout").as_double();
-  compliance_entry_max_speed_=node->get_parameter("compliance.entry_max_speed").as_double();
-  compliance_filter_time_constant_=node->get_parameter("compliance.filter_time_constant").as_double();
-  compliance_cartesian_null_damping_=node->get_parameter("compliance.cartesian_null_damping").as_double();
-  compliance_soft_limit_margin_=node->get_parameter("compliance.soft_limit_margin").as_double();
-  compliance_soft_limit_stiffness_=node->get_parameter("compliance.soft_limit_stiffness").as_double();
-  compliance_soft_limit_damping_=node->get_parameter("compliance.soft_limit_damping").as_double();
-  compliance_torque_slew_rate_=node->get_parameter("compliance.torque_slew_rate").as_double();
-  compliance_fv_scale_=node->get_parameter("compliance.friction_viscous_scale").as_double();
-  compliance_fc_scale_=node->get_parameter("compliance.friction_coulomb_scale").as_double();
-  compliance_fric_trans_speed_=node->get_parameter("compliance.friction_transition_speed").as_double();
-  compliance_fric_quiet_speed_=node->get_parameter("compliance.friction_quiet_speed").as_double();
-  const auto ext_lim=node->get_parameter("compliance.max_external_joint_torque").as_double_array();
-  compliance_external_torque_timeout_=node->get_parameter("compliance.external_torque_timeout").as_double();
 
-  auto positive=[](double v){return std::isfinite(v)&&v>0.0;};
-  auto nonneg=[](double v){return std::isfinite(v)&&v>=0.0;};
-  auto unit=[](double v){return std::isfinite(v)&&v>=0.0&&v<=1.0;};
-  if(!positive(compliance_max_joint_velocity_)||!nonneg(compliance_hard_limit_tolerance_)||
-     !positive(compliance_saturation_timeout_)||!positive(compliance_entry_max_speed_)||
-     !positive(compliance_filter_time_constant_)||!nonneg(compliance_cartesian_null_damping_)||
-     !nonneg(compliance_soft_limit_margin_)||!nonneg(compliance_soft_limit_stiffness_)||
-     !nonneg(compliance_soft_limit_damping_)||!positive(compliance_torque_slew_rate_)||
-     !unit(compliance_fv_scale_)||!unit(compliance_fc_scale_)||
-     !positive(compliance_fric_trans_speed_)||!nonneg(compliance_fric_quiet_speed_)||
-     !positive(compliance_external_torque_timeout_)||ext_lim.size()!=6||
-     !std::all_of(ext_lim.begin(),ext_lim.end(),positive)) {
-    RCLCPP_ERROR(node->get_logger(),"Invalid compliance safety or control parameter");
+const Lite6CTCController::ComplianceModeConfig &
+Lite6CTCController::active_compliance_config() const
+{
+  if (system_state_ == SystemState::CARTESIAN_IMPEDANCE) {
+    return cart_imp_cfg_;
+  }
+  if (system_state_ == SystemState::TEACH) {
+    return teach_cfg_;
+  }
+  return joint_imp_cfg_;
+}
+
+bool Lite6CTCController::configure_compliance()
+{
+  const auto node = get_node();
+  auto positive = [](double v) { return std::isfinite(v) && v > 0.0; };
+  auto nonneg = [](double v) { return std::isfinite(v) && v >= 0.0; };
+  auto unit = [](double v) { return std::isfinite(v) && v >= 0.0 && v <= 1.0; };
+
+  auto load_mode_common = [&](const std::string & prefix, ComplianceModeConfig & cfg) -> bool {
+    cfg.max_joint_velocity = node->get_parameter(prefix + ".max_joint_velocity").as_double();
+    cfg.hard_limit_tolerance = node->get_parameter(prefix + ".hard_limit_tolerance").as_double();
+    cfg.saturation_timeout = node->get_parameter(prefix + ".saturation_timeout").as_double();
+    cfg.entry_max_speed = node->get_parameter(prefix + ".entry_max_speed").as_double();
+    const auto ext_lim =
+      node->get_parameter(prefix + ".max_external_joint_torque").as_double_array();
+    cfg.external_torque_timeout =
+      node->get_parameter(prefix + ".external_torque_timeout").as_double();
+    cfg.filter_time_constant = node->get_parameter(prefix + ".filter_time_constant").as_double();
+    cfg.soft_limit_margin = node->get_parameter(prefix + ".soft_limit_margin").as_double();
+    cfg.soft_limit_stiffness = node->get_parameter(prefix + ".soft_limit_stiffness").as_double();
+    cfg.soft_limit_damping = node->get_parameter(prefix + ".soft_limit_damping").as_double();
+    cfg.torque_slew_rate = node->get_parameter(prefix + ".torque_slew_rate").as_double();
+    cfg.transition_duration = node->get_parameter(prefix + ".transition_duration").as_double();
+
+    if (!positive(cfg.max_joint_velocity) || !nonneg(cfg.hard_limit_tolerance) ||
+        !positive(cfg.saturation_timeout) || !positive(cfg.entry_max_speed) ||
+        !positive(cfg.external_torque_timeout) || ext_lim.size() != 6 ||
+        !std::all_of(ext_lim.begin(), ext_lim.end(), positive) ||
+        !positive(cfg.filter_time_constant) || !nonneg(cfg.soft_limit_margin) ||
+        !nonneg(cfg.soft_limit_stiffness) || !nonneg(cfg.soft_limit_damping) ||
+        !positive(cfg.torque_slew_rate) || !positive(cfg.transition_duration))
+    {
+      RCLCPP_ERROR(node->get_logger(), "Invalid common compliance parameters under %s", prefix.c_str());
+      return false;
+    }
+    for (size_t i = 0; i < 6; ++i) {
+      cfg.max_external_torque[i] = ext_lim[i];
+    }
+    return true;
+  };
+
+  auto load_mode_friction = [&](const std::string & prefix, ComplianceModeConfig & cfg) -> bool {
+    cfg.fv_scale = node->get_parameter(prefix + ".friction_viscous_scale").as_double();
+    cfg.fc_scale = node->get_parameter(prefix + ".friction_coulomb_scale").as_double();
+    cfg.fric_trans_speed = node->get_parameter(prefix + ".friction_transition_speed").as_double();
+    cfg.fric_quiet_speed = node->get_parameter(prefix + ".friction_quiet_speed").as_double();
+    if (!unit(cfg.fv_scale) || !unit(cfg.fc_scale) ||
+        !positive(cfg.fric_trans_speed) || !nonneg(cfg.fric_quiet_speed) ||
+        cfg.fric_quiet_speed >= cfg.fric_trans_speed)
+    {
+      RCLCPP_ERROR(
+        node->get_logger(),
+        "Invalid friction parameters under %s (require 0 <= quiet_speed < transition_speed)",
+        prefix.c_str());
+      return false;
+    }
+    return true;
+  };
+
+  if (!load_mode_common("compliance.joint_impedance", joint_imp_cfg_) ||
+      !load_mode_friction("compliance.joint_impedance", joint_imp_cfg_) ||
+      !load_mode_common("compliance.cartesian_impedance", cart_imp_cfg_) ||
+      !load_mode_friction("compliance.cartesian_impedance", cart_imp_cfg_) ||
+      !load_mode_common("compliance.teach", teach_cfg_))
+  {
     return false;
   }
-  for(size_t i=0;i<6;++i) compliance_max_external_torque_[i]=ext_lim[i];
-  if(!load_teach_levels(node,"compliance.teach.damping_levels",0.0,false,100.0,teach_damping_levels_)||
-     !load_teach_levels(node,"compliance.teach.assistance_levels",0.0,false,1.0,teach_assistance_levels_)||
-     !load_teach_levels(node,"compliance.teach.friction_transition_levels",0.0,true,10.0,teach_friction_transition_levels_)||
-     !load_teach_levels(node,"compliance.teach.quiet_speed_levels",0.0,false,10.0,teach_quiet_speed_levels_)) {
+
+  cart_imp_cfg_.min_translation_damping =
+    node->get_parameter("compliance.cartesian_impedance.min_translation_damping").as_double();
+  cart_imp_cfg_.min_rotation_damping =
+    node->get_parameter("compliance.cartesian_impedance.min_rotation_damping").as_double();
+  cart_imp_cfg_.min_effective_mass =
+    node->get_parameter("compliance.cartesian_impedance.min_effective_mass").as_double();
+  cart_imp_cfg_.max_effective_mass =
+    node->get_parameter("compliance.cartesian_impedance.max_effective_mass").as_double();
+  cart_imp_cfg_.min_effective_inertia =
+    node->get_parameter("compliance.cartesian_impedance.min_effective_inertia").as_double();
+  cart_imp_cfg_.max_effective_inertia =
+    node->get_parameter("compliance.cartesian_impedance.max_effective_inertia").as_double();
+  cart_imp_cfg_.operational_damping_lambda =
+    node->get_parameter("compliance.cartesian_impedance.operational_damping_lambda").as_double();
+
+  if (!positive(cart_imp_cfg_.min_translation_damping) ||
+      !positive(cart_imp_cfg_.min_rotation_damping) ||
+      !positive(cart_imp_cfg_.min_effective_mass) ||
+      !positive(cart_imp_cfg_.max_effective_mass) ||
+      cart_imp_cfg_.min_effective_mass > cart_imp_cfg_.max_effective_mass ||
+      !positive(cart_imp_cfg_.min_effective_inertia) ||
+      !positive(cart_imp_cfg_.max_effective_inertia) ||
+      cart_imp_cfg_.min_effective_inertia > cart_imp_cfg_.max_effective_inertia ||
+      !positive(cart_imp_cfg_.operational_damping_lambda))
+  {
+    RCLCPP_ERROR(node->get_logger(), "Invalid compliance.cartesian_impedance operational damping parameters");
     return false;
   }
 
-  compliance_frame_=pin_model_.getFrameId("link_eef");
-  if(compliance_frame_>=static_cast<pinocchio::FrameIndex>(pin_model_.nframes)) throw std::runtime_error("Missing compliance TCP frame");
+  teach_armature_weight_ = node->get_parameter("compliance.teach.armature_weight").as_double();
+  const auto teach_min_d =
+    node->get_parameter("compliance.teach.min_joint_damping").as_double_array();
+  const auto teach_max_d =
+    node->get_parameter("compliance.teach.max_joint_damping").as_double_array();
+  if (!nonneg(teach_armature_weight_) || teach_armature_weight_ > 1.0 ||
+      teach_min_d.size() != 6 || teach_max_d.size() != 6)
+  {
+    RCLCPP_ERROR(node->get_logger(), "Invalid compliance.teach diag(M) normalization parameters");
+    return false;
+  }
+  for (size_t i = 0; i < 6; ++i) {
+    if (!positive(teach_min_d[i]) || !positive(teach_max_d[i]) || teach_min_d[i] > teach_max_d[i]) {
+      RCLCPP_ERROR(node->get_logger(), "Invalid compliance.teach min/max joint damping bounds");
+      return false;
+    }
+    teach_min_joint_damping_[i] = teach_min_d[i];
+    teach_max_joint_damping_[i] = teach_max_d[i];
+  }
+
+  if (!load_teach_levels(
+        node, "compliance.teach.damping_levels", 0.0, true, 200.0, teach_damping_levels_) ||
+      !load_teach_levels(
+        node, "compliance.teach.assistance_levels", 0.0, false, 1.0, teach_assistance_levels_) ||
+      !load_teach_levels(
+        node, "compliance.teach.friction_transition_levels",
+        0.0, true, 10.0, teach_friction_transition_levels_) ||
+      !load_teach_levels(
+        node, "compliance.teach.quiet_speed_levels",
+        0.0, false, 10.0, teach_quiet_speed_levels_))
+  {
+    return false;
+  }
+  for (size_t i = 0; i < 5; ++i) {
+    if (teach_quiet_speed_levels_[i] >= teach_friction_transition_levels_[i]) {
+      RCLCPP_ERROR(
+        node->get_logger(),
+        "compliance.teach.quiet_speed_levels[%zu] must be strictly less than friction_transition_levels[%zu]",
+        i, i);
+      return false;
+    }
+  }
+
+  compliance_frame_ = pin_model_.getFrameId("link_eef");
+  if (compliance_frame_ >= static_cast<pinocchio::FrameIndex>(pin_model_.nframes)) {
+    throw std::runtime_error("Missing compliance TCP frame");
+  }
   compliance_jacobian_.setZero();
   return true;
 }
 
-void Lite6CTCController::check_compliance_safety_limits(double dt) {
+void Lite6CTCController::check_compliance_safety_limits(double dt)
+{
   if (!compliance_active() && system_state_ != SystemState::COMPLIANCE_STOPPING) {
     return;
   }
   using CS = lite6_interfaces::msg::ControllerStatus;
+  const auto & cfg = active_compliance_config();
   for (int i = 0; i < 6; ++i) {
-    if (q_[i] < pin_model_.lowerPositionLimit[i] - compliance_hard_limit_tolerance_) {
-      latch_estop_reason(CS::ESTOP_COMPLIANCE_POSITION_LIMIT, i, q_[i], pin_model_.lowerPositionLimit[i]);
+    if (q_[i] < pin_model_.lowerPositionLimit[i] - cfg.hard_limit_tolerance) {
+      latch_estop_reason(
+        CS::ESTOP_COMPLIANCE_POSITION_LIMIT, i, q_[i], pin_model_.lowerPositionLimit[i]);
       request_execution_stop();
       return;
     }
-    if (q_[i] > pin_model_.upperPositionLimit[i] + compliance_hard_limit_tolerance_) {
-      latch_estop_reason(CS::ESTOP_COMPLIANCE_POSITION_LIMIT, i, q_[i], pin_model_.upperPositionLimit[i]);
+    if (q_[i] > pin_model_.upperPositionLimit[i] + cfg.hard_limit_tolerance) {
+      latch_estop_reason(
+        CS::ESTOP_COMPLIANCE_POSITION_LIMIT, i, q_[i], pin_model_.upperPositionLimit[i]);
       request_execution_stop();
       return;
     }
-    if (std::abs(dq_[i]) > compliance_max_joint_velocity_) {
-      latch_estop_reason(CS::ESTOP_COMPLIANCE_VELOCITY_LIMIT, i, dq_[i], compliance_max_joint_velocity_);
+    if (std::abs(dq_[i]) > cfg.max_joint_velocity) {
+      latch_estop_reason(
+        CS::ESTOP_COMPLIANCE_VELOCITY_LIMIT, i, dq_[i], cfg.max_joint_velocity);
       request_execution_stop();
       return;
     }
@@ -115,21 +239,24 @@ void Lite6CTCController::check_compliance_safety_limits(double dt) {
   double ext_val = 0.0;
   double ext_limit = 0.0;
   if (check_external_torque_limit(
-        dt, compliance_max_external_torque_,
-        compliance_external_torque_timeout_, compliance_external_torque_time_,
-        ext_joint, ext_val, ext_limit)) {
+        dt, cfg.max_external_torque,
+        cfg.external_torque_timeout, compliance_external_torque_time_,
+        ext_joint, ext_val, ext_limit))
+  {
     latch_estop_reason(CS::ESTOP_COMPLIANCE_EXTERNAL_TORQUE, ext_joint, ext_val, ext_limit);
     request_execution_stop();
   }
 }
 
-void Lite6CTCController::step_compliance_stopping(double dt) {
+void Lite6CTCController::step_compliance_stopping(double dt)
+{
   if (system_state_ != SystemState::COMPLIANCE_STOPPING) {
     return;
   }
   compliance_stopping_elapsed_ += dt;
   if (estop_dq_.cwiseAbs().maxCoeff() < 1e-4 &&
-      dq_.cwiseAbs().maxCoeff() <= lite6_interfaces::contract::kPlannerSettleSpeedRadPerSec) {
+      dq_.cwiseAbs().maxCoeff() <= lite6_interfaces::contract::kPlannerSettleSpeedRadPerSec)
+  {
     // Resume NORMAL at the measured resting pose, never at the old equilibrium.
     for (size_t i = 0; i < 6; ++i) {
       reference_interfaces_[i] = q_[i];
@@ -139,6 +266,7 @@ void Lite6CTCController::step_compliance_stopping(double dt) {
     q_target_ = q_;
     dq_target_.setZero();
     ddq_target_.setZero();
+    tau_point_ff_.setZero();
     clear_estop_reason();
     compliance_stopping_elapsed_ = 0.0;
     transition_system_state(SystemState::NORMAL);
@@ -153,81 +281,198 @@ void Lite6CTCController::step_compliance_stopping(double dt) {
     request_execution_stop();
   }
 }
-void Lite6CTCController::compute_compliance(double dt) {
+
+void Lite6CTCController::compute_compliance(double dt)
+{
   // Only encoder position/velocity and model dynamics/gravity are used. No effort
   // state, MuJoCo contact force, applied force, or hidden friction state enters here.
-  const double alpha=1.0-std::exp(-dt/compliance_filter_time_constant_);
-  auto smooth=[alpha](double& value,double target){value+=alpha*(target-value);};
-  auto& s=compliance_filtered_;
-  smooth(s.joint_stiffness,compliance_settings_.joint_stiffness);
-  smooth(s.joint_damping,compliance_settings_.joint_damping);
-  smooth(s.translation_stiffness,compliance_settings_.translation_stiffness);
-  smooth(s.translation_damping,compliance_settings_.translation_damping);
-  smooth(s.rotation_stiffness,compliance_settings_.rotation_stiffness);
-  smooth(s.rotation_damping,compliance_settings_.rotation_damping);
-  smooth(s.sensitivity,compliance_settings_.sensitivity);
-  tau_cmd_=(gmo_gravity_cached_this_cycle_
-    ? pin_data_gmo_.g
-    : pinocchio::computeGeneralizedGravity(pin_model_,pin_data_,dynamics_q_)).head<6>();
-  a_d_.setZero();integral_effort_.setZero();
-  if(system_state_==SystemState::JOINT_IMPEDANCE) {
-    tau_cmd_+=s.joint_stiffness*(compliance_q_-q_)-s.joint_damping*dq_;
-    add_passive_friction_ff(compliance_fv_scale_,compliance_fc_scale_,
-      compliance_fric_trans_speed_,compliance_fric_quiet_speed_,dq_,tau_cmd_);
-  } else if(system_state_==SystemState::CARTESIAN_IMPEDANCE) {
-    const pinocchio::SE3 * pose_ptr=nullptr;
-    const Mat6x8d * jac_ptr=nullptr;
-    read_cached_tcp_kinematics(pose_ptr,jac_ptr);
-    const auto& pose=*pose_ptr;
-    const auto& jac=*jac_ptr;
-    Vec6d error, wrench;
-    error.head<3>()=compliance_pose_.translation()-pose.translation();
-    error.tail<3>()=pinocchio::log3(compliance_pose_.rotation()*pose.rotation().transpose());
-    const Vec6d velocity=jac*dynamics_dq_;
-    wrench.head<3>()=s.translation_stiffness*error.head<3>()-s.translation_damping*velocity.head<3>();
-    wrench.tail<3>()=s.rotation_stiffness*error.tail<3>()-s.rotation_damping*velocity.tail<3>();
-    tau_cmd_.noalias()+=jac.leftCols<6>().transpose()*wrench;
-    // Small joint damping also damps task-null directions near singularities.
-    tau_cmd_-=compliance_cartesian_null_damping_*dq_;
-    add_passive_friction_ff(compliance_fv_scale_,compliance_fc_scale_,
-      compliance_fric_trans_speed_,compliance_fric_quiet_speed_,dq_,tau_cmd_);
-  } else {
-    // Interpolate configured sensitivity 1..5 profiles and fade out Coulomb
-    // assistance near rest so low-speed bristle dynamics stay quiet.
-    const double damping=interpolate_teach_level(teach_damping_levels_,s.sensitivity);
-    const double assistance=interpolate_teach_level(teach_assistance_levels_,s.sensitivity);
-    const double friction_transition=interpolate_teach_level(teach_friction_transition_levels_,s.sensitivity);
-    const double quiet_speed=interpolate_teach_level(teach_quiet_speed_levels_,s.sensitivity);
-    tau_cmd_-=damping*dq_;
-    add_passive_friction_ff(assistance,assistance,friction_transition,quiet_speed,dq_,tau_cmd_);
-  }
-  bool saturated=false;
-  int saturated_joint=-1;
-  for(int i=0;i<6;++i) {
+  ensure_dynamics_cached();
+  const auto & cfg = active_compliance_config();
+  const double alpha = 1.0 - std::exp(-dt / cfg.filter_time_constant);
+  auto smooth = [alpha](double & value, double target) { value += alpha * (target - value); };
+  auto & s = compliance_filtered_;
+
+  // Candidate stiffness increments: negative increments (softening) are strictly passive;
+  // positive increments (stiffening under deflection) are regulated by the Energy Tank.
+  const double cand_dkq = alpha * (compliance_settings_.joint_stiffness - s.joint_stiffness);
+  const double cand_dkt = alpha * (compliance_settings_.translation_stiffness - s.translation_stiffness);
+  const double cand_dkr = alpha * (compliance_settings_.rotation_stiffness - s.rotation_stiffness);
+  const double cand_dknull = alpha * (compliance_settings_.nullspace_stiffness - s.nullspace_stiffness);
+
+  smooth(s.joint_damping, compliance_settings_.joint_damping);
+  smooth(s.translation_damping, compliance_settings_.translation_damping);
+  smooth(s.rotation_damping, compliance_settings_.rotation_damping);
+  smooth(s.sensitivity, compliance_settings_.sensitivity);
+  smooth(s.nullspace_damping, compliance_settings_.nullspace_damping);
+
+  // Apply purely passive (decreasing) stiffness steps immediately.
+  if (cand_dkq <= 0.0) s.joint_stiffness += cand_dkq;
+  if (cand_dkt <= 0.0) s.translation_stiffness += cand_dkt;
+  if (cand_dkr <= 0.0) s.rotation_stiffness += cand_dkr;
+  if (cand_dknull <= 0.0) s.nullspace_stiffness += cand_dknull;
+
+  // Conservative gravity compensation (never attenuated by the energy tank).
+  Vec6d tau_passive = pin_data_gmo_.g.head<6>();
+  Vec6d tau_active = Vec6d::Zero();
+  double dissipated_power = 0.0;
+  double stiffness_rate_power = 0.0;
+  a_d_.setZero();
+  integral_effort_.setZero();
+
+  // Compute soft-limit wall contribution and its damping dissipation first.
+  Vec6d tau_soft_limit = Vec6d::Zero();
+  for (int i = 0; i < 6; ++i) {
     // Preserve an equilibrium captured inside the margin (home is on joint3's
     // lower boundary). Do not push the arm simply because a mode was entered.
-    // Hard-limit checks tolerate the configured allowance for solver/encoder noise.
-    const double lo=std::min(pin_model_.lowerPositionLimit[i]+compliance_soft_limit_margin_,compliance_q_[i]);
-    const double hi=std::max(pin_model_.upperPositionLimit[i]-compliance_soft_limit_margin_,compliance_q_[i]);
-    if(q_[i]<lo) tau_cmd_[i]+=compliance_soft_limit_stiffness_*(lo-q_[i])-compliance_soft_limit_damping_*std::min(0.0,dq_[i]);
-    if(q_[i]>hi) tau_cmd_[i]-=compliance_soft_limit_stiffness_*(q_[i]-hi)+compliance_soft_limit_damping_*std::max(0.0,dq_[i]);
-    if(std::abs(tau_cmd_[i])>max_effort_[i]) {
-      saturated=true;
-      if(saturated_joint<0) saturated_joint=i;
+    const double lo = std::min(
+      pin_model_.lowerPositionLimit[i] + cfg.soft_limit_margin, compliance_q_[i]);
+    const double hi = std::max(
+      pin_model_.upperPositionLimit[i] - cfg.soft_limit_margin, compliance_q_[i]);
+    if (q_[i] < lo) {
+      const double v_in = std::min(0.0, dq_[i]);
+      tau_soft_limit[i] += cfg.soft_limit_stiffness * (lo - q_[i]) - cfg.soft_limit_damping * v_in;
+      dissipated_power += cfg.soft_limit_damping * v_in * v_in;
     }
-    const double max_step=compliance_torque_slew_rate_*dt;
-    tau_cmd_[i]=std::clamp(tau_cmd_[i],compliance_last_tau_[i]-max_step,
-      compliance_last_tau_[i]+max_step);
-    compliance_last_tau_[i]=std::clamp(tau_cmd_[i],-max_effort_[i],max_effort_[i]);
+    if (q_[i] > hi) {
+      const double v_out = std::max(0.0, dq_[i]);
+      tau_soft_limit[i] -= cfg.soft_limit_stiffness * (q_[i] - hi) + cfg.soft_limit_damping * v_out;
+      dissipated_power += cfg.soft_limit_damping * v_out * v_out;
+    }
   }
-  compliance_saturation_time_=saturated?compliance_saturation_time_+dt:0.0;
+  tau_passive += tau_soft_limit;
+
+  if (system_state_ == SystemState::JOINT_IMPEDANCE) {
+    const Vec6d q_err = compliance_q_ - q_;
+    dissipated_power += s.joint_damping * dq_.squaredNorm();
+    if (cand_dkq > 0.0 && dt > 1e-6) {
+      stiffness_rate_power += 0.5 * (cand_dkq / dt) * q_err.squaredNorm();
+    }
+    add_passive_friction_ff(
+      cfg.fv_scale, cfg.fc_scale, cfg.fric_trans_speed, cfg.fric_quiet_speed, dq_, tau_active);
+
+    const double active_power = tau_active.dot(dq_) + stiffness_rate_power;
+    const double tank_valve = step_energy_tank(dt, dissipated_power, active_power);
+    if (cand_dkq > 0.0) {
+      s.joint_stiffness += tank_valve * cand_dkq;
+    }
+    tau_passive += s.joint_stiffness * q_err - s.joint_damping * dq_;
+    tau_cmd_ = tau_passive + tank_valve * tau_active;
+  } else if (system_state_ == SystemState::CARTESIAN_IMPEDANCE) {
+    const pinocchio::SE3 * pose_ptr = nullptr;
+    const Mat6x8d * jac_ptr = nullptr;
+    read_cached_tcp_kinematics(pose_ptr, jac_ptr);
+    const auto & pose = *pose_ptr;
+    const auto & jac = *jac_ptr;
+    const Mat6d j_arm = jac.leftCols<6>();
+
+    Vec6d lambda_diag = Vec6d::Ones();
+    compute_cartesian_effective_inertia(
+      j_arm, cfg.operational_damping_lambda,
+      cfg.min_effective_mass, cfg.max_effective_mass,
+      cfg.min_effective_inertia, cfg.max_effective_inertia,
+      lambda_diag);
+
+    Vec6d error;
+    error.head<3>() = compliance_pose_.translation() - pose.translation();
+    error.tail<3>() = pinocchio::log3(compliance_pose_.rotation() * pose.rotation().transpose());
+    const Vec6d velocity = jac * dynamics_dq_;
+    const Vec6d q_null_err = compliance_q_ - q_;
+
+    // Precompute damping dissipation using current stiffness estimate.
+    Vec6d d_cart;
+    for (int k = 0; k < 3; ++k) {
+      d_cart[k] = std::max(
+        cfg.min_translation_damping,
+        2.0 * s.translation_damping * std::sqrt(std::max(0.0, s.translation_stiffness) * lambda_diag[k]));
+      d_cart[k + 3] = std::max(
+        cfg.min_rotation_damping,
+        2.0 * s.rotation_damping * std::sqrt(std::max(0.0, s.rotation_stiffness) * lambda_diag[k + 3]));
+      dissipated_power += d_cart[k] * velocity[k] * velocity[k] +
+        d_cart[k + 3] * velocity[k + 3] * velocity[k + 3];
+    }
+    dissipated_power += s.nullspace_damping * dq_.squaredNorm();
+
+    if (dt > 1e-6) {
+      if (cand_dkt > 0.0) {
+        stiffness_rate_power += 0.5 * (cand_dkt / dt) * error.head<3>().squaredNorm();
+      }
+      if (cand_dkr > 0.0) {
+        stiffness_rate_power += 0.5 * (cand_dkr / dt) * error.tail<3>().squaredNorm();
+      }
+      if (cand_dknull > 0.0) {
+        stiffness_rate_power += 0.5 * (cand_dknull / dt) * q_null_err.squaredNorm();
+      }
+    }
+    add_passive_friction_ff(
+      cfg.fv_scale, cfg.fc_scale, cfg.fric_trans_speed, cfg.fric_quiet_speed, dq_, tau_active);
+
+    const double active_power = tau_active.dot(dq_) + stiffness_rate_power;
+    const double tank_valve = step_energy_tank(dt, dissipated_power, active_power);
+    if (cand_dkt > 0.0) s.translation_stiffness += tank_valve * cand_dkt;
+    if (cand_dkr > 0.0) s.rotation_stiffness += tank_valve * cand_dkr;
+    if (cand_dknull > 0.0) s.nullspace_stiffness += tank_valve * cand_dknull;
+
+    // Constant damping ratio law: D_i(q) = max(D_min, 2 * zeta_i * sqrt(K_i * Lambda_i(q))).
+    Vec6d wrench;
+    for (int k = 0; k < 3; ++k) {
+      const double d_trans = std::max(
+        cfg.min_translation_damping,
+        2.0 * s.translation_damping * std::sqrt(std::max(0.0, s.translation_stiffness) * lambda_diag[k]));
+      const double d_rot = std::max(
+        cfg.min_rotation_damping,
+        2.0 * s.rotation_damping * std::sqrt(std::max(0.0, s.rotation_stiffness) * lambda_diag[k + 3]));
+      wrench[k] = s.translation_stiffness * error[k] - d_trans * velocity[k];
+      wrench[k + 3] = s.rotation_stiffness * error[k + 3] - d_rot * velocity[k + 3];
+    }
+    tau_passive.noalias() += j_arm.transpose() * wrench;
+    tau_passive += s.nullspace_stiffness * q_null_err - s.nullspace_damping * dq_;
+    tau_cmd_ = tau_passive + tank_valve * tau_active;
+  } else {
+    // diag(M)-normalized drag teaching:
+    // d_i(q) = clamp(lambda_teach(sensitivity) * (M_link_ii(q) + beta_arm * I_arm_i), d_min_i, d_max_i).
+    const double decay_rate = interpolate_teach_level(teach_damping_levels_, s.sensitivity);
+    const double assistance = interpolate_teach_level(teach_assistance_levels_, s.sensitivity);
+    const double friction_transition =
+      interpolate_teach_level(teach_friction_transition_levels_, s.sensitivity);
+    const double quiet_speed = interpolate_teach_level(teach_quiet_speed_levels_, s.sensitivity);
+    for (int i = 0; i < 6; ++i) {
+      const double m_eff_i = std::max(
+        1e-4, pin_data_gmo_.M(i, i) + teach_armature_weight_ * armature_[i]);
+      const double d_i = std::clamp(
+        decay_rate * m_eff_i,
+        teach_min_joint_damping_[static_cast<size_t>(i)],
+        teach_max_joint_damping_[static_cast<size_t>(i)]);
+      tau_passive[i] -= d_i * dq_[i];
+      dissipated_power += d_i * dq_[i] * dq_[i];
+    }
+    add_passive_friction_ff(
+      assistance, assistance, friction_transition, quiet_speed, dq_, tau_active);
+
+    const double active_power = tau_active.dot(dq_);
+    const double tank_valve = step_energy_tank(dt, dissipated_power, active_power);
+    tau_cmd_ = tau_passive + tank_valve * tau_active;
+  }
+
+  // Apply torque slew-rate limiting ONLY during mode/recapture transition windows.
+  apply_transition_torque_slew(dt, cfg.torque_slew_rate, tau_cmd_);
+
+  bool saturated = false;
+  int saturated_joint = -1;
+  for (int i = 0; i < 6; ++i) {
+    if (std::abs(tau_cmd_[i]) > max_effort_[i]) {
+      saturated = true;
+      if (saturated_joint < 0) saturated_joint = i;
+    }
+  }
+  compliance_saturation_time_ = saturated ? compliance_saturation_time_ + dt : 0.0;
   // Apply braking on the next cycle, so this cycle retains force-mode semantics.
-  if(compliance_saturation_time_>compliance_saturation_timeout_) {
-    compliance_saturation_estop_pending_=true;
-    pending_estop_joint_=static_cast<int8_t>(saturated_joint);
-    pending_estop_value_=compliance_saturation_time_;
-    pending_estop_limit_=compliance_saturation_timeout_;
+  if (compliance_saturation_time_ > cfg.saturation_timeout) {
+    compliance_saturation_estop_pending_ = true;
+    pending_estop_joint_ = static_cast<int8_t>(saturated_joint);
+    pending_estop_value_ = compliance_saturation_time_;
+    pending_estop_limit_ = cfg.saturation_timeout;
     emergency_pending_.store(true);
   }
 }
-}
+
+}  // namespace lite6_controllers

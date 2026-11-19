@@ -49,7 +49,7 @@ ctc_controller:
     # Below the unchanged NORMAL restoration guards: 0.05 rad and 0.01 rad/s.
     execution.sysid_goal_position_tolerance: [0.04, 0.04, 0.04, 0.04, 0.04, 0.04]  # rad
     execution.sysid_goal_velocity_tolerance: [0.005, 0.005, 0.005, 0.005, 0.005, 0.005]  # rad/s
-    execution.goal_velocity_tolerance: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]  # rad/s
+    execution.goal_velocity_tolerance: [0.02, 0.02, 0.02, 0.02, 0.02, 0.02]  # rad/s (kRigidGoalVelocityToleranceRadPerSec)
     execution.goal_settle_duration: 1.0  # Continuous in-tolerance time after the endpoint [s].
     
     execution.goal_time_tolerance: 5.0  # Endpoint deadline allowance incl. settling [s], <= 10.

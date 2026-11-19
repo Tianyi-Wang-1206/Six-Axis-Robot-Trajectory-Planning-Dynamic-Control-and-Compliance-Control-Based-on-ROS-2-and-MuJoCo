@@ -110,6 +110,7 @@ class ROS2Worker(QThread):
     estop_fault_signal = pyqtSignal(str)
     recovery_complete_signal = pyqtSignal()
     gripper_signal = pyqtSignal(object)
+    motion_feedback_signal = pyqtSignal(int, float, float)
 
     def __init__(self):
         super().__init__()
@@ -363,16 +364,19 @@ class ROS2Worker(QThread):
             self._report_error(message)
 
     def _send_command(self, event, session=0, reason="", done=None, compliance=None,
-                      expected_revision=0):
+                      expected_revision=0, payload_mass=0.0, payload_com_tcp=None):
         if self._executor_thread_id is not None and threading.get_ident() == self._executor_thread_id:
             return self._send_command_on_executor(
-                event, session, reason, done, compliance, expected_revision)
+                event, session, reason, done, compliance, expected_revision,
+                payload_mass, payload_com_tcp)
         return self._run_on_executor(
             lambda: self._send_command_on_executor(
-                event, session, reason, done, compliance, expected_revision))
+                event, session, reason, done, compliance, expected_revision,
+                payload_mass, payload_com_tcp))
 
     def _send_command_on_executor(self, event, session=0, reason="", done=None,
-                                  compliance=None, expected_revision=0):
+                                  compliance=None, expected_revision=0,
+                                  payload_mass=0.0, payload_com_tcp=None):
         if not self.command_client.service_is_ready():
             self._report_error("Supervisor command service is unavailable")
             if done is not None:
@@ -385,6 +389,11 @@ class ROS2Worker(QThread):
         req.reason = str(reason)
         if compliance is not None:
             req.compliance = compliance
+        req.payload_mass = float(payload_mass)
+        if payload_com_tcp is not None:
+            req.payload_com_tcp = [float(payload_com_tcp[0]),
+                                   float(payload_com_tcp[1]),
+                                   float(payload_com_tcp[2])]
         try:
             future = self.command_client.call_async(req)
             future.add_done_callback(lambda f: self._command_response(f, done))
@@ -394,6 +403,32 @@ class ROS2Worker(QThread):
             if done is not None:
                 done(None)
             return False
+
+    def set_payload(self, mass_kg, com_tcp_m, done=None):
+        expected_rev = 0
+        with self.state_lock:
+            if self.supervisor_state is not None:
+                expected_rev = int(self.supervisor_state.revision)
+        return self._send_command(
+            SupervisorCommand.Request.CMD_SET_PAYLOAD,
+            reason=f"HMI set payload {mass_kg:.3f} kg",
+            done=done,
+            expected_revision=expected_rev,
+            payload_mass=float(mass_kg),
+            payload_com_tcp=list(com_tcp_m),
+        )
+
+    def tare_gmo(self, done=None):
+        expected_rev = 0
+        with self.state_lock:
+            if self.supervisor_state is not None:
+                expected_rev = int(self.supervisor_state.revision)
+        return self._send_command(
+            SupervisorCommand.Request.CMD_TARE_GMO,
+            reason="HMI tare GMO",
+            done=done,
+            expected_revision=expected_rev,
+        )
 
     def _command_response(self, future, done):
         try:
@@ -690,7 +725,11 @@ class ROS2Worker(QThread):
             self._report_error(err)
             return False
         try:
-            fut = self.move_client.send_goal_async(goal, goal_uuid=UUID(uuid=list(goal_id.bytes)))
+            fut = self.move_client.send_goal_async(
+                goal,
+                goal_uuid=UUID(uuid=list(goal_id.bytes)),
+                feedback_callback=lambda fb_msg, ep=epoch: self._goal_feedback(fb_msg, ep),
+            )
             fut.add_done_callback(lambda f: self._goal_response(
                 f, epoch, int(goal.context), int(goal.session_id), key))
             return True
@@ -783,6 +822,13 @@ class ROS2Worker(QThread):
             self._report_error(f"Action goal response failed: {exc}")
             self._scoped_dispatch_failed(context, session, "Action response unavailable")
 
+    def _goal_feedback(self, fb_msg, epoch):
+        with self.state_lock:
+            if epoch != self._goal_epoch:
+                return
+        fb = fb_msg.feedback
+        self.motion_feedback_signal.emit(int(fb.current_state), float(fb.percent_complete), -1.0)
+
     def _goal_result(self, future, epoch, context, session):
         try:
             wrapped = future.result()
@@ -792,6 +838,11 @@ class ROS2Worker(QThread):
                 self._result_reported_epoch = epoch
                 self.current_goal_handle = None
             result = wrapped.result
+            self.motion_feedback_signal.emit(
+                int(IndustrialMotion.Feedback.STATE_EXECUTING),
+                100.0 if result.error_code == IndustrialMotion.Result.SUCCESS else 0.0,
+                float(result.execution_time),
+            )
             if result.error_code != IndustrialMotion.Result.SUCCESS:
                 if result.error_code != IndustrialMotion.Result.ERR_CANCELLED:
                     # Only the Action result opens a notice. SupervisorState
@@ -905,9 +956,12 @@ class ROS2Worker(QThread):
             self._report_error("System identification engine is unavailable")
             return
         not_ready = False
+        has_payload = False
         with self.state_lock:
             snap = self.supervisor_state
-            if (self._begin_pending or self._calculation_active or self._motion_pending or
+            if snap is not None and snap.payload_mass > 1e-6:
+                has_payload = True
+            elif (self._begin_pending or self._calculation_active or self._motion_pending or
                     snap is None or not snap.motion_allowed):
                 not_ready = True
             else:
@@ -915,6 +969,11 @@ class ROS2Worker(QThread):
                 self._prepare_epoch += 1
                 epoch = self._prepare_epoch
                 revision = snap.revision
+        if has_payload:
+            self._report_error(
+                "System Identification is not allowed while payload mass > 0 kg.\n"
+                "Unload the robot and set Payload Mass to 0.0 kg in Manual Control first.")
+            return
         if not_ready:
             self._report_error("Supervisor or identification worker is not ready")
             return

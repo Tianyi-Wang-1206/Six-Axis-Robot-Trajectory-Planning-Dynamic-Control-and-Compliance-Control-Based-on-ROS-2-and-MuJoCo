@@ -743,8 +743,9 @@ Supervisor::Reply Supervisor::command(const Command::Request& req) {
   }
   case C::Request::CMD_SET_PAYLOAD:
     if(req.session_id!=0||!active_key_.empty()||!fresh_controller_unlocked()||
-       state_.mode==S::MODE_INITIALIZING||state_.mode==S::MODE_COMPLIANCE_SWITCHING) {
-      reject("Payload update requires idle state and fresh controller observation");break;
+       state_.mode==S::MODE_INITIALIZING||state_.mode==S::MODE_COMPLIANCE_SWITCHING||
+       state_.mode==S::MODE_SYSID||state_.controller_mode==CS::MODE_SYSID) {
+      reject("Payload update requires non-SysID idle state and fresh controller observation");break;
     }
     if(!lite6_interfaces::valid_payload_params(req.payload_mass,req.payload_com_tcp)) {
       reject("Payload parameters out of bounds");break;
@@ -755,13 +756,15 @@ Supervisor::Reply Supervisor::command(const Command::Request& req) {
     r.effects.payload_com_tcp=req.payload_com_tcp;
     r.effects.expected_controller_epoch=state_.controller_epoch;
     r.effects.cmd_reason=req.reason;
+    changed_unlocked("Updating payload model ("+format_fixed(req.payload_mass,3)+" kg)");
     r.accepted=true;
     break;
   case C::Request::CMD_TARE_GMO:
     if(req.session_id!=0||state_.estop_latched||state_.mode==S::MODE_ESTOP||
        state_.mode==S::MODE_INITIALIZING||state_.mode==S::MODE_COMPLIANCE_SWITCHING||
+       state_.mode==S::MODE_SYSID||state_.controller_mode==CS::MODE_SYSID||
        !active_key_.empty()||!fresh_joint_unlocked()||!fresh_controller_unlocked()) {
-      reject("GMO tare requires non-ESTOP idle state and fresh feedback");break;
+      reject("GMO tare requires non-ESTOP/non-SysID idle state and fresh feedback");break;
     }
     if(stable_since_==Clock::time_point{}||Clock::now()-stable_since_<kSettleDuration) {
       reject("Robot must be stationary to tare GMO");break;
@@ -769,6 +772,7 @@ Supervisor::Reply Supervisor::command(const Command::Request& req) {
     r.effects.ctc_cmd=CTC::Request::CMD_TARE_GMO;
     r.effects.expected_controller_epoch=state_.controller_epoch;
     r.effects.cmd_reason=req.reason;
+    changed_unlocked("GMO stationary bias tared");
     r.accepted=true;
     break;
   case C::Request::CMD_BEGIN_RECOVERY:
@@ -804,6 +808,11 @@ Supervisor::Reply Supervisor::command(const Command::Request& req) {
        !active_key_.empty()||!fresh_joint_unlocked()||!fresh_controller_unlocked()||
        state_.controller_mode!=CS::MODE_NORMAL) {
       reject("SysID requires idle NORMAL mode and fresh observations");break;
+    }
+    if(state_.payload_mass>1e-6) {
+      reject("SysID is prohibited when payload is attached ("+
+        format_fixed(state_.payload_mass,3)+" kg > 0.0 kg); reset payload to 0 kg first");
+      break;
     }
     state_.mode=S::MODE_SYSID;
     state_.sysid_phase=S::SYSID_PRE_ALIGN;

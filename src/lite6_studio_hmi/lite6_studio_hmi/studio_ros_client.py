@@ -16,7 +16,9 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
-from lite6_interfaces.msg import CompileDiagnostic, GripperState, StudioState
+from lite6_interfaces.msg import (
+    CompileDiagnostic, ControllerStatus, GripperState, StudioState,
+)
 from lite6_interfaces.srv import (
     CompileProgram, ControllerCommand, GripperCommand, StudioCommand,
 )
@@ -26,6 +28,7 @@ class StudioRosWorker(QThread):
     """Runs an isolated rclpy node loop and dispatches telemetry/service results via Qt signals."""
 
     studio_state_updated = pyqtSignal(object)
+    controller_status_updated = pyqtSignal(object)
     gripper_state_updated = pyqtSignal(object)
     telemetry_updated = pyqtSignal(object, object, object)  # q_list, dq_list, tcp6_or_none
     compile_finished = pyqtSignal(object)
@@ -121,6 +124,12 @@ class StudioRosWorker(QThread):
             GripperState,
             "/gripper/state",
             lambda msg: None if self._stop_requested else self.gripper_state_updated.emit(msg),
+            10,
+        )
+        node.create_subscription(
+            ControllerStatus,
+            "/ctc_controller/status",
+            lambda msg: None if self._stop_requested else self.controller_status_updated.emit(msg),
             10,
         )
 

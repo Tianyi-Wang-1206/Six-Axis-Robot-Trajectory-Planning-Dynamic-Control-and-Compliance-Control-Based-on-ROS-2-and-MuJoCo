@@ -26,7 +26,7 @@ class PyQtHMI(QMainWindow):
         super().__init__()
         self.worker = worker
         self.setWindowTitle("Robot - Industrial HMI Interface")
-        self.resize(800, 700)
+        self.resize(920, 780)
 
         # Style definition via QSS (Modern Slate Industrial Theme)
         self.setStyleSheet("""
@@ -153,7 +153,9 @@ class PyQtHMI(QMainWindow):
         self.worker.estop_fault_signal.connect(self.on_estop_fault, Qt.QueuedConnection)
         self.worker.recovery_complete_signal.connect(self.on_recovery_completed)
         self.worker.gripper_signal.connect(self.on_gripper_updated)
+        self.worker.motion_feedback_signal.connect(self.on_motion_feedback)
         self._supervisor_offline_displayed = False
+        self._stationary_since = 0.0
 
         # Render the cached snapshot as well as future transitions. A Worker
         # supplied by another caller may already have received its first state.
@@ -204,12 +206,13 @@ class PyQtHMI(QMainWindow):
         enabled = self.worker.gripper_ready()
         for button in (self.btn_gripper_open, self.btn_gripper_close, self.btn_gripper_stop):
             button.setEnabled(enabled)
-        # The transport checks heartbeat age independently of the state label.
+        #The transport checks heartbeat age independently of the state label.
         import time
         with self.worker.state_lock:
             stale = time.monotonic() - self.worker.last_gripper_rx_time > 0.25
         if stale:
             self.gripper_status.setText("Gripper feedback offline; controls disabled")
+        self.refresh_payload_and_gmo_status()
 
     def setup_ui(self):
         main_widget = QWidget()
@@ -265,7 +268,21 @@ class PyQtHMI(QMainWindow):
             lbl.setFont(QFont("Consolas", 10))
             tele_layout.addWidget(lbl)
             self.lbl_p_curr.append(lbl)
-        
+
+        line_m = QFrame()
+        line_m.setFrameShape(QFrame.HLine)
+        line_m.setFrameShadow(QFrame.Sunken)
+        tele_layout.addWidget(line_m)
+
+        self.lbl_motion_feedback = QLabel("Motion: IDLE")
+        self.lbl_motion_feedback.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        tele_layout.addWidget(self.lbl_motion_feedback)
+        self.bar_motion_progress = QProgressBar()
+        self.bar_motion_progress.setRange(0, 100)
+        self.bar_motion_progress.setValue(0)
+        self.bar_motion_progress.setFixedHeight(16)
+        tele_layout.addWidget(self.bar_motion_progress)
+
         tele_layout.addStretch()
         workspace_layout.addWidget(telemetry_container)
 
@@ -370,9 +387,14 @@ class PyQtHMI(QMainWindow):
         bot_layout.addWidget(self.btn_estop)
 
     def setup_manual_tab(self, parent):
-        tab_layout = QHBoxLayout(parent)
-        tab_layout.setContentsMargins(10, 10, 10, 10)
+        outer_layout = QVBoxLayout(parent)
+        outer_layout.setContentsMargins(8, 8, 8, 8)
+        outer_layout.setSpacing(8)
+
+        tab_layout = QHBoxLayout()
+        tab_layout.setContentsMargins(0, 0, 0, 0)
         tab_layout.setSpacing(10)
+        outer_layout.addLayout(tab_layout, 1)
 
         # Column 1: Joint Space Control
         j_group = QGroupBox("Joint Space Commands (PTP)")
@@ -538,6 +560,70 @@ class PyQtHMI(QMainWindow):
         self.btn_move_c.setStyleSheet("background-color: #8e44ad; height: 30px;")
         self.btn_move_c.clicked.connect(self.cmd_move_c)
         c_layout.addWidget(self.btn_move_c)
+
+        # Full-width Payload Mass & Center of Mass (TCP Frame) Configuration + GMO Mismatch Warning
+        p_group = QGroupBox("Payload Mass & Center of Mass (TCP Frame)")
+        outer_layout.addWidget(p_group)
+        p_outer = QVBoxLayout(p_group)
+        p_outer.setContentsMargins(12, 8, 12, 8)
+        p_outer.setSpacing(6)
+
+        p_inputs = QHBoxLayout()
+        p_inputs.setSpacing(6)
+
+        p_inputs.addWidget(QLabel("Mass (kg):"))
+        self.payload_mass_entry = QLineEdit("0.000")
+        self.payload_mass_entry.setFixedWidth(64)
+        self.payload_mass_entry.setAlignment(Qt.AlignCenter)
+        self.payload_mass_entry.setValidator(self.float_validator)
+        p_inputs.addWidget(self.payload_mass_entry)
+
+        p_inputs.addWidget(QLabel("CoM X (mm):"))
+        self.payload_com_x_entry = QLineEdit("0.0")
+        self.payload_com_x_entry.setFixedWidth(56)
+        self.payload_com_x_entry.setAlignment(Qt.AlignCenter)
+        self.payload_com_x_entry.setValidator(self.float_validator)
+        p_inputs.addWidget(self.payload_com_x_entry)
+
+        p_inputs.addWidget(QLabel("Y:"))
+        self.payload_com_y_entry = QLineEdit("0.0")
+        self.payload_com_y_entry.setFixedWidth(56)
+        self.payload_com_y_entry.setAlignment(Qt.AlignCenter)
+        self.payload_com_y_entry.setValidator(self.float_validator)
+        p_inputs.addWidget(self.payload_com_y_entry)
+
+        p_inputs.addWidget(QLabel("Z:"))
+        self.payload_com_z_entry = QLineEdit("0.0")
+        self.payload_com_z_entry.setFixedWidth(56)
+        self.payload_com_z_entry.setAlignment(Qt.AlignCenter)
+        self.payload_com_z_entry.setValidator(self.float_validator)
+        p_inputs.addWidget(self.payload_com_z_entry)
+
+        p_inputs.addStretch()
+
+        self.btn_apply_payload = QPushButton("Apply Payload")
+        self.btn_apply_payload.setStyleSheet("background-color: #16a085; height: 26px; padding: 4px 10px;")
+        self.btn_apply_payload.clicked.connect(self.cmd_apply_payload)
+        self.btn_reset_payload = QPushButton("Reset (0 kg)")
+        self.btn_reset_payload.setStyleSheet("background-color: #7f8c8d; height: 26px; padding: 4px 10px;")
+        self.btn_reset_payload.clicked.connect(self.cmd_reset_payload)
+        p_inputs.addWidget(self.btn_apply_payload)
+        p_inputs.addWidget(self.btn_reset_payload)
+        p_outer.addLayout(p_inputs)
+
+        p_status = QHBoxLayout()
+        p_status.setSpacing(10)
+        self.lbl_payload_active = QLabel("Active Payload: 0.000 kg | CoM: [0.0, 0.0, 0.0] mm")
+        self.lbl_payload_active.setFont(QFont("Consolas", 8.5))
+        p_status.addWidget(self.lbl_payload_active)
+
+        self.lbl_payload_gmo_hint = QLabel("GMO Load Check: OK (no discrepancy detected)")
+        self.lbl_payload_gmo_hint.setWordWrap(True)
+        self.lbl_payload_gmo_hint.setStyleSheet(
+            "background-color: #e8f8f5; color: #117864; border-radius: 4px; padding: 4px 8px; font-size: 8.5pt; font-weight: bold;"
+        )
+        p_status.addWidget(self.lbl_payload_gmo_hint, 1)
+        p_outer.addLayout(p_status)
 
     def setup_sysid_tab(self, parent):
         tab_layout = QVBoxLayout(parent)
@@ -808,13 +894,141 @@ class PyQtHMI(QMainWindow):
         self.lbl_p_curr[4].setText(f" Pitch(°): {math.degrees(p[4]):7.2f}")
         self.lbl_p_curr[5].setText(f" Yaw  (°): {math.degrees(p[5]):7.2f}")
 
+    def on_motion_feedback(self, state_code, pct, exec_time):
+        fb_names = {
+            IndustrialMotion.Feedback.STATE_PLANNING: "PLANNING",
+            IndustrialMotion.Feedback.STATE_WAITING_CTC: "WAITING CTC",
+            IndustrialMotion.Feedback.STATE_EXECUTING: "EXECUTING",
+            IndustrialMotion.Feedback.STATE_CANCELING: "CANCELING",
+        }
+        label = fb_names.get(state_code, "MOTION")
+        self.bar_motion_progress.setValue(int(round(max(0.0, min(100.0, pct)))))
+        if exec_time >= 0.0:
+            self.lbl_motion_feedback.setText(f"Motion: DONE ({exec_time:.2f} s)")
+        else:
+            self.lbl_motion_feedback.setText(f"Motion: {label} ({pct:.0f}%)")
+
+    def cmd_apply_payload(self):
+        try:
+            mass = float(self.payload_mass_entry.text())
+            cx_mm = float(self.payload_com_x_entry.text())
+            cy_mm = float(self.payload_com_y_entry.text())
+            cz_mm = float(self.payload_com_z_entry.text())
+        except ValueError as exc:
+            QMessageBox.critical(self, "Payload Input Error", f"Invalid numeric value: {exc}")
+            return
+        if not (0.0 <= mass <= 2.0):
+            QMessageBox.warning(
+                self, "Payload Out of Range", "Payload mass must lie within [0.0, 2.0] kg."
+            )
+            return
+        com_m = [cx_mm / 1000.0, cy_mm / 1000.0, cz_mm / 1000.0]
+        radius = math.sqrt(com_m[0] ** 2 + com_m[1] ** 2 + com_m[2] ** 2)
+        if radius > 0.30:
+            QMessageBox.warning(
+                self,
+                "Payload CoM Out of Range",
+                f"CoM offset norm ({radius * 1000.0:.1f} mm) exceeds maximum 300.0 mm.",
+            )
+            return
+        self.worker.set_payload(mass, com_m)
+
+    def cmd_reset_payload(self):
+        self.payload_mass_entry.setText("0.000")
+        self.payload_com_x_entry.setText("0.0")
+        self.payload_com_y_entry.setText("0.0")
+        self.payload_com_z_entry.setText("0.0")
+        self.worker.set_payload(0.0, [0.0, 0.0, 0.0])
+
+    def refresh_payload_and_gmo_status(self):
+        import time
+        now = time.monotonic()
+        with self.worker.state_lock:
+            snap = self.worker.supervisor_state
+            dq = list(self.worker.dq_curr)
+            state = self.worker.state
+            preparation = self.worker.sysid_preparation_status
+            fresh = bool(
+                snap is not None
+                and snap.controller_fresh
+                and snap.joint_states_fresh
+                and (now - self.worker.last_supervisor_rx_time < 0.8)
+            )
+        if not fresh or snap is None:
+            return
+
+        mass = float(snap.payload_mass)
+        com = list(snap.payload_com_tcp)
+        self.lbl_payload_active.setText(
+            f"Active Payload: {mass:.3f} kg | CoM: [{com[0]*1000.0:+.1f}, {com[1]*1000.0:+.1f}, {com[2]*1000.0:+.1f}] mm"
+        )
+        has_payload = mass > 1e-6
+        can_sysid = (state == Lite6StateMachine.IDLE) and (not preparation) and (not has_payload)
+        self.btn_run_sysid.setEnabled(can_sysid)
+        if has_payload and not preparation:
+            self.btn_run_sysid.setText("SysID Disabled (Payload > 0 kg)")
+            self.btn_run_sysid.setToolTip(
+                "System Identification is disabled when payload is non-zero. Reset payload to 0 kg first."
+            )
+        else:
+            self.btn_run_sysid.setText(
+                preparation if preparation else "Start Automated Identification Routine"
+            )
+            self.btn_run_sysid.setToolTip("")
+
+        max_dq = max((abs(v) for v in dq), default=0.0)
+        if max_dq <= 0.015:
+            if self._stationary_since <= 0.0:
+                self._stationary_since = now
+        else:
+            self._stationary_since = 0.0
+
+        settled_for = (now - self._stationary_since) if self._stationary_since > 0.0 else 0.0
+        w = snap.external_cartesian_wrench
+        fx, fy, fz = float(w[0]), float(w[1]), float(w[2])
+        f_horiz = math.hypot(fx, fy)
+        # In LOCAL_WORLD_ALIGNED frame, +Z is upward; an uncompensated downward weight gives Fz < 0,
+        # whereas an over-compensated payload mass gives an upward residual Fz > 0.
+        est_mass_err_kg = -fz / 9.81
+        if settled_for >= 0.5 and abs(fz) >= 2.5 and f_horiz <= 0.65 * abs(fz):
+            if est_mass_err_kg > 0.25:
+                self.lbl_payload_gmo_hint.setText(
+                    f"⚠ GMO Warning: ~+{est_mass_err_kg:.2f} kg uncompensated load ({fz:+.1f} N Z)! "
+                    f"Entered payload ({mass:.2f} kg) may be too low, or TCP is pressed downward."
+                )
+                self.lbl_payload_gmo_hint.setStyleSheet(
+                    "background-color: #fef9e7; color: #b9770e; border: 1px solid #f5b041; "
+                    "border-radius: 4px; padding: 4px; font-size: 8.5pt; font-weight: bold;"
+                )
+            elif est_mass_err_kg < -0.25:
+                self.lbl_payload_gmo_hint.setText(
+                    f"⚠ GMO Warning: ~{abs(est_mass_err_kg):.2f} kg excess upward compensation ({fz:+.1f} N Z)! "
+                    f"Entered payload ({mass:.2f} kg) may be too high or payload was released."
+                )
+                self.lbl_payload_gmo_hint.setStyleSheet(
+                    "background-color: #fdedec; color: #b03a2e; border: 1px solid #ec7063; "
+                    "border-radius: 4px; padding: 4px; font-size: 8.5pt; font-weight: bold;"
+                )
+        else:
+            self.lbl_payload_gmo_hint.setText("GMO Load Check: OK (consistent with configured payload)")
+            self.lbl_payload_gmo_hint.setStyleSheet(
+                "background-color: #e8f8f5; color: #117864; border-radius: 4px; padding: 4px; font-size: 8.5pt; font-weight: bold;"
+            )
+
     def on_state_updated(self, state, error_msg):
         """Processes state transition events safely."""
         with self.worker.state_lock:
             preparation = self.worker.sysid_preparation_status
-        self.btn_run_sysid.setEnabled(state == Lite6StateMachine.IDLE and not preparation)
-        self.btn_run_sysid.setText(
-            preparation if preparation else "Start Automated Identification Routine")
+            snap = self.worker.supervisor_state
+            has_payload = bool(snap is not None and snap.payload_mass > 1e-6)
+        self.btn_run_sysid.setEnabled(
+            state == Lite6StateMachine.IDLE and not preparation and not has_payload
+        )
+        if has_payload and not preparation:
+            self.btn_run_sysid.setText("SysID Disabled (Payload > 0 kg)")
+        else:
+            self.btn_run_sysid.setText(
+                preparation if preparation else "Start Automated Identification Routine")
         # Keep long per-branch diagnostics readable without expanding the banner.
         self.state_banner.setToolTip(error_msg)
         error_summary = error_msg.splitlines()[0] if error_msg else ""

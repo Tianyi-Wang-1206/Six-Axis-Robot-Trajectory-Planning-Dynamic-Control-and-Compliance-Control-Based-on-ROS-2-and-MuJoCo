@@ -8,49 +8,124 @@ ctc_controller:
       enabled: true
       observer_gains: [25.0, 25.0, 25.0, 30.0, 30.0, 30.0]  # rad/s per joint (1st-order LPF cutoff)
       jacobian_damping: 0.04                                # DLS regularization near wrist singularities
-      friction_transition_speed: 0.03                       # rad/s; nominal Coulomb tanh smoothing for observer
-      contact_force_threshold: 2.5                          # N; Cartesian wrench magnitude to flag contact
+      characteristic_length: 0.15                           # m; metric length scale for translational vs rotational DLS
+      friction_transition_speed: 0.025                      # rad/s; nominal Coulomb tanh smoothing matching LuGre v_s=0.02
+      stiction_deadband_scale_normal: 0.18                  # share of Fc at rest in NORMAL mode (stiction/integrator margin)
+      stiction_deadband_scale_compliance: 0.12              # share of Fc at rest in compliance/impedance modes
+      stribeck_deadband_scale: 0.15                         # share of Fc for kinetic Stribeck excess peak near |dq| ~ v_s
+      contact_force_threshold: 2.5                          # N; Cartesian force magnitude threshold to flag contact
+      contact_moment_threshold: 0.40                        # Nm; Cartesian moment magnitude threshold to flag contact
+      contact_joint_torque_threshold: [1.5, 1.5, 1.0, 0.6, 0.35, 0.25]  # Nm; per-joint external torque threshold
+      contact_hysteresis_ratio: 0.70                        # Schmitt trigger release ratio (off_thresh = ratio * on_thresh)
+      contact_on_debounce_sec: 0.015                        # s; continuous duration above threshold to latch contact
+      contact_off_debounce_sec: 0.040                       # s; continuous duration below release threshold to clear contact
+      max_tare_torque_ratio: 0.40                           # max share of external torque safety limit allowed for CMD_TARE_GMO
+      overload_decay_rate: 2.0                              # 1/s; leaky integrator decay rate when external torque is below limit
+
+    # Real-time Pinocchio payload inertia update and linear static-moment smoothing.
+    payload:
+      filter_time_constant: 0.15                            # s; exponential smoothing time constant for (m, m*c)
+      nominal_gyration_radius: 0.025                        # m; point-payload effective gyration radius for local wrist inertia
+
+    # Passivity-based Energy Tank layer for compliance and impedance modes.
+    energy_tank:
+      enabled: true
+      initial_energy: 1.5                                   # J; initial tank storage on entering compliance/impedance
+      max_energy: 4.0                                       # J; upper energy bound (excess dissipated)
+      low_energy_threshold: 0.25                            # J; C1 Hermite valve attenuation threshold near depletion
+      dissipation_harvest_ratio: 0.80                       # [0..1] fraction of physical damping power harvested into tank
+      max_injected_power: 15.0                              # W; instantaneous active power injection ceiling
 
     compliance:
-      # Safety limits active during all three compliance modes
-      # (JOINT_IMPEDANCE, CARTESIAN_IMPEDANCE, and TEACH).
-      max_joint_velocity: 3.0         # rad/s; exceeding this triggers E-STOP
-      hard_limit_tolerance: 0.01      # rad; numerical allowance past URDF limits before E-STOP
-      saturation_timeout: 1.0         # s; continuous effort saturation before E-STOP
-      entry_max_speed: 0.01           # rad/s; max joint speed allowed when entering compliance
-      max_external_joint_torque: [35.0, 35.0, 24.0, 20.0, 20.0, 12.0]  # Nm; GMO overload limit
-      external_torque_timeout: 0.25   # s; continuous GMO overload duration before E-STOP
+      # Shared transition and soft-limit defaults (overridden by per-mode settings below).
+      max_joint_velocity: 3.0
+      hard_limit_tolerance: 0.01
+      saturation_timeout: 1.0
+      entry_max_speed: 0.03
+      max_external_joint_torque: [35.0, 35.0, 24.0, 20.0, 20.0, 12.0]
+      external_torque_timeout: 0.25
+      friction_viscous_scale: 0.85
+      friction_coulomb_scale: 0.0
+      friction_transition_speed: 0.04
+      friction_quiet_speed: 0.015
+      filter_time_constant: 0.15
+      cartesian_null_damping: 0.50
+      soft_limit_margin: 0.15
+      soft_limit_stiffness: 80.0
+      soft_limit_damping: 5.0
+      torque_slew_rate: 120.0
+      transition_duration: 0.25
 
-      # Passive velocity-based friction feedforward for JOINT_IMPEDANCE & CARTESIAN_IMPEDANCE
-      # (Coulomb share stays 0.0 by default to prevent limit cycles inside virtual spring wells)
-      friction_viscous_scale: 0.85    # [0..1) share of friction_v_nominal
-      friction_coulomb_scale: 0.0     # [0..1) optional Coulomb share (keep 0 unless D is high)
-      friction_transition_speed: 0.06 # rad/s; tanh transition width
-      friction_quiet_speed: 0.08      # rad/s; C1 Hermite ramp threshold near rest
+      # 1. Dedicated Joint-Space Impedance Mode Parameters (MODE_JOINT_IMPEDANCE)
+      joint_impedance:
+        max_joint_velocity: 3.0
+        hard_limit_tolerance: 0.01
+        saturation_timeout: 1.0
+        entry_max_speed: 0.03
+        max_external_joint_torque: [35.0, 35.0, 24.0, 20.0, 20.0, 12.0]
+        external_torque_timeout: 0.25
+        friction_viscous_scale: 0.85
+        friction_coulomb_scale: 0.0
+        friction_transition_speed: 0.04
+        friction_quiet_speed: 0.015
+        filter_time_constant: 0.15
+        soft_limit_margin: 0.15
+        soft_limit_stiffness: 80.0
+        soft_limit_damping: 5.0
+        torque_slew_rate: 120.0
+        transition_duration: 0.25
 
-      # Gain smoothing and Cartesian null-space damping
-      filter_time_constant: 0.15      # s; exponential smoothing time constant for mode gains
-      cartesian_null_damping: 0.15    # Nm s/rad; joint-space damping in Cartesian impedance
+      # 2. Dedicated Interactive Cartesian-Space Impedance Parameters (MODE_CARTESIAN_IMPEDANCE)
+      cartesian_impedance:
+        max_joint_velocity: 3.0
+        hard_limit_tolerance: 0.01
+        saturation_timeout: 1.0
+        entry_max_speed: 0.03
+        max_external_joint_torque: [35.0, 35.0, 24.0, 20.0, 20.0, 12.0]
+        external_torque_timeout: 0.25
+        friction_viscous_scale: 0.85
+        friction_coulomb_scale: 0.0
+        friction_transition_speed: 0.04
+        friction_quiet_speed: 0.015
+        filter_time_constant: 0.15
+        min_translation_damping: 2.0                        # N s/m floor when translation_stiffness -> 0
+        min_rotation_damping: 0.15                          # Nm s/rad floor when rotation_stiffness -> 0
+        min_effective_mass: 0.30                            # kg; operational-space translational mass lower clamp
+        max_effective_mass: 15.0                            # kg; operational-space translational mass upper clamp
+        min_effective_inertia: 0.005                        # kg m^2; operational-space rotational inertia lower clamp
+        max_effective_inertia: 0.60                         # kg m^2; operational-space rotational inertia upper clamp
+        operational_damping_lambda: 0.04                    # DLS regularization for operational inertia inversion
+        soft_limit_margin: 0.15
+        soft_limit_stiffness: 80.0
+        soft_limit_damping: 5.0
+        torque_slew_rate: 120.0
+        transition_duration: 0.25
 
-      # Soft joint-limit wall inside mechanical travel limits
-      soft_limit_margin: 0.15         # rad; distance inward from joint limits where wall starts
-      soft_limit_stiffness: 80.0      # Nm/rad; soft wall spring gain
-      soft_limit_damping: 5.0         # Nm s/rad; one-sided soft wall damping
-
-      # Output torque rate limiting during compliance modes
-      torque_slew_rate: 100.0         # Nm/s; maximum commanded torque rate of change
-
-      # Drag teaching sensitivity profiles for levels 1 (firm) through 5 (light).
-      # Intermediate sensitivity values are interpolated piecewise-linearly.
+      # 3. Dedicated diag(M)-Normalized Drag Teaching Parameters (MODE_TEACH)
       teach:
-        damping_levels: [4.0, 3.25, 2.5, 2.25, 2.0]                 # Nm s/rad
-        assistance_levels: [0.35, 0.475, 0.60, 0.625, 0.65]         # bounded friction share [0..1]
-        friction_transition_levels: [0.06, 0.06, 0.06, 0.06, 0.06]  # rad/s; tanh transition width
-        quiet_speed_levels: [0.06, 0.06, 0.06, 0.06, 0.06]          # rad/s; Coulomb gate threshold
+        max_joint_velocity: 3.0
+        hard_limit_tolerance: 0.01
+        saturation_timeout: 1.0
+        entry_max_speed: 0.03
+        max_external_joint_torque: [35.0, 35.0, 24.0, 20.0, 20.0, 12.0]
+        external_torque_timeout: 0.25
+        filter_time_constant: 0.15
+        soft_limit_margin: 0.15
+        soft_limit_stiffness: 80.0
+        soft_limit_damping: 5.0
+        torque_slew_rate: 120.0
+        transition_duration: 0.25
+        armature_weight: 0.04                               # weight on rotor armature in M_teach_i = M_link_ii(q) + beta * I_arm_i
+        min_joint_damping: [0.15, 0.15, 0.10, 0.04, 0.03, 0.015]  # Nm s/rad per-joint floor
+        max_joint_damping: [15.0, 15.0, 10.0, 4.0, 3.0, 1.5]      # Nm s/rad per-joint ceiling
+        # diag(M)-normalized velocity decay rates [1/s] for sensitivity levels 1 (firm) through 5 (light):
+        # d_i(q) = clamp(lambda_teach(sensitivity) * M_teach_i(q), min_joint_damping[i], max_joint_damping[i]).
+        damping_levels: [22.0, 17.5, 13.5, 11.5, 9.5]
+        assistance_levels: [0.35, 0.475, 0.60, 0.625, 0.65]
+        friction_transition_levels: [0.045, 0.040, 0.035, 0.030, 0.025]  # rad/s; tanh transition width (> quiet_speed)
+        quiet_speed_levels: [0.015, 0.012, 0.010, 0.008, 0.006]          # rad/s; pre-sliding bristle quiet gate (< v_s=0.02)
 
-    # Isolated tolerances and safety envelope for time-varying Cartesian impedance
-    # trajectory tracking (MODE_CARTESIAN_IMPEDANCE_TRAJECTORY).
-    # Rigid trajectory execution.* parameters in ros2_controllers.yaml remain untouched.
+    # 4. Dedicated Time-Varying Cartesian Impedance Trajectory Parameters (MODE_CARTESIAN_IMPEDANCE_TRAJECTORY)
     impedance_execution:
       max_translation_deviation: 0.12     # m; max allowed TCP position deflection under external force
       max_rotation_deviation: 0.60        # rad; max allowed TCP orientation deflection under external force
@@ -60,15 +135,27 @@ ctc_controller:
       saturation_timeout: 1.0             # s; continuous effort saturation before E-STOP
       max_external_joint_torque: [35.0, 35.0, 24.0, 20.0, 20.0, 12.0]  # Nm; GMO overload limit
       external_torque_timeout: 0.25       # s; continuous GMO overload duration before E-STOP
-      # Passive viscous FF on measured dq_ + exogenous Coulomb FF on planned dq_ref(t)
-      friction_viscous_scale: 0.90        # [0..1) share of friction_v_nominal
-      friction_coulomb_scale: 0.80        # [0..1) share of friction_c_nominal along dq_ref(t)
-      friction_transition_speed: 0.04     # rad/s; tanh transition width
-      friction_quiet_speed: 0.01          # rad/s; C1 Hermite ramp threshold near ref stop
+      dynamics_ff_scale: 1.0              # [0..1] passivity-preserving inertial + Coriolis feedforward scale
+      friction_viscous_scale: 0.90        # [0..1] share of friction_v_nominal
+      friction_coulomb_scale: 0.80        # [0..1] share of friction_c_nominal along dq_ref(t)
+      friction_transition_speed: 0.025    # rad/s; tanh transition width (> quiet_speed)
+      friction_quiet_speed: 0.008         # rad/s; C1 Hermite ramp threshold near ref stop
+      filter_time_constant: 0.10          # s; gain/wrench exponential smoothing time constant
+      min_translation_damping: 2.0        # N s/m floor when translation_stiffness -> 0
+      min_rotation_damping: 0.15          # Nm s/rad floor when rotation_stiffness -> 0
+      min_effective_mass: 0.30            # kg; operational-space translational mass lower clamp
+      max_effective_mass: 15.0            # kg; operational-space translational mass upper clamp
+      min_effective_inertia: 0.005        # kg m^2; operational-space rotational inertia lower clamp
+      max_effective_inertia: 0.60         # kg m^2; operational-space rotational inertia upper clamp
+      operational_damping_lambda: 0.04    # DLS regularization for operational inertia inversion
+      soft_limit_margin: 0.15             # rad; soft joint-limit wall margin
+      soft_limit_stiffness: 80.0          # Nm/rad; soft joint-limit wall stiffness
+      soft_limit_damping: 5.0             # Nm s/rad; soft joint-limit wall damping
+      torque_slew_rate: 150.0             # Nm/s; transition-only torque slew rate limit
       goal_translation_tolerance: 0.05    # m; endpoint compliant equilibrium position envelope
       goal_rotation_tolerance: 0.25       # rad; endpoint compliant equilibrium orientation envelope
-      goal_velocity_tolerance: 0.01       # rad/s; endpoint stationary velocity requirement
+      goal_velocity_tolerance: 0.015      # rad/s; endpoint stationary velocity requirement (kPlannerSettleSpeedRadPerSec)
       goal_settle_duration: 0.3           # s; continuous stationary settling duration at endpoint
       goal_time_tolerance: 5.0            # s; endpoint settling deadline allowance
-      entry_max_speed: 0.02               # rad/s; max joint speed allowed when starting impedance trajectory
+      entry_max_speed: 0.03               # rad/s; max joint speed allowed when starting impedance trajectory (kControllerEntryMaxSpeedRadPerSec)
       entry_position_tolerance: 0.15      # rad; max initial joint offset |q_d(0) - q(0)| allowed on entry

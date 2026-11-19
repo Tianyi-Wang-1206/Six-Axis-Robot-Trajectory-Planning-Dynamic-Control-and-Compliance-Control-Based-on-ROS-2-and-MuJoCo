@@ -35,25 +35,68 @@ uint8_t map_trajectory_estop_reason(ResultEnum reason)
 bool Lite6CTCController::valid_trajectory_goal(const FollowTrajectory::Goal & goal) const
 {
   const auto & trajectory = goal.trajectory;
-  // This endpoint consumes the planner's already validated, fully sampled references.
-  // Reject unsupported options rather than silently ignoring their semantics.
   if (trajectory.joint_names != joint_names_ || trajectory.points.empty() ||
       trajectory.header.stamp.sec != 0 || trajectory.header.stamp.nanosec != 0 ||
       !goal.multi_dof_trajectory.points.empty() ||
       !goal.multi_dof_trajectory.joint_names.empty() ||
-      !goal.path_tolerance.empty() || !goal.goal_tolerance.empty() ||
-      !goal.component_path_tolerance.empty() || !goal.component_goal_tolerance.empty() ||
-      goal.goal_time_tolerance.sec != 0 || goal.goal_time_tolerance.nanosec != 0) return false;
+      !goal.component_path_tolerance.empty() || !goal.component_goal_tolerance.empty())
+  {
+    return false;
+  }
+
+  auto valid_joint_tolerances = [this](const std::vector<control_msgs::msg::JointTolerance> & tols) {
+    if (tols.size() > joint_names_.size()) return false;
+    for (const auto & tol : tols) {
+      const auto it = std::find(joint_names_.begin(), joint_names_.end(), tol.name);
+      if (it == joint_names_.end()) return false;
+      if (!std::isfinite(tol.position) || tol.position < 0.0 ||
+          !std::isfinite(tol.velocity) || tol.velocity < 0.0 ||
+          !std::isfinite(tol.acceleration) || tol.acceleration < 0.0)
+      {
+        return false;
+      }
+    }
+    return true;
+  };
+  if (!valid_joint_tolerances(goal.path_tolerance) ||
+      !valid_joint_tolerances(goal.goal_tolerance))
+  {
+    return false;
+  }
+  if (goal.goal_time_tolerance.sec < 0 || goal.goal_time_tolerance.nanosec >= 1000000000u) {
+    return false;
+  }
+  const double custom_goal_time = seconds(goal.goal_time_tolerance);
+  if (custom_goal_time > 0.0 &&
+      (custom_goal_time < goal_settle_duration_ || custom_goal_time > 10.0))
+  {
+    return false;
+  }
+
   double previous = -1.0;
   for (const auto & point : trajectory.points) {
     const double t = seconds(point.time_from_start);
     if (point.time_from_start.sec < 0 || point.time_from_start.nanosec >= 1000000000u ||
         t <= previous || point.positions.size() != joint_names_.size() ||
         point.velocities.size() != joint_names_.size() ||
-        point.accelerations.size() != joint_names_.size() || !point.effort.empty()) return false;
+        point.accelerations.size() != joint_names_.size() ||
+        (!point.effort.empty() && point.effort.size() != joint_names_.size()))
+    {
+      return false;
+    }
     for (size_t i = 0; i < joint_names_.size(); ++i) {
       if (!std::isfinite(point.positions[i]) || !std::isfinite(point.velocities[i]) ||
-          !std::isfinite(point.accelerations[i])) return false;
+          !std::isfinite(point.accelerations[i]))
+      {
+        return false;
+      }
+      if (!point.effort.empty()) {
+        if (!std::isfinite(point.effort[i]) ||
+            std::abs(point.effort[i]) > max_effort_[static_cast<Eigen::Index>(i)])
+        {
+          return false;
+        }
+      }
     }
     previous = t;
   }
@@ -63,8 +106,47 @@ bool Lite6CTCController::valid_trajectory_goal(const FollowTrajectory::Goal & go
   for (size_t i = 0; i < joint_names_.size(); ++i) {
     if (std::abs(last.velocities[i]) > 1e-8 || std::abs(last.accelerations[i]) > 1e-8)
       return false;
+    if (!last.effort.empty() && std::abs(last.effort[i]) > 1e-8)
+      return false;
   }
   return true;
+}
+
+void Lite6CTCController::populate_goal_tolerances(
+  const FollowTrajectory::Goal & goal, TrajectoryExecution & exec) const
+{
+  for (size_t i = 0; i < joint_names_.size(); ++i) {
+    exec.path_pos_tol[i] = path_position_tolerance_[i];
+    exec.path_vel_tol[i] = path_velocity_tolerance_[i];
+    exec.goal_pos_tol[i] = goal_position_tolerance_[i];
+    exec.goal_vel_tol[i] = goal_velocity_tolerance_[i];
+  }
+  exec.goal_time_tol = goal_time_tolerance_;
+
+  for (const auto & tol : goal.path_tolerance) {
+    const auto it = std::find(joint_names_.begin(), joint_names_.end(), tol.name);
+    if (it != joint_names_.end()) {
+      const size_t idx = static_cast<size_t>(std::distance(joint_names_.begin(), it));
+      if (tol.position > 0.0) exec.path_pos_tol[idx] = tol.position;
+      if (tol.velocity > 0.0) exec.path_vel_tol[idx] = tol.velocity;
+    }
+  }
+  for (const auto & tol : goal.goal_tolerance) {
+    const auto it = std::find(joint_names_.begin(), joint_names_.end(), tol.name);
+    if (it != joint_names_.end()) {
+      const size_t idx = static_cast<size_t>(std::distance(joint_names_.begin(), it));
+      if (tol.position > 0.0) {
+        exec.goal_pos_tol[idx] = std::min(tol.position, exec.path_pos_tol[idx]);
+      }
+      if (tol.velocity > 0.0) {
+        exec.goal_vel_tol[idx] = std::min(tol.velocity, exec.path_vel_tol[idx]);
+      }
+    }
+  }
+  const double custom_goal_time = seconds(goal.goal_time_tolerance);
+  if (custom_goal_time >= goal_settle_duration_ && custom_goal_time <= 10.0) {
+    exec.goal_time_tol = custom_goal_time;
+  }
 }
 
 void Lite6CTCController::configure_trajectory_action()
@@ -98,6 +180,7 @@ void Lite6CTCController::configure_trajectory_action()
         retired_trajectories_.push_back(std::move(active_trajectory_));
       }
       active_trajectory_ = std::make_shared<TrajectoryExecution>(goal);
+      populate_goal_tolerances(*goal->get_goal(), *active_trajectory_);
       if (!trajectory_enabled_.load()) {
         active_trajectory_->result.store(TrajectoryResult::DEACTIVATED);
       }
@@ -115,9 +198,13 @@ void Lite6CTCController::update_trajectory_reference(
 {
   // The non-RT buffer retains ownership; no allocations, action calls or blocking locks here.
   auto * execution = current_execution_;
-  if (!execution || execution->result.load() != TrajectoryResult::RUNNING) return;
+  if (!execution || execution->result.load() != TrajectoryResult::RUNNING) {
+    tau_point_ff_.setZero();
+    return;
+  }
   const size_t n = joint_names_.size();
   if (execution->cancel.load()) {
+    tau_point_ff_.setZero();
     if (!execution->started) {
       execution->cancel_applied = true;
       return;
@@ -137,10 +224,12 @@ void Lite6CTCController::update_trajectory_reference(
     }
     return;
   }
-  if (execution->started) execution->elapsed += period.seconds();
-  else {
+  if (execution->started) {
+    execution->elapsed += period.seconds();
+  } else {
     if (system_state_ != SystemState::NORMAL && system_state_ != SystemState::SYS_ID) {
       execution->result.store(TrajectoryResult::MODE_CHANGED);
+      tau_point_ff_.setZero();
       return;
     }
     execution->started = true;
@@ -148,7 +237,10 @@ void Lite6CTCController::update_trajectory_reference(
     execution->start_mode = static_cast<int>(system_state_);
   }
   // Hold the exact endpoint while the physical robot settles; keep timing it.
-  if (execution->endpoint_applied) return;
+  if (execution->endpoint_applied) {
+    tau_point_ff_.setZero();
+    return;
+  }
 
   const auto & points = execution->goal->get_goal()->trajectory.points;
   size_t index = execution->last_sample_index;
@@ -164,6 +256,8 @@ void Lite6CTCController::update_trajectory_reference(
     reference_interfaces_[i] = point.positions[i];
     reference_interfaces_[n + i] = point.velocities[i];
     reference_interfaces_[2 * n + i] = point.accelerations[i];
+    tau_point_ff_[static_cast<Eigen::Index>(i)] =
+      point.effort.size() == n ? point.effort[i] : 0.0;
   }
   execution->sample.store(index);
   execution->endpoint_applied = index + 1 == points.size();
@@ -196,6 +290,7 @@ void Lite6CTCController::request_execution_stop()
 {
   rigid_cancel_braking_ = false;
   rigid_cancel_elapsed_ = 0.0;
+  tau_point_ff_.setZero();
   if (system_state_ != SystemState::ESTOP) {
     // Invalid feedback is handled by fail_controller(), not fed into the brake tracker.
     begin_deceleration_tracker();
@@ -232,6 +327,7 @@ controller_interface::return_type Lite6CTCController::fail_controller(
   }
   fail_impedance_trajectory(imp_reason, joint);
   integral_effort_.setZero();
+  tau_point_ff_.setZero();
   tau_cmd_.setZero();
   // Best effort only: an inaccessible interface cannot be made writable here.
   // ERROR asks controller_manager to deactivate this controller as well.
@@ -254,16 +350,20 @@ void Lite6CTCController::check_trajectory_path()
   }
   const size_t n = joint_names_.size();
   for (size_t i = 0; i < n; ++i) {
+    const double pos_tol = execution->path_pos_tol[i] > 0.0 ?
+      execution->path_pos_tol[i] : path_position_tolerance_[i];
+    const double vel_tol = execution->path_vel_tol[i] > 0.0 ?
+      execution->path_vel_tol[i] : path_velocity_tolerance_[i];
     const double position_error = std::abs(reference_interfaces_[i] - q_[i]);
     const double velocity_error = std::abs(reference_interfaces_[n + i] - dq_[i]);
-    if (position_error > path_position_tolerance_[i]) {
+    if (position_error > pos_tol) {
       fail_trajectory(TrajectoryResult::PATH_POSITION, static_cast<int>(i),
-        position_error, path_position_tolerance_[i]);
+        position_error, pos_tol);
       return;
     }
-    if (velocity_error > path_velocity_tolerance_[i]) {
+    if (velocity_error > vel_tol) {
       fail_trajectory(TrajectoryResult::PATH_VELOCITY, static_cast<int>(i),
-        velocity_error, path_velocity_tolerance_[i]);
+        velocity_error, vel_tol);
       return;
     }
   }
@@ -273,18 +373,29 @@ void Lite6CTCController::finish_trajectory_cycle(double dt)
 {
   auto * execution = current_execution_;
   if (!execution || execution->result.load() != TrajectoryResult::RUNNING) return;
+
+  for (size_t i = 0; i < joint_names_.size(); ++i) {
+    const Eigen::Index idx = static_cast<Eigen::Index>(i);
+    execution->actual_pos[i].store(q_[idx], std::memory_order_relaxed);
+    execution->actual_vel[i].store(dq_[idx], std::memory_order_relaxed);
+    execution->actual_eff[i].store(tau_cmd_[idx], std::memory_order_relaxed);
+    execution->error_pos[i].store(e_[idx], std::memory_order_relaxed);
+    execution->error_vel[i].store(de_[idx], std::memory_order_relaxed);
+  }
+
   // Numerical/interface failures have already taken precedence over cancellation.
   if (execution->cancel.load()) {
     if (execution->cancel_applied) {
       const bool settled =
         !execution->started ||
         (estop_dq_.cwiseAbs().maxCoeff() < 1e-4 &&
-         dq_.cwiseAbs().maxCoeff() <= 0.01);
+         dq_.cwiseAbs().maxCoeff() <= lite6_interfaces::contract::kPlannerSettleSpeedRadPerSec);
       const bool mode_left =
         execution->started && system_state_ != static_cast<SystemState>(execution->start_mode);
       if (settled || mode_left) {
         rigid_cancel_braking_ = false;
         rigid_cancel_elapsed_ = 0.0;
+        tau_point_ff_.setZero();
         if (system_state_ == SystemState::NORMAL || system_state_ == SystemState::SYS_ID) {
           const size_t n = joint_names_.size();
           for (size_t i = 0; i < n; ++i) {
@@ -317,18 +428,17 @@ void Lite6CTCController::finish_trajectory_cycle(double dt)
   // static friction can leave a steady position error. Use its own bounded
   // endpoint tolerance for excitation and post-alignment; NORMAL pre/return
   // alignment keeps the precision tolerance. Mode changes still abort above.
-  const auto & position_tolerance =
-    execution->start_mode == static_cast<int>(SystemState::SYS_ID) ?
-    sysid_goal_position_tolerance_ : goal_position_tolerance_;
-  const auto & velocity_tolerance =
-    execution->start_mode == static_cast<int>(SystemState::SYS_ID) ?
-    sysid_goal_velocity_tolerance_ : goal_velocity_tolerance_;
+  const bool is_sysid = (execution->start_mode == static_cast<int>(SystemState::SYS_ID));
   double worst_ratio = 0.0;
   int worst_joint = -1;
   for (size_t i = 0; i < joint_names_.size(); ++i) {
+    const double pos_tol = is_sysid ? sysid_goal_position_tolerance_[i] :
+      (execution->goal_pos_tol[i] > 0.0 ? execution->goal_pos_tol[i] : goal_position_tolerance_[i]);
+    const double vel_tol = is_sysid ? sysid_goal_velocity_tolerance_[i] :
+      (execution->goal_vel_tol[i] > 0.0 ? execution->goal_vel_tol[i] : goal_velocity_tolerance_[i]);
     const double ratio = std::max(
-      std::abs(reference_interfaces_[i] - q_[i]) / position_tolerance[i],
-      std::abs(dq_[i]) / velocity_tolerance[i]);
+      std::abs(reference_interfaces_[i] - q_[i]) / pos_tol,
+      std::abs(dq_[i]) / vel_tol);
     if (ratio > worst_ratio) {worst_ratio = ratio; worst_joint = static_cast<int>(i);}
   }
   // Do not credit an unobserved scheduling gap as continuously settled time.
@@ -341,8 +451,10 @@ void Lite6CTCController::finish_trajectory_cycle(double dt)
     execution->was_settled = false;
   }
   const double end_time = seconds(execution->goal->get_goal()->trajectory.points.back().time_from_start);
+  const double time_tol = execution->goal_time_tol > 0.0 ?
+    execution->goal_time_tol : goal_time_tolerance_;
   // The deadline includes the continuous settling window, not just first entry.
-  if (execution->elapsed > end_time + goal_time_tolerance_) {
+  if (execution->elapsed > end_time + time_tol) {
     fail_trajectory(TrajectoryResult::GOAL_TIMEOUT, worst_joint, worst_ratio, 1.0);
   } else if (execution->settled_duration >= goal_settle_duration_) {
     execution->result.store(TrajectoryResult::SUCCEEDED);
@@ -377,7 +489,23 @@ void Lite6CTCController::monitor_trajectory()
       auto feedback = std::make_shared<FollowTrajectory::Feedback>();
       feedback->header.stamp = node_clock_ ? node_clock_->now() : get_node()->now();
       feedback->joint_names = joint_names_;
-      feedback->desired = goal->get_goal()->trajectory.points[execution->sample.load()];
+      const size_t sample_idx = execution->sample.load();
+      feedback->desired = goal->get_goal()->trajectory.points[sample_idx];
+      const size_t n = joint_names_.size();
+      feedback->actual.time_from_start = feedback->desired.time_from_start;
+      feedback->actual.positions.resize(n);
+      feedback->actual.velocities.resize(n);
+      feedback->actual.effort.resize(n);
+      feedback->error.time_from_start = feedback->desired.time_from_start;
+      feedback->error.positions.resize(n);
+      feedback->error.velocities.resize(n);
+      for (size_t i = 0; i < n; ++i) {
+        feedback->actual.positions[i] = execution->actual_pos[i].load(std::memory_order_relaxed);
+        feedback->actual.velocities[i] = execution->actual_vel[i].load(std::memory_order_relaxed);
+        feedback->actual.effort[i] = execution->actual_eff[i].load(std::memory_order_relaxed);
+        feedback->error.positions[i] = execution->error_pos[i].load(std::memory_order_relaxed);
+        feedback->error.velocities[i] = execution->error_vel[i].load(std::memory_order_relaxed);
+      }
       goal->publish_feedback(feedback);
     }
     return;

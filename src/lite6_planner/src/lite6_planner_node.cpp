@@ -381,6 +381,12 @@ private:
       std::lock_guard<std::mutex> transition(transition_mutex_);
       if(!supervisor_.request_cancel(key)) return rclcpp_action::CancelResponse::REJECT;
     }
+    if(gh&&gh->is_active()) {
+      auto fb=std::make_shared<Motion::Feedback>();
+      fb->current_state=Motion::Feedback::STATE_CANCELING;
+      fb->percent_complete=0.0;
+      gh->publish_feedback(fb);
+    }
     cancel_ctc(key);publish_state();
     return rclcpp_action::CancelResponse::ACCEPT;
   }
@@ -416,6 +422,12 @@ private:
   void compute_and_dispatch(const std::shared_ptr<MotionHandle>& gh) {
     const auto key=hex_uuid(gh->get_goal_id());
     try {
+      if(gh&&gh->is_active()) {
+        auto plan_fb=std::make_shared<Motion::Feedback>();
+        plan_fb->current_state=Motion::Feedback::STATE_PLANNING;
+        plan_fb->percent_complete=0.0;
+        gh->publish_feedback(plan_fb);
+      }
       MotionPlanner::InitialState start;
       double dummy_speed=0.0; uint64_t dummy_seq=0; int64_t dummy_ns=0;
       if(!read_shm_joints(start,dummy_speed,dummy_seq,dummy_ns)) {

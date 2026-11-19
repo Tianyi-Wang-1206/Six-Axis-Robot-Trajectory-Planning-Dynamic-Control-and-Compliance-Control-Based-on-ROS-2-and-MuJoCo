@@ -370,7 +370,8 @@ private:
         const std::string & id = peek().lexeme;
         if (id == "joint" || id == "pose" || id == "MoveJ" || id == "MoveP" ||
             id == "MoveL" || id == "MoveC" || id == "MovePVA" ||
-            id == "ImpedanceCartesian" || id == "Gripper" || id == "Wait") {
+            id == "ImpedanceCartesian" || id == "Gripper" || id == "Wait" ||
+            id == "SetPayload") {
           return;
         }
       }
@@ -837,13 +838,14 @@ private:
               "Translational stiffness 'kt'=" + std::to_string(v) + " N/m must lie in [0.0, 1000.0]");
           }
         }
-      } else if (key.lexeme == "dt") {
+      } else if (key.lexeme == "dt" || key.lexeme == "zeta_t") {
         params.dt = parse_scalar_or_vec3(block_idx);
         for (double v : params.dt) {
-          if (v < 1.0 || v > 100.0) {
+          if (v < 0.1 || v > 2.0) {
             throw ParseError(
               D::STAGE_SEMANTIC, key.line, key.column, block_idx, "ERR_IMPEDANCE_GAIN",
-              "Translational damping 'dt'=" + std::to_string(v) + " N*s/m must lie in [1.0, 100.0]");
+              "Translational damping ratio '" + key.lexeme + "'=" + std::to_string(v) +
+                " must lie in [0.1, 2.0]");
           }
         }
       } else if (key.lexeme == "kr") {
@@ -855,15 +857,24 @@ private:
               "Rotational stiffness 'kr'=" + std::to_string(v) + " Nm/rad must lie in [0.0, 50.0]");
           }
         }
-      } else if (key.lexeme == "dr") {
+      } else if (key.lexeme == "dr" || key.lexeme == "zeta_r") {
         params.dr = parse_scalar_or_vec3(block_idx);
         for (double v : params.dr) {
-          if (v < 0.1 || v > 20.0) {
+          if (v < 0.1 || v > 2.0) {
             throw ParseError(
               D::STAGE_SEMANTIC, key.line, key.column, block_idx, "ERR_IMPEDANCE_GAIN",
-              "Rotational damping 'dr'=" + std::to_string(v) + " Nm*s/rad must lie in [0.1, 20.0]");
+              "Rotational damping ratio '" + key.lexeme + "'=" + std::to_string(v) +
+                " must lie in [0.1, 2.0]");
           }
         }
+      } else if (key.lexeme == "null_stiffness") {
+        const Token & num = expect(TokenKind::NUMBER, "null_stiffness value", block_idx);
+        if (num.number < 0.0 || num.number > 50.0) {
+          throw ParseError(
+            D::STAGE_SEMANTIC, key.line, key.column, block_idx, "ERR_IMPEDANCE_GAIN",
+            "Parameter 'null_stiffness'=" + std::to_string(num.number) + " must lie in [0.0, 50.0]");
+        }
+        params.null_stiffness = num.number;
       } else if (key.lexeme == "null_damping") {
         const Token & num = expect(TokenKind::NUMBER, "null_damping value", block_idx);
         if (num.number < 0.0 || num.number > 20.0) {
@@ -880,6 +891,31 @@ private:
             "Parameter 'transition_time'=" + std::to_string(num.number) + " s must lie in [0.01, 5.0]");
         }
         params.transition_time = num.number;
+      } else if (key.lexeme == "wrench_ff") {
+        params.wrench_ff = parse_fixed_vector<6>(block_idx);
+        for (int i = 0; i < 3; ++i) {
+          if (std::abs(params.wrench_ff[static_cast<size_t>(i)]) > 30.0) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, key.line, key.column, block_idx, "ERR_IMPEDANCE_GAIN",
+              "Feedforward force component in 'wrench_ff' must lie in [-30.0, 30.0] N");
+          }
+          if (std::abs(params.wrench_ff[static_cast<size_t>(i + 3)]) > 5.0) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, key.line, key.column, block_idx, "ERR_IMPEDANCE_GAIN",
+              "Feedforward torque component in 'wrench_ff' must lie in [-5.0, 5.0] Nm");
+          }
+        }
+      } else if (key.lexeme == "hold") {
+        const Token & b = expect(TokenKind::IDENT, "'true' or 'false'", block_idx);
+        if (b.lexeme == "true") {
+          params.end_behavior = 1;
+        } else if (b.lexeme == "false") {
+          params.end_behavior = 0;
+        } else {
+          throw ParseError(
+            D::STAGE_SEMANTIC, b.line, b.column, block_idx, "ERR_BOOL_VALUE",
+            "Parameter 'hold' requires 'true' or 'false'");
+        }
       } else {
         throw ParseError(
           D::STAGE_SEMANTIC, key.line, key.column, block_idx, "ERR_UNKNOWN_PARAM",
@@ -909,6 +945,8 @@ private:
         block_stmt.body.push_back(parse_gripper_stmt(inner_kw));
       } else if (inner_kw.lexeme == "Wait") {
         block_stmt.body.push_back(parse_wait_stmt(inner_kw));
+      } else if (inner_kw.lexeme == "SetPayload") {
+        block_stmt.body.push_back(parse_set_payload_stmt(inner_kw));
       } else {
         throw ParseError(
           D::STAGE_SEMANTIC, inner_kw.line, inner_kw.column, next_stmt_index_,
@@ -1038,6 +1076,76 @@ private:
     return st;
   }
 
+  ASTStatement parse_set_payload_stmt(const Token & kw)
+  {
+    const int stmt_idx = next_stmt_index_++;
+    expect(TokenKind::LPAREN, "'(' after SetPayload", stmt_idx);
+    PayloadStatement p;
+    p.loc = {kw.line, kw.column, stmt_idx, line_snippet(kw.line)};
+    bool has_mass = false;
+
+    while (peek().kind != TokenKind::RPAREN && !at_eof()) {
+      if (peek().kind == TokenKind::IDENT && peek(1).kind == TokenKind::EQUALS) {
+        const Token & key = advance();
+        advance();  // '='
+        if (key.lexeme == "mass") {
+          const Token & num = expect(TokenKind::NUMBER, "payload mass [kg]", stmt_idx);
+          if (num.number < 0.0 || num.number > 2.0) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, num.line, num.column, stmt_idx, "ERR_PAYLOAD_RANGE",
+              "Payload 'mass'=" + std::to_string(num.number) + " kg must lie in [0.0, 2.0]");
+          }
+          p.mass_kg = num.number;
+          has_mass = true;
+        } else if (key.lexeme == "com") {
+          p.com_tcp = parse_fixed_vector<3>(stmt_idx);
+          const double r2 =
+            p.com_tcp[0] * p.com_tcp[0] +
+            p.com_tcp[1] * p.com_tcp[1] +
+            p.com_tcp[2] * p.com_tcp[2];
+          if (r2 > 0.30 * 0.30) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_PAYLOAD_RANGE",
+              "Payload 'com' offset norm=" + std::to_string(std::sqrt(r2)) +
+                " m exceeds maximum 0.30 m");
+          }
+        } else {
+          throw ParseError(
+            D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_UNKNOWN_PARAM",
+            "Unknown SetPayload parameter '" + key.lexeme + "'; expected 'mass' or 'com'");
+        }
+      } else if (!has_mass && peek().kind == TokenKind::NUMBER) {
+        const Token & num = advance();
+        if (num.number < 0.0 || num.number > 2.0) {
+          throw ParseError(
+            D::STAGE_SEMANTIC, num.line, num.column, stmt_idx, "ERR_PAYLOAD_RANGE",
+            "Payload 'mass'=" + std::to_string(num.number) + " kg must lie in [0.0, 2.0]");
+        }
+        p.mass_kg = num.number;
+        has_mass = true;
+      } else {
+        throw ParseError(
+          D::STAGE_LEX_SYNTAX, peek().line, peek().column, stmt_idx, "ERR_SYNTAX",
+          "Invalid argument in SetPayload(...); expected mass=<kg>[, com=[x, y, z]]");
+      }
+      if (!match(TokenKind::COMMA)) {
+        break;
+      }
+    }
+    expect(TokenKind::RPAREN, "')' to close SetPayload(...)", stmt_idx);
+    if (!has_mass) {
+      throw ParseError(
+        D::STAGE_SEMANTIC, kw.line, kw.column, stmt_idx, "ERR_MISSING_PAYLOAD_MASS",
+        "SetPayload(...) requires 'mass=<kg>' in [0.0, 2.0]");
+    }
+
+    ASTStatement st;
+    st.kind = StatementKind::SET_PAYLOAD;
+    st.loc = p.loc;
+    st.payload_stmt = p;
+    return st;
+  }
+
   void parse_top_level(ASTProgram & prog)
   {
     const Token & kw = expect(TokenKind::IDENT, "statement or declaration keyword", -1);
@@ -1071,6 +1179,8 @@ private:
       prog.statements.push_back(parse_gripper_stmt(kw));
     } else if (kw.lexeme == "Wait") {
       prog.statements.push_back(parse_wait_stmt(kw));
+    } else if (kw.lexeme == "SetPayload") {
+      prog.statements.push_back(parse_set_payload_stmt(kw));
     } else {
       throw ParseError(
         D::STAGE_LEX_SYNTAX, kw.line, kw.column, -1, "ERR_UNKNOWN_COMMAND",

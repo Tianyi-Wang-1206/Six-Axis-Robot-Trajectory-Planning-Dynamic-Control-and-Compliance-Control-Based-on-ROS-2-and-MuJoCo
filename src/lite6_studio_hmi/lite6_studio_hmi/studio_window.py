@@ -461,8 +461,11 @@ class StudioMainWindow(QMainWindow):
         self.btn_insert_joints.setToolTip("Insert live measured joint vector into editor")
         self.btn_insert_pose = QPushButton("+ TCP Pose")
         self.btn_insert_pose.setToolTip("Insert live measured TCP Pose(...) into editor")
+        self.btn_insert_payload = QPushButton("+ Payload")
+        self.btn_insert_payload.setToolTip("Insert SetPayload(mass=..., com=[...]) statement into editor")
         outer.addWidget(self.btn_insert_joints)
         outer.addWidget(self.btn_insert_pose)
+        outer.addWidget(self.btn_insert_payload)
 
         self.chk_use_current_start = QCheckBox("Use Live Start Pose")
         self.chk_use_current_start.setChecked(True)
@@ -645,6 +648,9 @@ class StudioMainWindow(QMainWindow):
         self.lbl_ext_tau = QLabel("[+0.00, +0.00, +0.00, +0.00, +0.00, +0.00] Nm")
         self.lbl_ext_tau.setFont(QFont(_MONO_FONT_FAMILY, 9))
         self.lbl_ext_tau.setWordWrap(True)
+        self.lbl_payload_info = QLabel("0.000 kg | CoM: [0.0, 0.0, 0.0] mm")
+        self.lbl_payload_info.setFont(QFont(_MONO_FONT_FAMILY, 9))
+        self.lbl_payload_info.setWordWrap(True)
 
         c_grid.addWidget(_key_label("CTC Mode:"), 0, 0)
         c_grid.addWidget(self.lbl_ctrl_mode, 0, 1)
@@ -658,6 +664,8 @@ class StudioMainWindow(QMainWindow):
         c_grid.addWidget(self.lbl_ext_wrench, 4, 1)
         c_grid.addWidget(_key_label("GMO Ext Tau:"), 5, 0, Qt.AlignTop)
         c_grid.addWidget(self.lbl_ext_tau, 5, 1)
+        c_grid.addWidget(_key_label("Active Payload:"), 6, 0, Qt.AlignTop)
+        c_grid.addWidget(self.lbl_payload_info, 6, 1)
         ctrl_v.addLayout(c_grid)
         layout.addWidget(ctrl_card)
 
@@ -746,6 +754,7 @@ class StudioMainWindow(QMainWindow):
         self.btn_load_preset.clicked.connect(self._on_load_preset)
         self.btn_insert_joints.clicked.connect(self._on_insert_joints)
         self.btn_insert_pose.clicked.connect(self._on_insert_pose)
+        self.btn_insert_payload.clicked.connect(self._on_insert_payload)
 
         self.btn_compile.clicked.connect(self.trigger_compile)
         self.btn_run_resume.clicked.connect(self._on_run_or_resume)
@@ -792,6 +801,7 @@ class StudioMainWindow(QMainWindow):
         )
 
         self.worker.studio_state_updated.connect(self.on_studio_state)
+        self.worker.controller_status_updated.connect(self.on_controller_status)
         self.worker.gripper_state_updated.connect(self.on_gripper_state)
         self.worker.telemetry_updated.connect(self.on_telemetry)
         self.worker.compile_finished.connect(self.on_compile_finished)
@@ -845,6 +855,7 @@ class StudioMainWindow(QMainWindow):
             self.btn_load_preset,
             self.btn_insert_joints,
             self.btn_insert_pose,
+            self.btn_insert_payload,
         ):
             btn.setEnabled(not active_exec)
         self.btn_compile.setEnabled(can_compile if online else True)
@@ -947,6 +958,9 @@ class StudioMainWindow(QMainWindow):
             f"rpy=[{r:.5f}, {p:.5f}, {w:.5f}]), vel=0.40, acc=0.40)\n"
         )
         self.editor.insert_snippet_at_cursor(snippet)
+
+    def _on_insert_payload(self):
+        self.editor.insert_snippet_at_cursor("SetPayload(mass=0.50, com=[0.0, 0.0, 0.0])\n")
 
     def trigger_compile(self):
         self._compile_in_flight = True
@@ -1145,6 +1159,13 @@ class StudioMainWindow(QMainWindow):
             self.lbl_compile_summary.setStyleSheet("color: #475569; font-weight: 600;")
 
         self._refresh_button_states()
+
+    def on_controller_status(self, msg):
+        mass = float(msg.payload_mass)
+        com = list(msg.payload_com_tcp)
+        self.lbl_payload_info.setText(
+            f"{mass:.3f} kg | CoM: [{com[0]*1000.0:+.1f}, {com[1]*1000.0:+.1f}, {com[2]*1000.0:+.1f}] mm"
+        )
 
     def on_gripper_state(self, msg):
         gname, gbg = _GRIPPER_STATE_NAMES.get(msg.state, (f"STATE_{msg.state}", "#64748B"))

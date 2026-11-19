@@ -35,13 +35,13 @@ inline constexpr double kMaxJointDamping = 20.0;
 
 inline constexpr double kMinTranslationStiffness = 0.0;
 inline constexpr double kMaxTranslationStiffness = 1000.0;
-inline constexpr double kMinTranslationDamping = 1.0;
-inline constexpr double kMaxTranslationDamping = 100.0;
+inline constexpr double kMinTranslationDamping = 0.1;
+inline constexpr double kMaxTranslationDamping = 2.0;
 
 inline constexpr double kMinRotationStiffness = 0.0;
 inline constexpr double kMaxRotationStiffness = 50.0;
 inline constexpr double kMinRotationDamping = 0.1;
-inline constexpr double kMaxRotationDamping = 20.0;
+inline constexpr double kMaxRotationDamping = 2.0;
 
 inline constexpr double kMinComplianceSensitivity = 1.0;
 inline constexpr double kMaxComplianceSensitivity = 5.0;

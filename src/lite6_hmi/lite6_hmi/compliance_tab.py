@@ -34,12 +34,14 @@ class ComplianceTab(QWidget):
         definitions = [
             ("Joint gains", [("joint_stiffness", "Stiffness (Nm/rad)", 0, 100, 20),
                              ("joint_damping", "Damping (Nm s/rad)", .1, 20, 3)]),
-            ("Cartesian gains (world-aligned)", [
+            ("Cartesian gains (world-aligned, equal damping ratio)", [
                 ("translation_stiffness", "Translation stiffness (N/m)", 0, 1000, 200),
-                ("translation_damping", "Translation damping (N s/m)", 1, 100, 25),
+                ("translation_damping", "Translation damping ratio (ζ_t)", .1, 2.0, .8),
                 ("rotation_stiffness", "Rotation stiffness (Nm/rad)", 0, 50, 8),
-                ("rotation_damping", "Rotation damping (Nm s/rad)", .1, 20, 1.5)]),
-            ("Teaching sensitivity", [("sensitivity", "1 = firm, 5 = light", 1, 5, 3)])]
+                ("rotation_damping", "Rotation damping ratio (ζ_r)", .1, 2.0, .8),
+                ("nullspace_stiffness", "Null-space stiffness (Nm/rad)", 0, 50, 0.0),
+                ("nullspace_damping", "Null-space damping (Nm s/rad)", 0, 20, 0.5)]),
+            ("Teaching sensitivity (diag(M)-normalized)", [("sensitivity", "1 = firm, 5 = light", 1, 5, 3)])]
         for title, fields in definitions:
             group = QGroupBox(title)
             form = QFormLayout(group)
@@ -79,6 +81,10 @@ class ComplianceTab(QWidget):
         )
         obs_head.addWidget(self.ext_wrench_label, 1)
         obs_head.addWidget(self.contact_badge)
+        self.btn_tare_gmo = QPushButton("Tare GMO")
+        self.btn_tare_gmo.setToolTip("Capture stationary GMO residual torque bias as zero reference")
+        self.btn_tare_gmo.clicked.connect(self.tare_gmo)
+        obs_head.addWidget(self.btn_tare_gmo)
         obs_layout.addLayout(obs_head)
         self.ext_tau_label = QLabel("Ext Joint Tau (Nm): [ +0.00,  +0.00,  +0.00,  +0.00,  +0.00,  +0.00]")
         self.ext_tau_label.setFont(QFont("Consolas", 9))
@@ -148,6 +154,13 @@ class ComplianceTab(QWidget):
                 expected_rev = int(self.worker.supervisor_state.revision)
         self.request(C.Request.CMD_EXIT_COMPLIANCE, expected_revision=expected_rev)
 
+    def tare_gmo(self):
+        expected_rev = 0
+        with self.worker.state_lock:
+            if self.worker.supervisor_state is not None:
+                expected_rev = int(self.worker.supervisor_state.revision)
+        self.request(C.Request.CMD_TARE_GMO, expected_revision=expected_rev)
+
     def _on_command_done(self):
         self.pending = False
         self.refresh()
@@ -172,6 +185,7 @@ class ComplianceTab(QWidget):
             ready = fresh and not state.estop_latched and not self.pending
             self.apply.setEnabled(bool(ready and (active or state.motion_allowed)))
             self.exit.setEnabled(bool(ready and active))
+            self.btn_tare_gmo.setEnabled(bool(ready and (active or state.motion_allowed)))
             teach = fresh and state.mode == S.MODE_TEACH
             recording = self.worker.teaching
             if not teach:

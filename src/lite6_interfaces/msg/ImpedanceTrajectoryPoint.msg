@@ -11,13 +11,13 @@ float64[6] accelerations
 # Per-axis translational stiffness [N/m] in LOCAL_WORLD_ALIGNED frame, range [0.0, 1000.0].
 float64[3] translation_stiffness
 
-# Per-axis translational damping [N*s/m] in LOCAL_WORLD_ALIGNED frame, range [1.0, 100.0].
+# Per-axis translational damping ratio zeta_t [-] in LOCAL_WORLD_ALIGNED frame, range [0.1, 2.0].
 float64[3] translation_damping
 
 # Per-axis rotational stiffness [Nm/rad] in LOCAL_WORLD_ALIGNED frame, range [0.0, 50.0].
 float64[3] rotation_stiffness
 
-# Per-axis rotational damping [Nm*s/rad] in LOCAL_WORLD_ALIGNED frame, range [0.1, 20.0].
+# Per-axis rotational damping ratio zeta_r [-] in LOCAL_WORLD_ALIGNED frame, range [0.1, 2.0].
 float64[3] rotation_damping
 
 # Joint-space null damping [Nm*s/rad] relative to reference joint velocity, range [0.0, 20.0].

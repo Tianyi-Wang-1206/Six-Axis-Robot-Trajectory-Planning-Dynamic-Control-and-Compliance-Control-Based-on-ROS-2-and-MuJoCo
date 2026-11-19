@@ -815,6 +815,78 @@ private:
     }
   }
 
+  bool ensure_controller_normal(uint64_t session, std::string & out_err)
+  {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
+    auto last_send = std::chrono::steady_clock::time_point{};
+    while (rclcpp::ok() && !worker_exit_) {
+      if (session != supervisor_->active_session()) {
+        return false;
+      }
+      const auto snap = supervisor_->snapshot();
+      if (snap.controller_mode == ControllerStatus::MODE_NORMAL) {
+        return true;
+      }
+      if (snap.controller_mode == ControllerStatus::MODE_ESTOP) {
+        return false;
+      }
+      if (snap.controller_mode == ControllerStatus::MODE_CARTESIAN_IMPEDANCE) {
+        const auto now_tp = std::chrono::steady_clock::now();
+        if (last_send == std::chrono::steady_clock::time_point{} ||
+            (now_tp - last_send) > std::chrono::milliseconds(300))
+        {
+          uint8_t ack = ControllerCommand::Response::ACK_NONE;
+          uint8_t ack_mode = ControllerStatus::MODE_UNKNOWN;
+          std::string msg;
+          const bool ok = send_controller_command_sync(
+            ControllerCommand::Request::CMD_ENTER_NORMAL,
+            snap.controller_epoch,
+            "Studio exiting held Cartesian impedance to MODE_NORMAL",
+            ack, msg, &ack_mode);
+          last_send = now_tp;
+          const bool transient =
+            ok ||
+            ack == ControllerCommand::Response::ACK_REJECTED_BUSY ||
+            ack == ControllerCommand::Response::ACK_RT_TIMEOUT ||
+            (ack == ControllerCommand::Response::ACK_REJECTED_STATE &&
+             (ack_mode == ControllerStatus::MODE_NORMAL ||
+              ack_mode == ControllerStatus::MODE_COMPLIANCE_STOPPING));
+          if (!transient) {
+            out_err = msg.empty() ?
+              "Controller rejected CMD_ENTER_NORMAL while exiting impedance hold" : msg;
+            return false;
+          }
+        }
+      } else if (snap.controller_mode != ControllerStatus::MODE_COMPLIANCE_STOPPING) {
+        out_err = "Controller in unexpected mode while returning to MODE_NORMAL";
+        return false;
+      }
+
+      if (std::chrono::steady_clock::now() > deadline) {
+        out_err = "Timed out waiting for controller to return to MODE_NORMAL after impedance hold";
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+  }
+
+  bool ensure_normal_or_fault(uint64_t session, int32_t err_code)
+  {
+    std::string norm_err;
+    if (ensure_controller_normal(session, norm_err)) {
+      return true;
+    }
+    if (!norm_err.empty() && session == supervisor_->active_session() &&
+        supervisor_->current_state() != StudioState::STATE_ESTOP)
+    {
+      StudioSupervisor::Effects eff;
+      supervisor_->on_execution_fault(session, err_code, norm_err, false, eff);
+      apply_effects(eff);
+    }
+    return false;
+  }
+
   void execute_program(uint64_t session)
   {
     std::shared_ptr<const CompiledProgram> prog;
@@ -861,12 +933,18 @@ private:
         return;
       }
       if (supervisor_->stop_requested(session)) {
+        if (!ensure_normal_or_fault(session, -38)) {
+          return;
+        }
         std::lock_guard<std::mutex> lock(exec_mutex_);
         reset_exec_cursor_unlocked();
         supervisor_->on_stop_completed(session);
         return;
       }
       if (supervisor_->pause_requested(session)) {
+        if (!ensure_normal_or_fault(session, -38)) {
+          return;
+        }
         const auto & ref_blk = resume_mid ? paused_blk : prog->blocks[block_idx];
         std::lock_guard<std::mutex> lock(exec_mutex_);
         exec_block_idx_ = block_idx;
@@ -915,6 +993,17 @@ private:
         }
         resume_mid = false;
         resume_wait_sec = -1.0;
+      }
+
+      // If a previous ImpedanceCartesian(..., hold=true) left the controller in
+      // MODE_CARTESIAN_IMPEDANCE, return cleanly to MODE_NORMAL before dispatching
+      // the next rigid or impedance trajectory (or alignment bridge).
+      if (block_to_run.type == ExecutionBlockType::RIGID_TRAJECTORY ||
+          block_to_run.type == ExecutionBlockType::IMPEDANCE_TRAJECTORY)
+      {
+        if (!ensure_normal_or_fault(session, -38)) {
+          return;
+        }
       }
 
       // Pre-execution joint alignment bridge or post-impedance start-pose replanning
@@ -1039,6 +1128,10 @@ private:
         if (!execute_wait_block(session, block_to_run, block_idx, calc_total_pct)) {
           return;
         }
+      } else if (block_to_run.type == ExecutionBlockType::PAYLOAD_CMD) {
+        if (!execute_payload_block(session, block_to_run, block_idx, calc_total_pct)) {
+          return;
+        }
       }
 
       // Block succeeded: advance cursor
@@ -1056,6 +1149,9 @@ private:
       }
 
       if (supervisor_->stop_requested(session)) {
+        if (!ensure_normal_or_fault(session, -38)) {
+          return;
+        }
         std::lock_guard<std::mutex> lock(exec_mutex_);
         reset_exec_cursor_unlocked();
         supervisor_->on_stop_completed(session);
@@ -1063,6 +1159,9 @@ private:
       }
 
       if (supervisor_->is_step_mode(session)) {
+        if (!ensure_normal_or_fault(session, -38)) {
+          return;
+        }
         const bool more = block_idx < total_blocks;
         const int32_t next_line = more ? prog->blocks[block_idx].loc.line : 0;
         const int32_t next_stmt = more ? prog->blocks[block_idx].loc.statement_index : -1;
@@ -1073,6 +1172,9 @@ private:
       }
 
       if (supervisor_->pause_requested(session) && block_idx < total_blocks) {
+        if (!ensure_normal_or_fault(session, -38)) {
+          return;
+        }
         supervisor_->on_pause_settled(
           session, prog->blocks[block_idx].loc.line,
           prog->blocks[block_idx].loc.statement_index,
@@ -1082,6 +1184,9 @@ private:
     }
 
     if (session == supervisor_->active_session()) {
+      if (!ensure_normal_or_fault(session, -38)) {
+        return;
+      }
       {
         std::lock_guard<std::mutex> lock(exec_mutex_);
         reset_exec_cursor_unlocked();
@@ -1209,12 +1314,18 @@ private:
       return true;
     }
     if (supervisor_->stop_requested(session)) {
+      if (!ensure_normal_or_fault(session, -38)) {
+        return false;
+      }
       std::lock_guard<std::mutex> lock(exec_mutex_);
       reset_exec_cursor_unlocked();
       supervisor_->on_stop_completed(session);
       return false;
     }
     if (outcome == ActionOutcome::CANCELED) {
+      if (!ensure_normal_or_fault(session, -38)) {
+        return false;
+      }
       const size_t safe_idx = (total_pts > 0) ? std::min(sample_idx, total_pts - 1) : 0;
       const double frac =
         (total_pts > 1) ? static_cast<double>(safe_idx) / static_cast<double>(total_pts - 1) : 0.0;
@@ -1302,6 +1413,9 @@ private:
 
     while (rclcpp::ok() && session == supervisor_->active_session()) {
       if (supervisor_->stop_requested(session)) {
+        if (!ensure_normal_or_fault(session, -38)) {
+          return false;
+        }
         std::lock_guard<std::mutex> lock(exec_mutex_);
         reset_exec_cursor_unlocked();
         supervisor_->on_stop_completed(session);
@@ -1397,12 +1511,18 @@ private:
         return true;
       }
       if (supervisor_->stop_requested(session)) {
+        if (!ensure_normal_or_fault(session, -38)) {
+          return false;
+        }
         std::lock_guard<std::mutex> lock(exec_mutex_);
         reset_exec_cursor_unlocked();
         supervisor_->on_stop_completed(session);
         return false;
       }
       if (supervisor_->pause_requested(session)) {
+        if (!ensure_normal_or_fault(session, -38)) {
+          return false;
+        }
         const double remaining = std::max(0.0, dur - elapsed);
         const double frac = (dur > 1e-6) ? std::clamp(elapsed / dur, 0.0, 1.0) : 1.0;
         {
@@ -1424,6 +1544,72 @@ private:
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     return false;
+  }
+
+  bool execute_payload_block(
+    uint64_t session,
+    const ExecutionBlock & blk,
+    size_t block_idx,
+    const std::function<double(size_t, double)> & calc_total_pct)
+  {
+    supervisor_->update_execution_progress(
+      session, blk.loc.line, blk.loc.statement_index,
+      static_cast<int32_t>(block_idx), 20.0, calc_total_pct(block_idx, 0.2));
+
+    // Wait briefly if needed so the controller's busy flag has cleared.
+    for (int wait_i = 0; wait_i < 20; ++wait_i) {
+      std::array<double, 6> q_tmp{};
+      double max_dq = 0.0;
+      if (get_latest_joint_state(q_tmp, max_dq) && max_dq <= 0.03) {
+        break;
+      }
+      if (session != supervisor_->active_session() || supervisor_->stop_requested(session)) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+
+    if (!ctc_cmd_client_->wait_for_service(std::chrono::milliseconds(250))) {
+      StudioSupervisor::Effects eff;
+      supervisor_->on_execution_fault(
+        session, -35, "/ctc_controller/command service unavailable for SetPayload", false, eff);
+      apply_effects(eff);
+      return false;
+    }
+
+    auto req = std::make_shared<ControllerCommand::Request>();
+    req->command = ControllerCommand::Request::CMD_SET_PAYLOAD;
+    req->expected_epoch = supervisor_->snapshot().controller_epoch;
+    req->payload_mass = blk.payload_cmd.mass_kg;
+    req->payload_com_tcp = blk.payload_cmd.com_tcp;
+    req->reason = "Studio DSL SetPayload";
+
+    auto future = ctc_cmd_client_->async_send_request(req);
+    if (future.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready) {
+      ctc_cmd_client_->remove_pending_request(future);
+      StudioSupervisor::Effects eff;
+      supervisor_->on_execution_fault(
+        session, -36, "Timed out waiting for /ctc_controller/command SetPayload response",
+        false, eff);
+      apply_effects(eff);
+      return false;
+    }
+
+    const auto resp = future.get();
+    if (!resp || !resp->accepted) {
+      StudioSupervisor::Effects eff;
+      supervisor_->on_execution_fault(
+        session, -37,
+        resp ? ("Controller rejected SetPayload: " + resp->message) : "Null SetPayload response",
+        false, eff);
+      apply_effects(eff);
+      return false;
+    }
+
+    supervisor_->update_execution_progress(
+      session, blk.loc.line, blk.loc.statement_index,
+      static_cast<int32_t>(block_idx), 100.0, calc_total_pct(block_idx, 1.0));
+    return true;
   }
 
   lite6_planner::KinematicsEngine kinematics_;

@@ -23,7 +23,8 @@ enum class ExecutionBlockType
   RIGID_TRAJECTORY,
   IMPEDANCE_TRAJECTORY,
   GRIPPER_CMD,
-  WAIT_CMD
+  WAIT_CMD,
+  PAYLOAD_CMD
 };
 
 enum class BlockSourceKind
@@ -68,6 +69,9 @@ struct ExecutionBlock
 
   // Populated when type == WAIT_CMD
   WaitStatement wait_cmd;
+
+  // Populated when type == PAYLOAD_CMD
+  PayloadStatement payload_cmd;
 };
 
 struct CompiledProgram

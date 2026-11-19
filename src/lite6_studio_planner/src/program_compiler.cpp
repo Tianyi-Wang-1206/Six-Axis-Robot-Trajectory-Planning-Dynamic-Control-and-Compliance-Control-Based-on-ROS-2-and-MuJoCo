@@ -92,6 +92,8 @@ void populate_execution_block(
   if (is_impedance) {
     blk.impedance_params = imp_params;
     blk.impedance_goal.joint_names = kJointNames;
+    blk.impedance_goal.transition_time = imp_params.transition_time;
+    blk.impedance_goal.end_behavior = imp_params.end_behavior;
     blk.impedance_goal.points.clear();
     blk.impedance_goal.points.reserve(sampled.samples.size());
     for (const auto & s : sampled.samples) {
@@ -104,7 +106,9 @@ void populate_execution_block(
       pt.translation_damping = imp_params.dt;
       pt.rotation_stiffness = imp_params.kr;
       pt.rotation_damping = imp_params.dr;
+      pt.nullspace_stiffness = imp_params.null_stiffness;
       pt.nullspace_damping = imp_params.null_damping;
+      pt.wrench_ff = imp_params.wrench_ff;
       blk.impedance_goal.points.push_back(pt);
       blk.sample_locations.push_back(s.loc);
     }
@@ -1137,6 +1141,16 @@ bool ProgramCompiler::compile(
         blk.end_joints = curr_q;
         blk.wait_cmd = *st.wait_stmt;
         blk.duration_sec = st.wait_stmt->duration_sec;
+        out_program.blocks.push_back(std::move(blk));
+        ++i;
+      } else if (st.kind == StatementKind::SET_PAYLOAD) {
+        ExecutionBlock blk;
+        blk.type = ExecutionBlockType::PAYLOAD_CMD;
+        blk.loc = st.loc;
+        blk.start_joints = curr_q;
+        blk.end_joints = curr_q;
+        blk.payload_cmd = *st.payload_stmt;
+        blk.duration_sec = 0.05;
         out_program.blocks.push_back(std::move(blk));
         ++i;
       }

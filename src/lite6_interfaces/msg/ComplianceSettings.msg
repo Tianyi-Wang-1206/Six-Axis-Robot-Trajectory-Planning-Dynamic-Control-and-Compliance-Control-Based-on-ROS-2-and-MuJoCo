@@ -2,9 +2,11 @@
 float64 joint_stiffness 20.0
 float64 joint_damping 3.0
 float64 translation_stiffness 200.0
-float64 translation_damping 25.0
+# Dimensionless translational damping ratio zeta_t in [0.1, 2.0].
+float64 translation_damping 0.8
 float64 rotation_stiffness 8.0
-float64 rotation_damping 1.5
+# Dimensionless rotational damping ratio zeta_r in [0.1, 2.0].
+float64 rotation_damping 0.8
 # 1 (firm) to 5 (light): bounded friction assistance and positive damping.
 float64 sensitivity 3.0
 # Same-mode updates preserve the equilibrium unless explicitly requested.

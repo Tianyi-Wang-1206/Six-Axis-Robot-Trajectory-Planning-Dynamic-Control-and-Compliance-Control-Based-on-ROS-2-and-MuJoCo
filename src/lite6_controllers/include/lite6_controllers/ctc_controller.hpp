@@ -47,6 +47,7 @@ protected:
 private:
   using Vec6d = Eigen::Matrix<double, 6, 1>;
   using Vec8d = Eigen::Matrix<double, 8, 1>;
+  using Mat6d = Eigen::Matrix<double, 6, 6>;
   using Mat6x8d = Eigen::Matrix<double, 6, 8>;
 
   using FollowTrajectory = control_msgs::action::FollowJointTrajectory;
@@ -62,6 +63,17 @@ private:
     std::atomic<bool> cancel{false};
     std::atomic<TrajectoryResult> result{TrajectoryResult::RUNNING};
     std::atomic<size_t> sample{0};
+    std::array<std::atomic<double>, 6> actual_pos{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+    std::array<std::atomic<double>, 6> actual_vel{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+    std::array<std::atomic<double>, 6> actual_eff{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+    std::array<std::atomic<double>, 6> error_pos{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+    std::array<std::atomic<double>, 6> error_vel{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+    // Optional per-goal tolerance overrides populated before RT handoff.
+    std::array<double, 6> path_pos_tol{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+    std::array<double, 6> path_vel_tol{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+    std::array<double, 6> goal_pos_tol{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+    std::array<double, 6> goal_vel_tol{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+    double goal_time_tol = 0.0;
     // Only the control thread accesses these playback fields.
     size_t last_sample_index = 0;
     double elapsed = 0.0;
@@ -80,6 +92,8 @@ private:
   };
   void configure_trajectory_action();
   bool valid_trajectory_goal(const FollowTrajectory::Goal & goal) const;
+  void populate_goal_tolerances(
+    const FollowTrajectory::Goal & goal, TrajectoryExecution & exec) const;
   void monitor_trajectory();
   void check_trajectory_path();
   void finish_trajectory_cycle(double dt);
@@ -101,6 +115,7 @@ private:
   double saturation_timeout_ = 1.0;
   std::array<bool, 6> effort_saturated_{};
   std::vector<double> reference_interfaces_;
+  Vec6d tau_point_ff_ = Vec6d::Zero();
   std::atomic<bool> trajectory_enabled_{false};
   std::mutex trajectory_mutex_;  // Non-real-time callbacks only.
   bool trajectory_reserved_ = false;
@@ -114,6 +129,9 @@ private:
 
   pinocchio::Model pin_model_;
   pinocchio::Data pin_data_;
+  pinocchio::JointIndex joint6_id_ = 0;
+  pinocchio::Inertia base_joint6_inertia_ = pinocchio::Inertia::Zero();
+  pinocchio::SE3 eef_to_joint6_placement_ = pinocchio::SE3::Identity();
   // Full articulated dynamics; command/reference/estop vectors stay six-axis.
   Vec8d dynamics_q_ = Vec8d::Zero(), dynamics_dq_ = Vec8d::Zero(), dynamics_ddq_ = Vec8d::Zero();
 
@@ -133,7 +151,7 @@ private:
   Vec6d friction_v_ = Vec6d::Zero(), friction_c_ = Vec6d::Zero(), armature_ = Vec6d::Zero();
   Vec6d friction_error_gain_ = Vec6d::Zero();
   Vec6d max_effort_ = Vec6d::Zero();
-  double tanh_slope_;
+  double tanh_slope_ = 300.0;
 
   enum class SystemState {
     NORMAL,
@@ -145,11 +163,74 @@ private:
     COMPLIANCE_STOPPING,
     CARTESIAN_IMPEDANCE_TRAJECTORY
   };
+
+  struct ComplianceModeConfig {
+    double max_joint_velocity = 3.0;
+    double hard_limit_tolerance = 0.01;
+    double saturation_timeout = 1.0;
+    double entry_max_speed = 0.03;
+    std::array<double, 6> max_external_torque{35.0, 35.0, 24.0, 20.0, 20.0, 12.0};
+    double external_torque_timeout = 0.25;
+    double fv_scale = 0.85;
+    double fc_scale = 0.0;
+    double fric_trans_speed = 0.04;
+    double fric_quiet_speed = 0.015;
+    double filter_time_constant = 0.15;
+    double soft_limit_margin = 0.15;
+    double soft_limit_stiffness = 80.0;
+    double soft_limit_damping = 5.0;
+    double torque_slew_rate = 120.0;
+    double transition_duration = 0.25;
+    double min_translation_damping = 2.0;
+    double min_rotation_damping = 0.15;
+    double min_effective_mass = 0.30;
+    double max_effective_mass = 15.0;
+    double min_effective_inertia = 0.005;
+    double max_effective_inertia = 0.60;
+    double operational_damping_lambda = 0.04;
+  };
+
   bool compliance_active() const;
   bool impedance_trajectory_active() const;
   bool rigid_trajectory_active() const;
+  const ComplianceModeConfig & active_compliance_config() const;
   bool configure_compliance();
   void compute_compliance(double dt);
+  void compute_cartesian_effective_inertia(
+    const Mat6d & j_arm, double lambda,
+    double min_mass, double max_mass,
+    double min_inertia, double max_inertia,
+    Vec6d & out_lambda_diag) const;
+
+  // Real-time payload inertia update and linear static-moment smoothing.
+  void update_payload_model(double dt);
+  double payload_filter_time_constant_ = 0.20;
+  double payload_nominal_gyration_radius_ = 0.025;
+  double payload_mass_ = 0.0;
+  std::array<double, 3> payload_com_tcp_{0.0, 0.0, 0.0};
+  double payload_mass_filtered_ = 0.0;
+  Eigen::Vector3d payload_first_moment_link6_filtered_ = Eigen::Vector3d::Zero();
+  bool payload_smoothing_active_ = false;
+
+  // Passivity-based Energy Tank layer.
+  void reset_energy_tank();
+  double step_energy_tank(double dt, double dissipated_power, double active_power);
+  bool energy_tank_enabled_ = true;
+  double energy_tank_initial_ = 1.5;
+  double energy_tank_max_ = 4.0;
+  double energy_tank_low_threshold_ = 0.25;
+  double energy_tank_harvest_ratio_ = 0.80;
+  double energy_tank_max_power_ = 15.0;
+  double energy_tank_level_ = 1.5;
+
+  // Transition-only torque slew-rate limiter.
+  void begin_torque_transition(double duration_sec);
+  void apply_transition_torque_slew(double dt, double slew_rate, Vec6d & tau);
+  bool transition_slew_active_ = false;
+  double transition_slew_elapsed_ = 0.0;
+  double transition_slew_duration_ = 0.25;
+  int transition_slew_converged_cycles_ = 0;
+  Vec6d transition_last_tau_ = Vec6d::Zero();
 
   using FollowImpedance = lite6_interfaces::action::FollowImpedanceTrajectory;
   using ImpedanceGoal = rclcpp_action::ServerGoalHandle<FollowImpedance>;
@@ -221,24 +302,29 @@ private:
   Vec8d dynamics_q_ref_ = Vec8d::Zero();
   Vec8d dynamics_dq_ref_ = Vec8d::Zero();
   Mat6x8d imp_ref_jacobian_ = Mat6x8d::Zero();
-  Eigen::Matrix<double, 6, 1> q_imp_ref_ = Eigen::Matrix<double, 6, 1>::Zero();
-  Eigen::Matrix<double, 6, 1> dq_imp_ref_ = Eigen::Matrix<double, 6, 1>::Zero();
-  Eigen::Matrix<double, 6, 1> ddq_imp_ref_ = Eigen::Matrix<double, 6, 1>::Zero();
+  Vec6d q_imp_ref_ = Vec6d::Zero();
+  Vec6d dq_imp_ref_ = Vec6d::Zero();
+  Vec6d ddq_imp_ref_ = Vec6d::Zero();
   bool imp_ref_kinematics_cached_ = false;
   Vec6d imp_ref_cached_q_ = Vec6d::Zero();
   Vec6d imp_ref_cached_dq_ = Vec6d::Zero();
   pinocchio::SE3 imp_ref_pose_cached_ = pinocchio::SE3::Identity();
   Vec6d imp_ref_vel_cached_ = Vec6d::Zero();
   Eigen::Vector3d imp_kt_target_ = Eigen::Vector3d::Constant(200.0);
-  Eigen::Vector3d imp_dt_target_ = Eigen::Vector3d::Constant(25.0);
+  Eigen::Vector3d imp_dt_target_ = Eigen::Vector3d::Constant(0.8);
   Eigen::Vector3d imp_kr_target_ = Eigen::Vector3d::Constant(8.0);
-  Eigen::Vector3d imp_dr_target_ = Eigen::Vector3d::Constant(1.5);
+  Eigen::Vector3d imp_dr_target_ = Eigen::Vector3d::Constant(0.8);
+  double imp_null_stiffness_target_ = 0.0;
   double imp_null_damping_target_ = 0.15;
+  Vec6d imp_wrench_ff_target_ = Vec6d::Zero();
   Eigen::Vector3d imp_kt_filtered_ = Eigen::Vector3d::Constant(200.0);
-  Eigen::Vector3d imp_dt_filtered_ = Eigen::Vector3d::Constant(25.0);
+  Eigen::Vector3d imp_dt_filtered_ = Eigen::Vector3d::Constant(0.8);
   Eigen::Vector3d imp_kr_filtered_ = Eigen::Vector3d::Constant(8.0);
-  Eigen::Vector3d imp_dr_filtered_ = Eigen::Vector3d::Constant(1.5);
+  Eigen::Vector3d imp_dr_filtered_ = Eigen::Vector3d::Constant(0.8);
+  double imp_null_stiffness_filtered_ = 0.0;
   double imp_null_damping_filtered_ = 0.15;
+  Vec6d imp_wrench_ff_filtered_ = Vec6d::Zero();
+  double imp_active_transition_time_ = 0.30;
   Eigen::Vector3d imp_current_pos_error_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d imp_current_rot_error_ = Eigen::Vector3d::Zero();
   std::array<bool, 6> imp_effort_saturated_{};
@@ -251,38 +337,47 @@ private:
   double imp_saturation_timeout_ = 1.0;
   double imp_goal_trans_tolerance_ = 0.05;
   double imp_goal_rot_tolerance_ = 0.25;
-  double imp_goal_velocity_tolerance_ = 0.01;
+  double imp_goal_velocity_tolerance_ = 0.015;
   double imp_goal_settle_duration_ = 0.3;
   double imp_goal_time_tolerance_ = 5.0;
-  double imp_entry_max_speed_ = 0.02;
+  double imp_entry_max_speed_ = 0.03;
   double imp_entry_position_tolerance_ = 0.15;
-  double compliance_max_joint_velocity_ = 1.5;
-  double compliance_hard_limit_tolerance_ = 0.01;
-  double compliance_saturation_timeout_ = 1.0;
-  double compliance_entry_max_speed_ = 0.01;
-  double compliance_filter_time_constant_ = 0.15;
-  double compliance_cartesian_null_damping_ = 0.15;
-  double compliance_soft_limit_margin_ = 0.15;
-  double compliance_soft_limit_stiffness_ = 80.0;
-  double compliance_soft_limit_damping_ = 5.0;
-  double compliance_torque_slew_rate_ = 100.0;
-  double compliance_fv_scale_ = 0.85;
-  double compliance_fc_scale_ = 0.0;
-  double compliance_fric_trans_speed_ = 0.06;
-  double compliance_fric_quiet_speed_ = 0.08;
-  std::array<double, 6> compliance_max_external_torque_{35.0, 35.0, 24.0, 20.0, 20.0, 12.0};
-  double compliance_external_torque_timeout_ = 0.25;
-  double compliance_external_torque_time_ = 0.0;
+  double imp_dynamics_ff_scale_ = 1.0;
   double imp_fv_scale_ = 0.90;
   double imp_fc_scale_ = 0.80;
-  double imp_fric_trans_speed_ = 0.04;
-  double imp_fric_quiet_speed_ = 0.01;
+  double imp_fric_trans_speed_ = 0.025;
+  double imp_fric_quiet_speed_ = 0.008;
+  double imp_filter_time_constant_ = 0.10;
+  double imp_min_translation_damping_ = 2.0;
+  double imp_min_rotation_damping_ = 0.15;
+  double imp_min_effective_mass_ = 0.30;
+  double imp_max_effective_mass_ = 15.0;
+  double imp_min_effective_inertia_ = 0.005;
+  double imp_max_effective_inertia_ = 0.60;
+  double imp_operational_damping_lambda_ = 0.04;
+  double imp_soft_limit_margin_ = 0.15;
+  double imp_soft_limit_stiffness_ = 80.0;
+  double imp_soft_limit_damping_ = 5.0;
+  double imp_torque_slew_rate_ = 150.0;
   std::array<double, 6> imp_max_external_torque_{35.0, 35.0, 24.0, 20.0, 20.0, 12.0};
   double imp_external_torque_timeout_ = 0.25;
 
+  ComplianceModeConfig joint_imp_cfg_;
+  ComplianceModeConfig cart_imp_cfg_;
+  ComplianceModeConfig teach_cfg_;
+  double compliance_external_torque_time_ = 0.0;
+  double teach_armature_weight_ = 0.04;
+  std::array<double, 6> teach_min_joint_damping_{0.15, 0.15, 0.10, 0.04, 0.03, 0.015};
+  std::array<double, 6> teach_max_joint_damping_{15.0, 15.0, 10.0, 4.0, 3.0, 1.5};
+  std::array<double, 5> teach_damping_levels_{22.0, 17.5, 13.5, 11.5, 9.5};
+  std::array<double, 5> teach_assistance_levels_{0.35, 0.475, 0.60, 0.625, 0.65};
+  std::array<double, 5> teach_friction_transition_levels_{0.045, 0.040, 0.035, 0.030, 0.025};
+  std::array<double, 5> teach_quiet_speed_levels_{0.015, 0.012, 0.010, 0.008, 0.006};
+
   // Sensorless Generalized Momentum Observer (GMO) state & configuration.
   bool configure_momentum_observer();
-  void reset_momentum_observer();
+  void reset_momentum_observer(bool clear_tare_bias = false);
+  void ensure_dynamics_cached();
   void update_momentum_observer(double dt);
   void read_cached_tcp_kinematics(
     const pinocchio::SE3 * & out_pose, const Mat6x8d * & out_jacobian);
@@ -296,31 +391,43 @@ private:
 
   bool gmo_enabled_ = true;
   bool gmo_initialized_ = false;
+  bool gmo_dynamics_cached_this_cycle_ = false;
   bool gmo_gravity_cached_this_cycle_ = false;
   bool gmo_tcp_cached_this_cycle_ = false;
   std::array<double, 6> gmo_gains_{25.0, 25.0, 25.0, 30.0, 30.0, 30.0};
   double gmo_jacobian_damping_ = 0.04;
-  double gmo_fric_trans_speed_ = 0.03;
+  double gmo_characteristic_length_ = 0.15;
+  double gmo_fric_trans_speed_ = 0.025;
+  double gmo_stiction_scale_normal_ = 0.30;
+  double gmo_stiction_scale_compliance_ = 0.20;
+  double gmo_stribeck_scale_ = 0.15;
   double gmo_contact_force_threshold_ = 2.5;
+  double gmo_contact_moment_threshold_ = 0.40;
+  std::array<double, 6> gmo_contact_joint_torque_threshold_{1.5, 1.5, 1.0, 0.6, 0.35, 0.25};
+  double gmo_contact_hysteresis_ratio_ = 0.70;
+  double gmo_contact_on_debounce_sec_ = 0.015;
+  double gmo_contact_off_debounce_sec_ = 0.040;
+  double gmo_max_tare_torque_ratio_ = 0.40;
+  double gmo_overload_decay_rate_ = 2.0;
+  double gmo_contact_on_timer_ = 0.0;
+  double gmo_contact_off_timer_ = 0.0;
   pinocchio::Data pin_data_gmo_;
   Mat6x8d gmo_jacobian_ = Mat6x8d::Zero();
   Vec6d gmo_p_integral_ = Vec6d::Zero();
+  Vec6d gmo_raw_residual_tau_ = Vec6d::Zero();
+  Vec6d gmo_tare_bias_tau_ = Vec6d::Zero();
   Vec6d gmo_residual_tau_ = Vec6d::Zero();
   Vec6d gmo_external_wrench_ = Vec6d::Zero();
   Vec6d tau_applied_prev_ = Vec6d::Zero();
   bool gmo_contact_detected_ = false;
-  std::array<double, 5> teach_damping_levels_{4.0, 3.25, 2.5, 2.25, 2.0};
-  std::array<double, 5> teach_assistance_levels_{0.35, 0.475, 0.60, 0.625, 0.65};
-  std::array<double, 5> teach_friction_transition_levels_{0.06, 0.06, 0.06, 0.06, 0.06};
-  std::array<double, 5> teach_quiet_speed_levels_{0.06, 0.06, 0.06, 0.06, 0.06};
+
   lite6_interfaces::msg::ComplianceSettings compliance_settings_, compliance_filtered_;
   Vec6d compliance_q_ = Vec6d::Zero();
-  Vec6d compliance_last_tau_ = Vec6d::Zero();
   Mat6x8d compliance_jacobian_ = Mat6x8d::Zero();
   pinocchio::SE3 compliance_pose_;
-  pinocchio::FrameIndex compliance_frame_=0;
-  uint64_t compliance_sequence_=0;
-  double compliance_saturation_time_=0.0;
+  pinocchio::FrameIndex compliance_frame_ = 0;
+  uint64_t compliance_sequence_ = 0;
+  double compliance_saturation_time_ = 0.0;
   std::atomic<bool> compliance_blocks_trajectory_{false};
   std::atomic<bool> emergency_pending_{false};
   SystemState system_state_ = SystemState::NORMAL;
@@ -339,9 +446,9 @@ private:
     double joint_stiffness = 20.0;
     double joint_damping = 3.0;
     double translation_stiffness = 200.0;
-    double translation_damping = 25.0;
+    double translation_damping = 0.8;
     double rotation_stiffness = 8.0;
-    double rotation_damping = 1.5;
+    double rotation_damping = 0.8;
     double sensitivity = 3.0;
     double nullspace_stiffness = 0.0;
     double nullspace_damping = 0.5;
@@ -389,8 +496,6 @@ private:
   uint64_t last_cmd_seq_ = 0;
   uint8_t last_cmd_code_ = lite6_interfaces::srv::ControllerCommand::Request::CMD_NONE;
   uint8_t last_cmd_result_ = lite6_interfaces::srv::ControllerCommand::Response::ACK_NONE;
-  double payload_mass_ = 0.0;
-  std::array<double, 3> payload_com_tcp_{0.0, 0.0, 0.0};
   double compliance_stopping_elapsed_ = 0.0;
   bool rigid_cancel_braking_ = false;
   double rigid_cancel_elapsed_ = 0.0;

@@ -98,14 +98,24 @@ struct WaitStatement
   double duration_sec = 0.5;
 };
 
+struct PayloadStatement
+{
+  SourceLocation loc;
+  double mass_kg = 0.0;
+  std::array<double, 3> com_tcp{{0.0, 0.0, 0.0}};
+};
+
 struct ImpedanceParams
 {
   std::array<double, 3> kt{{250.0, 250.0, 250.0}};
-  std::array<double, 3> dt{{30.0, 30.0, 30.0}};
+  std::array<double, 3> dt{{0.8, 0.8, 0.8}};
   std::array<double, 3> kr{{10.0, 10.0, 10.0}};
-  std::array<double, 3> dr{{1.8, 1.8, 1.8}};
+  std::array<double, 3> dr{{0.8, 0.8, 0.8}};
+  double null_stiffness = 0.0;
   double null_damping = 0.15;
   double transition_time = 0.15;
+  std::array<double, 6> wrench_ff{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+  uint8_t end_behavior = 0;
 };
 
 enum class StatementKind
@@ -114,6 +124,7 @@ enum class StatementKind
   MOVE_PVA,
   GRIPPER,
   WAIT,
+  SET_PAYLOAD,
   IMPEDANCE_BLOCK
 };
 
@@ -125,6 +136,7 @@ struct ASTStatement
   std::optional<MovePVAStatement> move_pva;
   std::optional<GripperStatement> gripper;
   std::optional<WaitStatement> wait_stmt;
+  std::optional<PayloadStatement> payload_stmt;
   std::optional<ImpedanceParams> impedance_params;
   std::vector<ASTStatement> body;
 };
