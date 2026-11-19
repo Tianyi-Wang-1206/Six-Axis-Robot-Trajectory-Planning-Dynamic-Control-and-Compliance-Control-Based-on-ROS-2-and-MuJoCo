@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from PyQt5.QtCore import QTimer, pyqtSignal
 from PyQt5.QtGui import QFont
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout, QLabel,
                              QComboBox, QDoubleSpinBox, QCheckBox, QPushButton,
                              QGroupBox, QFileDialog, QMessageBox)
 from lite6_interfaces.msg import ComplianceSettings, SupervisorState as S
@@ -21,6 +21,8 @@ class ComplianceTab(QWidget):
         self.pending = False
         self._command_done_signal.connect(self._on_command_done)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
         info = QLabel("Encoder-based compliance + passive friction feedforward + sensorless GMO load observer at link_eef. "
                       "Entering a mode captures the current equilibrium.\n"
                       "In the viewer: select a link, then Ctrl + right drag for force or Ctrl + left drag for torque.")
@@ -44,15 +46,33 @@ class ComplianceTab(QWidget):
             ("Teaching sensitivity (diag(M)-normalized)", [("sensitivity", "1 = firm, 5 = light", 1, 5, 3)])]
         for title, fields in definitions:
             group = QGroupBox(title)
-            form = QFormLayout(group)
-            for name, label, low, high, value in fields:
-                field = QDoubleSpinBox()
-                field.setRange(low, high)
-                field.setDecimals(2)
-                field.setValue(value)
-                field.setSingleStep(.1 if high <= 20 else 1)
-                form.addRow(label, field)
-                self.fields[name] = field
+            if len(fields) >= 6:
+                grid = QGridLayout(group)
+                grid.setHorizontalSpacing(10)
+                grid.setVerticalSpacing(6)
+                for idx, (name, label, low, high, value) in enumerate(fields):
+                    field = QDoubleSpinBox()
+                    field.setRange(low, high)
+                    field.setDecimals(2)
+                    field.setValue(value)
+                    field.setSingleStep(.1 if high <= 20 else 1)
+                    field.setMinimumHeight(26)
+                    row_i = idx // 2
+                    col_i = (idx % 2) * 2
+                    grid.addWidget(QLabel(label), row_i, col_i)
+                    grid.addWidget(field, row_i, col_i + 1)
+                    self.fields[name] = field
+            else:
+                form = QFormLayout(group)
+                for name, label, low, high, value in fields:
+                    field = QDoubleSpinBox()
+                    field.setRange(low, high)
+                    field.setDecimals(2)
+                    field.setValue(value)
+                    field.setSingleStep(.1 if high <= 20 else 1)
+                    field.setMinimumHeight(26)
+                    form.addRow(label, field)
+                    self.fields[name] = field
             layout.addWidget(group)
             self.groups.append(group)
         self.recapture = QCheckBox("Capture current equilibrium when applying in the same mode")
@@ -70,6 +90,8 @@ class ComplianceTab(QWidget):
         layout.addWidget(self.status)
         observer = QGroupBox("Sensorless External Load Observer (GMO)")
         obs_layout = QVBoxLayout(observer)
+        obs_layout.setContentsMargins(10, 6, 10, 8)
+        obs_layout.setSpacing(4)
         obs_head = QHBoxLayout()
         self.ext_wrench_label = QLabel("TCP Force:  0.0 N  [+0.0, +0.0, +0.0]  |  Moment: [+0.00, +0.00, +0.00] Nm")
         self.ext_wrench_label.setFont(QFont("Consolas", 9))
@@ -93,6 +115,8 @@ class ComplianceTab(QWidget):
         layout.addWidget(observer)
         teaching = QGroupBox("Teaching capture (encoder positions only)")
         capture = QVBoxLayout(teaching)
+        capture.setContentsMargins(10, 6, 10, 8)
+        capture.setSpacing(4)
         row = QHBoxLayout()
         self.point = QPushButton("Capture point")
         self.point.clicked.connect(self.capture_point)

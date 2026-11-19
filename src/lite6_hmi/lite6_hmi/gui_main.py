@@ -562,7 +562,7 @@ class PyQtHMI(QMainWindow):
         c_layout.addWidget(self.btn_move_c)
 
         # Full-width Payload Mass & Center of Mass (TCP Frame) Configuration + GMO Mismatch Warning
-        p_group = QGroupBox("Payload Mass & Center of Mass (TCP Frame)")
+        p_group = QGroupBox("Payload Mass && Center of Mass (TCP Frame)")
         outer_layout.addWidget(p_group)
         p_outer = QVBoxLayout(p_group)
         p_outer.setContentsMargins(12, 8, 12, 8)
@@ -614,7 +614,7 @@ class PyQtHMI(QMainWindow):
         p_status = QHBoxLayout()
         p_status.setSpacing(10)
         self.lbl_payload_active = QLabel("Active Payload: 0.000 kg | CoM: [0.0, 0.0, 0.0] mm")
-        self.lbl_payload_active.setFont(QFont("Consolas", 8.5))
+        self.lbl_payload_active.setFont(QFont("Consolas", 9))
         p_status.addWidget(self.lbl_payload_active)
 
         self.lbl_payload_gmo_hint = QLabel("GMO Load Check: OK (no discrepancy detected)")
