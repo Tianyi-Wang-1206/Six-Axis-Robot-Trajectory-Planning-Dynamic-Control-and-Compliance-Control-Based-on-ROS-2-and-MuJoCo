@@ -34,7 +34,6 @@ uint8_t map_impedance_estop_reason(
     case 8: return CS::ESTOP_INVALID_COMMAND;
     case 9: return CS::ESTOP_COMMAND_WRITE;
     case 10: return CS::ESTOP_CONTROL_EXCEPTION;
-    case 11: return CS::ESTOP_COMPLIANCE_EXTERNAL_TORQUE;
     default: return CS::ESTOP_EXTERNAL;
   }
 }
@@ -106,11 +105,6 @@ bool Lite6CTCController::configure_impedance_trajectory()
     node->get_parameter("impedance_execution.soft_limit_damping").as_double();
   imp_torque_slew_rate_ =
     node->get_parameter("impedance_execution.torque_slew_rate").as_double();
-  const auto imp_ext_lim =
-    node->get_parameter("impedance_execution.max_external_joint_torque").as_double_array();
-  imp_external_torque_timeout_ =
-    node->get_parameter("impedance_execution.external_torque_timeout").as_double();
-
   auto positive = [](double v) { return std::isfinite(v) && v > 0.0; };
   auto nonneg = [](double v) { return std::isfinite(v) && v >= 0.0; };
   auto unit = [](double v) { return std::isfinite(v) && v >= 0.0 && v <= 1.0; };
@@ -120,9 +114,6 @@ bool Lite6CTCController::configure_impedance_trajectory()
       !positive(imp_max_joint_velocity_) ||
       !nonneg(imp_hard_limit_tolerance_) ||
       !positive(imp_saturation_timeout_) ||
-      !positive(imp_external_torque_timeout_) ||
-      imp_ext_lim.size() != 6 ||
-      !std::all_of(imp_ext_lim.begin(), imp_ext_lim.end(), positive) ||
       !unit(imp_dynamics_ff_scale_) ||
       !unit(imp_fv_scale_) ||
       !unit(imp_fc_scale_) ||
@@ -149,6 +140,7 @@ bool Lite6CTCController::configure_impedance_trajectory()
       !positive(imp_goal_settle_duration_) ||
       !positive(imp_goal_time_tolerance_) ||
       !positive(imp_entry_max_speed_) ||
+      imp_entry_max_speed_ > lite6_interfaces::contract::kControllerEntryMaxSpeedRadPerSec ||
       !positive(imp_entry_position_tolerance_) ||
       imp_goal_trans_tolerance_ > imp_max_trans_deviation_ ||
       imp_goal_rot_tolerance_ > imp_max_rot_deviation_ ||
@@ -159,10 +151,6 @@ bool Lite6CTCController::configure_impedance_trajectory()
     RCLCPP_ERROR(node->get_logger(), "Invalid impedance_execution safety or tolerance parameters");
     return false;
   }
-  for (size_t i = 0; i < 6; ++i) {
-    imp_max_external_torque_[i] = imp_ext_lim[i];
-  }
-
   imp_ref_jacobian_.setZero();
   impedance_trajectory_server_ = rclcpp_action::create_server<FollowImpedance>(
     node, "~/follow_impedance_trajectory",
@@ -261,7 +249,6 @@ void Lite6CTCController::fail_impedance_trajectory(
     case ImpedanceTrajectoryResult::INVALID_COMMAND: code = 8; break;
     case ImpedanceTrajectoryResult::COMMAND_WRITE: code = 9; break;
     case ImpedanceTrajectoryResult::CONTROL_EXCEPTION: code = 10; break;
-    case ImpedanceTrajectoryResult::EXTERNAL_TORQUE_LIMIT: code = 11; break;
     default: code = 0; break;
   }
   latch_estop_reason(map_impedance_estop_reason(code), joint, value, limit);
@@ -347,6 +334,8 @@ void Lite6CTCController::update_impedance_trajectory_reference(
         return;
       }
     }
+    // Start the trajectory clock only after payload inertia smoothing has completed.
+    if (payload_smoothing_active_) return;
     execution->started = true;
     execution->start_time_ns = time.nanoseconds();
     imp_active_transition_time_ = (goal.transition_time > 0.0) ?
@@ -355,7 +344,6 @@ void Lite6CTCController::update_impedance_trajectory_reference(
     transition_system_state(SystemState::CARTESIAN_IMPEDANCE_TRAJECTORY);
     // Preserve last cycle's output torque for bumpless transition into impedance control.
     begin_torque_transition(imp_active_transition_time_);
-    reset_energy_tank();
     compliance_saturation_time_ = 0.0;
     compliance_saturation_estop_pending_ = false;
     integral_effort_.setZero();
@@ -473,37 +461,23 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
   imp_null_damping_filtered_ += alpha * (imp_null_damping_target_ - imp_null_damping_filtered_);
   imp_wrench_ff_filtered_ += alpha * (imp_wrench_ff_target_ - imp_wrench_ff_filtered_);
 
-  // Apply passive (decreasing) stiffness steps immediately; positive steps are tank-regulated.
-  for (int k = 0; k < 3; ++k) {
-    if (cand_dkt[k] <= 0.0) imp_kt_filtered_[k] += cand_dkt[k];
-    if (cand_dkr[k] <= 0.0) imp_kr_filtered_[k] += cand_dkr[k];
-  }
-  if (cand_dknull <= 0.0) imp_null_stiffness_filtered_ += cand_dknull;
-
-  // Conservative gravity compensation on the measured configuration.
-  Vec6d tau_passive = pin_data_gmo_.g.head<6>();
-  Vec6d tau_active = Vec6d::Zero();
-  // Physical joint friction (nominal model) dissipates energy that friction
-  // compensation in the active channel partially returns; credit it for harvesting.
-  double dissipated_power = modeled_friction_dissipation();
-  double stiffness_rate_power = 0.0;
+  imp_kt_filtered_ += cand_dkt;
+  imp_kr_filtered_ += cand_dkr;
+  imp_null_stiffness_filtered_ += cand_dknull;
+  Vec6d tau_model = pin_data_dynamics_.g.head<6>();
+  Vec6d tau_feedforward = Vec6d::Zero();
   a_d_.setZero();
   integral_effort_.setZero();
 
-  // Passivity-preserving dynamic feedforward reusing cached CRBA M(q) and Christoffel C(q, dq):
-  // tau_dyn = gamma_dyn * ((M_a(q) + diag(I_armature)) * ddq_ref + C_a(q, dq) * dq_ref).
-  // With C built from the measured dq this is the Slotine-Li reference term: thanks to
-  // the skew symmetry of (dM/dt - 2C), the tracking-error dynamics driven by the
-  // impedance spring/damper stay passive, so it is NOT routed through the energy tank
-  // (gating it would only drain the tank and degrade tracking on every acceleration).
+  // Moving references and dynamic feedforward supply energy for powered tracking.
   if (imp_dynamics_ff_scale_ > 1e-6) {
     Vec6d tau_dyn_acc =
-      pin_data_gmo_.M.topLeftCorner<6, 6>() * ddq_imp_ref_ +
-      pin_data_gmo_.C.topLeftCorner<6, 6>() * dq_imp_ref_;
+      pin_data_dynamics_.M.topLeftCorner<6, 6>() * ddq_imp_ref_ +
+      pin_data_dynamics_.C.topLeftCorner<6, 6>() * dq_imp_ref_;
     for (int i = 0; i < 6; ++i) {
       tau_dyn_acc[i] += armature_[i] * ddq_imp_ref_[i];
     }
-    tau_passive += imp_dynamics_ff_scale_ * tau_dyn_acc;
+    tau_model += imp_dynamics_ff_scale_ * tau_dyn_acc;
   }
 
   // 1. Evaluate time-varying equilibrium pose T_d(t) and twist v_d(t) from (q_imp_ref_, dq_imp_ref_).
@@ -532,7 +506,7 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
   const auto & ref_pose = imp_ref_pose_cached_;
   const Vec6d & ref_velocity = imp_ref_vel_cached_;
 
-  // 2. Evaluate measured pose T(q) and twist v(q, dq), reusing GMO cache if valid this cycle.
+  // 2. Evaluate measured pose T(q) and twist v(q, dq), reusing the current-cycle kinematic cache.
   const pinocchio::SE3 * meas_pose_ptr = nullptr;
   const Mat6x8d * meas_jac_ptr = nullptr;
   read_cached_tcp_kinematics(meas_pose_ptr, meas_jac_ptr);
@@ -557,45 +531,13 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
   const Vec6d q_null_err = q_imp_ref_ - q_;
   const Vec6d dq_null_err = dq_ - dq_imp_ref_;
 
-  // Evaluate baseline damping dissipation and stiffness-increase power demand.
-  for (int k = 0; k < 3; ++k) {
-    const double d_trans_est = std::max(
-      imp_min_translation_damping_,
-      2.0 * imp_dt_filtered_[k] * std::sqrt(std::max(0.0, imp_kt_filtered_[k]) * lambda_diag[k]));
-    const double d_rot_est = std::max(
-      imp_min_rotation_damping_,
-      2.0 * imp_dr_filtered_[k] * std::sqrt(std::max(0.0, imp_kr_filtered_[k]) * lambda_diag[k + 3]));
-    dissipated_power += d_trans_est * vel_trans_error[k] * vel_trans_error[k] +
-      d_rot_est * vel_rot_error[k] * vel_rot_error[k];
-  }
-
-  if (dt > 1e-6) {
-    for (int k = 0; k < 3; ++k) {
-      if (cand_dkt[k] > 0.0) {
-        stiffness_rate_power += 0.5 * (cand_dkt[k] / dt) *
-          imp_current_pos_error_[k] * imp_current_pos_error_[k];
-      }
-      if (cand_dkr[k] > 0.0) {
-        stiffness_rate_power += 0.5 * (cand_dkr[k] / dt) *
-          imp_current_rot_error_[k] * imp_current_rot_error_[k];
-      }
-    }
-    if (cand_dknull > 0.0) {
-      stiffness_rate_power += 0.5 * (cand_dknull / dt) * q_null_err.squaredNorm();
-    }
-  }
-
-  // Utilize Cartesian feedforward wrench wrench_ff via active tank channel.
-  tau_active.noalias() += j_arm.transpose() * imp_wrench_ff_filtered_;
-  // Posture regulation about q_ref(t), restricted to the dynamically consistent null
-  // space of the TCP task so it never alters the commanded Cartesian stiffness. Its
-  // projected power is not sign-definite, so it runs through the bidirectional tank.
-  tau_active += project_nullspace_torque(
+  tau_feedforward.noalias() += j_arm.transpose() * imp_wrench_ff_filtered_;
+  tau_feedforward += project_nullspace_torque(
     j_arm, imp_operational_damping_lambda_,
     imp_null_stiffness_filtered_ * q_null_err - imp_null_damping_filtered_ * dq_null_err);
-  add_passive_friction_ff(
+  add_trajectory_friction_ff(
     imp_fv_scale_, imp_fc_scale_, imp_fric_trans_speed_, imp_fric_quiet_speed_,
-    dq_imp_ref_, tau_active);
+    dq_imp_ref_, tau_feedforward);
 
   for (int i = 0; i < 6; ++i) {
     const double lo =
@@ -604,27 +546,18 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
       std::max(pin_model_.upperPositionLimit[i] - imp_soft_limit_margin_, q_imp_ref_[i]);
     if (q_[i] < lo) {
       const double v_in = std::min(0.0, dq_[i]);
-      tau_passive[i] += imp_soft_limit_stiffness_ * (lo - q_[i]) - imp_soft_limit_damping_ * v_in;
-      dissipated_power += imp_soft_limit_damping_ * v_in * v_in;
+      tau_model[i] += imp_soft_limit_stiffness_ * (lo - q_[i]) - imp_soft_limit_damping_ * v_in;
     }
     if (q_[i] > hi) {
       const double v_out = std::max(0.0, dq_[i]);
-      tau_passive[i] -= imp_soft_limit_stiffness_ * (q_[i] - hi) + imp_soft_limit_damping_ * v_out;
-      dissipated_power += imp_soft_limit_damping_ * v_out * v_out;
+      tau_model[i] -= imp_soft_limit_stiffness_ * (q_[i] - hi) + imp_soft_limit_damping_ * v_out;
     }
   }
 
-  // Passivity Energy Tank valve regulates active power-injecting terms and positive stiffness increments.
-  const double active_power = tau_active.dot(dq_) + stiffness_rate_power;
-  const double tank_valve = step_energy_tank(dt, dissipated_power, active_power);
-  for (int k = 0; k < 3; ++k) {
-    if (cand_dkt[k] > 0.0) imp_kt_filtered_[k] += tank_valve * cand_dkt[k];
-    if (cand_dkr[k] > 0.0) imp_kr_filtered_[k] += tank_valve * cand_dkr[k];
-  }
-  if (cand_dknull > 0.0) imp_null_stiffness_filtered_ += tank_valve * cand_dknull;
-
   // Constant damping ratio law: D_i(q) = max(D_min, 2 * zeta_i * sqrt(K_i * Lambda_i(q))).
   Vec6d wrench_imp;
+  const Eigen::Vector3d rotation_torque = rotational_spring_torque(
+    ref_pose.rotation() * meas_pose.rotation().transpose(), imp_kr_filtered_);
   for (int k = 0; k < 3; ++k) {
     const double d_trans = std::max(
       imp_min_translation_damping_,
@@ -633,11 +566,11 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
       imp_min_rotation_damping_,
       2.0 * imp_dr_filtered_[k] * std::sqrt(std::max(0.0, imp_kr_filtered_[k]) * lambda_diag[k + 3]));
     wrench_imp[k] = imp_kt_filtered_[k] * imp_current_pos_error_[k] + d_trans * vel_trans_error[k];
-    wrench_imp[k + 3] = imp_kr_filtered_[k] * imp_current_rot_error_[k] + d_rot * vel_rot_error[k];
+    wrench_imp[k + 3] = rotation_torque[k] + d_rot * vel_rot_error[k];
   }
-  tau_passive.noalias() += j_arm.transpose() * wrench_imp;
+  tau_model.noalias() += j_arm.transpose() * wrench_imp;
 
-  tau_cmd_ = tau_passive + tank_valve * tau_active;
+  tau_cmd_ = tau_model + tau_feedforward;
 
   // Apply torque slew-rate limiting ONLY during the entry transition window.
   apply_transition_torque_slew(dt, imp_torque_slew_rate_, tau_cmd_);
@@ -682,14 +615,6 @@ void Lite6CTCController::finish_impedance_trajectory_cycle(double dt)
     execution->pos_error[k].store(imp_current_pos_error_[static_cast<int>(k)], std::memory_order_relaxed);
     execution->rot_error[k].store(imp_current_rot_error_[static_cast<int>(k)], std::memory_order_relaxed);
   }
-  for (size_t k = 0; k < 6; ++k) {
-    execution->external_torque[k].store(
-      gmo_residual_tau_[static_cast<Eigen::Index>(k)], std::memory_order_relaxed);
-    execution->external_wrench[k].store(
-      gmo_external_wrench_[static_cast<Eigen::Index>(k)], std::memory_order_relaxed);
-  }
-  execution->contact_detected.store(gmo_contact_detected_, std::memory_order_relaxed);
-
   const double pos_err_norm = imp_current_pos_error_.norm();
   const double rot_err_norm = imp_current_rot_error_.norm();
   if (pos_err_norm > imp_max_trans_deviation_) {
@@ -723,19 +648,6 @@ void Lite6CTCController::finish_impedance_trajectory_cycle(double dt)
       ImpedanceTrajectoryResult::SATURATION, saturated_joint,
       execution->saturation_duration, imp_saturation_timeout_,
       "Continuous effort saturation timeout during impedance trajectory [s]");
-    return;
-  }
-
-  int ext_joint = -1;
-  double ext_val = 0.0;
-  double ext_limit = 0.0;
-  if (check_external_torque_limit(
-        dt, imp_max_external_torque_, imp_external_torque_timeout_,
-        execution->external_torque_duration, ext_joint, ext_val, ext_limit)) {
-    fail_impedance_trajectory(
-      ImpedanceTrajectoryResult::EXTERNAL_TORQUE_LIMIT, ext_joint,
-      ext_val, ext_limit,
-      "External joint torque estimate exceeded impedance safety limit [Nm]");
     return;
   }
 
@@ -800,7 +712,6 @@ void Lite6CTCController::finish_impedance_trajectory_cycle(double dt)
       compliance_filtered_.nullspace_damping = imp_null_damping_filtered_;
       begin_torque_transition(cart_imp_cfg_.transition_duration);
       compliance_saturation_time_ = 0.0;
-      compliance_external_torque_time_ = 0.0;
       compliance_saturation_estop_pending_ = false;
       integral_effort_.setZero();
       transition_system_state(SystemState::CARTESIAN_IMPEDANCE);
@@ -862,14 +773,6 @@ void Lite6CTCController::monitor_impedance_trajectory()
         feedback->position_error_m[k] = execution->pos_error[k].load(std::memory_order_relaxed);
         feedback->rotation_error_rad[k] = execution->rot_error[k].load(std::memory_order_relaxed);
       }
-      for (size_t k = 0; k < 6; ++k) {
-        feedback->external_joint_torque[k] =
-          execution->external_torque[k].load(std::memory_order_relaxed);
-        feedback->external_cartesian_wrench[k] =
-          execution->external_wrench[k].load(std::memory_order_relaxed);
-      }
-      feedback->contact_detected =
-        execution->contact_detected.load(std::memory_order_relaxed);
       goal->publish_feedback(feedback);
     }
     return;
@@ -916,9 +819,6 @@ void Lite6CTCController::monitor_impedance_trajectory()
         break;
       case ImpedanceTrajectoryResult::SATURATION:
         result->error_code = FollowImpedance::Result::SATURATION_TIMEOUT;
-        break;
-      case ImpedanceTrajectoryResult::EXTERNAL_TORQUE_LIMIT:
-        result->error_code = FollowImpedance::Result::EXTERNAL_TORQUE_LIMIT_VIOLATED;
         break;
       case ImpedanceTrajectoryResult::GOAL_TIMEOUT:
         result->error_code = FollowImpedance::Result::GOAL_TIMEOUT;

@@ -3,55 +3,20 @@
 
 ctc_controller:
   ros__parameters:
-    # Sensorless Generalized Momentum Observer (GMO) running continuously at 1 kHz.
-    gmo:
-      enabled: true
-      observer_gains: [25.0, 25.0, 25.0, 30.0, 30.0, 30.0]  # rad/s per joint (1st-order LPF cutoff)
-      jacobian_damping: 0.04                                # DLS regularization near wrist singularities
-      characteristic_length: 0.15                           # m; metric length scale for translational vs rotational DLS
-      friction_transition_speed: 0.025                      # rad/s; nominal Coulomb tanh smoothing matching LuGre v_s=0.02
-      stiction_deadband_scale_normal: 0.18                  # share of Fc at rest in NORMAL mode (stiction/integrator margin)
-      stiction_deadband_scale_compliance: 0.12              # share of Fc at rest in compliance/impedance modes
-      stribeck_deadband_scale: 0.15                         # share of Fc for kinetic Stribeck excess peak near |dq| ~ v_s
-      contact_force_threshold: 2.5                          # N; Cartesian force magnitude threshold to flag contact
-      contact_moment_threshold: 0.40                        # Nm; Cartesian moment magnitude threshold to flag contact
-      contact_joint_torque_threshold: [1.5, 1.5, 1.0, 0.6, 0.35, 0.25]  # Nm; per-joint external torque threshold
-      contact_hysteresis_ratio: 0.70                        # Schmitt trigger release ratio (off_thresh = ratio * on_thresh)
-      contact_on_debounce_sec: 0.015                        # s; continuous duration above threshold to latch contact
-      contact_off_debounce_sec: 0.040                       # s; continuous duration below release threshold to clear contact
-      max_tare_contact_ratio: 3.0                           # CMD_TARE_GMO bound: multiple of contact_joint_torque_threshold
-      tare_average_window_sec: 0.20                         # s; stationary raw-residual averaging window used by CMD_TARE_GMO
-      overload_decay_rate: 2.0                              # 1/s; leaky integrator decay rate when external torque is below limit
-
     # Real-time Pinocchio payload inertia update and linear static-moment smoothing.
     payload:
       filter_time_constant: 0.15                            # s; exponential smoothing time constant for (m, m*c)
       nominal_gyration_radius: 0.025                        # m; point-payload effective gyration radius for local wrist inertia
 
-    # Passivity-based Energy Tank layer for compliance and impedance modes.
-    energy_tank:
-      enabled: true
-      initial_energy: 1.5                                   # J; initial tank storage on entering compliance/impedance
-      max_energy: 4.0                                       # J; upper energy bound (excess dissipated)
-      low_energy_threshold: 0.25                            # J; C1 Hermite valve attenuation threshold near depletion
-      dissipation_harvest_ratio: 0.80                       # [0..1] fraction of physical damping power harvested into tank
-      max_injected_power: 15.0                              # W; instantaneous active power injection ceiling
-
-    # Each compliance mode reads only its own sub-block below; there are no shared
-    # top-level compliance.* defaults.
+    # Per-mode gains and limits share the Cartesian regularization metric.
     compliance:
+      characteristic_length: 0.15  # m; translational/rotational regularization metric
       # 1. Dedicated Joint-Space Impedance Mode Parameters (MODE_JOINT_IMPEDANCE)
       joint_impedance:
         max_joint_velocity: 3.0
         hard_limit_tolerance: 0.01
         saturation_timeout: 1.0
         entry_max_speed: 0.03
-        max_external_joint_torque: [35.0, 35.0, 24.0, 20.0, 20.0, 12.0]
-        external_torque_timeout: 0.25
-        friction_viscous_scale: 0.85
-        friction_coulomb_scale: 0.0
-        friction_transition_speed: 0.04
-        friction_quiet_speed: 0.015
         filter_time_constant: 0.15
         soft_limit_margin: 0.15
         soft_limit_stiffness: 80.0
@@ -65,12 +30,6 @@ ctc_controller:
         hard_limit_tolerance: 0.01
         saturation_timeout: 1.0
         entry_max_speed: 0.03
-        max_external_joint_torque: [35.0, 35.0, 24.0, 20.0, 20.0, 12.0]
-        external_torque_timeout: 0.25
-        friction_viscous_scale: 0.85
-        friction_coulomb_scale: 0.0
-        friction_transition_speed: 0.04
-        friction_quiet_speed: 0.015
         filter_time_constant: 0.15
         min_translation_damping: 2.0                        # N s/m floor when translation_stiffness -> 0
         min_rotation_damping: 0.15                          # Nm s/rad floor when rotation_stiffness -> 0
@@ -91,8 +50,6 @@ ctc_controller:
         hard_limit_tolerance: 0.01
         saturation_timeout: 1.0
         entry_max_speed: 0.03
-        max_external_joint_torque: [35.0, 35.0, 24.0, 20.0, 20.0, 12.0]
-        external_torque_timeout: 0.25
         filter_time_constant: 0.15
         soft_limit_margin: 0.15
         soft_limit_stiffness: 80.0
@@ -105,9 +62,6 @@ ctc_controller:
         # diag(M)-normalized velocity decay rates [1/s] for sensitivity levels 1 (firm) through 5 (light):
         # d_i(q) = clamp(lambda_teach(sensitivity) * M_teach_i(q), min_joint_damping[i], max_joint_damping[i]).
         damping_levels: [22.0, 17.5, 13.5, 11.5, 9.5]
-        assistance_levels: [0.35, 0.475, 0.60, 0.625, 0.65]
-        friction_transition_levels: [0.045, 0.040, 0.035, 0.030, 0.025]  # rad/s; tanh transition width (> quiet_speed)
-        quiet_speed_levels: [0.015, 0.012, 0.010, 0.008, 0.006]          # rad/s; pre-sliding bristle quiet gate (< v_s=0.02)
 
     # 4. Dedicated Time-Varying Cartesian Impedance Trajectory Parameters (MODE_CARTESIAN_IMPEDANCE_TRAJECTORY)
     impedance_execution:
@@ -117,9 +71,7 @@ ctc_controller:
       max_joint_velocity: 3.0             # rad/s; exceeding this triggers E-STOP
       hard_limit_tolerance: 0.01          # rad; allowance past URDF joint limits before E-STOP
       saturation_timeout: 1.0             # s; continuous effort saturation before E-STOP
-      max_external_joint_torque: [35.0, 35.0, 24.0, 20.0, 20.0, 12.0]  # Nm; GMO overload limit
-      external_torque_timeout: 0.25       # s; continuous GMO overload duration before E-STOP
-      dynamics_ff_scale: 1.0              # [0..1] passivity-preserving inertial + Coriolis feedforward scale
+      dynamics_ff_scale: 1.0              # [0..1] powered tracking inertial + Coriolis feedforward scale
       friction_viscous_scale: 0.90        # [0..1] share of friction_v_nominal
       friction_coulomb_scale: 0.80        # [0..1] share of friction_c_nominal along dq_ref(t)
       friction_transition_speed: 0.025    # rad/s; tanh transition width (> quiet_speed)

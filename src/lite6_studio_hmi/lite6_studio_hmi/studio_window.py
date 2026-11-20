@@ -81,7 +81,6 @@ _ESTOP_REASON_NAMES = {
     ControllerStatus.ESTOP_CONTROL_EXCEPTION: "Controller Exception",
     ControllerStatus.ESTOP_IMPEDANCE_TRAJECTORY_DEVIATION: "Impedance Deviation Limit",
     ControllerStatus.ESTOP_IMPEDANCE_TRAJECTORY_GOAL_TIMEOUT: "Impedance Goal Timeout",
-    ControllerStatus.ESTOP_COMPLIANCE_EXTERNAL_TORQUE: "Compliance/Impedance External Torque Limit",
 }
 
 _GRIPPER_STATE_NAMES = {
@@ -642,12 +641,6 @@ class StudioMainWindow(QMainWindow):
         self.lbl_rot_err = QLabel("0.00 deg [0.0, 0.0, 0.0]")
         self.lbl_rot_err.setFont(QFont(_MONO_FONT_FAMILY, 9))
         self.lbl_rot_err.setWordWrap(True)
-        self.lbl_ext_wrench = QLabel("0.0 N [+0.0, +0.0, +0.0] | NO CONTACT")
-        self.lbl_ext_wrench.setFont(QFont(_MONO_FONT_FAMILY, 9))
-        self.lbl_ext_wrench.setWordWrap(True)
-        self.lbl_ext_tau = QLabel("[+0.00, +0.00, +0.00, +0.00, +0.00, +0.00] Nm")
-        self.lbl_ext_tau.setFont(QFont(_MONO_FONT_FAMILY, 9))
-        self.lbl_ext_tau.setWordWrap(True)
         self.lbl_payload_info = QLabel("0.000 kg | CoM: [0.0, 0.0, 0.0] mm")
         self.lbl_payload_info.setFont(QFont(_MONO_FONT_FAMILY, 9))
         self.lbl_payload_info.setWordWrap(True)
@@ -660,12 +653,8 @@ class StudioMainWindow(QMainWindow):
         c_grid.addWidget(self.lbl_pos_err, 2, 1)
         c_grid.addWidget(_key_label("Impedance Rot Err:"), 3, 0)
         c_grid.addWidget(self.lbl_rot_err, 3, 1)
-        c_grid.addWidget(_key_label("GMO Ext Wrench:"), 4, 0, Qt.AlignTop)
-        c_grid.addWidget(self.lbl_ext_wrench, 4, 1)
-        c_grid.addWidget(_key_label("GMO Ext Tau:"), 5, 0, Qt.AlignTop)
-        c_grid.addWidget(self.lbl_ext_tau, 5, 1)
-        c_grid.addWidget(_key_label("Active Payload:"), 6, 0, Qt.AlignTop)
-        c_grid.addWidget(self.lbl_payload_info, 6, 1)
+        c_grid.addWidget(_key_label("Configured Payload:"), 4, 0, Qt.AlignTop)
+        c_grid.addWidget(self.lbl_payload_info, 4, 1)
         ctrl_v.addLayout(c_grid)
         layout.addWidget(ctrl_card)
 
@@ -1131,19 +1120,6 @@ class StudioMainWindow(QMainWindow):
         self.lbl_rot_err.setText(
             f"{r_norm_deg:5.2f} deg [{math.degrees(re[0]):5.1f}, {math.degrees(re[1]):5.1f}, {math.degrees(re[2]):5.1f}]"
         )
-        ew = msg.external_cartesian_wrench
-        et = msg.external_joint_torque
-        f_norm = math.sqrt(ew[0] ** 2 + ew[1] ** 2 + ew[2] ** 2)
-        contact_tag = "CONTACT" if msg.contact_detected else "NO CONTACT"
-        self.lbl_ext_wrench.setText(
-            f"{f_norm:5.1f} N [{ew[0]:+5.1f}, {ew[1]:+5.1f}, {ew[2]:+5.1f}] | {contact_tag}"
-        )
-        self.lbl_ext_wrench.setStyleSheet(
-            "color: #B45309; font-weight: bold;" if msg.contact_detected else "color: #334155;"
-        )
-        tau_str = ", ".join(f"{v:+5.2f}" for v in et)
-        self.lbl_ext_tau.setText(f"[{tau_str}] Nm")
-
         if msg.revision != self._last_logged_revision and msg.detail:
             self._last_logged_revision = msg.revision
             self.append_log(f"[{name}] {msg.detail}")

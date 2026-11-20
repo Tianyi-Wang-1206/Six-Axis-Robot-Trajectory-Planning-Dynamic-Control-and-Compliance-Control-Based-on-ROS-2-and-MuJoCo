@@ -2,6 +2,7 @@
 import os
 import sys
 import math
+from lite6_motion_contract import MAX_PAYLOAD_MASS_KG, MAX_PAYLOAD_COM_RADIUS_M
 import numpy as np
 import rclpy
 from lite6_interfaces.action import IndustrialMotion
@@ -155,7 +156,6 @@ class PyQtHMI(QMainWindow):
         self.worker.gripper_signal.connect(self.on_gripper_updated)
         self.worker.motion_feedback_signal.connect(self.on_motion_feedback)
         self._supervisor_offline_displayed = False
-        self._stationary_since = 0.0
 
         # Render the cached snapshot as well as future transitions. A Worker
         # supplied by another caller may already have received its first state.
@@ -212,7 +212,7 @@ class PyQtHMI(QMainWindow):
             stale = time.monotonic() - self.worker.last_gripper_rx_time > 0.25
         if stale:
             self.gripper_status.setText("Gripper feedback offline; controls disabled")
-        self.refresh_payload_and_gmo_status()
+        self.refresh_payload_status()
 
     def setup_ui(self):
         main_widget = QWidget()
@@ -561,8 +561,8 @@ class PyQtHMI(QMainWindow):
         self.btn_move_c.clicked.connect(self.cmd_move_c)
         c_layout.addWidget(self.btn_move_c)
 
-        # Full-width Payload Mass & Center of Mass (TCP Frame) Configuration + GMO Mismatch Warning
-        p_group = QGroupBox("Payload Mass && Center of Mass (TCP Frame)")
+        # Full-width Payload Mass & Center of Mass (TCP Frame) Configuration
+        p_group = QGroupBox("Additional Payload (0-600 g) && Center of Mass (TCP Frame)")
         outer_layout.addWidget(p_group)
         p_outer = QVBoxLayout(p_group)
         p_outer.setContentsMargins(12, 8, 12, 8)
@@ -613,16 +613,10 @@ class PyQtHMI(QMainWindow):
 
         p_status = QHBoxLayout()
         p_status.setSpacing(10)
-        self.lbl_payload_active = QLabel("Active Payload: 0.000 kg | CoM: [0.0, 0.0, 0.0] mm")
+        self.lbl_payload_active = QLabel("Configured Payload: 0.000 kg | CoM: [0.0, 0.0, 0.0] mm")
         self.lbl_payload_active.setFont(QFont("Consolas", 9))
         p_status.addWidget(self.lbl_payload_active)
 
-        self.lbl_payload_gmo_hint = QLabel("GMO Load Check: OK (no discrepancy detected)")
-        self.lbl_payload_gmo_hint.setWordWrap(True)
-        self.lbl_payload_gmo_hint.setStyleSheet(
-            "background-color: #e8f8f5; color: #117864; border-radius: 4px; padding: 4px 8px; font-size: 8.5pt; font-weight: bold;"
-        )
-        p_status.addWidget(self.lbl_payload_gmo_hint, 1)
         p_outer.addLayout(p_status)
 
     def setup_sysid_tab(self, parent):
@@ -917,18 +911,18 @@ class PyQtHMI(QMainWindow):
         except ValueError as exc:
             QMessageBox.critical(self, "Payload Input Error", f"Invalid numeric value: {exc}")
             return
-        if not (0.0 <= mass <= 2.0):
+        if not (0.0 <= mass <= MAX_PAYLOAD_MASS_KG):
             QMessageBox.warning(
-                self, "Payload Out of Range", "Payload mass must lie within [0.0, 2.0] kg."
+                self, "Payload Out of Range", f"Additional payload must lie within [0.0, {MAX_PAYLOAD_MASS_KG}] kg (simulation limit)."
             )
             return
         com_m = [cx_mm / 1000.0, cy_mm / 1000.0, cz_mm / 1000.0]
-        radius = math.sqrt(com_m[0] ** 2 + com_m[1] ** 2 + com_m[2] ** 2)
-        if radius > 0.30:
+        radius = math.hypot(*com_m)
+        if not math.isfinite(radius) or radius > MAX_PAYLOAD_COM_RADIUS_M:
             QMessageBox.warning(
                 self,
                 "Payload CoM Out of Range",
-                f"CoM offset norm ({radius * 1000.0:.1f} mm) exceeds maximum 300.0 mm.",
+                f"CoM must be finite and within {MAX_PAYLOAD_COM_RADIUS_M * 1000.0:.1f} mm of the TCP.",
             )
             return
         self.worker.set_payload(mass, com_m)
@@ -940,12 +934,11 @@ class PyQtHMI(QMainWindow):
         self.payload_com_z_entry.setText("0.0")
         self.worker.set_payload(0.0, [0.0, 0.0, 0.0])
 
-    def refresh_payload_and_gmo_status(self):
+    def refresh_payload_status(self):
         import time
         now = time.monotonic()
         with self.worker.state_lock:
             snap = self.worker.supervisor_state
-            dq = list(self.worker.dq_curr)
             state = self.worker.state
             preparation = self.worker.sysid_preparation_status
             fresh = bool(
@@ -955,12 +948,14 @@ class PyQtHMI(QMainWindow):
                 and (now - self.worker.last_supervisor_rx_time < 0.8)
             )
         if not fresh or snap is None:
+            self.lbl_payload_active.setText("Configured Payload: feedback unavailable")
+            self.btn_run_sysid.setEnabled(False)
             return
 
         mass = float(snap.payload_mass)
         com = list(snap.payload_com_tcp)
         self.lbl_payload_active.setText(
-            f"Active Payload: {mass:.3f} kg | CoM: [{com[0]*1000.0:+.1f}, {com[1]*1000.0:+.1f}, {com[2]*1000.0:+.1f}] mm"
+            f"Configured Payload: {mass:.3f} kg | CoM: [{com[0]*1000.0:+.1f}, {com[1]*1000.0:+.1f}, {com[2]*1000.0:+.1f}] mm"
         )
         has_payload = mass > 1e-6
         can_sysid = (state == Lite6StateMachine.IDLE) and (not preparation) and (not has_payload)
@@ -975,45 +970,6 @@ class PyQtHMI(QMainWindow):
                 preparation if preparation else "Start Automated Identification Routine"
             )
             self.btn_run_sysid.setToolTip("")
-
-        max_dq = max((abs(v) for v in dq), default=0.0)
-        if max_dq <= 0.015:
-            if self._stationary_since <= 0.0:
-                self._stationary_since = now
-        else:
-            self._stationary_since = 0.0
-
-        settled_for = (now - self._stationary_since) if self._stationary_since > 0.0 else 0.0
-        w = snap.external_cartesian_wrench
-        fx, fy, fz = float(w[0]), float(w[1]), float(w[2])
-        f_horiz = math.hypot(fx, fy)
-        # In LOCAL_WORLD_ALIGNED frame, +Z is upward; an uncompensated downward weight gives Fz < 0,
-        # whereas an over-compensated payload mass gives an upward residual Fz > 0.
-        est_mass_err_kg = -fz / 9.81
-        if settled_for >= 0.5 and abs(fz) >= 2.5 and f_horiz <= 0.65 * abs(fz):
-            if est_mass_err_kg > 0.25:
-                self.lbl_payload_gmo_hint.setText(
-                    f"⚠ GMO Warning: ~+{est_mass_err_kg:.2f} kg uncompensated load ({fz:+.1f} N Z)! "
-                    f"Entered payload ({mass:.2f} kg) may be too low, or TCP is pressed downward."
-                )
-                self.lbl_payload_gmo_hint.setStyleSheet(
-                    "background-color: #fef9e7; color: #b9770e; border: 1px solid #f5b041; "
-                    "border-radius: 4px; padding: 4px; font-size: 8.5pt; font-weight: bold;"
-                )
-            elif est_mass_err_kg < -0.25:
-                self.lbl_payload_gmo_hint.setText(
-                    f"⚠ GMO Warning: ~{abs(est_mass_err_kg):.2f} kg excess upward compensation ({fz:+.1f} N Z)! "
-                    f"Entered payload ({mass:.2f} kg) may be too high or payload was released."
-                )
-                self.lbl_payload_gmo_hint.setStyleSheet(
-                    "background-color: #fdedec; color: #b03a2e; border: 1px solid #ec7063; "
-                    "border-radius: 4px; padding: 4px; font-size: 8.5pt; font-weight: bold;"
-                )
-        else:
-            self.lbl_payload_gmo_hint.setText("GMO Load Check: OK (consistent with configured payload)")
-            self.lbl_payload_gmo_hint.setStyleSheet(
-                "background-color: #e8f8f5; color: #117864; border-radius: 4px; padding: 4px; font-size: 8.5pt; font-weight: bold;"
-            )
 
     def on_state_updated(self, state, error_msg):
         """Processes state transition events safely."""

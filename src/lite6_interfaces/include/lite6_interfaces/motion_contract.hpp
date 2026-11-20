@@ -62,7 +62,8 @@ inline constexpr double kDefaultImpedanceTransitionTimeSec = 0.3;
 
 // Known rigid payload bounds (TCP-frame mass & CoM offset).
 inline constexpr double kMinPayloadMassKg = 0.0;
-inline constexpr double kMaxPayloadMassKg = 2.0;
+// Additional carried mass; the simulation model already includes the gripper.
+inline constexpr double kMaxPayloadMassKg = 0.6;
 inline constexpr double kMaxPayloadComRadiusM = 0.30;
 
 }  // namespace lite6_interfaces::contract

@@ -67,7 +67,6 @@ inline bool valid_controller_command(const srv::ControllerCommand::Request& req)
     case Cmd::CMD_ESTOP:
     case Cmd::CMD_CLEAR_ESTOP:
     case Cmd::CMD_ENTER_SYSID:
-    case Cmd::CMD_TARE_GMO:
       return true;
     case Cmd::CMD_ENTER_JOINT_IMPEDANCE:
     case Cmd::CMD_ENTER_CARTESIAN_IMPEDANCE:

@@ -11,7 +11,6 @@ uint8 CMD_ENTER_CARTESIAN_IMPEDANCE=6   # Enter/switch to CARTESIAN_IMPEDANCE wi
 uint8 CMD_ENTER_TEACH=7                 # Enter/switch to TEACH with validated ComplianceSettings
 uint8 CMD_UPDATE_COMPLIANCE_SETTINGS=8  # Live-update settings while already in JOINT/CARTESIAN_IMPEDANCE or TEACH
 uint8 CMD_SET_PAYLOAD=9                 # Set known rigid payload mass and TCP-frame CoM offset
-uint8 CMD_TARE_GMO=10                   # Capture stationary GMO residual torque bias in a settled steady mode
 
 uint8 command
 
@@ -22,7 +21,7 @@ uint64 expected_epoch 0
 # Used by CMD_ENTER_{JOINT_IMPEDANCE,CARTESIAN_IMPEDANCE,TEACH} and CMD_UPDATE_COMPLIANCE_SETTINGS.
 ComplianceSettings compliance
 
-# Known rigid payload parameters for gravity/inertia/GMO compensation (CMD_SET_PAYLOAD).
+# Known rigid payload parameters for gravity/inertia compensation (CMD_SET_PAYLOAD).
 float64 payload_mass 0.0
 float64[3] payload_com_tcp
 

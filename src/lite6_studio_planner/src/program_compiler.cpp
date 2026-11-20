@@ -1,5 +1,6 @@
 #include "lite6_studio_planner/program_compiler.hpp"
 #include "lite6_planner/motion_tolerances.hpp"
+#include "lite6_interfaces/compliance_validation.hpp"
 
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/jacobian.hpp>
@@ -1160,6 +1161,12 @@ bool ProgramCompiler::compile(
         out_program.blocks.push_back(std::move(blk));
         ++i;
       } else if (st.kind == StatementKind::SET_PAYLOAD) {
+        if (!st.payload_stmt || !lite6_interfaces::valid_payload_params(
+              st.payload_stmt->mass_kg, st.payload_stmt->com_tcp)) {
+          add_diag(out_diagnostics, D::STAGE_SEMANTIC, st.loc, "ERR_PAYLOAD_RANGE",
+            "Additional payload or TCP-frame center of mass exceeds simulation bounds");
+          return false;
+        }
         ExecutionBlock blk;
         blk.type = ExecutionBlockType::PAYLOAD_CMD;
         blk.loc = st.loc;

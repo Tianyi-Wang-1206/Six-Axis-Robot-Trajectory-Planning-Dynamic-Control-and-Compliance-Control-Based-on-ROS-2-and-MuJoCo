@@ -21,7 +21,6 @@ int32 SATURATION_TIMEOUT=-5
 int32 GOAL_TIMEOUT=-6
 int32 MODE_CHANGED=-7
 int32 CONTROLLER_FAULT=-8
-int32 EXTERNAL_TORQUE_LIMIT_VIOLATED=-9
 int32 CONTROLLER_EPOCH_MISMATCH=-10
 int32 STOPPING_TIMEOUT=-11
 
@@ -32,6 +31,3 @@ builtin_interfaces/Time stamp
 uint32 current_sample
 float64[3] position_error_m
 float64[3] rotation_error_rad
-float64[6] external_joint_torque
-float64[6] external_cartesian_wrench
-bool contact_detected

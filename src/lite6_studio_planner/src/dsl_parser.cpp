@@ -1,3 +1,4 @@
+#include "lite6_interfaces/motion_contract.hpp"
 #include "lite6_studio_planner/dsl_parser.hpp"
 
 #include <algorithm>
@@ -1090,10 +1091,12 @@ private:
         advance();  // '='
         if (key.lexeme == "mass") {
           const Token & num = expect(TokenKind::NUMBER, "payload mass [kg]", stmt_idx);
-          if (num.number < 0.0 || num.number > 2.0) {
+          if (!std::isfinite(num.number) || num.number < lite6_interfaces::contract::kMinPayloadMassKg ||
+              num.number > lite6_interfaces::contract::kMaxPayloadMassKg) {
             throw ParseError(
               D::STAGE_SEMANTIC, num.line, num.column, stmt_idx, "ERR_PAYLOAD_RANGE",
-              "Payload 'mass'=" + std::to_string(num.number) + " kg must lie in [0.0, 2.0]");
+              "Payload 'mass'=" + std::to_string(num.number) + " kg exceeds the additional-payload simulation range [0.0, " +
+                std::to_string(lite6_interfaces::contract::kMaxPayloadMassKg) + "]");
           }
           p.mass_kg = num.number;
           has_mass = true;
@@ -1103,7 +1106,8 @@ private:
             p.com_tcp[0] * p.com_tcp[0] +
             p.com_tcp[1] * p.com_tcp[1] +
             p.com_tcp[2] * p.com_tcp[2];
-          if (r2 > 0.30 * 0.30) {
+          if (!std::isfinite(r2) || r2 >
+              lite6_interfaces::contract::kMaxPayloadComRadiusM * lite6_interfaces::contract::kMaxPayloadComRadiusM) {
             throw ParseError(
               D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_PAYLOAD_RANGE",
               "Payload 'com' offset norm=" + std::to_string(std::sqrt(r2)) +
@@ -1116,10 +1120,12 @@ private:
         }
       } else if (!has_mass && peek().kind == TokenKind::NUMBER) {
         const Token & num = advance();
-        if (num.number < 0.0 || num.number > 2.0) {
+        if (!std::isfinite(num.number) || num.number < lite6_interfaces::contract::kMinPayloadMassKg ||
+              num.number > lite6_interfaces::contract::kMaxPayloadMassKg) {
           throw ParseError(
             D::STAGE_SEMANTIC, num.line, num.column, stmt_idx, "ERR_PAYLOAD_RANGE",
-            "Payload 'mass'=" + std::to_string(num.number) + " kg must lie in [0.0, 2.0]");
+            "Payload 'mass'=" + std::to_string(num.number) + " kg exceeds the additional-payload simulation range [0.0, " +
+                std::to_string(lite6_interfaces::contract::kMaxPayloadMassKg) + "]");
         }
         p.mass_kg = num.number;
         has_mass = true;
@@ -1136,7 +1142,7 @@ private:
     if (!has_mass) {
       throw ParseError(
         D::STAGE_SEMANTIC, kw.line, kw.column, stmt_idx, "ERR_MISSING_PAYLOAD_MASS",
-        "SetPayload(...) requires 'mass=<kg>' in [0.0, 2.0]");
+        "SetPayload(...) requires 'mass=<kg>' (additional carried mass)");
     }
 
     ASTStatement st;

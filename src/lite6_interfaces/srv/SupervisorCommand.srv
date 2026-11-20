@@ -15,7 +15,6 @@ uint8 CMD_TEACH=10
 uint8 CMD_EXIT_COMPLIANCE=11
 uint8 CMD_UPDATE_COMPLIANCE=12
 uint8 CMD_SET_PAYLOAD=13
-uint8 CMD_TARE_GMO=14
 
 # Used by the compliance entry and CMD_UPDATE_COMPLIANCE events.
 ComplianceSettings compliance

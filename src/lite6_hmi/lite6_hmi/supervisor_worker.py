@@ -418,18 +418,6 @@ class ROS2Worker(QThread):
             payload_com_tcp=list(com_tcp_m),
         )
 
-    def tare_gmo(self, done=None):
-        expected_rev = 0
-        with self.state_lock:
-            if self.supervisor_state is not None:
-                expected_rev = int(self.supervisor_state.revision)
-        return self._send_command(
-            SupervisorCommand.Request.CMD_TARE_GMO,
-            reason="HMI tare GMO",
-            done=done,
-            expected_revision=expected_rev,
-        )
-
     def _command_response(self, future, done):
         try:
             resp = future.result()

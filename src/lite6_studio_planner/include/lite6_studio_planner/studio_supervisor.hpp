@@ -77,9 +77,6 @@ public:
     int32_t last_error_code = 0;
     std::array<double, 3> cartesian_pos_error_m{};
     std::array<double, 3> cartesian_rot_error_rad{};
-    std::array<double, 6> external_joint_torque{};
-    std::array<double, 6> external_cartesian_wrench{};
-    bool contact_detected = false;
     std::string detail;
     uint64_t controller_epoch = 0;
     uint64_t program_revision = 0;

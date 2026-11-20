@@ -210,9 +210,6 @@ private:
     msg.last_error_code = snap.last_error_code;
     msg.cartesian_pos_error_m = snap.cartesian_pos_error_m;
     msg.cartesian_rot_error_rad = snap.cartesian_rot_error_rad;
-    msg.external_joint_torque = snap.external_joint_torque;
-    msg.external_cartesian_wrench = snap.external_cartesian_wrench;
-    msg.contact_detected = snap.contact_detected;
     msg.detail = snap.detail;
     msg.controller_epoch = snap.controller_epoch;
     msg.program_revision = snap.program_revision;

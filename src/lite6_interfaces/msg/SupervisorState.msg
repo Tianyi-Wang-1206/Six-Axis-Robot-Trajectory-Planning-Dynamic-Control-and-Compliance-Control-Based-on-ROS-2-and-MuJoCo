@@ -72,13 +72,8 @@ uint8 ESTOP_COMPLIANCE_SATURATION=4
 uint8 ESTOP_TRAJECTORY=5
 uint8 ESTOP_CONTROLLER_FAULT=6
 uint8 ESTOP_SUPERVISOR=7
-uint8 ESTOP_COMPLIANCE_EXTERNAL_TORQUE=8
 uint8 estop_reason
 
-# Sensorless Generalized Momentum Observer (GMO) external load estimates.
-float64[6] external_joint_torque
-float64[6] external_cartesian_wrench
-bool contact_detected
 
 int32 ERROR_SYSID_ESTIMATION=-14
 int32 last_error_code

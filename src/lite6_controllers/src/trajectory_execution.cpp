@@ -327,6 +327,8 @@ void Lite6CTCController::update_trajectory_reference(
       tau_point_ff_.setZero();
       return;
     }
+    // Start the trajectory clock only after the configured payload model has settled.
+    if (payload_smoothing_active_) return;
     execution->started = true;
     execution->start_time_ns = time.nanoseconds();
     execution->start_time_pub_ns.store(execution->start_time_ns, std::memory_order_release);

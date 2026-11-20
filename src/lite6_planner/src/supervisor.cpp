@@ -85,7 +85,6 @@ uint8_t map_supervisor_estop_reason(uint8_t ctc_reason) {
     case CS::ESTOP_COMPLIANCE_POSITION_LIMIT: return S::ESTOP_COMPLIANCE_POSITION_LIMIT;
     case CS::ESTOP_COMPLIANCE_VELOCITY_LIMIT: return S::ESTOP_COMPLIANCE_VELOCITY_LIMIT;
     case CS::ESTOP_COMPLIANCE_SATURATION: return S::ESTOP_COMPLIANCE_SATURATION;
-    case CS::ESTOP_COMPLIANCE_EXTERNAL_TORQUE: return S::ESTOP_COMPLIANCE_EXTERNAL_TORQUE;
     case CS::ESTOP_TRAJECTORY_PATH_POSITION:
     case CS::ESTOP_TRAJECTORY_PATH_VELOCITY:
     case CS::ESTOP_TRAJECTORY_GOAL_TIMEOUT:
@@ -128,14 +127,6 @@ std::string describe_controller_estop(const CS& status,uint8_t previous_mode) {
         "Improper operation: The applied MuJoCo mouse drag force pulled too strongly against the compliance "
         "resistance or joint-limit wall for too long. Reduce the drag force or displacement (or lower stiffness), "
         "then press RESET FAULT to recover.";
-    case CS::ESTOP_COMPLIANCE_EXTERNAL_TORQUE:
-      return "Compliance E-STOP: "+joint+" GMO external torque estimate exceeded ("+
-        format_fixed(status.estop_value,2)+" Nm > "+format_fixed(status.estop_limit,2)+" Nm)\n"+
-        "Active mode: "+mode_name+"\n"+
-        "Cause: Sensorless Generalized Momentum Observer detected sustained external load on "+joint+
-        " exceeding "+format_fixed(status.estop_limit,2)+" Nm.\n"+
-        "Improper operation: Excessive collision or drag force occurred during compliance control. "
-        "Clear the obstruction, then press RESET FAULT to recover.";
     case CS::ESTOP_COMPLIANCE_STOPPING_TIMEOUT:
       return "Compliance E-STOP: transition braking timed out ("+
         format_fixed(status.estop_value,2)+" s >= "+format_fixed(status.estop_limit,2)+" s)\n"+
@@ -281,9 +272,6 @@ Supervisor::Effects Supervisor::observe_controller(const CS& status) {
   state_.controller_epoch=status.controller_epoch;
   state_.payload_mass=status.payload_mass;
   state_.payload_com_tcp=status.payload_com_tcp;
-  state_.external_joint_torque=status.external_joint_torque;
-  state_.external_cartesian_wrench=status.external_cartesian_wrench;
-  state_.contact_detected=status.external_contact_detected;
   if(status.controller_epoch!=0) last_controller_epoch_=status.controller_epoch;
 
   if(prev_epoch!=0&&status.controller_epoch!=0&&status.controller_epoch!=prev_epoch) {
@@ -338,13 +326,12 @@ Supervisor::Effects Supervisor::observe_controller(const CS& status) {
 void Supervisor::on_controller_command_ack(uint8_t cmd,bool accepted,uint8_t ack_result,
     uint8_t current_mode,const std::string& msg,bool outcome_unknown) {
   std::lock_guard<std::mutex> guard(mutex_);
-  // TARE_GMO / SET_PAYLOAD do not change the supervisor mode; report the CTC's
+  // SET_PAYLOAD does not change the supervisor mode; report the CTC's
   // actual outcome instead of announcing success when the event is issued.
-  if(cmd==CTC::Request::CMD_TARE_GMO||cmd==CTC::Request::CMD_SET_PAYLOAD) {
-    const std::string what=cmd==CTC::Request::CMD_TARE_GMO?"GMO tare":"Payload update";
+  if(cmd==CTC::Request::CMD_SET_PAYLOAD) {
+    const std::string what="Payload update";
     if(accepted) {
-      changed_unlocked(cmd==CTC::Request::CMD_TARE_GMO?"GMO stationary bias tared":
-        "Payload model updated by CTC");
+      changed_unlocked("Payload configuration accepted by CTC");
     } else if(outcome_unknown) {
       changed_unlocked(what+" outcome unknown: no /ctc_controller/command response; "
         "check ControllerStatus before retrying");
@@ -774,22 +761,6 @@ Supervisor::Reply Supervisor::command(const Command::Request& req) {
     r.effects.expected_controller_epoch=state_.controller_epoch;
     r.effects.cmd_reason=req.reason;
     changed_unlocked("Updating payload model ("+format_fixed(req.payload_mass,3)+" kg)");
-    r.accepted=true;
-    break;
-  case C::Request::CMD_TARE_GMO:
-    if(req.session_id!=0||state_.estop_latched||state_.mode==S::MODE_ESTOP||
-       state_.mode==S::MODE_INITIALIZING||state_.mode==S::MODE_COMPLIANCE_SWITCHING||
-       state_.mode==S::MODE_SYSID||state_.controller_mode==CS::MODE_SYSID||
-       !active_key_.empty()||!fresh_joint_unlocked()||!fresh_controller_unlocked()) {
-      reject("GMO tare requires non-ESTOP/non-SysID idle state and fresh feedback");break;
-    }
-    if(stable_since_==Clock::time_point{}||Clock::now()-stable_since_<kSettleDuration) {
-      reject("Robot must be stationary to tare GMO");break;
-    }
-    r.effects.ctc_cmd=CTC::Request::CMD_TARE_GMO;
-    r.effects.expected_controller_epoch=state_.controller_epoch;
-    r.effects.cmd_reason=req.reason;
-    changed_unlocked("Requesting GMO stationary bias tare");
     r.accepted=true;
     break;
   case C::Request::CMD_BEGIN_RECOVERY:

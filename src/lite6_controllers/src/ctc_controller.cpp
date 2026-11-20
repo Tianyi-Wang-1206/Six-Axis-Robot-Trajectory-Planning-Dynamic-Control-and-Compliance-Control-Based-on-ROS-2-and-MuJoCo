@@ -44,43 +44,16 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
   auto_declare<double>("execution.goal_time_tolerance", 5.0);
   auto_declare<double>("execution.saturation_timeout", 1.0);
 
-  auto_declare<bool>("gmo.enabled", true);
-  auto_declare<std::vector<double>>("gmo.observer_gains", {25.0, 25.0, 25.0, 30.0, 30.0, 30.0});
-  auto_declare<double>("gmo.jacobian_damping", 0.04);
-  auto_declare<double>("gmo.characteristic_length", 0.15);
-  auto_declare<double>("gmo.friction_transition_speed", 0.025);
-  auto_declare<double>("gmo.stiction_deadband_scale_normal", 0.30);
-  auto_declare<double>("gmo.stiction_deadband_scale_compliance", 0.20);
-  auto_declare<double>("gmo.stribeck_deadband_scale", 0.15);
-  auto_declare<double>("gmo.contact_force_threshold", 2.5);
-  auto_declare<double>("gmo.contact_moment_threshold", 0.40);
-  auto_declare<std::vector<double>>(
-    "gmo.contact_joint_torque_threshold", {1.5, 1.5, 1.0, 0.6, 0.35, 0.25});
-  auto_declare<double>("gmo.contact_hysteresis_ratio", 0.70);
-  auto_declare<double>("gmo.contact_on_debounce_sec", 0.015);
-  auto_declare<double>("gmo.contact_off_debounce_sec", 0.040);
-  auto_declare<double>("gmo.max_tare_contact_ratio", 3.0);
-  auto_declare<double>("gmo.tare_average_window_sec", 0.20);
-  auto_declare<double>("gmo.overload_decay_rate", 2.0);
-
   auto_declare<double>("payload.filter_time_constant", 0.20);
   auto_declare<double>("payload.nominal_gyration_radius", 0.025);
 
-  auto_declare<bool>("energy_tank.enabled", true);
-  auto_declare<double>("energy_tank.initial_energy", 1.5);
-  auto_declare<double>("energy_tank.max_energy", 4.0);
-  auto_declare<double>("energy_tank.low_energy_threshold", 0.25);
-  auto_declare<double>("energy_tank.dissipation_harvest_ratio", 0.80);
-  auto_declare<double>("energy_tank.max_injected_power", 15.0);
+  auto_declare<double>("compliance.characteristic_length", 0.15);
 
   auto declare_mode_common = [this](const std::string & prefix) {
     auto_declare<double>(prefix + ".max_joint_velocity", 3.0);
     auto_declare<double>(prefix + ".hard_limit_tolerance", 0.01);
     auto_declare<double>(prefix + ".saturation_timeout", 1.0);
     auto_declare<double>(prefix + ".entry_max_speed", 0.03);
-    auto_declare<std::vector<double>>(
-      prefix + ".max_external_joint_torque", {35.0, 35.0, 24.0, 20.0, 20.0, 12.0});
-    auto_declare<double>(prefix + ".external_torque_timeout", 0.25);
     auto_declare<double>(prefix + ".filter_time_constant", 0.15);
     auto_declare<double>(prefix + ".soft_limit_margin", 0.15);
     auto_declare<double>(prefix + ".soft_limit_stiffness", 80.0);
@@ -89,16 +62,8 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
     auto_declare<double>(prefix + ".transition_duration", 0.25);
   };
   declare_mode_common("compliance.joint_impedance");
-  auto_declare<double>("compliance.joint_impedance.friction_viscous_scale", 0.85);
-  auto_declare<double>("compliance.joint_impedance.friction_coulomb_scale", 0.0);
-  auto_declare<double>("compliance.joint_impedance.friction_transition_speed", 0.04);
-  auto_declare<double>("compliance.joint_impedance.friction_quiet_speed", 0.015);
 
   declare_mode_common("compliance.cartesian_impedance");
-  auto_declare<double>("compliance.cartesian_impedance.friction_viscous_scale", 0.85);
-  auto_declare<double>("compliance.cartesian_impedance.friction_coulomb_scale", 0.0);
-  auto_declare<double>("compliance.cartesian_impedance.friction_transition_speed", 0.04);
-  auto_declare<double>("compliance.cartesian_impedance.friction_quiet_speed", 0.015);
   auto_declare<double>("compliance.cartesian_impedance.min_translation_damping", 2.0);
   auto_declare<double>("compliance.cartesian_impedance.min_rotation_damping", 0.15);
   auto_declare<double>("compliance.cartesian_impedance.min_effective_mass", 0.30);
@@ -114,21 +79,12 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
   auto_declare<std::vector<double>>(
     "compliance.teach.max_joint_damping", {15.0, 15.0, 10.0, 4.0, 3.0, 1.5});
   auto_declare<std::vector<double>>("compliance.teach.damping_levels", {22.0, 17.5, 13.5, 11.5, 9.5});
-  auto_declare<std::vector<double>>("compliance.teach.assistance_levels", {0.35, 0.475, 0.60, 0.625, 0.65});
-  auto_declare<std::vector<double>>(
-    "compliance.teach.friction_transition_levels", {0.045, 0.040, 0.035, 0.030, 0.025});
-  auto_declare<std::vector<double>>(
-    "compliance.teach.quiet_speed_levels", {0.015, 0.012, 0.010, 0.008, 0.006});
-
   auto_declare<double>("impedance_execution.max_translation_deviation", 0.12);
   auto_declare<double>("impedance_execution.max_rotation_deviation", 0.60);
   auto_declare<double>("impedance_execution.max_joint_deviation", 0.80);
   auto_declare<double>("impedance_execution.max_joint_velocity", 3.0);
   auto_declare<double>("impedance_execution.hard_limit_tolerance", 0.01);
   auto_declare<double>("impedance_execution.saturation_timeout", 1.0);
-  auto_declare<std::vector<double>>(
-    "impedance_execution.max_external_joint_torque", {35.0, 35.0, 24.0, 20.0, 20.0, 12.0});
-  auto_declare<double>("impedance_execution.external_torque_timeout", 0.25);
   auto_declare<double>("impedance_execution.dynamics_ff_scale", 1.0);
   auto_declare<double>("impedance_execution.friction_viscous_scale", 0.90);
   auto_declare<double>("impedance_execution.friction_coulomb_scale", 0.80);
@@ -327,24 +283,6 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
     return controller_interface::CallbackReturn::ERROR;
   }
 
-  energy_tank_enabled_ = get_node()->get_parameter("energy_tank.enabled").as_bool();
-  energy_tank_initial_ = get_node()->get_parameter("energy_tank.initial_energy").as_double();
-  energy_tank_max_ = get_node()->get_parameter("energy_tank.max_energy").as_double();
-  energy_tank_low_threshold_ = get_node()->get_parameter("energy_tank.low_energy_threshold").as_double();
-  energy_tank_harvest_ratio_ = get_node()->get_parameter("energy_tank.dissipation_harvest_ratio").as_double();
-  energy_tank_max_power_ = get_node()->get_parameter("energy_tank.max_injected_power").as_double();
-  if (!std::isfinite(energy_tank_initial_) || energy_tank_initial_ < 0.0 ||
-      !std::isfinite(energy_tank_max_) || energy_tank_max_ <= 0.0 ||
-      energy_tank_initial_ > energy_tank_max_ ||
-      !std::isfinite(energy_tank_low_threshold_) || energy_tank_low_threshold_ <= 0.0 ||
-      energy_tank_low_threshold_ > energy_tank_max_ ||
-      !std::isfinite(energy_tank_harvest_ratio_) || energy_tank_harvest_ratio_ < 0.0 ||
-      energy_tank_harvest_ratio_ > 1.0 ||
-      !std::isfinite(energy_tank_max_power_) || energy_tank_max_power_ <= 0.0) {
-    RCLCPP_ERROR(get_node()->get_logger(), "Invalid energy_tank parameter configuration");
-    return controller_interface::CallbackReturn::ERROR;
-  }
-
   configure_command_service();
 
   try {
@@ -375,8 +313,8 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
 
     pin_data_ = pinocchio::Data(pin_model_);
     pin_data_ref_ = pinocchio::Data(pin_model_);
-    pin_data_gmo_ = pinocchio::Data(pin_model_);
-    gmo_jacobian_.setZero();
+    pin_data_dynamics_ = pinocchio::Data(pin_model_);
+    tcp_jacobian_.setZero();
     dynamics_q_.setZero();
     dynamics_dq_.setZero();
     dynamics_ddq_.setZero();
@@ -405,9 +343,6 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   rt_status_pub_->msg_.estop_joint = -1;
   rt_status_pub_->msg_.estop_value = 0.0;
   rt_status_pub_->msg_.estop_limit = 0.0;
-  rt_status_pub_->msg_.external_joint_torque.fill(0.0);
-  rt_status_pub_->msg_.external_cartesian_wrench.fill(0.0);
-  rt_status_pub_->msg_.external_contact_detected = false;
   rt_status_pub_->msg_.status_seq = 0;
   rt_status_pub_->msg_.controller_epoch = 0;
   rt_status_pub_->msg_.mode_epoch = 0;
@@ -420,7 +355,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   status_publish_counter_ = 0;
   status_publish_pending_ = true;
 
-  if (!configure_momentum_observer() || !configure_compliance() || !configure_impedance_trajectory()) {
+  if (!configure_compliance() || !configure_impedance_trajectory()) {
     return controller_interface::CallbackReturn::ERROR;
   }
   configure_trajectory_action();
@@ -501,8 +436,6 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   }
   tau_applied_prev_.setZero();
   imp_ref_kinematics_cached_ = false;
-  reset_momentum_observer(true);
-  reset_energy_tank();
   cmd_ring_.discard_all();
   cmd_gate_.store(0ULL, std::memory_order_release);
   controller_epoch_atomic_.store(controller_epoch_, std::memory_order_release);
@@ -618,63 +551,6 @@ void Lite6CTCController::update_payload_model(double dt)
   }
 }
 
-void Lite6CTCController::reset_energy_tank()
-{
-  energy_tank_level_ = energy_tank_initial_;
-}
-
-double Lite6CTCController::step_energy_tank(
-  double dt, double dissipated_power, double active_power)
-{
-  if (!energy_tank_enabled_ || !(dt > 0.0)) {
-    return 1.0;
-  }
-  const double p_diss = std::max(0.0, std::isfinite(dissipated_power) ? dissipated_power : 0.0);
-  const double p_out = std::isfinite(active_power) ? active_power : 0.0;
-  const double harvested_e =
-    (energy_tank_level_ < energy_tank_max_) ? (energy_tank_harvest_ratio_ * p_diss * dt) : 0.0;
-  const double e_avail = std::max(0.0, energy_tank_level_ + harvested_e);
-
-  double valve = 1.0;
-  if (energy_tank_level_ < energy_tank_low_threshold_) {
-    const double u = std::clamp(
-      energy_tank_level_ / std::max(1e-6, energy_tank_low_threshold_), 0.0, 1.0);
-    valve = u * u * (3.0 - 2.0 * u);
-  }
-
-  if (p_out > 1e-9) {
-    const double w_power = std::clamp(energy_tank_max_power_ / p_out, 0.0, 1.0);
-    const double w_energy = std::clamp(e_avail / (p_out * dt), 0.0, 1.0);
-    valve = std::min({valve, w_power, w_energy});
-  } else {
-    // Dissipative or zero active work never needs throttling.
-    valve = 1.0;
-  }
-
-  // Bidirectional (lossless) tank: energy injected through the active channel is drawn
-  // from the tank and energy the active channel absorbs (negative power, e.g. friction
-  // compensation or null-space terms opposing the motion) flows back into it. Only the
-  // physical/modeled dissipation is harvested with harvest_ratio < 1.
-  const double drawn_e = (p_out > 1e-9) ? (valve * p_out * dt) : (p_out * dt);
-  const double next_e = energy_tank_level_ + harvested_e - drawn_e;
-  energy_tank_level_ = std::clamp(next_e, 0.0, energy_tank_max_);
-  return valve;
-}
-
-double Lite6CTCController::modeled_friction_dissipation() const
-{
-  // Power dissipated by the nominal joint friction model at the measured velocity:
-  // sum_i Fv_i dq_i^2 + Fc_i tanh(|dq_i| / v_s) |dq_i| >= 0. Friction compensation with a
-  // scale <= 1 injects at most this much, so crediting it keeps the active channel
-  // passive with respect to the physical friction it cancels.
-  double p = 0.0;
-  for (int i = 0; i < 6; ++i) {
-    const double v = std::abs(dq_[i]);
-    p += friction_v_[i] * v * v + friction_c_[i] * std::tanh(v / gmo_fric_trans_speed_) * v;
-  }
-  return std::isfinite(p) ? p : 0.0;
-}
-
 void Lite6CTCController::begin_torque_transition(double duration_sec)
 {
   transition_slew_active_ = true;
@@ -721,7 +597,7 @@ void Lite6CTCController::compute_cartesian_effective_inertia(
   double min_inertia, double max_inertia,
   Vec6d & out_lambda_diag) const
 {
-  Mat6d m_tot = pin_data_gmo_.M.topLeftCorner<6, 6>();
+  Mat6d m_tot = pin_data_dynamics_.M.topLeftCorner<6, 6>();
   for (int i = 0; i < 6; ++i) {
     m_tot(i, i) += armature_[i];
   }
@@ -734,7 +610,7 @@ void Lite6CTCController::compute_cartesian_effective_inertia(
   Mat6d lambda_inv = j_arm * llt.solve(j_arm.transpose());
   const double lam_rot_sq = lambda * lambda;
   const double lam_trans_sq =
-    (gmo_characteristic_length_ * lambda) * (gmo_characteristic_length_ * lambda);
+    (cartesian_characteristic_length_ * lambda) * (cartesian_characteristic_length_ * lambda);
   for (int k = 0; k < 3; ++k) {
     lambda_inv(k, k) += lam_trans_sq;
     lambda_inv(k + 3, k + 3) += lam_rot_sq;
@@ -761,12 +637,8 @@ void Lite6CTCController::compute_cartesian_effective_inertia(
 Lite6CTCController::Vec6d Lite6CTCController::project_nullspace_torque(
   const Mat6d & j_arm, double lambda, const Vec6d & tau0) const
 {
-  // N^T = I - J^T Lambda J M^-1 with Lambda = (J M^-1 J^T + DLS)^-1. For this 6-DoF arm
-  // the exact null space of a 6-D task is empty, so away from singularities the result
-  // vanishes and the Cartesian stiffness seen at the TCP is exactly the commanded one;
-  // near singularities the DLS regularization hands the unobservable directions to
-  // the posture term. Uses the M(q) cached by ensure_dynamics_cached() this cycle.
-  Mat6d m_tot = pin_data_gmo_.M.topLeftCorner<6, 6>();
+  // Regularized posture projection: DLS permits task leakage, even at full rank.
+  Mat6d m_tot = pin_data_dynamics_.M.topLeftCorner<6, 6>();
   for (int i = 0; i < 6; ++i) {
     m_tot(i, i) += armature_[i];
   }
@@ -777,7 +649,7 @@ Lite6CTCController::Vec6d Lite6CTCController::project_nullspace_torque(
   Mat6d lambda_inv = j_arm * llt.solve(j_arm.transpose());
   const double lam_rot_sq = lambda * lambda;
   const double lam_trans_sq =
-    (gmo_characteristic_length_ * lambda) * (gmo_characteristic_length_ * lambda);
+    (cartesian_characteristic_length_ * lambda) * (cartesian_characteristic_length_ * lambda);
   for (int k = 0; k < 3; ++k) {
     lambda_inv(k, k) += lam_trans_sq;
     lambda_inv(k + 3, k + 3) += lam_rot_sq;
@@ -816,15 +688,11 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   if (!dynamics_q_.allFinite() || !dynamics_dq_.allFinite() || !dynamics_ddq_.tail(2).allFinite())
     return fail_controller(TrajectoryResult::INVALID_STATE);
 
-  // Smoothly update Pinocchio link6 payload inertia before evaluating GMO and control law.
+  // Smoothly update the payload model before evaluating the control law.
   update_payload_model(dt);
 
-  // Update the sensorless Generalized Momentum Observer using the torque applied in the
-  // previous cycle before generating this cycle's new reference or control command.
-  gmo_dynamics_cached_this_cycle_ = false;
-  gmo_gravity_cached_this_cycle_ = false;
-  gmo_tcp_cached_this_cycle_ = false;
-  update_momentum_observer(dt);
+  dynamics_cached_this_cycle_ = false;
+  tcp_cached_this_cycle_ = false;
 
   // Process ordered edge-triggered ControllerCommand requests and emergency triggers.
   process_controller_commands(dt);
@@ -832,7 +700,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   update_trajectory_reference(time, period);
   update_impedance_trajectory_reference(time, period);
 
-  check_compliance_safety_limits(dt);
+  check_compliance_safety_limits();
   step_compliance_stopping(dt);
   compliance_blocks_trajectory_.store(
     compliance_active() ||
@@ -965,11 +833,6 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       status.estop_joint = estop_joint_;
       status.estop_value = estop_value_;
       status.estop_limit = estop_limit_;
-      for (size_t i = 0; i < 6; ++i) {
-        status.external_joint_torque[i] = gmo_residual_tau_[static_cast<Eigen::Index>(i)];
-        status.external_cartesian_wrench[i] = gmo_external_wrench_[static_cast<Eigen::Index>(i)];
-      }
-      status.external_contact_detected = gmo_contact_detected_;
       ++status_seq_;
       status.status_seq = status_seq_;
       status.controller_epoch = controller_epoch_;
@@ -1005,301 +868,39 @@ void Lite6CTCController::publish_shadow_shm(const Vec6d * target, bool valid)
   state_shm_->shadow_state.write(pod);
 }
 
-bool Lite6CTCController::configure_momentum_observer()
-{
-  const auto node = get_node();
-  gmo_enabled_ = node->get_parameter("gmo.enabled").as_bool();
-  const auto gains = node->get_parameter("gmo.observer_gains").as_double_array();
-  gmo_jacobian_damping_ = node->get_parameter("gmo.jacobian_damping").as_double();
-  gmo_characteristic_length_ = node->get_parameter("gmo.characteristic_length").as_double();
-  gmo_fric_trans_speed_ = node->get_parameter("gmo.friction_transition_speed").as_double();
-  gmo_stiction_scale_normal_ = node->get_parameter("gmo.stiction_deadband_scale_normal").as_double();
-  gmo_stiction_scale_compliance_ =
-    node->get_parameter("gmo.stiction_deadband_scale_compliance").as_double();
-  gmo_stribeck_scale_ = node->get_parameter("gmo.stribeck_deadband_scale").as_double();
-  gmo_contact_force_threshold_ = node->get_parameter("gmo.contact_force_threshold").as_double();
-  gmo_contact_moment_threshold_ = node->get_parameter("gmo.contact_moment_threshold").as_double();
-  const auto joint_contact_thresh =
-    node->get_parameter("gmo.contact_joint_torque_threshold").as_double_array();
-  gmo_contact_hysteresis_ratio_ = node->get_parameter("gmo.contact_hysteresis_ratio").as_double();
-  gmo_contact_on_debounce_sec_ = node->get_parameter("gmo.contact_on_debounce_sec").as_double();
-  gmo_contact_off_debounce_sec_ = node->get_parameter("gmo.contact_off_debounce_sec").as_double();
-  gmo_max_tare_contact_ratio_ = node->get_parameter("gmo.max_tare_contact_ratio").as_double();
-  gmo_tare_average_window_ = node->get_parameter("gmo.tare_average_window_sec").as_double();
-  gmo_overload_decay_rate_ = node->get_parameter("gmo.overload_decay_rate").as_double();
-
-  if (gains.size() != 6 || joint_contact_thresh.size() != 6 ||
-      !std::all_of(gains.begin(), gains.end(), [](double v) { return std::isfinite(v) && v > 0.0; }) ||
-      !std::all_of(joint_contact_thresh.begin(), joint_contact_thresh.end(),
-        [](double v) { return std::isfinite(v) && v > 0.0; }) ||
-      !std::isfinite(gmo_jacobian_damping_) || gmo_jacobian_damping_ <= 0.0 ||
-      !std::isfinite(gmo_characteristic_length_) || gmo_characteristic_length_ <= 0.0 ||
-      !std::isfinite(gmo_fric_trans_speed_) || gmo_fric_trans_speed_ <= 0.0 ||
-      !std::isfinite(gmo_stiction_scale_normal_) || gmo_stiction_scale_normal_ < 0.0 ||
-      !std::isfinite(gmo_stiction_scale_compliance_) || gmo_stiction_scale_compliance_ < 0.0 ||
-      !std::isfinite(gmo_stribeck_scale_) || gmo_stribeck_scale_ < 0.0 ||
-      !std::isfinite(gmo_contact_force_threshold_) || gmo_contact_force_threshold_ <= 0.0 ||
-      !std::isfinite(gmo_contact_moment_threshold_) || gmo_contact_moment_threshold_ <= 0.0 ||
-      !std::isfinite(gmo_contact_hysteresis_ratio_) ||
-      gmo_contact_hysteresis_ratio_ <= 0.0 || gmo_contact_hysteresis_ratio_ >= 1.0 ||
-      !std::isfinite(gmo_contact_on_debounce_sec_) || gmo_contact_on_debounce_sec_ < 0.0 ||
-      !std::isfinite(gmo_contact_off_debounce_sec_) || gmo_contact_off_debounce_sec_ < 0.0 ||
-      !std::isfinite(gmo_max_tare_contact_ratio_) ||
-      gmo_max_tare_contact_ratio_ <= 0.0 || gmo_max_tare_contact_ratio_ > 10.0 ||
-      !std::isfinite(gmo_tare_average_window_) ||
-      gmo_tare_average_window_ < 0.01 || gmo_tare_average_window_ > 2.0 ||
-      !std::isfinite(gmo_overload_decay_rate_) || gmo_overload_decay_rate_ <= 0.0) {
-    RCLCPP_ERROR(node->get_logger(), "Invalid gmo observer parameter configuration");
-    return false;
-  }
-  for (size_t i = 0; i < 6; ++i) {
-    gmo_gains_[i] = gains[i];
-    gmo_contact_joint_torque_threshold_[i] = joint_contact_thresh[i];
-  }
-  compliance_frame_ = pin_model_.getFrameId("link_eef");
-  if (compliance_frame_ >= static_cast<pinocchio::FrameIndex>(pin_model_.nframes)) {
-    RCLCPP_ERROR(node->get_logger(), "Missing link_eef frame for momentum observer / compliance");
-    return false;
-  }
-  tau_applied_prev_.setZero();
-  reset_momentum_observer(true);
-  return true;
-}
-
-void Lite6CTCController::reset_momentum_observer(bool clear_tare_bias)
-{
-  gmo_initialized_ = false;
-  gmo_dynamics_cached_this_cycle_ = false;
-  gmo_gravity_cached_this_cycle_ = false;
-  gmo_tcp_cached_this_cycle_ = false;
-  gmo_p_integral_.setZero();
-  gmo_raw_residual_tau_.setZero();
-  gmo_raw_residual_avg_.setZero();
-  gmo_stationary_time_ = 0.0;
-  if (clear_tare_bias) {
-    gmo_tare_bias_tau_.setZero();
-  }
-  gmo_residual_tau_.setZero();
-  gmo_external_wrench_.setZero();
-  gmo_contact_detected_ = false;
-  gmo_contact_on_timer_ = 0.0;
-  gmo_contact_off_timer_ = 0.0;
-}
-
 void Lite6CTCController::ensure_dynamics_cached()
 {
-  if (gmo_dynamics_cached_this_cycle_) {
+  if (dynamics_cached_this_cycle_) {
     return;
   }
-  pinocchio::crba(pin_model_, pin_data_gmo_, dynamics_q_);
-  pin_data_gmo_.M.triangularView<Eigen::StrictlyLower>() =
-    pin_data_gmo_.M.transpose().triangularView<Eigen::StrictlyLower>();
-  pinocchio::computeCoriolisMatrix(pin_model_, pin_data_gmo_, dynamics_q_, dynamics_dq_);
-  pinocchio::computeGeneralizedGravity(pin_model_, pin_data_gmo_, dynamics_q_);
-  gmo_dynamics_cached_this_cycle_ = true;
-  gmo_gravity_cached_this_cycle_ = true;
-}
-
-void Lite6CTCController::update_momentum_observer(double dt)
-{
-  if (!gmo_enabled_) {
-    gmo_raw_residual_tau_.setZero();
-    gmo_residual_tau_.setZero();
-    gmo_external_wrench_.setZero();
-    gmo_contact_detected_ = false;
-    gmo_contact_on_timer_ = 0.0;
-    gmo_contact_off_timer_ = 0.0;
-    return;
-  }
-  if (!(dt > 0.0)) {
-    return;
-  }
-  if (dt > 0.1) {
-    // A scheduling gap leaves the momentum integral stale relative to the measured
-    // momentum, which would produce a spurious residual spike (false contact or
-    // external-torque trip). Re-initialize from the current momentum instead; the
-    // stationary tare bias is a model property and is retained.
-    reset_momentum_observer(false);
-    return;
-  }
-
-  ensure_dynamics_cached();
-  Vec6d p_a = pin_data_gmo_.M.topRows<6>() * dynamics_dq_;
-  for (int i = 0; i < 6; ++i) {
-    p_a[i] += armature_[i] * dynamics_dq_[i];
-  }
-  const Vec6d ct_dq = (pin_data_gmo_.C.transpose() * dynamics_dq_).head<6>();
-  const Vec6d g_a = pin_data_gmo_.g.head<6>();
-
-  if (!gmo_initialized_) {
-    gmo_p_integral_ = p_a;
-    gmo_raw_residual_tau_.setZero();
-    gmo_residual_tau_.setZero();
-    gmo_external_wrench_.setZero();
-    gmo_contact_detected_ = false;
-    gmo_contact_on_timer_ = 0.0;
-    gmo_contact_off_timer_ = 0.0;
-    gmo_initialized_ = true;
-    return;
-  }
-
-  Vec6d tau_f_obs;
-  for (int i = 0; i < 6; ++i) {
-    tau_f_obs[i] = friction_v_[i] * dq_[i] +
-      friction_c_[i] * std::tanh(dq_[i] / gmo_fric_trans_speed_);
-  }
-
-  const Vec6d beta = tau_applied_prev_ - tau_f_obs - g_a + ct_dq;
-  for (int i = 0; i < 6; ++i) {
-    const double ko = gmo_gains_[static_cast<size_t>(i)];
-    const double r_i = (ko / (1.0 + ko * dt)) *
-      (p_a[i] - gmo_p_integral_[i] - dt * beta[i]);
-    gmo_raw_residual_tau_[i] = r_i;
-    gmo_p_integral_[i] += dt * (beta[i] + r_i);
-  }
-
-  if (!gmo_raw_residual_tau_.allFinite()) {
-    reset_momentum_observer(false);
-    return;
-  }
-
-  // Windowed raw-residual average and continuous stationary time for CMD_TARE_GMO:
-  // the tare captures a settled mean instead of one noisy sample. The average restarts
-  // whenever the arm moves, so it only ever spans stationary data.
-  if (dq_.cwiseAbs().maxCoeff() <= lite6_interfaces::contract::kControllerEntryMaxSpeedRadPerSec) {
-    const double alpha_avg = 1.0 - std::exp(-dt / gmo_tare_average_window_);
-    gmo_raw_residual_avg_ = (gmo_stationary_time_ > 0.0) ?
-      Vec6d(gmo_raw_residual_avg_ + alpha_avg * (gmo_raw_residual_tau_ - gmo_raw_residual_avg_)) :
-      gmo_raw_residual_tau_;
-    gmo_stationary_time_ += dt;
-  } else {
-    gmo_stationary_time_ = 0.0;
-    gmo_raw_residual_avg_ = gmo_raw_residual_tau_;
-  }
-
-  if (system_state_ == SystemState::SYS_ID) {
-    gmo_residual_tau_.setZero();
-    gmo_external_wrench_.setZero();
-    gmo_contact_detected_ = false;
-    gmo_contact_on_timer_ = 0.0;
-    gmo_contact_off_timer_ = 0.0;
-    return;
-  }
-
-  // Subtract captured stationary tare offset and apply velocity-adaptive soft deadband
-  // to suppress low-speed LuGre stiction and Stribeck excess residuals.
-  const Vec6d r_tared = gmo_raw_residual_tau_ - gmo_tare_bias_tau_;
-  const double stiction_scale =
-    (system_state_ == SystemState::NORMAL || system_state_ == SystemState::ESTOP) ?
-    gmo_stiction_scale_normal_ : gmo_stiction_scale_compliance_;
-  const double v_s = std::max(1e-4, gmo_fric_trans_speed_);
-  for (int i = 0; i < 6; ++i) {
-    const double ratio = dq_[i] / v_s;
-    const double e_zero = std::exp(-ratio * ratio);
-    const double stribeck_bump = (1.0 - e_zero) * std::exp(-0.25 * ratio * ratio);
-    const double delta_unc =
-      (stiction_scale * e_zero + gmo_stribeck_scale_ * stribeck_bump + 0.03) * friction_c_[i];
-    const double abs_r = std::abs(r_tared[i]);
-    gmo_residual_tau_[i] = (abs_r > delta_unc) ?
-      std::copysign(abs_r - delta_unc, r_tared[i]) : 0.0;
-  }
-
-  const bool has_nonzero_residual = gmo_residual_tau_.cwiseAbs().maxCoeff() > 1e-6;
-  const bool need_tcp_kinematics =
-    has_nonzero_residual ||
-    system_state_ == SystemState::CARTESIAN_IMPEDANCE ||
-    system_state_ == SystemState::CARTESIAN_IMPEDANCE_TRAJECTORY ||
-    status_publish_pending_ ||
-    system_state_ != last_reported_state_ ||
-    (status_publish_counter_ + 1 >= status_publish_rate_divider_);
-
-  if (need_tcp_kinematics) {
-    pinocchio::computeJointJacobians(pin_model_, pin_data_gmo_, dynamics_q_);
-    pinocchio::updateFramePlacement(pin_model_, pin_data_gmo_, compliance_frame_);
-    gmo_jacobian_.setZero();
-    pinocchio::getFrameJacobian(
-      pin_model_, pin_data_gmo_, compliance_frame_,
-      pinocchio::LOCAL_WORLD_ALIGNED, gmo_jacobian_);
-    gmo_tcp_cached_this_cycle_ = true;
-
-    if (has_nonzero_residual) {
-      const Mat6d j_arm = gmo_jacobian_.leftCols<6>();
-      Mat6d jj_t = j_arm * j_arm.transpose();
-      const double lam_rot_sq = gmo_jacobian_damping_ * gmo_jacobian_damping_;
-      const double lam_trans_sq =
-        (gmo_characteristic_length_ * gmo_jacobian_damping_) *
-        (gmo_characteristic_length_ * gmo_jacobian_damping_);
-      for (int k = 0; k < 3; ++k) {
-        jj_t(k, k) += lam_trans_sq;
-        jj_t(k + 3, k + 3) += lam_rot_sq;
-      }
-      gmo_external_wrench_ = jj_t.ldlt().solve(j_arm * gmo_residual_tau_);
-      if (!gmo_external_wrench_.allFinite()) {
-        reset_momentum_observer(false);
-        return;
-      }
-    } else {
-      gmo_external_wrench_.setZero();
-    }
-  } else {
-    gmo_external_wrench_.setZero();
-  }
-
-  // Multi-channel contact detection with Schmitt trigger hysteresis and temporal debounce.
-  const double f_ratio = (gmo_contact_force_threshold_ > 1e-6) ?
-    (gmo_external_wrench_.head<3>().norm() / gmo_contact_force_threshold_) : 0.0;
-  const double m_ratio = (gmo_contact_moment_threshold_ > 1e-6) ?
-    (gmo_external_wrench_.tail<3>().norm() / gmo_contact_moment_threshold_) : 0.0;
-  double tau_ratio = 0.0;
-  for (int i = 0; i < 6; ++i) {
-    const double th = gmo_contact_joint_torque_threshold_[static_cast<size_t>(i)];
-    if (th > 1e-6) {
-      tau_ratio = std::max(tau_ratio, std::abs(gmo_residual_tau_[i]) / th);
-    }
-  }
-  const double contact_metric = std::max({f_ratio, m_ratio, tau_ratio});
-  if (!gmo_contact_detected_) {
-    if (contact_metric >= 1.0) {
-      gmo_contact_on_timer_ += dt;
-      if (gmo_contact_on_timer_ >= gmo_contact_on_debounce_sec_) {
-        gmo_contact_detected_ = true;
-        gmo_contact_off_timer_ = 0.0;
-      }
-    } else {
-      gmo_contact_on_timer_ = std::max(0.0, gmo_contact_on_timer_ - dt);
-    }
-  } else {
-    if (contact_metric <= gmo_contact_hysteresis_ratio_) {
-      gmo_contact_off_timer_ += dt;
-      if (gmo_contact_off_timer_ >= gmo_contact_off_debounce_sec_) {
-        gmo_contact_detected_ = false;
-        gmo_contact_on_timer_ = 0.0;
-      }
-    } else {
-      gmo_contact_off_timer_ = std::max(0.0, gmo_contact_off_timer_ - dt);
-    }
-  }
+  pinocchio::crba(pin_model_, pin_data_dynamics_, dynamics_q_);
+  pin_data_dynamics_.M.triangularView<Eigen::StrictlyLower>() =
+    pin_data_dynamics_.M.transpose().triangularView<Eigen::StrictlyLower>();
+  pinocchio::computeCoriolisMatrix(pin_model_, pin_data_dynamics_, dynamics_q_, dynamics_dq_);
+  pinocchio::computeGeneralizedGravity(pin_model_, pin_data_dynamics_, dynamics_q_);
+  dynamics_cached_this_cycle_ = true;
 }
 
 void Lite6CTCController::read_cached_tcp_kinematics(
   const pinocchio::SE3 * & out_pose, const Mat6x8d * & out_jacobian)
 {
-  if (gmo_tcp_cached_this_cycle_) {
-    out_pose = &pin_data_gmo_.oMf[compliance_frame_];
-    out_jacobian = &gmo_jacobian_;
+  if (tcp_cached_this_cycle_) {
+    out_pose = &pin_data_dynamics_.oMf[compliance_frame_];
+    out_jacobian = &tcp_jacobian_;
     return;
   }
-  pinocchio::computeJointJacobians(pin_model_, pin_data_, dynamics_q_);
-  pinocchio::updateFramePlacement(pin_model_, pin_data_, compliance_frame_);
-  compliance_jacobian_.setZero();
+  pinocchio::computeJointJacobians(pin_model_, pin_data_dynamics_, dynamics_q_);
+  pinocchio::updateFramePlacement(pin_model_, pin_data_dynamics_, compliance_frame_);
+  tcp_jacobian_.setZero();
   pinocchio::getFrameJacobian(
-    pin_model_, pin_data_, compliance_frame_,
-    pinocchio::LOCAL_WORLD_ALIGNED, compliance_jacobian_);
-  out_pose = &pin_data_.oMf[compliance_frame_];
-  out_jacobian = &compliance_jacobian_;
+    pin_model_, pin_data_dynamics_, compliance_frame_,
+    pinocchio::LOCAL_WORLD_ALIGNED, tcp_jacobian_);
+  tcp_cached_this_cycle_ = true;
+  out_pose = &pin_data_dynamics_.oMf[compliance_frame_];
+  out_jacobian = &tcp_jacobian_;
 }
 
-void Lite6CTCController::add_passive_friction_ff(
+void Lite6CTCController::add_trajectory_friction_ff(
   double fv_scale, double fc_scale, double v_trans, double quiet_speed,
   const Vec6d & dq_coulomb,
   Vec6d & tau_out) const
@@ -1307,7 +908,7 @@ void Lite6CTCController::add_passive_friction_ff(
   const size_t n = joint_names_.size();
   for (size_t i = 0; i < n; ++i) {
     const Eigen::Index idx = static_cast<Eigen::Index>(i);
-    const double viscous = fv_scale * friction_v_[idx] * dq_[idx];
+    const double viscous = fv_scale * friction_v_[idx] * dq_coulomb[idx];
     const double dq_c = dq_coulomb[idx];
     double coulomb_gate = 1.0;
     if (quiet_speed > 0.0) {
@@ -1318,43 +919,6 @@ void Lite6CTCController::add_passive_friction_ff(
       friction_c_[idx] * std::tanh(dq_c / v_trans);
     tau_out[idx] += viscous + coulomb;
   }
-}
-
-bool Lite6CTCController::check_external_torque_limit(
-  double dt, const std::array<double, 6> & limits, double timeout,
-  double & accum_duration, int & out_joint, double & out_val, double & out_limit) const
-{
-  if (!gmo_enabled_) {
-    accum_duration = 0.0;
-    return false;
-  }
-  int worst_joint = -1;
-  double worst_ratio = 0.0;
-  for (int i = 0; i < 6; ++i) {
-    const double lim = limits[static_cast<size_t>(i)];
-    const double mag = std::max(std::abs(gmo_residual_tau_[i]), std::abs(gmo_raw_residual_tau_[i]));
-    if (mag > lim) {
-      const double ratio = mag / lim;
-      if (ratio > worst_ratio) {
-        worst_ratio = ratio;
-        worst_joint = i;
-      }
-    }
-  }
-  if (worst_joint >= 0) {
-    accum_duration += dt;
-    if (accum_duration >= timeout) {
-      out_joint = worst_joint;
-      out_val = std::max(
-        std::abs(gmo_residual_tau_[worst_joint]),
-        std::abs(gmo_raw_residual_tau_[worst_joint]));
-      out_limit = limits[static_cast<size_t>(worst_joint)];
-      return true;
-    }
-  } else {
-    accum_duration = std::max(0.0, accum_duration - gmo_overload_decay_rate_ * dt);
-  }
-  return false;
 }
 
 uint8_t Lite6CTCController::controller_mode_for_state(SystemState state)
@@ -1791,7 +1355,7 @@ uint8_t Lite6CTCController::apply_controller_command(const PendingControllerComm
     case Cmd::CMD_ENTER_JOINT_IMPEDANCE:
     case Cmd::CMD_ENTER_CARTESIAN_IMPEDANCE:
     case Cmd::CMD_ENTER_TEACH: {
-      if (busy) return Resp::ACK_REJECTED_BUSY;
+      if (busy || payload_smoothing_active_) return Resp::ACK_REJECTED_BUSY;
       if (system_state_ != SystemState::NORMAL && !compliance_active()) {
         return Resp::ACK_REJECTED_STATE;
       }
@@ -1813,8 +1377,8 @@ uint8_t Lite6CTCController::apply_controller_command(const PendingControllerComm
       populate_compliance_settings(compliance_settings_);
       if (entering || cmd.compliance_recapture) {
         compliance_q_ = q_;
-        if (gmo_tcp_cached_this_cycle_) {
-          compliance_pose_ = pin_data_gmo_.oMf[compliance_frame_];
+        if (tcp_cached_this_cycle_) {
+          compliance_pose_ = pin_data_dynamics_.oMf[compliance_frame_];
         } else {
           pinocchio::forwardKinematics(pin_model_, pin_data_, dynamics_q_);
           compliance_pose_ = pinocchio::updateFramePlacement(pin_model_, pin_data_, compliance_frame_);
@@ -1827,10 +1391,8 @@ uint8_t Lite6CTCController::apply_controller_command(const PendingControllerComm
       if (entering) {
         compliance_filtered_ = compliance_settings_;
         compliance_saturation_time_ = 0.0;
-        compliance_external_torque_time_ = 0.0;
         compliance_saturation_estop_pending_ = false;
         integral_effort_.setZero();
-        reset_energy_tank();
       }
       transition_system_state(desired);
       return Resp::ACK_APPLIED;
@@ -1843,8 +1405,8 @@ uint8_t Lite6CTCController::apply_controller_command(const PendingControllerComm
       set_cartesian_targets_from_settings(false);
       if (cmd.compliance_recapture) {
         compliance_q_ = q_;
-        if (gmo_tcp_cached_this_cycle_) {
-          compliance_pose_ = pin_data_gmo_.oMf[compliance_frame_];
+        if (tcp_cached_this_cycle_) {
+          compliance_pose_ = pin_data_dynamics_.oMf[compliance_frame_];
         } else {
           pinocchio::forwardKinematics(pin_model_, pin_data_, dynamics_q_);
           compliance_pose_ = pinocchio::updateFramePlacement(pin_model_, pin_data_, compliance_frame_);
@@ -1856,44 +1418,13 @@ uint8_t Lite6CTCController::apply_controller_command(const PendingControllerComm
     case Cmd::CMD_SET_PAYLOAD:
       if (busy) return Resp::ACK_REJECTED_BUSY;
       if (system_state_ == SystemState::SYS_ID) return Resp::ACK_REJECTED_STATE;
+      if (!q_.allFinite() || !dq_.allFinite()) return Resp::ACK_REJECTED_STATE;
+      if (max_speed > lite6_interfaces::contract::kPlannerSettleSpeedRadPerSec) {
+        return Resp::ACK_REJECTED_SPEED;
+      }
       payload_mass_ = cmd.payload_mass;
       payload_com_tcp_ = {cmd.payload_com_tcp[0], cmd.payload_com_tcp[1], cmd.payload_com_tcp[2]};
-      // Clear any previously tared stationary bias so the updated payload model takes effect cleanly.
-      gmo_tare_bias_tau_.setZero();
-      return Resp::ACK_APPLIED;
-
-    case Cmd::CMD_TARE_GMO:
-      if (busy) return Resp::ACK_REJECTED_BUSY;
-      if (system_state_ == SystemState::ESTOP || system_state_ == SystemState::SYS_ID) {
-        return Resp::ACK_REJECTED_STATE;
-      }
-      if (max_speed > lite6_interfaces::contract::kControllerEntryMaxSpeedRadPerSec) {
-        return Resp::ACK_REJECTED_SPEED;
-      }
-      // The averaged residual needs enough stationary data behind it (1.5 windows at
-      // the controller-entry speed bound; supervisors confirm 0.3 s at the stricter
-      // planner settle bound before issuing the command).
-      if (!gmo_enabled_ || !gmo_initialized_ ||
-          gmo_stationary_time_ < 1.5 * gmo_tare_average_window_) {
-        return Resp::ACK_REJECTED_SPEED;
-      }
-      // A tare may only absorb model error, never a real load: bound it by a small
-      // multiple of the per-joint contact detection threshold.
-      for (size_t i = 0; i < 6; ++i) {
-        const double max_tare =
-          gmo_max_tare_contact_ratio_ * gmo_contact_joint_torque_threshold_[i];
-        if (std::abs(gmo_raw_residual_avg_[static_cast<Eigen::Index>(i)]) > max_tare) {
-          return Resp::ACK_REJECTED_LIMIT;
-        }
-      }
-      // Capture the windowed stationary raw residual as the new tare offset without
-      // resetting gmo_p_integral_ (which would cause a re-integration transient spike).
-      gmo_tare_bias_tau_ = gmo_raw_residual_avg_;
-      gmo_residual_tau_.setZero();
-      gmo_external_wrench_.setZero();
-      gmo_contact_detected_ = false;
-      gmo_contact_on_timer_ = 0.0;
-      gmo_contact_off_timer_ = 0.0;
+      payload_smoothing_active_ = true;
       return Resp::ACK_APPLIED;
 
     default:

@@ -192,12 +192,6 @@ private:
     double hard_limit_tolerance = 0.01;
     double saturation_timeout = 1.0;
     double entry_max_speed = 0.03;
-    std::array<double, 6> max_external_torque{35.0, 35.0, 24.0, 20.0, 20.0, 12.0};
-    double external_torque_timeout = 0.25;
-    double fv_scale = 0.85;
-    double fc_scale = 0.0;
-    double fric_trans_speed = 0.04;
-    double fric_quiet_speed = 0.015;
     double filter_time_constant = 0.15;
     double soft_limit_margin = 0.15;
     double soft_limit_stiffness = 80.0;
@@ -235,21 +229,9 @@ private:
   Eigen::Vector3d payload_first_moment_link6_filtered_ = Eigen::Vector3d::Zero();
   bool payload_smoothing_active_ = false;
 
-  // Passivity-based Energy Tank layer.
-  void reset_energy_tank();
-  double step_energy_tank(double dt, double dissipated_power, double active_power);
-  double modeled_friction_dissipation() const;
-  // Dynamically consistent null-space projection N^T tau0 = tau0 - J^T Lambda J M^-1 tau0
+  // Regularized posture projection N^T tau0 = tau0 - J^T Lambda J M^-1 tau0
   // (same DLS-regularized Lambda as the operational damping), using cached M(q).
   Vec6d project_nullspace_torque(const Mat6d & j_arm, double lambda, const Vec6d & tau0) const;
-  bool energy_tank_enabled_ = true;
-  double energy_tank_initial_ = 1.5;
-  double energy_tank_max_ = 4.0;
-  double energy_tank_low_threshold_ = 0.25;
-  double energy_tank_harvest_ratio_ = 0.80;
-  double energy_tank_max_power_ = 15.0;
-  double energy_tank_level_ = 1.5;
-
   // Transition-only torque slew-rate limiter.
   void begin_torque_transition(double duration_sec);
   void apply_transition_torque_slew(double dt, double slew_rate, Vec6d & tau);
@@ -270,7 +252,6 @@ private:
     VELOCITY_LIMIT,
     POSITION_LIMIT,
     SATURATION,
-    EXTERNAL_TORQUE_LIMIT,
     GOAL_TIMEOUT,
     MODE_CHANGED,
     EPOCH_MISMATCH,
@@ -288,9 +269,6 @@ private:
     std::atomic<size_t> sample{0};
     std::array<std::atomic<double>, 3> pos_error{{0.0, 0.0, 0.0}};
     std::array<std::atomic<double>, 3> rot_error{{0.0, 0.0, 0.0}};
-    std::array<std::atomic<double>, 6> external_torque{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
-    std::array<std::atomic<double>, 6> external_wrench{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
-    std::atomic<bool> contact_detected{false};
     // Control thread only fields.
     size_t last_sample_index = 0;
     double elapsed = 0.0;
@@ -301,7 +279,6 @@ private:
     double settled_duration = 0.0;
     bool was_settled = false;
     double saturation_duration = 0.0;
-    double external_torque_duration = 0.0;
     int failure_joint = -1;
     double failure_value = 0.0;
     double failure_limit = 0.0;
@@ -386,72 +363,30 @@ private:
   double imp_soft_limit_stiffness_ = 80.0;
   double imp_soft_limit_damping_ = 5.0;
   double imp_torque_slew_rate_ = 150.0;
-  std::array<double, 6> imp_max_external_torque_{35.0, 35.0, 24.0, 20.0, 20.0, 12.0};
-  double imp_external_torque_timeout_ = 0.25;
 
   ComplianceModeConfig joint_imp_cfg_;
   ComplianceModeConfig cart_imp_cfg_;
   ComplianceModeConfig teach_cfg_;
-  double compliance_external_torque_time_ = 0.0;
   double teach_armature_weight_ = 0.04;
   std::array<double, 6> teach_min_joint_damping_{0.15, 0.15, 0.10, 0.04, 0.03, 0.015};
   std::array<double, 6> teach_max_joint_damping_{15.0, 15.0, 10.0, 4.0, 3.0, 1.5};
   std::array<double, 5> teach_damping_levels_{22.0, 17.5, 13.5, 11.5, 9.5};
-  std::array<double, 5> teach_assistance_levels_{0.35, 0.475, 0.60, 0.625, 0.65};
-  std::array<double, 5> teach_friction_transition_levels_{0.045, 0.040, 0.035, 0.030, 0.025};
-  std::array<double, 5> teach_quiet_speed_levels_{0.015, 0.012, 0.010, 0.008, 0.006};
 
-  // Sensorless Generalized Momentum Observer (GMO) state & configuration.
-  bool configure_momentum_observer();
-  void reset_momentum_observer(bool clear_tare_bias = false);
+  // Shared dynamics and TCP kinematics, independent of force estimation.
   void ensure_dynamics_cached();
-  void update_momentum_observer(double dt);
   void read_cached_tcp_kinematics(
     const pinocchio::SE3 * & out_pose, const Mat6x8d * & out_jacobian);
-  void add_passive_friction_ff(
+  void add_trajectory_friction_ff(
     double fv_scale, double fc_scale, double v_trans, double quiet_speed,
-    const Vec6d & dq_coulomb,
-    Vec6d & tau_out) const;
-  bool check_external_torque_limit(
-    double dt, const std::array<double, 6> & limits, double timeout,
-    double & accum_duration, int & out_joint, double & out_val, double & out_limit) const;
-
-  bool gmo_enabled_ = true;
-  bool gmo_initialized_ = false;
-  bool gmo_dynamics_cached_this_cycle_ = false;
-  bool gmo_gravity_cached_this_cycle_ = false;
-  bool gmo_tcp_cached_this_cycle_ = false;
-  std::array<double, 6> gmo_gains_{25.0, 25.0, 25.0, 30.0, 30.0, 30.0};
-  double gmo_jacobian_damping_ = 0.04;
-  double gmo_characteristic_length_ = 0.15;
-  double gmo_fric_trans_speed_ = 0.025;
-  double gmo_stiction_scale_normal_ = 0.30;
-  double gmo_stiction_scale_compliance_ = 0.20;
-  double gmo_stribeck_scale_ = 0.15;
-  double gmo_contact_force_threshold_ = 2.5;
-  double gmo_contact_moment_threshold_ = 0.40;
-  std::array<double, 6> gmo_contact_joint_torque_threshold_{1.5, 1.5, 1.0, 0.6, 0.35, 0.25};
-  double gmo_contact_hysteresis_ratio_ = 0.70;
-  double gmo_contact_on_debounce_sec_ = 0.015;
-  double gmo_contact_off_debounce_sec_ = 0.040;
-  // CMD_TARE_GMO accepts at most this multiple of the per-joint contact threshold.
-  double gmo_max_tare_contact_ratio_ = 3.0;
-  // Raw residual averaging window [s] and the stationary time required before taring.
-  double gmo_tare_average_window_ = 0.20;
-  double gmo_overload_decay_rate_ = 2.0;
-  Vec6d gmo_raw_residual_avg_ = Vec6d::Zero();
-  double gmo_stationary_time_ = 0.0;
-  double gmo_contact_on_timer_ = 0.0;
-  double gmo_contact_off_timer_ = 0.0;
-  pinocchio::Data pin_data_gmo_;
-  Mat6x8d gmo_jacobian_ = Mat6x8d::Zero();
-  Vec6d gmo_p_integral_ = Vec6d::Zero();
-  Vec6d gmo_raw_residual_tau_ = Vec6d::Zero();
-  Vec6d gmo_tare_bias_tau_ = Vec6d::Zero();
-  Vec6d gmo_residual_tau_ = Vec6d::Zero();
-  Vec6d gmo_external_wrench_ = Vec6d::Zero();
+    const Vec6d & dq_coulomb, Vec6d & tau_out) const;
+  static Eigen::Vector3d rotational_spring_torque(
+    const Eigen::Matrix3d & error_rotation, const Eigen::Vector3d & stiffness);
+  bool dynamics_cached_this_cycle_ = false;
+  bool tcp_cached_this_cycle_ = false;
+  pinocchio::Data pin_data_dynamics_;
+  Mat6x8d tcp_jacobian_ = Mat6x8d::Zero();
+  double cartesian_characteristic_length_ = 0.15;
   Vec6d tau_applied_prev_ = Vec6d::Zero();
-  bool gmo_contact_detected_ = false;
 
   lite6_interfaces::msg::ComplianceSettings compliance_settings_, compliance_filtered_;
   // Per-axis gains [LOCAL_WORLD_ALIGNED] and feedforward wrench used by
@@ -512,7 +447,7 @@ private:
   void process_controller_commands(double dt);
   uint8_t apply_controller_command(const PendingControllerCommand & cmd);
   void step_compliance_stopping(double dt);
-  void check_compliance_safety_limits(double dt);
+  void check_compliance_safety_limits();
   void begin_deceleration_tracker();
   bool step_deceleration_tracker(double dt);
 
