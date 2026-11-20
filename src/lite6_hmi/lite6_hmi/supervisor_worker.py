@@ -859,12 +859,35 @@ class ROS2Worker(QThread):
             self._scoped_dispatch_failed(context, session, "Action result unavailable")
 
     def trigger_estop(self, reason, force_fallback=False):
-        """Request supervisor ESTOP; use CTC direct path only if unavailable."""
+        """Latch E-STOP directly on the CTC and request supervisor ESTOP in parallel.
+
+        The direct /ctc_controller/command request is sent first, so a busy or hung
+        supervisor (whose command service may wait on another CTC handshake) can
+        never delay the RT latch. The supervisor request keeps SupervisorState and
+        motion bookkeeping consistent.
+        """
         with self.state_lock:
             self._estop_requested_at = time.monotonic()
         self._run_on_executor(lambda: self._trigger_estop_on_executor(reason, force_fallback))
 
+    def _send_direct_ctc_estop_on_executor(self, reason):
+        """Unconditional direct CTC E-STOP (bypasses the one-shot fallback latch)."""
+        if not self.ctc_cmd_client.service_is_ready():
+            self.node.get_logger().error(
+                f"CTC DIRECT ESTOP unavailable ({reason}): /ctc_controller/command not ready")
+            return False
+        with self.state_lock:
+            self._direct_estop_sent = True
+        req = ControllerCommand.Request()
+        req.command = ControllerCommand.Request.CMD_ESTOP
+        req.expected_epoch = 0
+        req.reason = str(reason)
+        self.ctc_cmd_client.call_async(req)
+        self.node.get_logger().warn(f"CTC DIRECT ESTOP: {reason}")
+        return True
+
     def _trigger_estop_on_executor(self, reason, force_fallback=False):
+        self._send_direct_ctc_estop_on_executor(reason)
         with self.state_lock:
             h = self.current_goal_handle
         if h is not None:
@@ -873,12 +896,9 @@ class ROS2Worker(QThread):
             except Exception:
                 pass
         if force_fallback or not self.command_client.service_is_ready():
-            self._emergency_fallback_on_executor(reason)
             return
-        ok = self._send_command_on_executor(
+        self._send_command_on_executor(
             SupervisorCommand.Request.CMD_ESTOP, reason=reason, done=self._estop_reply)
-        if not ok:
-            self._emergency_fallback_on_executor(reason)
 
     def _estop_reply(self, resp):
         if resp is None or not resp.accepted:

@@ -59,7 +59,8 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
   auto_declare<double>("gmo.contact_hysteresis_ratio", 0.70);
   auto_declare<double>("gmo.contact_on_debounce_sec", 0.015);
   auto_declare<double>("gmo.contact_off_debounce_sec", 0.040);
-  auto_declare<double>("gmo.max_tare_torque_ratio", 0.40);
+  auto_declare<double>("gmo.max_tare_contact_ratio", 3.0);
+  auto_declare<double>("gmo.tare_average_window_sec", 0.20);
   auto_declare<double>("gmo.overload_decay_rate", 2.0);
 
   auto_declare<double>("payload.filter_time_constant", 0.20);
@@ -87,13 +88,6 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
     auto_declare<double>(prefix + ".torque_slew_rate", 120.0);
     auto_declare<double>(prefix + ".transition_duration", 0.25);
   };
-  declare_mode_common("compliance");
-  auto_declare<double>("compliance.friction_viscous_scale", 0.85);
-  auto_declare<double>("compliance.friction_coulomb_scale", 0.0);
-  auto_declare<double>("compliance.friction_transition_speed", 0.04);
-  auto_declare<double>("compliance.friction_quiet_speed", 0.015);
-  auto_declare<double>("compliance.cartesian_null_damping", 0.50);
-
   declare_mode_common("compliance.joint_impedance");
   auto_declare<double>("compliance.joint_impedance.friction_viscous_scale", 0.85);
   auto_declare<double>("compliance.joint_impedance.friction_coulomb_scale", 0.0);
@@ -491,8 +485,20 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   last_cmd_code_ = lite6_interfaces::srv::ControllerCommand::Request::CMD_NONE;
   last_cmd_result_ = lite6_interfaces::msg::ControllerStatus::ACK_NONE;
 
-  system_state_ = SystemState::NORMAL;
-  last_reported_state_ = SystemState::NORMAL;
+  // CMD_CLEAR_ESTOP is the sole ESTOP -> NORMAL recovery path, so a deactivate /
+  // activate cycle (for example after an RT fault made controller_manager deactivate
+  // this controller) must not act as an implicit E-STOP clear. Only the very first
+  // activation of this controller instance starts in NORMAL; every re-activation
+  // starts latched in ESTOP, braking from the measured state, and needs an explicit
+  // supervised CMD_CLEAR_ESTOP.
+  const bool reactivation = activated_once_;
+  activated_once_ = true;
+  system_state_ = reactivation ? SystemState::ESTOP : SystemState::NORMAL;
+  last_reported_state_ = system_state_;
+  if (reactivation) {
+    begin_deceleration_tracker();
+    latch_estop_reason(lite6_interfaces::msg::ControllerStatus::ESTOP_EXTERNAL);
+  }
   tau_applied_prev_.setZero();
   imp_ref_kinematics_cached_ = false;
   reset_momentum_observer(true);
@@ -502,16 +508,16 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   controller_epoch_atomic_.store(controller_epoch_, std::memory_order_release);
   mode_epoch_atomic_.store(mode_epoch_, std::memory_order_release);
   current_mode_atomic_.store(
-    lite6_interfaces::msg::ControllerStatus::MODE_NORMAL, std::memory_order_release);
+    controller_mode_for_state(system_state_), std::memory_order_release);
   last_cmd_ack_code_.store(last_cmd_code_, std::memory_order_relaxed);
   last_cmd_ack_result_.store(last_cmd_result_, std::memory_order_relaxed);
   last_cmd_ack_mode_.store(
-    lite6_interfaces::msg::ControllerStatus::MODE_NORMAL, std::memory_order_relaxed);
+    controller_mode_for_state(system_state_), std::memory_order_relaxed);
   last_cmd_ack_mode_epoch_.store(mode_epoch_, std::memory_order_relaxed);
   last_cmd_ack_seq_.store(0ULL, std::memory_order_release);
 
-  // Force a fresh NORMAL observation on the first successful update.
-  // Never infer a mode from the last command sent before reactivation.
+  // Force a fresh mode observation (NORMAL, or ESTOP on re-activation) on the first
+  // successful update. Never infer a mode from the last command sent before reactivation.
   status_publish_counter_ = 0;
   status_publish_pending_ = true;
   publish_shadow_shm(&q_, true);
@@ -641,15 +647,32 @@ double Lite6CTCController::step_energy_tank(
     const double w_energy = std::clamp(e_avail / (p_out * dt), 0.0, 1.0);
     valve = std::min({valve, w_power, w_energy});
   } else {
-    // Dissipative or zero active work does not drain tank energy.
+    // Dissipative or zero active work never needs throttling.
     valve = 1.0;
   }
 
-  // Strictly refill tank only from physical damping dissipation, never from active channel sign flips.
-  const double drawn_e = (p_out > 1e-9) ? (valve * p_out * dt) : 0.0;
+  // Bidirectional (lossless) tank: energy injected through the active channel is drawn
+  // from the tank and energy the active channel absorbs (negative power, e.g. friction
+  // compensation or null-space terms opposing the motion) flows back into it. Only the
+  // physical/modeled dissipation is harvested with harvest_ratio < 1.
+  const double drawn_e = (p_out > 1e-9) ? (valve * p_out * dt) : (p_out * dt);
   const double next_e = energy_tank_level_ + harvested_e - drawn_e;
   energy_tank_level_ = std::clamp(next_e, 0.0, energy_tank_max_);
   return valve;
+}
+
+double Lite6CTCController::modeled_friction_dissipation() const
+{
+  // Power dissipated by the nominal joint friction model at the measured velocity:
+  // sum_i Fv_i dq_i^2 + Fc_i tanh(|dq_i| / v_s) |dq_i| >= 0. Friction compensation with a
+  // scale <= 1 injects at most this much, so crediting it keeps the active channel
+  // passive with respect to the physical friction it cancels.
+  double p = 0.0;
+  for (int i = 0; i < 6; ++i) {
+    const double v = std::abs(dq_[i]);
+    p += friction_v_[i] * v * v + friction_c_[i] * std::tanh(v / gmo_fric_trans_speed_) * v;
+  }
+  return std::isfinite(p) ? p : 0.0;
 }
 
 void Lite6CTCController::begin_torque_transition(double duration_sec)
@@ -733,6 +756,39 @@ void Lite6CTCController::compute_cartesian_effective_inertia(
       out_lambda_diag[k + 3] = std::clamp(i_k, min_inertia, max_inertia);
     }
   }
+}
+
+Lite6CTCController::Vec6d Lite6CTCController::project_nullspace_torque(
+  const Mat6d & j_arm, double lambda, const Vec6d & tau0) const
+{
+  // N^T = I - J^T Lambda J M^-1 with Lambda = (J M^-1 J^T + DLS)^-1. For this 6-DoF arm
+  // the exact null space of a 6-D task is empty, so away from singularities the result
+  // vanishes and the Cartesian stiffness seen at the TCP is exactly the commanded one;
+  // near singularities the DLS regularization hands the unobservable directions to
+  // the posture term. Uses the M(q) cached by ensure_dynamics_cached() this cycle.
+  Mat6d m_tot = pin_data_gmo_.M.topLeftCorner<6, 6>();
+  for (int i = 0; i < 6; ++i) {
+    m_tot(i, i) += armature_[i];
+  }
+  const Eigen::LLT<Mat6d> llt(m_tot);
+  if (llt.info() != Eigen::Success) {
+    return Vec6d::Zero();
+  }
+  Mat6d lambda_inv = j_arm * llt.solve(j_arm.transpose());
+  const double lam_rot_sq = lambda * lambda;
+  const double lam_trans_sq =
+    (gmo_characteristic_length_ * lambda) * (gmo_characteristic_length_ * lambda);
+  for (int k = 0; k < 3; ++k) {
+    lambda_inv(k, k) += lam_trans_sq;
+    lambda_inv(k + 3, k + 3) += lam_rot_sq;
+  }
+  const Eigen::LDLT<Mat6d> ldlt(lambda_inv);
+  if (ldlt.info() != Eigen::Success) {
+    return Vec6d::Zero();
+  }
+  const Vec6d task_force = ldlt.solve(j_arm * llt.solve(tau0));
+  const Vec6d projected = tau0 - j_arm.transpose() * task_force;
+  return projected.allFinite() ? projected : Vec6d::Zero();
 }
 
 controller_interface::return_type Lite6CTCController::update_and_write_commands(
@@ -968,7 +1024,8 @@ bool Lite6CTCController::configure_momentum_observer()
   gmo_contact_hysteresis_ratio_ = node->get_parameter("gmo.contact_hysteresis_ratio").as_double();
   gmo_contact_on_debounce_sec_ = node->get_parameter("gmo.contact_on_debounce_sec").as_double();
   gmo_contact_off_debounce_sec_ = node->get_parameter("gmo.contact_off_debounce_sec").as_double();
-  gmo_max_tare_torque_ratio_ = node->get_parameter("gmo.max_tare_torque_ratio").as_double();
+  gmo_max_tare_contact_ratio_ = node->get_parameter("gmo.max_tare_contact_ratio").as_double();
+  gmo_tare_average_window_ = node->get_parameter("gmo.tare_average_window_sec").as_double();
   gmo_overload_decay_rate_ = node->get_parameter("gmo.overload_decay_rate").as_double();
 
   if (gains.size() != 6 || joint_contact_thresh.size() != 6 ||
@@ -987,8 +1044,10 @@ bool Lite6CTCController::configure_momentum_observer()
       gmo_contact_hysteresis_ratio_ <= 0.0 || gmo_contact_hysteresis_ratio_ >= 1.0 ||
       !std::isfinite(gmo_contact_on_debounce_sec_) || gmo_contact_on_debounce_sec_ < 0.0 ||
       !std::isfinite(gmo_contact_off_debounce_sec_) || gmo_contact_off_debounce_sec_ < 0.0 ||
-      !std::isfinite(gmo_max_tare_torque_ratio_) ||
-      gmo_max_tare_torque_ratio_ <= 0.0 || gmo_max_tare_torque_ratio_ > 1.0 ||
+      !std::isfinite(gmo_max_tare_contact_ratio_) ||
+      gmo_max_tare_contact_ratio_ <= 0.0 || gmo_max_tare_contact_ratio_ > 10.0 ||
+      !std::isfinite(gmo_tare_average_window_) ||
+      gmo_tare_average_window_ < 0.01 || gmo_tare_average_window_ > 2.0 ||
       !std::isfinite(gmo_overload_decay_rate_) || gmo_overload_decay_rate_ <= 0.0) {
     RCLCPP_ERROR(node->get_logger(), "Invalid gmo observer parameter configuration");
     return false;
@@ -1015,6 +1074,8 @@ void Lite6CTCController::reset_momentum_observer(bool clear_tare_bias)
   gmo_tcp_cached_this_cycle_ = false;
   gmo_p_integral_.setZero();
   gmo_raw_residual_tau_.setZero();
+  gmo_raw_residual_avg_.setZero();
+  gmo_stationary_time_ = 0.0;
   if (clear_tare_bias) {
     gmo_tare_bias_tau_.setZero();
   }
@@ -1050,7 +1111,15 @@ void Lite6CTCController::update_momentum_observer(double dt)
     gmo_contact_off_timer_ = 0.0;
     return;
   }
-  if (!(dt > 0.0) || dt > 0.1) {
+  if (!(dt > 0.0)) {
+    return;
+  }
+  if (dt > 0.1) {
+    // A scheduling gap leaves the momentum integral stale relative to the measured
+    // momentum, which would produce a spurious residual spike (false contact or
+    // external-torque trip). Re-initialize from the current momentum instead; the
+    // stationary tare bias is a model property and is retained.
+    reset_momentum_observer(false);
     return;
   }
 
@@ -1092,6 +1161,20 @@ void Lite6CTCController::update_momentum_observer(double dt)
   if (!gmo_raw_residual_tau_.allFinite()) {
     reset_momentum_observer(false);
     return;
+  }
+
+  // Windowed raw-residual average and continuous stationary time for CMD_TARE_GMO:
+  // the tare captures a settled mean instead of one noisy sample. The average restarts
+  // whenever the arm moves, so it only ever spans stationary data.
+  if (dq_.cwiseAbs().maxCoeff() <= lite6_interfaces::contract::kControllerEntryMaxSpeedRadPerSec) {
+    const double alpha_avg = 1.0 - std::exp(-dt / gmo_tare_average_window_);
+    gmo_raw_residual_avg_ = (gmo_stationary_time_ > 0.0) ?
+      Vec6d(gmo_raw_residual_avg_ + alpha_avg * (gmo_raw_residual_tau_ - gmo_raw_residual_avg_)) :
+      gmo_raw_residual_tau_;
+    gmo_stationary_time_ += dt;
+  } else {
+    gmo_stationary_time_ = 0.0;
+    gmo_raw_residual_avg_ = gmo_raw_residual_tau_;
   }
 
   if (system_state_ == SystemState::SYS_ID) {
@@ -1738,6 +1821,9 @@ uint8_t Lite6CTCController::apply_controller_command(const PendingControllerComm
         }
         begin_torque_transition(target_cfg.transition_duration);
       }
+      // Scalar settings replace any held per-axis gains / feedforward wrench; the filter
+      // restarts only when the mode is newly entered.
+      set_cartesian_targets_from_settings(entering);
       if (entering) {
         compliance_filtered_ = compliance_settings_;
         compliance_saturation_time_ = 0.0;
@@ -1754,6 +1840,7 @@ uint8_t Lite6CTCController::apply_controller_command(const PendingControllerComm
       if (busy) return Resp::ACK_REJECTED_BUSY;
       if (!compliance_active()) return Resp::ACK_REJECTED_STATE;
       populate_compliance_settings(compliance_settings_);
+      set_cartesian_targets_from_settings(false);
       if (cmd.compliance_recapture) {
         compliance_q_ = q_;
         if (gmo_tcp_cached_this_cycle_) {
@@ -1783,17 +1870,25 @@ uint8_t Lite6CTCController::apply_controller_command(const PendingControllerComm
       if (max_speed > lite6_interfaces::contract::kControllerEntryMaxSpeedRadPerSec) {
         return Resp::ACK_REJECTED_SPEED;
       }
-      // Reject taring if the robot is under an active large external load (> max_tare_torque_ratio * limit).
+      // The averaged residual needs enough stationary data behind it (1.5 windows at
+      // the controller-entry speed bound; supervisors confirm 0.3 s at the stricter
+      // planner settle bound before issuing the command).
+      if (!gmo_enabled_ || !gmo_initialized_ ||
+          gmo_stationary_time_ < 1.5 * gmo_tare_average_window_) {
+        return Resp::ACK_REJECTED_SPEED;
+      }
+      // A tare may only absorb model error, never a real load: bound it by a small
+      // multiple of the per-joint contact detection threshold.
       for (size_t i = 0; i < 6; ++i) {
         const double max_tare =
-          gmo_max_tare_torque_ratio_ * joint_imp_cfg_.max_external_torque[i];
-        if (std::abs(gmo_raw_residual_tau_[static_cast<Eigen::Index>(i)]) > max_tare) {
+          gmo_max_tare_contact_ratio_ * gmo_contact_joint_torque_threshold_[i];
+        if (std::abs(gmo_raw_residual_avg_[static_cast<Eigen::Index>(i)]) > max_tare) {
           return Resp::ACK_REJECTED_LIMIT;
         }
       }
-      // Capture the converged stationary raw residual as the new tare offset without
+      // Capture the windowed stationary raw residual as the new tare offset without
       // resetting gmo_p_integral_ (which would cause a re-integration transient spike).
-      gmo_tare_bias_tau_ = gmo_raw_residual_tau_;
+      gmo_tare_bias_tau_ = gmo_raw_residual_avg_;
       gmo_residual_tau_.setZero();
       gmo_external_wrench_.setZero();
       gmo_contact_detected_ = false;

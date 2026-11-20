@@ -55,7 +55,7 @@ private:
   enum class TrajectoryResult {
     RUNNING, SUCCEEDED, CANCELED, DEACTIVATED, PATH_POSITION, PATH_VELOCITY,
     GOAL_TIMEOUT, SATURATION, INVALID_STATE, INVALID_COMMAND, COMMAND_WRITE, MODE_CHANGED,
-    CONTROL_EXCEPTION
+    CONTROL_EXCEPTION, SPLICE_REJECTED
   };
   struct TrajectoryExecution {
     explicit TrajectoryExecution(std::shared_ptr<TrajectoryGoal> handle) : goal(std::move(handle)) {}
@@ -63,6 +63,24 @@ private:
     std::atomic<bool> cancel{false};
     std::atomic<TrajectoryResult> result{TrajectoryResult::RUNNING};
     std::atomic<size_t> sample{0};
+    // Actual first-cycle time [ns], published by the RT thread once the goal starts.
+    std::atomic<int64_t> start_time_pub_ns{0};
+    // Path-preserving splice. A splice goal (header.stamp == this execution's actual
+    // start) replaces the remaining reference from its first sample onward, e.g. a
+    // stop-along-path tail for a pause. Parent side: splice_owner is set once under
+    // trajectory_mutex_ before splice is published; the RT thread only uses splice.
+    std::shared_ptr<TrajectoryExecution> splice_owner;
+    std::atomic<TrajectoryExecution *> splice{nullptr};
+    bool splice_reserved = false;  // Non-RT, under trajectory_mutex_.
+    std::atomic<bool> on_tail{false};
+    // Child side (immutable after construction / before publication).
+    bool is_splice = false;
+    double splice_switch_time = 0.0;
+    std::weak_ptr<TrajectoryExecution> splice_parent;
+    // Control thread only: adopted splice tail and its resolution state.
+    TrajectoryExecution * tail = nullptr;
+    bool splice_seen = false;
+    bool splice_resolved = false;
     std::array<std::atomic<double>, 6> actual_pos{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
     std::array<std::atomic<double>, 6> actual_vel{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
     std::array<std::atomic<double>, 6> actual_eff{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
@@ -91,7 +109,10 @@ private:
     double failure_limit = 0.0;
   };
   void configure_trajectory_action();
-  bool valid_trajectory_goal(const FollowTrajectory::Goal & goal) const;
+  bool valid_trajectory_goal(const FollowTrajectory::Goal & goal, bool splice = false) const;
+  // Non-RT, under trajectory_mutex_: validates a splice goal against the active execution.
+  bool valid_splice_goal(const FollowTrajectory::Goal & goal) const;
+  void monitor_splices();
   void populate_goal_tolerances(
     const FollowTrajectory::Goal & goal, TrajectoryExecution & exec) const;
   void monitor_trajectory();
@@ -121,6 +142,8 @@ private:
   bool trajectory_reserved_ = false;
   std::shared_ptr<TrajectoryExecution> active_trajectory_;
   std::vector<std::shared_ptr<TrajectoryExecution>> retired_trajectories_;
+  // Accepted splice goals awaiting their adopted/rejected terminal result.
+  std::vector<std::shared_ptr<TrajectoryExecution>> pending_splices_;
   realtime_tools::RealtimeBuffer<std::shared_ptr<TrajectoryExecution>> trajectory_buffer_;
   rclcpp_action::Server<FollowTrajectory>::SharedPtr trajectory_server_;
   rclcpp::TimerBase::SharedPtr trajectory_monitor_;
@@ -215,6 +238,10 @@ private:
   // Passivity-based Energy Tank layer.
   void reset_energy_tank();
   double step_energy_tank(double dt, double dissipated_power, double active_power);
+  double modeled_friction_dissipation() const;
+  // Dynamically consistent null-space projection N^T tau0 = tau0 - J^T Lambda J M^-1 tau0
+  // (same DLS-regularized Lambda as the operational damping), using cached M(q).
+  Vec6d project_nullspace_torque(const Mat6d & j_arm, double lambda, const Vec6d & tau0) const;
   bool energy_tank_enabled_ = true;
   double energy_tank_initial_ = 1.5;
   double energy_tank_max_ = 4.0;
@@ -407,8 +434,13 @@ private:
   double gmo_contact_hysteresis_ratio_ = 0.70;
   double gmo_contact_on_debounce_sec_ = 0.015;
   double gmo_contact_off_debounce_sec_ = 0.040;
-  double gmo_max_tare_torque_ratio_ = 0.40;
+  // CMD_TARE_GMO accepts at most this multiple of the per-joint contact threshold.
+  double gmo_max_tare_contact_ratio_ = 3.0;
+  // Raw residual averaging window [s] and the stationary time required before taring.
+  double gmo_tare_average_window_ = 0.20;
   double gmo_overload_decay_rate_ = 2.0;
+  Vec6d gmo_raw_residual_avg_ = Vec6d::Zero();
+  double gmo_stationary_time_ = 0.0;
   double gmo_contact_on_timer_ = 0.0;
   double gmo_contact_off_timer_ = 0.0;
   pinocchio::Data pin_data_gmo_;
@@ -422,6 +454,21 @@ private:
   bool gmo_contact_detected_ = false;
 
   lite6_interfaces::msg::ComplianceSettings compliance_settings_, compliance_filtered_;
+  // Per-axis gains [LOCAL_WORLD_ALIGNED] and feedforward wrench used by
+  // MODE_CARTESIAN_IMPEDANCE. Commands broadcast the scalar ComplianceSettings; an
+  // END_HOLD_CARTESIAN_IMPEDANCE handover keeps the trajectory's anisotropic gains and
+  // final wrench_ff, starting from its filtered values for a continuous torque.
+  void set_cartesian_targets_from_settings(bool reset_filtered);
+  Eigen::Vector3d cart_kt_target_ = Eigen::Vector3d::Constant(200.0);
+  Eigen::Vector3d cart_dt_target_ = Eigen::Vector3d::Constant(0.8);
+  Eigen::Vector3d cart_kr_target_ = Eigen::Vector3d::Constant(8.0);
+  Eigen::Vector3d cart_dr_target_ = Eigen::Vector3d::Constant(0.8);
+  Eigen::Vector3d cart_kt_filtered_ = Eigen::Vector3d::Constant(200.0);
+  Eigen::Vector3d cart_dt_filtered_ = Eigen::Vector3d::Constant(0.8);
+  Eigen::Vector3d cart_kr_filtered_ = Eigen::Vector3d::Constant(8.0);
+  Eigen::Vector3d cart_dr_filtered_ = Eigen::Vector3d::Constant(0.8);
+  Vec6d cart_wrench_ff_target_ = Vec6d::Zero();
+  Vec6d cart_wrench_ff_filtered_ = Vec6d::Zero();
   Vec6d compliance_q_ = Vec6d::Zero();
   Mat6x8d compliance_jacobian_ = Mat6x8d::Zero();
   pinocchio::SE3 compliance_pose_;
@@ -431,6 +478,8 @@ private:
   std::atomic<bool> compliance_blocks_trajectory_{false};
   std::atomic<bool> emergency_pending_{false};
   SystemState system_state_ = SystemState::NORMAL;
+  // Set by the first on_activate(); every later activation starts latched in ESTOP.
+  bool activated_once_ = false;
 
   // Kinematic Deceleration Tracker
   Vec6d estop_q_ = Vec6d::Zero(), estop_dq_ = Vec6d::Zero();

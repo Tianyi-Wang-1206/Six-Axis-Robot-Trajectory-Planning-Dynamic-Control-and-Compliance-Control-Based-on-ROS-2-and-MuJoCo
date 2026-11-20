@@ -338,6 +338,21 @@ Supervisor::Effects Supervisor::observe_controller(const CS& status) {
 void Supervisor::on_controller_command_ack(uint8_t cmd,bool accepted,uint8_t ack_result,
     uint8_t current_mode,const std::string& msg,bool outcome_unknown) {
   std::lock_guard<std::mutex> guard(mutex_);
+  // TARE_GMO / SET_PAYLOAD do not change the supervisor mode; report the CTC's
+  // actual outcome instead of announcing success when the event is issued.
+  if(cmd==CTC::Request::CMD_TARE_GMO||cmd==CTC::Request::CMD_SET_PAYLOAD) {
+    const std::string what=cmd==CTC::Request::CMD_TARE_GMO?"GMO tare":"Payload update";
+    if(accepted) {
+      changed_unlocked(cmd==CTC::Request::CMD_TARE_GMO?"GMO stationary bias tared":
+        "Payload model updated by CTC");
+    } else if(outcome_unknown) {
+      changed_unlocked(what+" outcome unknown: no /ctc_controller/command response; "
+        "check ControllerStatus before retrying");
+    } else {
+      changed_unlocked(what+" rejected by CTC ("+std::to_string(ack_result)+"): "+msg);
+    }
+    return;
+  }
   if(accepted) return;
   if(outcome_unknown) {
     // Never assume rejection: the command may still have been applied. Compliance
@@ -381,7 +396,9 @@ Supervisor::Effects Supervisor::watchdog() {
   std::lock_guard<std::mutex> guard(mutex_);
   Effects fx;
   if(state_.mode==S::MODE_INITIALIZING) return fx;
-  if((state_.mode==S::MODE_ESTOP||state_.mode==S::MODE_FAULT||state_.mode==S::MODE_SOFT_FAULT)&&
+  // MODE_FAULT (SupervisorState) is reserved by the frozen interface but never entered:
+  // controller faults latch MODE_ESTOP and recoverable motion failures MODE_SOFT_FAULT.
+  if((state_.mode==S::MODE_ESTOP||state_.mode==S::MODE_SOFT_FAULT)&&
      seen_controller_&&!fresh_controller_unlocked()&&!controller_lost_notified_) {
     controller_lost_notified_=true;
     changed_unlocked(state_.detail+"\n\n"+kControllerLostHint);
@@ -394,7 +411,7 @@ Supervisor::Effects Supervisor::watchdog() {
     }
     return fx;
   }
-  if(state_.mode==S::MODE_FAULT||state_.mode==S::MODE_SOFT_FAULT) return fx;
+  if(state_.mode==S::MODE_SOFT_FAULT) return fx;
   if(!fresh_controller_unlocked()||!fresh_joint_unlocked()) {
     if(!fresh_controller_unlocked()) {
       controller_lost_notified_=true;
@@ -772,7 +789,7 @@ Supervisor::Reply Supervisor::command(const Command::Request& req) {
     r.effects.ctc_cmd=CTC::Request::CMD_TARE_GMO;
     r.effects.expected_controller_epoch=state_.controller_epoch;
     r.effects.cmd_reason=req.reason;
-    changed_unlocked("GMO stationary bias tared");
+    changed_unlocked("Requesting GMO stationary bias tare");
     r.accepted=true;
     break;
   case C::Request::CMD_BEGIN_RECOVERY:
@@ -792,7 +809,7 @@ Supervisor::Reply Supervisor::command(const Command::Request& req) {
     r.accepted=true;
     break;
   case C::Request::CMD_ACK_SOFT_FAULT:
-    if((state_.mode!=S::MODE_SOFT_FAULT&&state_.mode!=S::MODE_FAULT)||
+    if(state_.mode!=S::MODE_SOFT_FAULT||
        state_.estop_latched||req.session_id!=0||!active_key_.empty()||
        !fresh_joint_unlocked()||!fresh_controller_unlocked()||
        state_.controller_mode!=CS::MODE_NORMAL) {

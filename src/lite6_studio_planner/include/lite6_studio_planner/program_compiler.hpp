@@ -89,6 +89,10 @@ struct CompiledProgram
 class ProgramCompiler
 {
 public:
+  // Joint speed cap [rad/s] for impedance trajectory blocks: 90 % of the CTC
+  // impedance_execution.max_joint_velocity (3.0 rad/s), whose violation latches E-STOP.
+  static constexpr double kImpedanceJointVelocityCap = 2.7;
+
   using Diagnostic = lite6_interfaces::msg::CompileDiagnostic;
 
   explicit ProgramCompiler(const lite6_planner::KinematicsEngine & engine);
@@ -121,6 +125,27 @@ public:
     size_t pause_sample_idx,
     const std::array<double, 6> & q_actual,
     ExecutionBlock & out_resumed_block,
+    std::string & out_error) const;
+
+  enum class PauseSpliceStatus
+  {
+    OK,           // out_tail holds a stop-along-path splice
+    LET_FINISH,   // the remaining motion is shorter than a path-preserving stop
+    FAILED        // no admissible splice (caller falls back to a controller cancel)
+  };
+
+  // Builds a path-preserving stop for a running rigid block: from the 1 kHz sample at
+  // or after t_switch_sec (block time base), the remaining reference q(tau) is
+  // re-timed with tau_dot = sigma(t), where sigma falls from 1 to 0 along a septic
+  // (C^3) smoothstep, so the arm decelerates to rest ON the programmed path within
+  // joint velocity/acceleration/jerk limits. out_tail starts with the original sample
+  // verbatim (same time_from_start) for a seamless CTC splice; out_end_sample is the
+  // nearest original sample index to the stopping point.
+  PauseSpliceStatus plan_pause_splice(
+    const ExecutionBlock & block,
+    double t_switch_sec,
+    trajectory_msgs::msg::JointTrajectory & out_tail,
+    size_t & out_end_sample,
     std::string & out_error) const;
 
   // Replans an entire trajectory block directly from q_actual (used when an earlier impedance
@@ -169,8 +194,14 @@ private:
     const std::array<double, 6> & start_q,
     const MotionOptions & default_options,
     const SourceLocation & default_loc,
+    bool is_impedance,
     SampledTrajectory1kHz & out_sampled,
     std::vector<Diagnostic> & out_diagnostics) const;
+
+  // Joint limits used to plan and verify a block. Impedance blocks additionally cap
+  // max_vel at kImpedanceJointVelocityCap so the measured joint speed (reference plus
+  // compliant tracking lag) stays below the controller's impedance E-STOP threshold.
+  std::array<lite6_planner::JointLimit, 6> motion_limits(bool is_impedance) const;
 
   // Resolves joint-group waypoints and builds the blended joint path (>= 2 statements).
   bool build_joint_group_path(
@@ -198,7 +229,8 @@ private:
   bool verify_sampled_trajectory_1khz(
     const SampledTrajectory1kHz & sampled,
     bool check_singularity_along_path,
-    std::vector<Diagnostic> & diags) const;
+    std::vector<Diagnostic> & diags,
+    bool is_impedance = false) const;
 };
 
 }  // namespace lite6_studio_planner

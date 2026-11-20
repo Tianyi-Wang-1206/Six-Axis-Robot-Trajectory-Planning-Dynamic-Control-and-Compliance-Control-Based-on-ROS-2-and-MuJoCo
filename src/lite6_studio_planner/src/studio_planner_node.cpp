@@ -27,6 +27,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <pthread.h>
 #include <sstream>
 #include <stdexcept>
@@ -42,6 +43,9 @@ const std::vector<std::string> kJointNames{
   "joint1", "joint2", "joint3", "joint4", "joint5", "joint6"};
 
 constexpr double kAlignmentThresholdRad = 0.008;
+// Block-time lookahead between a pause request and the stop-along-path splice switch:
+// covers splice planning, the goal round trip and the CTC's first-sight decision.
+constexpr double kPauseSpliceLookaheadSec = 0.12;
 
 template <typename Fn>
 struct ScopeExit
@@ -173,6 +177,14 @@ private:
     CANCELED,
     FAULT,
     SESSION_SUPERSEDED
+  };
+
+  // How a running controller goal reacts to a PAUSE request.
+  enum class PauseHandling
+  {
+    CANCEL,      // cancel the goal (controller brakes; resume replans back onto the path)
+    SPLICED,     // a stop-along-path tail was adopted; wait for the goal to settle
+    LET_FINISH   // the goal ends sooner than a path stop; pause at the block boundary
   };
 
   void publish_snapshot(const StudioSupervisor::Snapshot & snap)
@@ -366,6 +378,11 @@ private:
 
   void on_controller_status(const ControllerStatus & msg)
   {
+    if (msg.trajectory_start.sec != 0 || msg.trajectory_start.nanosec != 0) {
+      std::lock_guard<std::mutex> lock(traj_status_mutex_);
+      last_traj_id_ = msg.trajectory_id;
+      last_traj_start_ = msg.trajectory_start;
+    }
     const auto effects = supervisor_->observe_controller(msg);
     apply_effects(effects);
   }
@@ -584,7 +601,8 @@ private:
     std::function<void(const typename ActionT::Feedback &)> on_feedback,
     bool is_rigid_action,
     bool honor_pause_stop,
-    std::string & out_error)
+    std::string & out_error,
+    std::function<PauseHandling(const rclcpp_action::GoalUUID &)> on_pause = nullptr)
   {
     const auto start_tp = std::chrono::steady_clock::now();
     while (!client->action_server_is_ready()) {
@@ -675,12 +693,23 @@ private:
     ScopeExit clear_guard{clear_active};
 
     bool cancel_sent = false;
+    // Set once a pause was turned into a path-preserving splice or a natural finish;
+    // STOP, E-STOP and session changes still cancel.
+    bool pause_handled = false;
     auto maybe_cancel = [&]() {
-      if (!cancel_sent &&
-          (!rclcpp::ok() || session != supervisor_->active_session() ||
-           (honor_pause_stop &&
-            (supervisor_->stop_requested(session) || supervisor_->pause_requested(session)))))
-      {
+      if (cancel_sent) {
+        return;
+      }
+      const bool superseded = !rclcpp::ok() || session != supervisor_->active_session();
+      const bool stop = honor_pause_stop && supervisor_->stop_requested(session);
+      bool pause = honor_pause_stop && supervisor_->pause_requested(session);
+      if (pause && !superseded && !stop && on_pause && !pause_handled) {
+        pause_handled = on_pause(goal_handle->get_goal_id()) != PauseHandling::CANCEL;
+      }
+      if (pause_handled) {
+        pause = false;
+      }
+      if (superseded || stop || pause) {
         cancel_sent = true;
         try {
           (void)client->async_cancel_goal(goal_handle);
@@ -1195,6 +1224,49 @@ private:
     }
   }
 
+  enum class SettleOutcome
+  {
+    SETTLED,
+    ABORTED,
+    TIMED_OUT
+  };
+
+  // Waits until every joint speed stays at or below the planner settle bound
+  // (kPlannerSettleSpeedRadPerSec, strictly below the controller admission bound)
+  // for a short continuous window, so 100 Hz SHM sampling jitter never lets a
+  // command reach the 1 kHz controller while it would still be speed-rejected.
+  SettleOutcome wait_for_planner_settle(uint64_t session, double timeout_sec)
+  {
+    constexpr auto kContinuous = std::chrono::milliseconds(50);
+    const auto start = std::chrono::steady_clock::now();
+    auto settled_since = std::chrono::steady_clock::time_point{};
+    while (rclcpp::ok() && !worker_exit_) {
+      if (session != supervisor_->active_session() || supervisor_->stop_requested(session)) {
+        return SettleOutcome::ABORTED;
+      }
+      const auto now = std::chrono::steady_clock::now();
+      std::array<double, 6> q_tmp{};
+      double max_dq = 0.0;
+      if (get_latest_joint_state(q_tmp, max_dq) &&
+          max_dq <= lite6_interfaces::contract::kPlannerSettleSpeedRadPerSec)
+      {
+        if (settled_since == std::chrono::steady_clock::time_point{}) {
+          settled_since = now;
+        }
+        if (now - settled_since >= kContinuous) {
+          return SettleOutcome::SETTLED;
+        }
+      } else {
+        settled_since = std::chrono::steady_clock::time_point{};
+      }
+      if (std::chrono::duration<double>(now - start).count() > timeout_sec) {
+        return SettleOutcome::TIMED_OUT;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return SettleOutcome::ABORTED;
+  }
+
   void handle_action_fault(uint64_t session, const std::string & err)
   {
     // Give /ctc_controller/status ~40 ms to deliver an E-STOP transition triggered by the abort
@@ -1242,11 +1314,90 @@ private:
         100.0 * frac, calc_total_pct(block_idx, frac));
     };
 
+    // PAUSE: stop ON the programmed path by splicing a re-timed tail into the running goal.
+    std::optional<size_t> splice_end_sample;
+    auto on_pause = [&](const rclcpp_action::GoalUUID & goal_id) {
+      return request_pause_splice(blk, goal_id, splice_end_sample);
+    };
     std::string err;
     const auto outcome = run_controller_action<FollowJointTrajectory>(
-      rigid_client_, goal, session, blk.duration_sec + 8.0, fb_cb, true, true, err);
+      rigid_client_, goal, session, blk.duration_sec + 8.0, fb_cb, true, true, err, on_pause);
+    if (outcome == ActionOutcome::SUCCEEDED && splice_end_sample.has_value()) {
+      // The goal settled at the end of the stop tail: a pause in the middle of the block.
+      return handle_trajectory_outcome(
+        session, blk, block_idx, *splice_end_sample, total_pts, ActionOutcome::CANCELED, err,
+        calc_total_pct);
+    }
     return handle_trajectory_outcome(
       session, blk, block_idx, last_sample.load(), total_pts, outcome, err, calc_total_pct);
+  }
+
+  // Plans a stop-along-path tail for the running rigid goal and splices it into the
+  // CTC execution (FollowJointTrajectory goal whose header.stamp is the running goal's
+  // actual start). Falls back to CANCEL whenever the splice cannot be confirmed.
+  PauseHandling request_pause_splice(
+    const ExecutionBlock & blk,
+    const rclcpp_action::GoalUUID & goal_id,
+    std::optional<size_t> & out_end_sample)
+  {
+    std::array<uint8_t, 16> traj_id{};
+    builtin_interfaces::msg::Time traj_start;
+    {
+      std::lock_guard<std::mutex> lock(traj_status_mutex_);
+      traj_id = last_traj_id_;
+      traj_start = last_traj_start_;
+    }
+    if (traj_id != goal_id || (traj_start.sec == 0 && traj_start.nanosec == 0)) {
+      return PauseHandling::CANCEL;  // Not started yet (or start not yet observed).
+    }
+    const rclcpp::Time start(traj_start, RCL_ROS_TIME);
+    auto block_time_now = [&]() { return (now() - start).seconds(); };
+
+    trajectory_msgs::msg::JointTrajectory tail;
+    size_t end_sample = 0;
+    std::string err;
+    const auto status = compiler_->plan_pause_splice(
+      blk, block_time_now() + kPauseSpliceLookaheadSec, tail, end_sample, err);
+    if (status == ProgramCompiler::PauseSpliceStatus::LET_FINISH) {
+      return PauseHandling::LET_FINISH;
+    }
+    if (status != ProgramCompiler::PauseSpliceStatus::OK) {
+      RCLCPP_WARN(get_logger(), "Pause splice planning failed (%s); canceling instead", err.c_str());
+      return PauseHandling::CANCEL;
+    }
+    const double t_switch = tail.points.front().time_from_start.sec +
+      1e-9 * tail.points.front().time_from_start.nanosec;
+    tail.header.stamp = traj_start;
+    tail.joint_names = kJointNames;
+
+    FollowJointTrajectory::Goal splice_goal;
+    splice_goal.trajectory = std::move(tail);
+    auto gh_future = rigid_client_->async_send_goal(splice_goal);
+    auto time_left = [&]() {
+      return std::chrono::duration<double>(std::max(0.0, t_switch - block_time_now()));
+    };
+    if (gh_future.wait_for(time_left()) != std::future_status::ready) {
+      return PauseHandling::CANCEL;
+    }
+    const auto splice_gh = gh_future.get();
+    if (!splice_gh) {
+      RCLCPP_WARN(get_logger(), "Controller rejected the pause splice; canceling instead");
+      return PauseHandling::CANCEL;
+    }
+    // The CTC resolves the splice at its switch time (result relayed within ~20 ms).
+    auto res_future = rigid_client_->async_get_result(splice_gh);
+    if (res_future.wait_for(time_left() + std::chrono::milliseconds(300)) !=
+        std::future_status::ready)
+    {
+      return PauseHandling::CANCEL;
+    }
+    const auto wrapped = res_future.get();
+    if (wrapped.code != rclcpp_action::ResultCode::SUCCEEDED) {
+      RCLCPP_WARN(get_logger(), "Pause splice was not adopted in time; canceling instead");
+      return PauseHandling::CANCEL;
+    }
+    out_end_sample = end_sample;
+    return PauseHandling::SPLICED;
   }
 
   bool execute_impedance_block(
@@ -1256,17 +1407,22 @@ private:
     size_t block_idx,
     const std::function<double(size_t, double)> & calc_total_pct)
   {
-    // Wait briefly for residual velocity damping so CTC entry_max_speed guard passes cleanly
-    for (int wait_i = 0; wait_i < 25; ++wait_i) {
-      std::array<double, 6> q_tmp{};
-      double max_dq = 0.0;
-      if (get_latest_joint_state(q_tmp, max_dq) && max_dq <= 0.03) {
-        break;
-      }
-      if (session != supervisor_->active_session() || supervisor_->stop_requested(session)) {
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    // Confirm settling below the planner bound so the CTC entry speed guard passes cleanly.
+    const auto settle = wait_for_planner_settle(session, 2.0);
+    if (settle == SettleOutcome::ABORTED) {
+      return handle_trajectory_outcome(
+        session, blk, block_idx, 0, blk.impedance_goal.points.size(),
+        session != supervisor_->active_session() ?
+        ActionOutcome::SESSION_SUPERSEDED : ActionOutcome::CANCELED,
+        "", calc_total_pct);
+    }
+    if (settle == SettleOutcome::TIMED_OUT) {
+      StudioSupervisor::Effects eff;
+      supervisor_->on_execution_fault(
+        session, -39, "Arm did not settle below the planner settle speed before impedance entry",
+        false, eff);
+      apply_effects(eff);
+      return false;
     }
 
     const size_t total_pts = blk.impedance_goal.points.size();
@@ -1556,17 +1712,25 @@ private:
       session, blk.loc.line, blk.loc.statement_index,
       static_cast<int32_t>(block_idx), 20.0, calc_total_pct(block_idx, 0.2));
 
-    // Wait briefly if needed so the controller's busy flag has cleared.
-    for (int wait_i = 0; wait_i < 20; ++wait_i) {
-      std::array<double, 6> q_tmp{};
-      double max_dq = 0.0;
-      if (get_latest_joint_state(q_tmp, max_dq) && max_dq <= 0.03) {
-        break;
+    // Confirm settling below the planner bound so the controller's busy flag has cleared.
+    const auto settle = wait_for_planner_settle(session, 2.0);
+    if (settle == SettleOutcome::ABORTED) {
+      if (session == supervisor_->active_session() && supervisor_->stop_requested(session)) {
+        if (ensure_normal_or_fault(session, -38)) {
+          std::lock_guard<std::mutex> lock(exec_mutex_);
+          reset_exec_cursor_unlocked();
+          supervisor_->on_stop_completed(session);
+        }
       }
-      if (session != supervisor_->active_session() || supervisor_->stop_requested(session)) {
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(15));
+      return false;
+    }
+    if (settle == SettleOutcome::TIMED_OUT) {
+      StudioSupervisor::Effects eff;
+      supervisor_->on_execution_fault(
+        session, -40, "Arm did not settle below the planner settle speed before SetPayload",
+        false, eff);
+      apply_effects(eff);
+      return false;
     }
 
     if (!ctc_cmd_client_->wait_for_service(std::chrono::milliseconds(250))) {
@@ -1661,6 +1825,10 @@ private:
   uint64_t program_revision_ = 0;
   size_t exec_block_idx_ = 0;
   bool paused_mid_block_ = false;
+  // Latest controller-reported trajectory correlation (ControllerStatus).
+  std::mutex traj_status_mutex_;
+  std::array<uint8_t, 16> last_traj_id_{};
+  builtin_interfaces::msg::Time last_traj_start_;
   size_t paused_sample_idx_ = 0;
   double paused_remaining_wait_sec_ = -1.0;
   ExecutionBlock paused_block_snapshot_;

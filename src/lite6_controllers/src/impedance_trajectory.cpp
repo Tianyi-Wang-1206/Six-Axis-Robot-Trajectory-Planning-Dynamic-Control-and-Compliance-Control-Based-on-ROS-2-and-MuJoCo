@@ -483,13 +483,19 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
   // Conservative gravity compensation on the measured configuration.
   Vec6d tau_passive = pin_data_gmo_.g.head<6>();
   Vec6d tau_active = Vec6d::Zero();
-  double dissipated_power = 0.0;
+  // Physical joint friction (nominal model) dissipates energy that friction
+  // compensation in the active channel partially returns; credit it for harvesting.
+  double dissipated_power = modeled_friction_dissipation();
   double stiffness_rate_power = 0.0;
   a_d_.setZero();
   integral_effort_.setZero();
 
   // Passivity-preserving dynamic feedforward reusing cached CRBA M(q) and Christoffel C(q, dq):
-  // tau_dyn_acc = gamma_dyn * ((M_a(q) + diag(I_armature)) * ddq_imp_ref_ + C_a(q, dq) * dq_imp_ref_).
+  // tau_dyn = gamma_dyn * ((M_a(q) + diag(I_armature)) * ddq_ref + C_a(q, dq) * dq_ref).
+  // With C built from the measured dq this is the Slotine-Li reference term: thanks to
+  // the skew symmetry of (dM/dt - 2C), the tracking-error dynamics driven by the
+  // impedance spring/damper stay passive, so it is NOT routed through the energy tank
+  // (gating it would only drain the tank and degrade tracking on every acceleration).
   if (imp_dynamics_ff_scale_ > 1e-6) {
     Vec6d tau_dyn_acc =
       pin_data_gmo_.M.topLeftCorner<6, 6>() * ddq_imp_ref_ +
@@ -497,7 +503,7 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
     for (int i = 0; i < 6; ++i) {
       tau_dyn_acc[i] += armature_[i] * ddq_imp_ref_[i];
     }
-    tau_active += imp_dynamics_ff_scale_ * tau_dyn_acc;
+    tau_passive += imp_dynamics_ff_scale_ * tau_dyn_acc;
   }
 
   // 1. Evaluate time-varying equilibrium pose T_d(t) and twist v_d(t) from (q_imp_ref_, dq_imp_ref_).
@@ -562,7 +568,6 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
     dissipated_power += d_trans_est * vel_trans_error[k] * vel_trans_error[k] +
       d_rot_est * vel_rot_error[k] * vel_rot_error[k];
   }
-  dissipated_power += imp_null_damping_filtered_ * dq_null_err.squaredNorm();
 
   if (dt > 1e-6) {
     for (int k = 0; k < 3; ++k) {
@@ -582,6 +587,12 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
 
   // Utilize Cartesian feedforward wrench wrench_ff via active tank channel.
   tau_active.noalias() += j_arm.transpose() * imp_wrench_ff_filtered_;
+  // Posture regulation about q_ref(t), restricted to the dynamically consistent null
+  // space of the TCP task so it never alters the commanded Cartesian stiffness. Its
+  // projected power is not sign-definite, so it runs through the bidirectional tank.
+  tau_active += project_nullspace_torque(
+    j_arm, imp_operational_damping_lambda_,
+    imp_null_stiffness_filtered_ * q_null_err - imp_null_damping_filtered_ * dq_null_err);
   add_passive_friction_ff(
     imp_fv_scale_, imp_fc_scale_, imp_fric_trans_speed_, imp_fric_quiet_speed_,
     dq_imp_ref_, tau_active);
@@ -625,7 +636,6 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
     wrench_imp[k + 3] = imp_kr_filtered_[k] * imp_current_rot_error_[k] + d_rot * vel_rot_error[k];
   }
   tau_passive.noalias() += j_arm.transpose() * wrench_imp;
-  tau_passive += imp_null_stiffness_filtered_ * q_null_err - imp_null_damping_filtered_ * dq_null_err;
 
   tau_cmd_ = tau_passive + tank_valve * tau_active;
 
@@ -764,35 +774,30 @@ void Lite6CTCController::finish_impedance_trajectory_cycle(double dt)
       compliance_pose_ = pinocchio::updateFramePlacement(
         pin_model_, pin_data_ref_, compliance_frame_);
       compliance_q_ = q_imp_ref_;
-      compliance_settings_.joint_stiffness = 20.0;
-      compliance_settings_.joint_damping = 3.0;
-      compliance_settings_.translation_stiffness = std::clamp(
-        (last.translation_stiffness[0] + last.translation_stiffness[1] + last.translation_stiffness[2]) / 3.0,
-        lite6_interfaces::contract::kMinTranslationStiffness,
-        lite6_interfaces::contract::kMaxTranslationStiffness);
-      compliance_settings_.translation_damping = std::clamp(
-        (last.translation_damping[0] + last.translation_damping[1] + last.translation_damping[2]) / 3.0,
-        lite6_interfaces::contract::kMinTranslationDamping,
-        lite6_interfaces::contract::kMaxTranslationDamping);
-      compliance_settings_.rotation_stiffness = std::clamp(
-        (last.rotation_stiffness[0] + last.rotation_stiffness[1] + last.rotation_stiffness[2]) / 3.0,
-        lite6_interfaces::contract::kMinRotationStiffness,
-        lite6_interfaces::contract::kMaxRotationStiffness);
-      compliance_settings_.rotation_damping = std::clamp(
-        (last.rotation_damping[0] + last.rotation_damping[1] + last.rotation_damping[2]) / 3.0,
-        lite6_interfaces::contract::kMinRotationDamping,
-        lite6_interfaces::contract::kMaxRotationDamping);
-      compliance_settings_.sensitivity = 3.0;
+      // Continuous handover: keep the trajectory's anisotropic per-axis gains and final
+      // feedforward wrench as the hold targets, starting from their current filtered
+      // values, instead of averaging axes or dropping the wrench. Joint-impedance and
+      // teach settings stay as last configured.
+      for (int k = 0; k < 3; ++k) {
+        cart_kt_target_[k] = last.translation_stiffness[k];
+        cart_dt_target_[k] = last.translation_damping[k];
+        cart_kr_target_[k] = last.rotation_stiffness[k];
+        cart_dr_target_[k] = last.rotation_damping[k];
+      }
+      for (int k = 0; k < 6; ++k) {
+        cart_wrench_ff_target_[k] = last.wrench_ff[static_cast<size_t>(k)];
+      }
+      cart_kt_filtered_ = imp_kt_filtered_;
+      cart_dt_filtered_ = imp_dt_filtered_;
+      cart_kr_filtered_ = imp_kr_filtered_;
+      cart_dr_filtered_ = imp_dr_filtered_;
+      cart_wrench_ff_filtered_ = imp_wrench_ff_filtered_;
       compliance_settings_.recapture = false;
-      compliance_settings_.nullspace_stiffness = std::clamp(
-        last.nullspace_stiffness,
-        lite6_interfaces::contract::kMinNullspaceStiffness,
-        lite6_interfaces::contract::kMaxNullspaceStiffness);
-      compliance_settings_.nullspace_damping = std::clamp(
-        last.nullspace_damping,
-        lite6_interfaces::contract::kMinNullspaceDamping,
-        lite6_interfaces::contract::kMaxNullspaceDamping);
+      compliance_settings_.nullspace_stiffness = last.nullspace_stiffness;
+      compliance_settings_.nullspace_damping = last.nullspace_damping;
       compliance_filtered_ = compliance_settings_;
+      compliance_filtered_.nullspace_stiffness = imp_null_stiffness_filtered_;
+      compliance_filtered_.nullspace_damping = imp_null_damping_filtered_;
       begin_torque_transition(cart_imp_cfg_.transition_duration);
       compliance_saturation_time_ = 0.0;
       compliance_external_torque_time_ = 0.0;

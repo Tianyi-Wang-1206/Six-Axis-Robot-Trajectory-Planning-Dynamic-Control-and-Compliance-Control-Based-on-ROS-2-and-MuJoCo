@@ -331,10 +331,22 @@ ProgramCompiler::ProgramCompiler(const lite6_planner::KinematicsEngine & engine)
 {
 }
 
+std::array<lite6_planner::JointLimit, 6> ProgramCompiler::motion_limits(bool is_impedance) const
+{
+  auto limits = engine_.get_joint_limits();
+  if (is_impedance) {
+    for (auto & lim : limits) {
+      lim.max_vel = std::min(lim.max_vel, kImpedanceJointVelocityCap);
+    }
+  }
+  return limits;
+}
+
 bool ProgramCompiler::verify_sampled_trajectory_1khz(
   const SampledTrajectory1kHz & sampled,
   bool check_singularity_along_path,
-  std::vector<Diagnostic> & diags) const
+  std::vector<Diagnostic> & diags,
+  bool is_impedance) const
 {
   if (sampled.samples.size() < 2) {
     SourceLocation loc;
@@ -347,7 +359,7 @@ bool ProgramCompiler::verify_sampled_trajectory_1khz(
     return false;
   }
 
-  const auto & limits = engine_.get_joint_limits();
+  const auto limits = motion_limits(is_impedance);
   const double sing_thresh = engine_.get_singularity_threshold();
   auto workspace = engine_.collision_workspace();
 
@@ -378,7 +390,7 @@ bool ProgramCompiler::verify_sampled_trajectory_1khz(
         oss << std::fixed << std::setprecision(5)
             << "Joint velocity limit violated at t=" << s.time_sec << " s: joint" << (i + 1)
             << " |dq|=" << std::abs(s.dq[i]) << " rad/s exceeds max_vel=" << lim.max_vel
-            << " rad/s";
+            << " rad/s" << (is_impedance ? " (impedance block joint speed cap)" : "");
         add_diag(diags, D::STAGE_KINEMATIC_LIMIT, s.loc, "ERR_JOINT_VEL_LIMIT", oss.str());
         return false;
       }
@@ -516,7 +528,8 @@ bool ProgramCompiler::compile_cartesian_group(
 
   SampledTrajectory1kHz sampled;
   if (!plan_cartesian_path(
-        cart_path, start_q, group.front().options, group.front().loc, sampled, out_diagnostics))
+        cart_path, start_q, group.front().options, group.front().loc, is_impedance, sampled,
+        out_diagnostics))
   {
     return false;
   }
@@ -714,6 +727,7 @@ bool ProgramCompiler::plan_cartesian_path(
   const std::array<double, 6> & start_q,
   const MotionOptions & default_options,
   const SourceLocation & default_loc,
+  bool is_impedance,
   SampledTrajectory1kHz & out_sampled,
   std::vector<Diagnostic> & out_diagnostics) const
 {
@@ -723,14 +737,15 @@ bool ProgramCompiler::plan_cartesian_path(
   }
   std::string topp_err;
   if (!TOPPJerkSolver::solve(
-        joint_path, &cart_path, engine_.get_joint_limits(), engine_.get_cartesian_limits(),
+        joint_path, &cart_path, motion_limits(is_impedance), engine_.get_cartesian_limits(),
         default_options.vel_scale, default_options.acc_scale, default_options.jerk_scale,
         default_loc, out_sampled, topp_err))
   {
     add_diag(out_diagnostics, D::STAGE_PLANNING, default_loc, "ERR_TOPP_SOLVER", topp_err);
     return false;
   }
-  return verify_sampled_trajectory_1khz(out_sampled, /*check_singularity=*/true, out_diagnostics);
+  return verify_sampled_trajectory_1khz(
+    out_sampled, /*check_singularity=*/true, out_diagnostics, is_impedance);
 }
 
 double ProgramCompiler::tcp_blend_trim(
@@ -895,7 +910,7 @@ bool ProgramCompiler::compile_pva_statement(
   ExecutionBlock & out_block,
   std::vector<Diagnostic> & out_diagnostics) const
 {
-  const auto & limits = engine_.get_joint_limits();
+  const auto limits = motion_limits(is_impedance);
   auto workspace = engine_.collision_workspace();
   const size_t M = pva.waypoints.size();
   std::vector<std::array<double, 6>> q_nodes(M + 1);
@@ -1029,7 +1044,8 @@ bool ProgramCompiler::compile_pva_statement(
   }
 
   if (!verify_sampled_trajectory_1khz(
-        sampled, /*check_singularity=*/(pva.space == SpaceType::CARTESIAN), out_diagnostics)) {
+        sampled, /*check_singularity=*/(pva.space == SpaceType::CARTESIAN), out_diagnostics,
+        is_impedance)) {
     return false;
   }
 
@@ -1223,6 +1239,167 @@ bool ProgramCompiler::plan_alignment_bridge(
   return true;
 }
 
+ProgramCompiler::PauseSpliceStatus ProgramCompiler::plan_pause_splice(
+  const ExecutionBlock & block,
+  double t_switch_sec,
+  trajectory_msgs::msg::JointTrajectory & out_tail,
+  size_t & out_end_sample,
+  std::string & out_error) const
+{
+  // Share of the acceleration limit used for the initial stop-duration guess, and the 1 kHz grid.
+  constexpr double kLimitShare = 0.8;
+  constexpr double kDt = 0.001;
+  constexpr int kMaxSearch = 48;
+
+  const auto & pts = block.rigid_trajectory.points;
+  if (block.type != ExecutionBlockType::RIGID_TRAJECTORY || pts.size() < 3) {
+    out_error = "Pause splice requires a rigid trajectory block";
+    return PauseSpliceStatus::FAILED;
+  }
+  auto t_of = [](const trajectory_msgs::msg::JointTrajectoryPoint & p) {
+    return p.time_from_start.sec + 1e-9 * p.time_from_start.nanosec;
+  };
+  const size_t n = pts.size();
+  const double t_end = t_of(pts.back());
+
+  // Switch sample: the first original sample at or after t_switch_sec.
+  size_t k_s = 0;
+  {
+    const auto it = std::lower_bound(
+      pts.begin(), pts.end(), t_switch_sec - 1e-9,
+      [&t_of](const trajectory_msgs::msg::JointTrajectoryPoint & p, double t) {
+        return t_of(p) < t;
+      });
+    k_s = static_cast<size_t>(std::distance(pts.begin(), it));
+  }
+  if (k_s + 2 >= n) {
+    return PauseSpliceStatus::LET_FINISH;
+  }
+  const double t_sw = t_of(pts[k_s]);
+  const double remaining = t_end - t_sw;
+
+  // Original reference at block time tau: cubic Hermite position from (q, dq) and
+  // linear velocity/acceleration between neighboring 1 kHz samples.
+  auto eval_orig = [&](double tau, Vec6 & q, Vec6 & dq, Vec6 & ddq) {
+    tau = std::clamp(tau, 0.0, t_end);
+    size_t a = std::min(n - 2, static_cast<size_t>(std::max(0.0, std::floor(tau / kDt))));
+    while (a + 1 < n - 1 && t_of(pts[a + 1]) <= tau) {
+      ++a;
+    }
+    while (a > 0 && t_of(pts[a]) > tau) {
+      --a;
+    }
+    const auto & pa = pts[a];
+    const auto & pb = pts[a + 1];
+    const double h = std::max(1e-9, t_of(pb) - t_of(pa));
+    const double s = std::clamp((tau - t_of(pa)) / h, 0.0, 1.0);
+    const double s2 = s * s;
+    const double s3 = s2 * s;
+    const double h00 = 2.0 * s3 - 3.0 * s2 + 1.0;
+    const double h10 = s3 - 2.0 * s2 + s;
+    const double h01 = -2.0 * s3 + 3.0 * s2;
+    const double h11 = s3 - s2;
+    for (int i = 0; i < 6; ++i) {
+      const size_t j = static_cast<size_t>(i);
+      q[i] = h00 * pa.positions[j] + h10 * h * pa.velocities[j] +
+        h01 * pb.positions[j] + h11 * h * pb.velocities[j];
+      dq[i] = (1.0 - s) * pa.velocities[j] + s * pb.velocities[j];
+      ddq[i] = (1.0 - s) * pa.accelerations[j] + s * pb.accelerations[j];
+    }
+  };
+
+  // sigma(x) = 1 - S7(x), S7 = 35x^4 - 84x^5 + 70x^6 - 20x^7 (C^3 smoothstep);
+  // integral of S7 over [0, x] = 7x^5 - 14x^6 + 10x^7 - 2.5x^8, so the stop consumes
+  // exactly T_d / 2 of block time.
+  auto s7 = [](double x) {
+    const double x4 = x * x * x * x;
+    return x4 * (35.0 + x * (-84.0 + x * (70.0 - 20.0 * x)));
+  };
+  auto s7_d = [](double x) {
+    const double x3 = x * x * x;
+    return x3 * (140.0 + x * (-420.0 + x * (420.0 - 140.0 * x)));
+  };
+  auto s7_int = [](double x) {
+    const double x5 = x * x * x * x * x;
+    return x5 * (7.0 + x * (-14.0 + x * (10.0 - 2.5 * x)));
+  };
+
+  const auto & limits = engine_.get_joint_limits();
+  double t_d = 0.05;
+  for (size_t i = 0; i < 6; ++i) {
+    // Peak sigma_dot of the septic smoothstep is 2.1875 / T_d.
+    t_d = std::max(
+      t_d, 2.1875 * std::abs(pts[k_s].velocities[i]) / (kLimitShare * limits[i].max_acc));
+  }
+
+  for (int attempt = 0; attempt < kMaxSearch; ++attempt, t_d *= 1.12) {
+    const int ticks = static_cast<int>(std::ceil(t_d / kDt - 1e-9));
+    const double td = ticks * kDt;
+    if (0.5 * td >= remaining - kDt) {
+      // The programmed motion stops sooner than a path-preserving stop could.
+      return PauseSpliceStatus::LET_FINISH;
+    }
+    trajectory_msgs::msg::JointTrajectory tail;
+    tail.joint_names = block.rigid_trajectory.joint_names;
+    tail.points.reserve(static_cast<size_t>(ticks) + 1);
+    tail.points.push_back(pts[k_s]);  // verbatim: seamless controller switch
+    tail.points.front().effort.clear();
+    const int64_t t0_ns = static_cast<int64_t>(pts[k_s].time_from_start.sec) * 1000000000LL +
+      static_cast<int64_t>(pts[k_s].time_from_start.nanosec);
+    bool ok = true;
+    Vec6 prev_ddq;
+    for (int i = 0; i < 6; ++i) {
+      prev_ddq[i] = pts[k_s].accelerations[static_cast<size_t>(i)];
+    }
+    double tau_end = t_sw;
+    for (int k = 1; k <= ticks && ok; ++k) {
+      const double x = static_cast<double>(k) / ticks;
+      const double sigma = 1.0 - s7(x);
+      const double sigma_dot = -s7_d(x) / td;
+      const double tau = t_sw + td * (x - s7_int(x));
+      Vec6 q, dq_o, ddq_o;
+      eval_orig(tau, q, dq_o, ddq_o);
+      trajectory_msgs::msg::JointTrajectoryPoint p;
+      p.positions.resize(6);
+      p.velocities.resize(6);
+      p.accelerations.resize(6);
+      const int64_t t_ns = t0_ns + static_cast<int64_t>(k) * 1000000LL;
+      p.time_from_start.sec = static_cast<int32_t>(t_ns / 1000000000LL);
+      p.time_from_start.nanosec = static_cast<uint32_t>(t_ns % 1000000000LL);
+      for (int i = 0; i < 6; ++i) {
+        const size_t j = static_cast<size_t>(i);
+        const bool last = (k == ticks);
+        const double v = last ? 0.0 : dq_o[i] * sigma;
+        const double a = last ? 0.0 : ddq_o[i] * sigma * sigma + dq_o[i] * sigma_dot;
+        // Same bounds as verify_sampled_trajectory_1khz(): the switch sample inherits the
+        // original reference, which may already run close to the limits.
+        const auto & lim = limits[j];
+        if (std::abs(v) > lim.max_vel + lite6_planner::tolerance::kTrajectoryVelocity ||
+            std::abs(a) > lim.max_acc + lite6_planner::tolerance::kTrajectoryAcceleration ||
+            std::abs(a - prev_ddq[i]) / kDt > lim.max_jerk * 1.001 + 1e-3)
+        {
+          ok = false;
+          break;
+        }
+        p.positions[j] = q[i];
+        p.velocities[j] = v;
+        p.accelerations[j] = a;
+        prev_ddq[i] = a;
+      }
+      tau_end = tau;
+      tail.points.push_back(std::move(p));
+    }
+    if (!ok) {
+      continue;
+    }
+    out_tail = std::move(tail);
+    out_end_sample = std::min(n - 1, static_cast<size_t>(std::llround(tau_end / kDt)));
+    return PauseSpliceStatus::OK;
+  }
+  out_error = "No admissible path-preserving stop within joint limits";
+  return PauseSpliceStatus::FAILED;
+}
+
 bool ProgramCompiler::replan_remaining_block(
   const ExecutionBlock & original_block,
   size_t pause_sample_idx,
@@ -1298,7 +1475,7 @@ bool ProgramCompiler::replan_remaining_block(
   } else if (original_block.source_kind == BlockSourceKind::MOVE_PVA) {
     opts = original_block.source_pva.options;
   }
-  const auto & limits = engine_.get_joint_limits();
+  const auto limits = motion_limits(is_imp);
   auto diag_error = [&](const std::vector<Diagnostic> & diags, const std::string & fallback) {
     out_error = diags.empty() ? fallback : diags.front().message;
     return false;
@@ -1329,7 +1506,7 @@ bool ProgramCompiler::replan_remaining_block(
           return false;
         }
         const CompositeCartesianPath sub = full.restricted(u_r);
-        if (!plan_cartesian_path(sub, get_pt_q(resume_idx), opts, loc_r, rest, diags)) {
+        if (!plan_cartesian_path(sub, get_pt_q(resume_idx), opts, loc_r, is_imp, rest, diags)) {
           return diag_error(diags, "Resumed Cartesian path planning failed");
         }
         map_path_u(rest);
@@ -1451,7 +1628,7 @@ bool ProgramCompiler::replan_remaining_block(
   }
 
   std::vector<Diagnostic> diags;
-  if (!verify_sampled_trajectory_1khz(combined, check_singularity, diags)) {
+  if (!verify_sampled_trajectory_1khz(combined, check_singularity, diags, is_imp)) {
     return diag_error(diags, "Resumed trajectory failed verification");
   }
 

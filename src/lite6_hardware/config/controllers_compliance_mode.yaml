@@ -19,7 +19,8 @@ ctc_controller:
       contact_hysteresis_ratio: 0.70                        # Schmitt trigger release ratio (off_thresh = ratio * on_thresh)
       contact_on_debounce_sec: 0.015                        # s; continuous duration above threshold to latch contact
       contact_off_debounce_sec: 0.040                       # s; continuous duration below release threshold to clear contact
-      max_tare_torque_ratio: 0.40                           # max share of external torque safety limit allowed for CMD_TARE_GMO
+      max_tare_contact_ratio: 3.0                           # CMD_TARE_GMO bound: multiple of contact_joint_torque_threshold
+      tare_average_window_sec: 0.20                         # s; stationary raw-residual averaging window used by CMD_TARE_GMO
       overload_decay_rate: 2.0                              # 1/s; leaky integrator decay rate when external torque is below limit
 
     # Real-time Pinocchio payload inertia update and linear static-moment smoothing.
@@ -36,26 +37,9 @@ ctc_controller:
       dissipation_harvest_ratio: 0.80                       # [0..1] fraction of physical damping power harvested into tank
       max_injected_power: 15.0                              # W; instantaneous active power injection ceiling
 
+    # Each compliance mode reads only its own sub-block below; there are no shared
+    # top-level compliance.* defaults.
     compliance:
-      # Shared transition and soft-limit defaults (overridden by per-mode settings below).
-      max_joint_velocity: 3.0
-      hard_limit_tolerance: 0.01
-      saturation_timeout: 1.0
-      entry_max_speed: 0.03
-      max_external_joint_torque: [35.0, 35.0, 24.0, 20.0, 20.0, 12.0]
-      external_torque_timeout: 0.25
-      friction_viscous_scale: 0.85
-      friction_coulomb_scale: 0.0
-      friction_transition_speed: 0.04
-      friction_quiet_speed: 0.015
-      filter_time_constant: 0.15
-      cartesian_null_damping: 0.50
-      soft_limit_margin: 0.15
-      soft_limit_stiffness: 80.0
-      soft_limit_damping: 5.0
-      torque_slew_rate: 120.0
-      transition_duration: 0.25
-
       # 1. Dedicated Joint-Space Impedance Mode Parameters (MODE_JOINT_IMPEDANCE)
       joint_impedance:
         max_joint_velocity: 3.0

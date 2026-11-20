@@ -806,7 +806,9 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
           break;
         }
         pause_requested_ = true;
-        res.effects.cancel_controller_goals = true;
+        // No direct goal cancellation: the worker observes pause_requested_ within one
+        // 20 ms poll and either splices a stop-along-path tail into a rigid block or
+        // cancels impedance / alignment goals itself.
         notify_unlocked("Pause requested; decelerating to stationary pause state");
         res.accepted = true;
         changed = true;

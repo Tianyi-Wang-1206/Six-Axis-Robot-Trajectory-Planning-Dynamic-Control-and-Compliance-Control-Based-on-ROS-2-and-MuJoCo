@@ -208,6 +208,22 @@ bool Lite6CTCController::configure_compliance()
   return true;
 }
 
+void Lite6CTCController::set_cartesian_targets_from_settings(bool reset_filtered)
+{
+  cart_kt_target_.setConstant(compliance_settings_.translation_stiffness);
+  cart_dt_target_.setConstant(compliance_settings_.translation_damping);
+  cart_kr_target_.setConstant(compliance_settings_.rotation_stiffness);
+  cart_dr_target_.setConstant(compliance_settings_.rotation_damping);
+  cart_wrench_ff_target_.setZero();
+  if (reset_filtered) {
+    cart_kt_filtered_ = cart_kt_target_;
+    cart_dt_filtered_ = cart_dt_target_;
+    cart_kr_filtered_ = cart_kr_target_;
+    cart_dr_filtered_ = cart_dr_target_;
+    cart_wrench_ff_filtered_.setZero();
+  }
+}
+
 void Lite6CTCController::check_compliance_safety_limits(double dt)
 {
   if (!compliance_active() && system_state_ != SystemState::COMPLIANCE_STOPPING) {
@@ -294,27 +310,24 @@ void Lite6CTCController::compute_compliance(double dt)
 
   // Candidate stiffness increments: negative increments (softening) are strictly passive;
   // positive increments (stiffening under deflection) are regulated by the Energy Tank.
+  // Cartesian translation/rotation gains are filtered per axis in their own branch.
   const double cand_dkq = alpha * (compliance_settings_.joint_stiffness - s.joint_stiffness);
-  const double cand_dkt = alpha * (compliance_settings_.translation_stiffness - s.translation_stiffness);
-  const double cand_dkr = alpha * (compliance_settings_.rotation_stiffness - s.rotation_stiffness);
   const double cand_dknull = alpha * (compliance_settings_.nullspace_stiffness - s.nullspace_stiffness);
 
   smooth(s.joint_damping, compliance_settings_.joint_damping);
-  smooth(s.translation_damping, compliance_settings_.translation_damping);
-  smooth(s.rotation_damping, compliance_settings_.rotation_damping);
   smooth(s.sensitivity, compliance_settings_.sensitivity);
   smooth(s.nullspace_damping, compliance_settings_.nullspace_damping);
 
   // Apply purely passive (decreasing) stiffness steps immediately.
   if (cand_dkq <= 0.0) s.joint_stiffness += cand_dkq;
-  if (cand_dkt <= 0.0) s.translation_stiffness += cand_dkt;
-  if (cand_dkr <= 0.0) s.rotation_stiffness += cand_dkr;
   if (cand_dknull <= 0.0) s.nullspace_stiffness += cand_dknull;
 
   // Conservative gravity compensation (never attenuated by the energy tank).
   Vec6d tau_passive = pin_data_gmo_.g.head<6>();
   Vec6d tau_active = Vec6d::Zero();
-  double dissipated_power = 0.0;
+  // Physical joint friction (nominal model) dissipates energy that friction
+  // compensation in the active channel partially returns; credit it for harvesting.
+  double dissipated_power = modeled_friction_dissipation();
   double stiffness_rate_power = 0.0;
   a_d_.setZero();
   integral_effort_.setZero();
@@ -372,60 +385,80 @@ void Lite6CTCController::compute_compliance(double dt)
       cfg.min_effective_inertia, cfg.max_effective_inertia,
       lambda_diag);
 
+    // Per-axis gain filtering: softening and damping/wrench changes apply directly;
+    // stiffening is energy-tank regulated below.
+    const Eigen::Vector3d cand_kt = alpha * (cart_kt_target_ - cart_kt_filtered_);
+    const Eigen::Vector3d cand_kr = alpha * (cart_kr_target_ - cart_kr_filtered_);
+    cart_dt_filtered_ += alpha * (cart_dt_target_ - cart_dt_filtered_);
+    cart_dr_filtered_ += alpha * (cart_dr_target_ - cart_dr_filtered_);
+    cart_wrench_ff_filtered_ += alpha * (cart_wrench_ff_target_ - cart_wrench_ff_filtered_);
+    for (int k = 0; k < 3; ++k) {
+      if (cand_kt[k] <= 0.0) cart_kt_filtered_[k] += cand_kt[k];
+      if (cand_kr[k] <= 0.0) cart_kr_filtered_[k] += cand_kr[k];
+    }
+
     Vec6d error;
     error.head<3>() = compliance_pose_.translation() - pose.translation();
     error.tail<3>() = pinocchio::log3(compliance_pose_.rotation() * pose.rotation().transpose());
     const Vec6d velocity = jac * dynamics_dq_;
     const Vec6d q_null_err = compliance_q_ - q_;
 
-    // Precompute damping dissipation using current stiffness estimate.
-    Vec6d d_cart;
-    for (int k = 0; k < 3; ++k) {
-      d_cart[k] = std::max(
-        cfg.min_translation_damping,
-        2.0 * s.translation_damping * std::sqrt(std::max(0.0, s.translation_stiffness) * lambda_diag[k]));
-      d_cart[k + 3] = std::max(
-        cfg.min_rotation_damping,
-        2.0 * s.rotation_damping * std::sqrt(std::max(0.0, s.rotation_stiffness) * lambda_diag[k + 3]));
-      dissipated_power += d_cart[k] * velocity[k] * velocity[k] +
-        d_cart[k + 3] * velocity[k + 3] * velocity[k + 3];
-    }
-    dissipated_power += s.nullspace_damping * dq_.squaredNorm();
+    // Constant damping ratio law: D_i(q) = max(D_min, 2 * zeta_i * sqrt(K_i * Lambda_i(q))).
+    auto cart_damping = [&]() {
+      Vec6d d;
+      for (int a = 0; a < 3; ++a) {
+        d[a] = std::max(
+          cfg.min_translation_damping,
+          2.0 * cart_dt_filtered_[a] * std::sqrt(std::max(0.0, cart_kt_filtered_[a]) * lambda_diag[a]));
+        d[a + 3] = std::max(
+          cfg.min_rotation_damping,
+          2.0 * cart_dr_filtered_[a] * std::sqrt(std::max(0.0, cart_kr_filtered_[a]) * lambda_diag[a + 3]));
+      }
+      return d;
+    };
+    // Dissipation estimate with the pre-stiffening gains.
+    dissipated_power += velocity.dot(cart_damping().cwiseProduct(velocity));
 
     if (dt > 1e-6) {
-      if (cand_dkt > 0.0) {
-        stiffness_rate_power += 0.5 * (cand_dkt / dt) * error.head<3>().squaredNorm();
-      }
-      if (cand_dkr > 0.0) {
-        stiffness_rate_power += 0.5 * (cand_dkr / dt) * error.tail<3>().squaredNorm();
+      for (int k = 0; k < 3; ++k) {
+        if (cand_kt[k] > 0.0) {
+          stiffness_rate_power += 0.5 * (cand_kt[k] / dt) * error[k] * error[k];
+        }
+        if (cand_kr[k] > 0.0) {
+          stiffness_rate_power += 0.5 * (cand_kr[k] / dt) * error[k + 3] * error[k + 3];
+        }
       }
       if (cand_dknull > 0.0) {
         stiffness_rate_power += 0.5 * (cand_dknull / dt) * q_null_err.squaredNorm();
       }
     }
+
+    // Posture regulation acts only in the dynamically consistent null space of the TCP
+    // task, so it never changes the commanded Cartesian stiffness. Its projected power is
+    // not sign-definite, so it runs through the (bidirectional) tank channel.
+    tau_active += project_nullspace_torque(
+      j_arm, cfg.operational_damping_lambda,
+      s.nullspace_stiffness * q_null_err - s.nullspace_damping * dq_);
+    // Feedforward wrench (non-zero only when holding an impedance trajectory's endpoint).
+    tau_active.noalias() += j_arm.transpose() * cart_wrench_ff_filtered_;
     add_passive_friction_ff(
       cfg.fv_scale, cfg.fc_scale, cfg.fric_trans_speed, cfg.fric_quiet_speed, dq_, tau_active);
 
     const double active_power = tau_active.dot(dq_) + stiffness_rate_power;
     const double tank_valve = step_energy_tank(dt, dissipated_power, active_power);
-    if (cand_dkt > 0.0) s.translation_stiffness += tank_valve * cand_dkt;
-    if (cand_dkr > 0.0) s.rotation_stiffness += tank_valve * cand_dkr;
+    for (int k = 0; k < 3; ++k) {
+      if (cand_kt[k] > 0.0) cart_kt_filtered_[k] += tank_valve * cand_kt[k];
+      if (cand_kr[k] > 0.0) cart_kr_filtered_[k] += tank_valve * cand_kr[k];
+    }
     if (cand_dknull > 0.0) s.nullspace_stiffness += tank_valve * cand_dknull;
 
-    // Constant damping ratio law: D_i(q) = max(D_min, 2 * zeta_i * sqrt(K_i * Lambda_i(q))).
+    const Vec6d d_cart = cart_damping();
     Vec6d wrench;
     for (int k = 0; k < 3; ++k) {
-      const double d_trans = std::max(
-        cfg.min_translation_damping,
-        2.0 * s.translation_damping * std::sqrt(std::max(0.0, s.translation_stiffness) * lambda_diag[k]));
-      const double d_rot = std::max(
-        cfg.min_rotation_damping,
-        2.0 * s.rotation_damping * std::sqrt(std::max(0.0, s.rotation_stiffness) * lambda_diag[k + 3]));
-      wrench[k] = s.translation_stiffness * error[k] - d_trans * velocity[k];
-      wrench[k + 3] = s.rotation_stiffness * error[k + 3] - d_rot * velocity[k + 3];
+      wrench[k] = cart_kt_filtered_[k] * error[k] - d_cart[k] * velocity[k];
+      wrench[k + 3] = cart_kr_filtered_[k] * error[k + 3] - d_cart[k + 3] * velocity[k + 3];
     }
     tau_passive.noalias() += j_arm.transpose() * wrench;
-    tau_passive += s.nullspace_stiffness * q_null_err - s.nullspace_damping * dq_;
     tau_cmd_ = tau_passive + tank_valve * tau_active;
   } else {
     // diag(M)-normalized drag teaching:
