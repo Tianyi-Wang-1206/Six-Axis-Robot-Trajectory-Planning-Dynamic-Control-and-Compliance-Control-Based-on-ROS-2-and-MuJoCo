@@ -28,10 +28,8 @@ ctc_controller:
     friction_v_nominal: [1.002, 1.009, 0.506, 0.201, 0.101, 0.051]
     friction_c_nominal: [1.499, 1.498, 0.999, 0.499, 0.200, 0.099]
 
-    # Smooth compensation direction; keep in sync with the Fourier fit if changed.
+    # Smooth Coulomb feedforward direction along reference velocity; keep in sync with the Fourier fit if changed.
     tanh_slope: 300.0
-    # Position-error injection into reference velocity [1/s], unchanged from 5*e.
-    friction_error_gain: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
 
     # Maximum torque of each joint (same as the xml file)
     max_effort : [50.0, 50.0, 32.0, 32.0, 32.0, 20.0]

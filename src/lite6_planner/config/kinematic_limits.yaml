@@ -13,5 +13,5 @@ cartesian_limits:
   max_rot_vel: 2.5
   max_rot_acc: 5.0
 
-singularity_threshold: 0.001
+singularity_threshold: 0.003
 quadrant_jump_threshold: 0.5

@@ -131,7 +131,7 @@ private:
   std::vector<double> path_position_tolerance_, path_velocity_tolerance_;
   std::vector<double> goal_position_tolerance_, goal_velocity_tolerance_;
   std::vector<double> sysid_goal_position_tolerance_, sysid_goal_velocity_tolerance_;
-  double goal_settle_duration_ = 0.3;
+  double goal_settle_duration_ = 1.0;
   double goal_time_tolerance_ = 5.0;
   double saturation_timeout_ = 1.0;
   std::array<bool, 6> effort_saturated_{};
@@ -172,7 +172,6 @@ private:
   Vec6d ki_ = Vec6d::Zero(), antiwindup_gain_ = Vec6d::Zero();
   Vec6d integral_max_effort_ = Vec6d::Zero(), integral_effort_ = Vec6d::Zero();
   Vec6d friction_v_ = Vec6d::Zero(), friction_c_ = Vec6d::Zero(), armature_ = Vec6d::Zero();
-  Vec6d friction_error_gain_ = Vec6d::Zero();
   Vec6d max_effort_ = Vec6d::Zero();
   double tanh_slope_ = 300.0;
 
@@ -221,7 +220,7 @@ private:
 
   // Real-time payload inertia update and linear static-moment smoothing.
   void update_payload_model(double dt);
-  double payload_filter_time_constant_ = 0.20;
+  double payload_filter_time_constant_ = 0.03;
   double payload_nominal_gyration_radius_ = 0.025;
   double payload_mass_ = 0.0;
   std::array<double, 3> payload_com_tcp_{0.0, 0.0, 0.0};
@@ -385,7 +384,7 @@ private:
   bool tcp_cached_this_cycle_ = false;
   pinocchio::Data pin_data_dynamics_;
   Mat6x8d tcp_jacobian_ = Mat6x8d::Zero();
-  double cartesian_characteristic_length_ = 0.15;
+  double cartesian_characteristic_length_ = 0.25;
   Vec6d tau_applied_prev_ = Vec6d::Zero();
 
   lite6_interfaces::msg::ComplianceSettings compliance_settings_, compliance_filtered_;

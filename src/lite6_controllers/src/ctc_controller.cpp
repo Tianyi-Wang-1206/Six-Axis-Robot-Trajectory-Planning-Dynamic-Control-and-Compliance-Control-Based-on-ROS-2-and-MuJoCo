@@ -20,34 +20,33 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
   joint_names_ = {"joint1", "joint2", "joint3", "joint4", "joint5", "joint6"};
   reference_interfaces_.resize(3 * joint_names_.size(), 0.0);
 
-  auto_declare<std::vector<double>>("kp", {800.0, 800.0, 800.0, 800.0, 800.0, 800.0});
-  auto_declare<std::vector<double>>("kv", {56.6, 56.6, 56.6, 56.6, 56.6, 56.6});
-  auto_declare<std::vector<double>>("ki", {1000.0, 1000.0, 700.0, 350.0, 150.0, 80.0});
+  auto_declare<std::vector<double>>("kp", {3000.0, 3000.0, 3000.0, 3000.0, 3000.0, 3000.0});
+  auto_declare<std::vector<double>>("kv", {100.0, 100.0, 100.0, 100.0, 100.0, 100.0});
+  auto_declare<std::vector<double>>("ki", {5000.0, 5000.0, 3500.0, 1750.0, 750.0, 400.0});
   auto_declare<std::vector<double>>("antiwindup_gain", {10.0, 10.0, 10.0, 10.0, 10.0, 10.0});
-  auto_declare<std::vector<double>>("integral_max_effort", {2.5, 2.5, 1.7, 0.85, 0.35, 0.18});
-  auto_declare<std::vector<double>>("friction_v_nominal", {1.0, 1.0, 0.5, 0.2, 0.1, 0.05});
-  auto_declare<std::vector<double>>("friction_c_nominal", {1.5, 1.5, 1.0, 0.5, 0.2, 0.1});
+  auto_declare<std::vector<double>>("integral_max_effort", {12.5, 12.5, 8.5, 4.25, 1.75, 0.9});
+  auto_declare<std::vector<double>>("friction_v_nominal", {1.002, 1.009, 0.506, 0.201, 0.101, 0.051});
+  auto_declare<std::vector<double>>("friction_c_nominal", {1.499, 1.498, 0.999, 0.499, 0.200, 0.099});
   auto_declare<std::vector<double>>("armature", {0.1, 0.1, 0.1, 0.1, 0.1, 0.1});
 
   auto_declare<std::vector<double>>("max_effort", {50.0, 50.0, 32.0, 32.0, 32.0, 20.0});
   auto_declare<double>("tanh_slope", 300.0);
-  auto_declare<std::vector<double>>("friction_error_gain", {5.0, 5.0, 5.0, 5.0, 5.0, 5.0});
 
   auto_declare<std::vector<double>>("estop_decel", {17.5, 12.5, 20.0, 40.0, 40.0, 50.0});
   auto_declare<std::vector<double>>("execution.path_position_tolerance", std::vector<double>(6, 0.1));
   auto_declare<std::vector<double>>("execution.path_velocity_tolerance", std::vector<double>(6, 0.5));
-  auto_declare<std::vector<double>>("execution.goal_position_tolerance", std::vector<double>(6, 0.01));
-  auto_declare<std::vector<double>>("execution.sysid_goal_position_tolerance", std::vector<double>(6, 0.01));
+  auto_declare<std::vector<double>>("execution.goal_position_tolerance", std::vector<double>(6, 0.00015));
+  auto_declare<std::vector<double>>("execution.sysid_goal_position_tolerance", std::vector<double>(6, 0.04));
   auto_declare<std::vector<double>>("execution.sysid_goal_velocity_tolerance", std::vector<double>(6, 0.005));
   auto_declare<std::vector<double>>("execution.goal_velocity_tolerance", std::vector<double>(6, 0.02));
-  auto_declare<double>("execution.goal_settle_duration", 0.3);
+  auto_declare<double>("execution.goal_settle_duration", 1.0);
   auto_declare<double>("execution.goal_time_tolerance", 5.0);
   auto_declare<double>("execution.saturation_timeout", 1.0);
 
-  auto_declare<double>("payload.filter_time_constant", 0.20);
+  auto_declare<double>("payload.filter_time_constant", 0.03);
   auto_declare<double>("payload.nominal_gyration_radius", 0.025);
 
-  auto_declare<double>("compliance.characteristic_length", 0.15);
+  auto_declare<double>("compliance.characteristic_length", 0.25);
 
   auto declare_mode_common = [this](const std::string & prefix) {
     auto_declare<double>(prefix + ".max_joint_velocity", 3.0);
@@ -129,7 +128,7 @@ controller_interface::InterfaceConfiguration Lite6CTCController::state_interface
   for (const auto & joint : joint_names_) config.names.push_back(joint + "/position");
   for (const auto & joint : joint_names_) config.names.push_back(joint + "/velocity");
   for (const auto * name : {"gripper_left_finger", "gripper_right_finger"}) {
-    for (const auto * field : {"position", "velocity", "acceleration"}) {
+    for (const auto * field : {"position", "velocity"}) {
       config.names.push_back(std::string(name) + "/" + field);
     }
   }
@@ -207,7 +206,6 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   auto ki_v = get_node()->get_parameter("ki").as_double_array();
   auto aw_v = get_node()->get_parameter("antiwindup_gain").as_double_array();
   auto integral_limit_v = get_node()->get_parameter("integral_max_effort").as_double_array();
-  auto error_gain_v = get_node()->get_parameter("friction_error_gain").as_double_array();
   auto fv_v = get_node()->get_parameter("friction_v_nominal").as_double_array();
   auto fc_v = get_node()->get_parameter("friction_c_nominal").as_double_array();
   if (fv_v.size() != n || fc_v.size() != n) {
@@ -227,7 +225,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   auto estop_decel_v = get_node()->get_parameter("estop_decel").as_double_array();
   tanh_slope_ = get_node()->get_parameter("tanh_slope").as_double();
   if (kp_v.size() != n || kv_v.size() != n || ki_v.size() != n || aw_v.size() != n ||
-      integral_limit_v.size() != n || error_gain_v.size() != n || arm_v.size() != n ||
+      integral_limit_v.size() != n || arm_v.size() != n ||
       effort_limit_v.size() != n || estop_decel_v.size() != n) {
     RCLCPP_ERROR(get_node()->get_logger(), "Control parameter arrays must contain six values");
     return controller_interface::CallbackReturn::ERROR;
@@ -242,7 +240,6 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
         !std::isfinite(ki_v[i]) || ki_v[i] < 0.0 ||
         !std::isfinite(aw_v[i]) || aw_v[i] < 0.0 ||
         !std::isfinite(integral_limit_v[i]) || integral_limit_v[i] < 0.0 ||
-        !std::isfinite(error_gain_v[i]) || error_gain_v[i] < 0.0 ||
         !std::isfinite(arm_v[i]) || arm_v[i] < 0.0 ||
         !std::isfinite(effort_limit_v[i]) || effort_limit_v[i] <= 0.0 ||
         !std::isfinite(estop_decel_v[i]) || estop_decel_v[i] <= 0.0 ||
@@ -261,7 +258,6 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   friction_v_.setZero(); friction_c_.setZero();
   armature_.setZero(); max_effort_.setZero(); estop_decel_.setZero();
   ki_.setZero(); antiwindup_gain_.setZero(); integral_max_effort_.setZero();
-  friction_error_gain_.setZero();
 
   for (size_t i = 0; i < n; ++i) {
     const Eigen::Index idx = static_cast<Eigen::Index>(i);
@@ -272,7 +268,6 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
     ki_[idx] = ki_v[i];
     antiwindup_gain_[idx] = aw_v[i];
     integral_max_effort_[idx] = integral_limit_v[i];
-    friction_error_gain_[idx] = error_gain_v[i];
   }
 
   payload_filter_time_constant_ = get_node()->get_parameter("payload.filter_time_constant").as_double();
@@ -514,8 +509,8 @@ void Lite6CTCController::update_payload_model(double dt)
   payload_mass_filtered_ += alpha * (payload_mass_ - payload_mass_filtered_);
   payload_first_moment_link6_filtered_ += alpha * (s_target - payload_first_moment_link6_filtered_);
 
-  if (std::abs(payload_mass_ - payload_mass_filtered_) <= 5e-4 &&
-      (s_target - payload_first_moment_link6_filtered_).norm() <= 5e-5)
+  if (std::abs(payload_mass_ - payload_mass_filtered_) <= 1e-3 &&
+      (s_target - payload_first_moment_link6_filtered_).norm() <= 1e-4)
   {
     payload_mass_filtered_ = payload_mass_;
     payload_first_moment_link6_filtered_ = s_target;
@@ -681,11 +676,12 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   dynamics_q_.head(6) = q_;
   dynamics_dq_.head(6) = dq_;
   for (size_t i = 0; i < 2; ++i) {
-    dynamics_q_[6 + i] = state_interfaces_[2 * n + 3 * i].get_value();
-    dynamics_dq_[6 + i] = state_interfaces_[2 * n + 3 * i + 1].get_value();
-    dynamics_ddq_[6 + i] = state_interfaces_[2 * n + 3 * i + 2].get_value();
+    dynamics_q_[6 + i] = state_interfaces_[2 * n + 2 * i].get_value();
+    dynamics_dq_[6 + i] = state_interfaces_[2 * n + 2 * i + 1].get_value();
   }
-  if (!dynamics_q_.allFinite() || !dynamics_dq_.allFinite() || !dynamics_ddq_.tail(2).allFinite())
+  // Do not read simulator jaw acceleration into the arm controller RNEA.
+  dynamics_ddq_.tail(2).setZero();
+  if (!dynamics_q_.allFinite() || !dynamics_dq_.allFinite())
     return fail_controller(TrajectoryResult::INVALID_STATE);
 
   // Smoothly update the payload model before evaluating the control law.
@@ -751,12 +747,15 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
     a_d_ = ddq_target_ + kp_.cwiseProduct(e_) + kv_.cwiseProduct(de_);
     dynamics_ddq_.head(6) = a_d_;
     pinocchio::rnea(pin_model_, pin_data_, dynamics_q_, dynamics_dq_, dynamics_ddq_);
+    const bool use_friction_ff = (system_state_ == SystemState::NORMAL);
     const bool use_point_ff =
       (system_state_ == SystemState::NORMAL) && rigid_trajectory_active() && !rigid_cancel_braking_;
     for (size_t i = 0; i < n; ++i) {
-      // Viscous friction and Coulomb friction with smooth reference/error direction.
-      tau_fric_[i] = friction_v_[i] * dq_[i] + friction_c_[i] *
-          std::tanh(tanh_slope_ * (dq_target_[i] + friction_error_gain_[i] * e_[i]));
+      // Feedforward viscous and Coulomb friction along reference velocity in NORMAL only.
+      // Disabled during ESTOP and COMPLIANCE_STOPPING so physical friction aids passive braking.
+      tau_fric_[i] = use_friction_ff
+        ? (friction_v_[i] * dq_target_[i] + friction_c_[i] * std::tanh(tanh_slope_ * dq_target_[i]))
+        : 0.0;
       // ki == 0 disables both integration and back-calculation for this joint.
       if (ki_[i] == 0.0) integral_effort_[i] = 0.0;
       const double ff_i = use_point_ff ? tau_point_ff_[static_cast<Eigen::Index>(i)] : 0.0;

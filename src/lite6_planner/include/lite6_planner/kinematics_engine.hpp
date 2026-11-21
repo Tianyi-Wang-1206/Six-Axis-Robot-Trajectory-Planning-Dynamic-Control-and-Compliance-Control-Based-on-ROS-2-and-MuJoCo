@@ -85,7 +85,7 @@ private:
   void raw_inverse_kinematics(const Eigen::Matrix4d& T, double solutions[8][6]) const;
   std::array<JointLimit,6> joint_limits_{};
   CartesianLimit cart_limits_{};
-  double singularity_threshold_=0.001;
+  double singularity_threshold_=0.003;
   double quadrant_jump_threshold_=0.5;
   std::vector<double> ground_size_{3.0,3.0,0.1};
   std::vector<double> ground_pos_{0.0,0.0,-0.05};

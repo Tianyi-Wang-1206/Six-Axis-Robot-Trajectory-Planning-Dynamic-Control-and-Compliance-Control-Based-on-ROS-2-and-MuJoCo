@@ -42,7 +42,7 @@ namespace
 const std::vector<std::string> kJointNames{
   "joint1", "joint2", "joint3", "joint4", "joint5", "joint6"};
 
-constexpr double kAlignmentThresholdRad = 0.008;
+constexpr double kAlignmentThresholdRad = 5e-4;
 // Block-time lookahead between a pause request and the stop-along-path splice switch:
 // covers splice planning, the goal round trip and the CTC's first-sight decision.
 constexpr double kPauseSpliceLookaheadSec = 0.12;
@@ -1107,7 +1107,7 @@ private:
             1e-9 * bridge_traj.points.back().time_from_start.nanosec;
           std::string exec_err;
           const auto outcome = run_controller_action<FollowJointTrajectory>(
-            rigid_client_, bridge_goal, session, bridge_dur + 8.0,
+            rigid_client_, bridge_goal, session, bridge_dur + 12.0,
             nullptr, true, true, exec_err);
 
           if (outcome == ActionOutcome::SESSION_SUPERSEDED) {
@@ -1318,7 +1318,7 @@ private:
     };
     std::string err;
     const auto outcome = run_controller_action<FollowJointTrajectory>(
-      rigid_client_, goal, session, blk.duration_sec + 8.0, fb_cb, true, true, err, on_pause);
+      rigid_client_, goal, session, blk.duration_sec + 12.0, fb_cb, true, true, err, on_pause);
     if (outcome == ActionOutcome::SUCCEEDED && splice_end_sample.has_value()) {
       // The goal settled at the end of the stop tail: a pause in the middle of the block.
       return handle_trajectory_outcome(
@@ -1444,7 +1444,7 @@ private:
     imp_goal.expected_controller_epoch = supervisor_->snapshot().controller_epoch;
     std::string err;
     const auto outcome = run_controller_action<FollowImpedanceTrajectory>(
-      imp_client_, imp_goal, session, blk.duration_sec + 12.0, fb_cb, false, true, err);
+      imp_client_, imp_goal, session, blk.duration_sec + 17.0, fb_cb, false, true, err);
     supervisor_->clear_impedance_errors();
     return handle_trajectory_outcome(
       session, blk, block_idx, last_sample.load(), total_pts, outcome, err, calc_total_pct);

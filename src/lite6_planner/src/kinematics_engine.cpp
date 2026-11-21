@@ -525,7 +525,7 @@ IKResult KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
       continue; // Do not publish an unverified inverse-kinematics branch.
     }
     if(continuous) {
-      const double sigma=check_singularity(q,workspace.data),threshold=std::max(0.003,singularity_threshold_);
+      const double sigma=check_singularity(q,workspace.data),threshold=singularity_threshold_;
       if(sigma<threshold) {
         std::ostringstream out;
         out<<std::setprecision(10)<<"normalized Jacobian sigma_min="<<sigma<<", threshold="<<threshold;

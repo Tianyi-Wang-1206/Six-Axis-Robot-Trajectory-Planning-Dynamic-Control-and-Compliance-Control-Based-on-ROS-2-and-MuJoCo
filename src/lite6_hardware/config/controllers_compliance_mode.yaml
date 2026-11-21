@@ -5,12 +5,12 @@ ctc_controller:
   ros__parameters:
     # Real-time Pinocchio payload inertia update and linear static-moment smoothing.
     payload:
-      filter_time_constant: 0.15                            # s; exponential smoothing time constant for (m, m*c)
+      filter_time_constant: 0.03                            # s; exponential smoothing time constant for (m, m*c)
       nominal_gyration_radius: 0.025                        # m; point-payload effective gyration radius for local wrist inertia
 
     # Per-mode gains and limits share the Cartesian regularization metric.
     compliance:
-      characteristic_length: 0.15  # m; translational/rotational regularization metric
+      characteristic_length: 0.25  # m; translational/rotational regularization metric
       # 1. Dedicated Joint-Space Impedance Mode Parameters (MODE_JOINT_IMPEDANCE)
       joint_impedance:
         max_joint_velocity: 3.0
