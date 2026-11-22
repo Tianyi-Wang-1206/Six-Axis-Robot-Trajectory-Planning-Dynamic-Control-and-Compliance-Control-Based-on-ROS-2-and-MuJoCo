@@ -322,9 +322,10 @@ void Lite6CTCController::compute_compliance(double dt)
       wrench[k + 3] -= d_rot * velocity[k + 3];
     }
     tau_cmd_.noalias() += j_arm.transpose() * (wrench + cart_wrench_ff_filtered_);
-    // Regularization permits task leakage. Posture and feedforward are powered terms.
-    tau_cmd_ += project_nullspace_torque(j_arm, cfg.operational_damping_lambda,
-      s.nullspace_stiffness * (compliance_q_ - q_) - s.nullspace_damping * dq_);
+    // Passive M-weighted singularity damping: -d0 * (M - J^T Lambda_reg J) * dq.
+    // Symmetric positive definite everywhere and vanishing away from singularities.
+    tau_cmd_ += compute_nullspace_damping_torque(
+      j_arm, cfg.operational_damping_lambda, s.nullspace_damping, dq_);
   } else {
     const double decay_rate = interpolate_teach_level(teach_damping_levels_, s.sensitivity);
     for (int i = 0; i < 6; ++i) {

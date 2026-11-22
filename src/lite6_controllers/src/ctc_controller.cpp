@@ -563,11 +563,20 @@ void Lite6CTCController::apply_transition_torque_slew(
     return;
   }
   transition_slew_elapsed_ += dt;
-  const double max_step = slew_rate * dt;
+  double effective_slew_rate = slew_rate;
+  if (transition_slew_elapsed_ > transition_slew_duration_) {
+    // Rather than dropping slew limiting abruptly mid-ramp when the nominal window
+    // elapses, smoothly accelerate catch-up (up to 4x) until all joints converge.
+    const double overtime = transition_slew_elapsed_ - transition_slew_duration_;
+    const double boost =
+      1.0 + std::min(3.0, overtime / std::max(0.05, transition_slew_duration_));
+    effective_slew_rate = slew_rate * boost;
+  }
+  const double max_step = effective_slew_rate * dt;
   bool all_within_step = true;
   for (int i = 0; i < 6; ++i) {
-    const double diff = std::abs(tau[i] - transition_last_tau_[i]);
-    if (diff > max_step) {
+    const double reachable_tau = std::clamp(tau[i], -max_effort_[i], max_effort_[i]);
+    if (std::abs(reachable_tau - transition_last_tau_[i]) > max_step) {
       all_within_step = false;
     }
     tau[i] = std::clamp(
@@ -579,8 +588,10 @@ void Lite6CTCController::apply_transition_torque_slew(
   } else {
     transition_slew_converged_cycles_ = 0;
   }
+  const double max_slew_window =
+    std::max(transition_slew_duration_ + 1.0, 2.0 * transition_slew_duration_);
   if (transition_slew_converged_cycles_ >= 5 ||
-      transition_slew_elapsed_ >= transition_slew_duration_)
+      transition_slew_elapsed_ >= max_slew_window)
   {
     transition_slew_active_ = false;
   }
@@ -629,33 +640,36 @@ void Lite6CTCController::compute_cartesian_effective_inertia(
   }
 }
 
-Lite6CTCController::Vec6d Lite6CTCController::project_nullspace_torque(
-  const Mat6d & j_arm, double lambda, const Vec6d & tau0) const
+Lite6CTCController::Vec6d Lite6CTCController::compute_nullspace_damping_torque(
+  const Mat6d & j_arm, double lambda, double nullspace_damping,
+  const Vec6d & dq_err) const
 {
-  // Regularized posture projection: DLS permits task leakage, even at full rank.
+  if (!(nullspace_damping > 0.0) || !(lambda > 0.0)) {
+    return Vec6d::Zero();
+  }
+  // Passive M-weighted singularity damping using the Woodbury identity:
+  //   M - J^T (J M^-1 J^T + Sigma_lambda)^-1 J = M * (M + J^T Sigma_lambda^-1 J)^-1 * M
+  // This avoids subtraction cancellation and guarantees a symmetric positive-definite
+  // damping matrix at every pose (near zero at full rank, M-scaled near singularities).
   Mat6d m_tot = pin_data_dynamics_.M.topLeftCorner<6, 6>();
   for (int i = 0; i < 6; ++i) {
     m_tot(i, i) += armature_[i];
   }
-  const Eigen::LLT<Mat6d> llt(m_tot);
+  const double inv_lam_rot_sq = 1.0 / (lambda * lambda);
+  const double lam_trans = cartesian_characteristic_length_ * lambda;
+  const double inv_lam_trans_sq = 1.0 / (lam_trans * lam_trans);
+  Mat6d j_weighted = j_arm;
+  j_weighted.topRows<3>() *= inv_lam_trans_sq;
+  j_weighted.bottomRows<3>() *= inv_lam_rot_sq;
+  Mat6d h_mat = m_tot;
+  h_mat.noalias() += j_arm.transpose() * j_weighted;
+  const Eigen::LLT<Mat6d> llt(h_mat);
   if (llt.info() != Eigen::Success) {
     return Vec6d::Zero();
   }
-  Mat6d lambda_inv = j_arm * llt.solve(j_arm.transpose());
-  const double lam_rot_sq = lambda * lambda;
-  const double lam_trans_sq =
-    (cartesian_characteristic_length_ * lambda) * (cartesian_characteristic_length_ * lambda);
-  for (int k = 0; k < 3; ++k) {
-    lambda_inv(k, k) += lam_trans_sq;
-    lambda_inv(k + 3, k + 3) += lam_rot_sq;
-  }
-  const Eigen::LDLT<Mat6d> ldlt(lambda_inv);
-  if (ldlt.info() != Eigen::Success) {
-    return Vec6d::Zero();
-  }
-  const Vec6d task_force = ldlt.solve(j_arm * llt.solve(tau0));
-  const Vec6d projected = tau0 - j_arm.transpose() * task_force;
-  return projected.allFinite() ? projected : Vec6d::Zero();
+  const Vec6d m_dq = m_tot * dq_err;
+  const Vec6d damped = -nullspace_damping * (m_tot * llt.solve(m_dq));
+  return damped.allFinite() ? damped : Vec6d::Zero();
 }
 
 controller_interface::return_type Lite6CTCController::update_and_write_commands(
@@ -729,6 +743,8 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
     return fail_controller(TrajectoryResult::INVALID_COMMAND);
 
   // 4. Branching Control Law
+  Vec6d tau_unslewed = Vec6d::Zero();
+  bool transition_slew_applied = false;
   if (impedance_trajectory_active()) {
     compute_impedance_trajectory(dt);
   } else if (compliance_active()) {
@@ -762,8 +778,10 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       tau_cmd_[i] = pin_data_.tau[i] + (armature_[i] * a_d_[i]) + tau_fric_[i] +
           integral_effort_[i] + ff_i;
     }
+    tau_unslewed = tau_cmd_;
     if (system_state_ == SystemState::NORMAL && transition_slew_active_) {
       apply_transition_torque_slew(dt, imp_torque_slew_rate_, tau_cmd_);
+      transition_slew_applied = true;
     } else {
       transition_last_tau_ = tau_cmd_;
     }
@@ -774,18 +792,34 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
 
   // 5. Limit the TOTAL effort, then update the bias for the NEXT control cycle.
   for (size_t i = 0; i < n; ++i) {
-    const double raw_effort = tau_cmd_[i];
-    effort_saturated_[i] = std::abs(raw_effort) > max_effort_[i];
-    tau_cmd_[i] = std::clamp(raw_effort, -max_effort_[i], max_effort_[i]);
+    const double pre_clamp_effort = tau_cmd_[i];
+    effort_saturated_[i] = std::abs(pre_clamp_effort) > max_effort_[i];
+    tau_cmd_[i] = std::clamp(pre_clamp_effort, -max_effort_[i], max_effort_[i]);
     if (system_state_ != SystemState::SYS_ID && !compliance_active() &&
         !impedance_trajectory_active() && ki_[i] > 0.0) {
-      // During ESTOP retain the holding bias without integrating position
-      // error. Back-calculation still unwinds bias if braking saturates.
-      // NORMAL resumes from this state; trajectory completion never resets it.
-      const double error_rate = system_state_ == SystemState::NORMAL ?
-          ki_[i] * e_[i] : 0.0;
-      const double rate = error_rate +
-          antiwindup_gain_[i] * (tau_cmd_[i] - raw_effort);
+      const double slew_delta = transition_slew_applied ?
+          (pre_clamp_effort - tau_unslewed[i]) : 0.0;
+      const double sat_delta = tau_cmd_[i] - pre_clamp_effort;
+      const bool slew_clipped = std::abs(slew_delta) > 1e-12;
+      // During ESTOP/COMPLIANCE_STOPPING retain the holding bias without integrating
+      // position error. During NORMAL transition slew ramps, freeze error integration
+      // on slew-clipped joints so the integrator cannot wind up against the ramp.
+      const double error_rate =
+        (system_state_ == SystemState::NORMAL && !slew_clipped) ?
+        ki_[i] * e_[i] : 0.0;
+      // Back-calculate actuator magnitude saturation unconditionally. If a nonzero
+      // integral bias actively opposes a slew ramp, unwind it toward zero without
+      // flipping its sign or pumping a zero bias into the decaying prior torque.
+      double slew_aw_rate = 0.0;
+      if (slew_clipped && integral_effort_[i] * slew_delta < 0.0) {
+        slew_aw_rate = antiwindup_gain_[i] * slew_delta;
+        const double next_i = integral_effort_[i] + dt * slew_aw_rate;
+        if ((integral_effort_[i] > 0.0 && next_i < 0.0) ||
+            (integral_effort_[i] < 0.0 && next_i > 0.0)) {
+          slew_aw_rate = -integral_effort_[i] / dt;
+        }
+      }
+      const double rate = error_rate + antiwindup_gain_[i] * sat_delta + slew_aw_rate;
       integral_effort_[i] = std::clamp(
           integral_effort_[i] + dt * rate,
           -integral_max_effort_[i], integral_max_effort_[i]);
@@ -901,21 +935,35 @@ void Lite6CTCController::read_cached_tcp_kinematics(
 
 void Lite6CTCController::add_trajectory_friction_ff(
   double fv_scale, double fc_scale, double v_trans, double quiet_speed,
-  const Vec6d & dq_coulomb,
+  const Vec6d & dq_ref,
   Vec6d & tau_out) const
 {
   const size_t n = joint_names_.size();
   for (size_t i = 0; i < n; ++i) {
     const Eigen::Index idx = static_cast<Eigen::Index>(i);
-    const double viscous = fv_scale * friction_v_[idx] * dq_coulomb[idx];
-    const double dq_c = dq_coulomb[idx];
+    const double v_ref = dq_ref[idx];
+    const double v_ref_abs = std::abs(v_ref);
+    if (v_ref_abs <= 0.0) {
+      continue;
+    }
+    // Gate friction feedforward on measured joint motion aligned with the reference
+    // direction so stalled contact (dq ~= 0) or external pushback (sign(dq) != sign(dq_ref))
+    // never receives phantom moving-friction drive, while free-space tracking (dq ~= dq_ref)
+    // retains smooth compensation.
+    const double v_along = (v_ref >= 0.0) ? dq_[idx] : -dq_[idx];
+    const double v_eff = std::clamp(v_along, 0.0, v_ref_abs);
+    if (v_eff <= 0.0) {
+      continue;
+    }
+    const double dq_eff = std::copysign(v_eff, v_ref);
+    const double viscous = fv_scale * friction_v_[idx] * dq_eff;
     double coulomb_gate = 1.0;
     if (quiet_speed > 0.0) {
-      const double ramp = std::clamp((std::abs(dq_c) - quiet_speed) / quiet_speed, 0.0, 1.0);
+      const double ramp = std::clamp((v_eff - quiet_speed) / quiet_speed, 0.0, 1.0);
       coulomb_gate = ramp * ramp * (3.0 - 2.0 * ramp);
     }
     const double coulomb = fc_scale * coulomb_gate *
-      friction_c_[idx] * std::tanh(dq_c / v_trans);
+      friction_c_[idx] * std::tanh(dq_eff / v_trans);
     tau_out[idx] += viscous + coulomb;
   }
 }

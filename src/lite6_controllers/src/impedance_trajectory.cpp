@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <string>
 
 namespace lite6_controllers
@@ -528,13 +529,12 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
     pinocchio::log3(ref_pose.rotation() * meas_pose.rotation().transpose());
   const Eigen::Vector3d vel_trans_error = ref_velocity.head<3>() - meas_velocity.head<3>();
   const Eigen::Vector3d vel_rot_error = ref_velocity.tail<3>() - meas_velocity.tail<3>();
-  const Vec6d q_null_err = q_imp_ref_ - q_;
   const Vec6d dq_null_err = dq_ - dq_imp_ref_;
 
   tau_feedforward.noalias() += j_arm.transpose() * imp_wrench_ff_filtered_;
-  tau_feedforward += project_nullspace_torque(
-    j_arm, imp_operational_damping_lambda_,
-    imp_null_stiffness_filtered_ * q_null_err - imp_null_damping_filtered_ * dq_null_err);
+  // Passive M-weighted singularity damping on velocity tracking error.
+  tau_model += compute_nullspace_damping_torque(
+    j_arm, imp_operational_damping_lambda_, imp_null_damping_filtered_, dq_null_err);
   add_trajectory_friction_ff(
     imp_fv_scale_, imp_fc_scale_, imp_fric_trans_speed_, imp_fric_quiet_speed_,
     dq_imp_ref_, tau_feedforward);
@@ -655,10 +655,104 @@ void Lite6CTCController::finish_impedance_trajectory_cycle(double dt)
     return;
   }
 
-  const double pos_ratio = pos_err_norm / imp_goal_trans_tolerance_;
-  const double rot_ratio = rot_err_norm / imp_goal_rot_tolerance_;
+  const auto & goal = *execution->goal->get_goal();
   const double vel_ratio = dq_.cwiseAbs().maxCoeff() / imp_goal_velocity_tolerance_;
-  const double worst_ratio = std::max({pos_ratio, rot_ratio, vel_ratio});
+  double worst_ratio = vel_ratio;
+  if (goal.end_behavior != FollowImpedance::Goal::END_HOLD_CARTESIAN_IMPEDANCE) {
+    // Per-axis endpoint pose settling for END_TRANSITION_NORMAL:
+    // - Pure force/torque axes (kt < 1.0 N/m or kr < 0.05 Nm/rad) have no spring
+    //   equilibrium target and rely on global deviation caps + velocity settling.
+    // - Soft or wrench_ff-biased axes widen their per-axis tolerance to cover
+    //   (|wrench_ff_k| + static LuGre friction deadband) / k_k, capped at max_*_deviation.
+    // - Stiff unbiased axes retain the exact nominal Euclidean tolerance.
+    constexpr double kMinPosControlledTransStiffness = 1.0;   // N/m
+    constexpr double kMinPosControlledRotStiffness = 0.05;    // Nm/rad
+    constexpr double kStaticFrictionMarginScale = 1.20;       // LuGre Fs = 1.15 * Fc + margin
+
+    Vec6d stiction_wrench = Vec6d::Zero();
+    const pinocchio::SE3 * meas_pose_ptr = nullptr;
+    const Mat6x8d * meas_jac_ptr = nullptr;
+    read_cached_tcp_kinematics(meas_pose_ptr, meas_jac_ptr);
+    const Mat6d j_arm = meas_jac_ptr->leftCols<6>();
+    Mat6d jjt = j_arm * j_arm.transpose();
+    const double lam_rot_sq = imp_operational_damping_lambda_ * imp_operational_damping_lambda_;
+    const double lam_trans = cartesian_characteristic_length_ * imp_operational_damping_lambda_;
+    const double lam_trans_sq = lam_trans * lam_trans;
+    for (int k = 0; k < 3; ++k) {
+      jjt(k, k) += lam_trans_sq;
+      jjt(k + 3, k + 3) += lam_rot_sq;
+    }
+    const Eigen::LDLT<Mat6d> ldlt(jjt);
+    const Vec6d tau_static = kStaticFrictionMarginScale * friction_c_;
+    if (ldlt.info() == Eigen::Success) {
+      const Mat6d j_pinv = j_arm.transpose() * ldlt.solve(Mat6d::Identity());
+      for (int k = 0; k < 6; ++k) {
+        const double rms = tau_static.cwiseProduct(j_pinv.col(k)).norm();
+        if (std::isfinite(rms)) {
+          stiction_wrench[k] = rms;
+        }
+      }
+    }
+    // Lower-bound by single-joint static breakaway so near-singular rows (where
+    // DLS J_pinv shrinks toward zero) still reflect large static resistance.
+    for (int k = 0; k < 6; ++k) {
+      bool has_frictionless_joint = false;
+      double max_sensitivity = 0.0;
+      for (int i = 0; i < 6; ++i) {
+        const double j_abs = std::abs(j_arm(k, i));
+        if (j_abs <= 1e-9) {
+          continue;
+        }
+        if (tau_static[i] <= 1e-9) {
+          has_frictionless_joint = true;
+          break;
+        }
+        max_sensitivity = std::max(max_sensitivity, j_abs / tau_static[i]);
+      }
+      if (!has_frictionless_joint) {
+        const double breakaway = (max_sensitivity > 1e-9)
+          ? (1.0 / max_sensitivity)
+          : std::numeric_limits<double>::infinity();
+        stiction_wrench[k] = std::max(stiction_wrench[k], breakaway);
+      }
+    }
+
+    double nom_pos_err_sq = 0.0;
+    double widened_pos_ratio = 0.0;
+    double nom_rot_err_sq = 0.0;
+    double widened_rot_ratio = 0.0;
+    for (int k = 0; k < 3; ++k) {
+      if (imp_kt_filtered_[k] >= kMinPosControlledTransStiffness) {
+        const double static_tol =
+          (std::abs(imp_wrench_ff_filtered_[k]) + stiction_wrench[k]) / imp_kt_filtered_[k];
+        const double eff_tol = std::min(
+          imp_max_trans_deviation_, std::max(imp_goal_trans_tolerance_, static_tol));
+        if (eff_tol <= imp_goal_trans_tolerance_ + 1e-12) {
+          nom_pos_err_sq += imp_current_pos_error_[k] * imp_current_pos_error_[k];
+        } else {
+          widened_pos_ratio = std::max(
+            widened_pos_ratio, std::abs(imp_current_pos_error_[k]) / eff_tol);
+        }
+      }
+      if (imp_kr_filtered_[k] >= kMinPosControlledRotStiffness) {
+        const double static_tol =
+          (std::abs(imp_wrench_ff_filtered_[k + 3]) + stiction_wrench[k + 3]) / imp_kr_filtered_[k];
+        const double eff_tol = std::min(
+          imp_max_rot_deviation_, std::max(imp_goal_rot_tolerance_, static_tol));
+        if (eff_tol <= imp_goal_rot_tolerance_ + 1e-12) {
+          nom_rot_err_sq += imp_current_rot_error_[k] * imp_current_rot_error_[k];
+        } else {
+          widened_rot_ratio = std::max(
+            widened_rot_ratio, std::abs(imp_current_rot_error_[k]) / eff_tol);
+        }
+      }
+    }
+    const double pos_ratio = std::max(
+      std::sqrt(nom_pos_err_sq) / imp_goal_trans_tolerance_, widened_pos_ratio);
+    const double rot_ratio = std::max(
+      std::sqrt(nom_rot_err_sq) / imp_goal_rot_tolerance_, widened_rot_ratio);
+    worst_ratio = std::max({pos_ratio, rot_ratio, vel_ratio});
+  }
 
   if (worst_ratio <= 1.0) {
     execution->settled_duration =
@@ -670,14 +764,13 @@ void Lite6CTCController::finish_impedance_trajectory_cycle(double dt)
   }
 
   const double end_time =
-    to_seconds(execution->goal->get_goal()->points.back().time_from_start);
+    to_seconds(goal.points.back().time_from_start);
   if (execution->elapsed > end_time + imp_goal_time_tolerance_) {
     fail_impedance_trajectory(
       ImpedanceTrajectoryResult::GOAL_TIMEOUT, -1,
       worst_ratio, 1.0,
       "Impedance trajectory goal settling deadline exceeded");
   } else if (execution->settled_duration >= imp_goal_settle_duration_) {
-    const auto & goal = *execution->goal->get_goal();
     if (goal.end_behavior == FollowImpedance::Goal::END_HOLD_CARTESIAN_IMPEDANCE) {
       const auto & last = goal.points.back();
       dynamics_q_ref_.head<6>() = q_imp_ref_;

@@ -228,9 +228,14 @@ private:
   Eigen::Vector3d payload_first_moment_link6_filtered_ = Eigen::Vector3d::Zero();
   bool payload_smoothing_active_ = false;
 
-  // Regularized posture projection N^T tau0 = tau0 - J^T Lambda J M^-1 tau0
-  // (same DLS-regularized Lambda as the operational damping), using cached M(q).
-  Vec6d project_nullspace_torque(const Mat6d & j_arm, double lambda, const Vec6d & tau0) const;
+  // Passive M-weighted singularity damping:
+  //   tau = -d0 * (M - J^T Lambda_reg J) * dq_err
+  //       = -d0 * M * (M + J^T Sigma_lambda^-1 J)^-1 * M * dq_err
+  // Symmetric positive definite everywhere and vanishing away from singularities,
+  // using cached M(q).
+  Vec6d compute_nullspace_damping_torque(
+    const Mat6d & j_arm, double lambda, double nullspace_damping,
+    const Vec6d & dq_err) const;
   // Transition-only torque slew-rate limiter.
   void begin_torque_transition(double duration_sec);
   void apply_transition_torque_slew(double dt, double slew_rate, Vec6d & tau);
@@ -377,7 +382,7 @@ private:
     const pinocchio::SE3 * & out_pose, const Mat6x8d * & out_jacobian);
   void add_trajectory_friction_ff(
     double fv_scale, double fc_scale, double v_trans, double quiet_speed,
-    const Vec6d & dq_coulomb, Vec6d & tau_out) const;
+    const Vec6d & dq_ref, Vec6d & tau_out) const;
   static Eigen::Vector3d rotational_spring_torque(
     const Eigen::Matrix3d & error_rotation, const Eigen::Vector3d & stiffness);
   bool dynamics_cached_this_cycle_ = false;
