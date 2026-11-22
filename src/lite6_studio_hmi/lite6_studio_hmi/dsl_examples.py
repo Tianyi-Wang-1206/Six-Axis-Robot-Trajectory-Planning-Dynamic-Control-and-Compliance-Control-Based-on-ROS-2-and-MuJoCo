@@ -7,9 +7,9 @@ PRESET_PROGRAMS = {
 joint READY = [0.0, 0.35, 1.0, 0.0, 0.65, 0.0]
 
 SetPayload(mass=0.0)
-MoveJ(READY, vel=0.60, acc=0.60)
+MoveJ(READY, vel=1.0, acc=1.0)
 
-MovePVA(space=CARTESIAN, vel=0.90, acc=0.90) {
+MovePVA(space=CARTESIAN, vel=1.0, acc=1.0) {
   point(
     p=Pose(xyz=[ 0.1729,  0.2923,  0.5212], rpy=[-2.5877, -1.1256,  0.7407]),
     v=[-0.125,  0.088,  0.018,  0.016, -0.077,  0.357],
@@ -71,39 +71,39 @@ MovePVA(space=CARTESIAN, vel=0.90, acc=0.90) {
 joint READY = [0.0, 0.1066, 1.1100, 0.0, 1.0034, 0.0]
 
 SetPayload(mass=0.0)
-MoveJ(READY, vel=0.60, acc=0.60)
+MoveJ(READY, vel=1.0, acc=1.0)
 
 # --- Loop 1: Exact stop-and-go at every corner on z = 0.250 m plane (blend = 0) ---
-MoveL(Pose(xyz=[0.165,  0.070, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
-MoveL(Pose(xyz=[0.335,  0.135, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
-MoveL(Pose(xyz=[0.165,  0.200, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
-MoveL(Pose(xyz=[0.240,  0.275, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
+MoveL(Pose(xyz=[0.165,  0.070, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0)
+MoveL(Pose(xyz=[0.335,  0.135, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0)
+MoveL(Pose(xyz=[0.165,  0.200, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0)
+MoveL(Pose(xyz=[0.240,  0.275, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0)
 MoveC(
   via=[0.370, 0.000, 0.250],
   target=Pose(xyz=[0.240, -0.275, 0.250], rpy=[3.14159, 0.0, 0.0]),
-  vel=0.65, acc=0.65
+  vel=1.0, acc=1.0
 )
-MoveL(Pose(xyz=[0.165, -0.200, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
-MoveL(Pose(xyz=[0.335, -0.135, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
-MoveL(Pose(xyz=[0.165, -0.070, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
-MoveL(Pose(xyz=[0.260,  0.000, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
+MoveL(Pose(xyz=[0.165, -0.200, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0)
+MoveL(Pose(xyz=[0.335, -0.135, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0)
+MoveL(Pose(xyz=[0.165, -0.070, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0)
+MoveL(Pose(xyz=[0.260,  0.000, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0)
 
-Wait(duration=0.50)
+Wait(duration=0.10)
 
 # --- Loop 2: Same horizontal route with smooth C3 corner blending ---
-MoveL(Pose(xyz=[0.165,  0.070, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65, blend=0.025)
-MoveL(Pose(xyz=[0.335,  0.135, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65, blend=0.025)
-MoveL(Pose(xyz=[0.165,  0.200, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65, blend=0.025)
-MoveL(Pose(xyz=[0.240,  0.275, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65, blend=0.025)
+MoveL(Pose(xyz=[0.165,  0.070, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0, blend=0.025)
+MoveL(Pose(xyz=[0.335,  0.135, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0, blend=0.025)
+MoveL(Pose(xyz=[0.165,  0.200, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0, blend=0.025)
+MoveL(Pose(xyz=[0.240,  0.275, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0, blend=0.025)
 MoveC(
   via=[0.370, 0.000, 0.250],
   target=Pose(xyz=[0.240, -0.275, 0.250], rpy=[3.14159, 0.0, 0.0]),
-  vel=0.65, acc=0.65, blend=0.025
+  vel=1.0, acc=1.0, blend=0.025
 )
-MoveL(Pose(xyz=[0.165, -0.200, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65, blend=0.025)
-MoveL(Pose(xyz=[0.335, -0.135, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65, blend=0.025)
-MoveL(Pose(xyz=[0.165, -0.070, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65, blend=0.025)
-MoveL(Pose(xyz=[0.260,  0.000, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
+MoveL(Pose(xyz=[0.165, -0.200, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0, blend=0.025)
+MoveL(Pose(xyz=[0.335, -0.135, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0, blend=0.025)
+MoveL(Pose(xyz=[0.165, -0.070, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0, blend=0.025)
+MoveL(Pose(xyz=[0.260,  0.000, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0)
 """,
     "3. Compliant Stack & Side-Grasp Arc (300 g Objects)": """# Full physical manipulation demo matching scene.xml object positions:
 # - Cylinder at [0.24, -0.15, 0.05] (height 100 mm, dia 30 mm, mass 0.30 kg)
@@ -117,20 +117,20 @@ MoveJ(READY, vel=0.55, acc=0.55)
 Gripper(action=OPEN, wait=true)
 
 # 1. MoveL directly above cylinder and stop
-MoveL(Pose(xyz=[0.240, -0.150, 0.160], rpy=[3.14159, 0.0, 0.0]), vel=0.45, acc=0.45)
+MoveL(Pose(xyz=[0.240, -0.150, 0.160], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0, blend=0.025)
 
 # 2. Descend to z=85 mm and close gripper to pick 0.30 kg cylinder
-MoveL(Pose(xyz=[0.240, -0.150, 0.085], rpy=[3.14159, 0.0, 0.0]), vel=0.28, acc=0.30)
+MoveL(Pose(xyz=[0.240, -0.150, 0.085], rpy=[3.14159, 0.0, 0.0]), vel=0.8, acc=0.7)
 Gripper(action=CLOSE, wait=true)
 SetPayload(mass=0.30, com=[0.0, 0.0, 0.0])
-Wait(duration=0.20)
+Wait(duration=0.05)
 
 # 3. Lift to z=200 mm and smoothly blend into a long MoveC arc above the box
-MoveL(Pose(xyz=[0.240, -0.150, 0.200], rpy=[3.14159, 0.0, 0.0]), vel=0.45, acc=0.45, blend=0.025)
+MoveL(Pose(xyz=[0.240, -0.150, 0.200], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0, blend=0.025)
 MoveC(
   via=Pose(xyz=[0.365, -0.015, 0.220], rpy=[3.14159, 0.0, 0.0]),
   target=Pose(xyz=[0.240, 0.120, 0.200], rpy=[3.14159, 0.0, 0.0]),
-  vel=0.45, acc=0.45
+  vel=0.9, acc=0.9
 )
 
 # 4. Cartesian impedance descent: cylinder contacts box top (~z=0.165),
@@ -140,29 +140,30 @@ ImpedanceCartesian(kt=[450, 450, 100], dt=[0.85, 0.85, 0.80], kr=[25, 25, 18], d
 }
 
 # 5. Stop, open gripper, reset payload, lift to z=200 mm, and blend MoveC to approach box from -Y side
-Wait(duration=0.30)
+Wait(duration=0.1)
 Gripper(action=OPEN, wait=true)
 SetPayload(mass=0.0)
-Wait(duration=0.20)
-MoveL(Pose(xyz=[0.240, 0.120, 0.200], rpy=[3.14159, 0.0, 0.0]), vel=0.40, acc=0.40, blend=0.025)
+Wait(duration=0.1)
+MoveL(Pose(xyz=[0.240, 0.120, 0.200], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0, blend=0.025)
 MoveC(
   via=Pose(xyz=[0.240, 0.055, 0.140], rpy=[3.14159, 1.309, -1.5708]),
   target=Pose(xyz=[0.240, 0.045, 0.055], rpy=[3.14159, 1.309, -1.5708]),
-  vel=0.35, acc=0.35
+  vel=0.6, acc=0.6,
+  blend=0.025
 )
 
 # Approach from the side at z=55 mm without touching the stacked cylinder,
 # then close gripper across the 30 mm X-width (0.30 kg box + 0.30 kg stacked cylinder = 0.60 kg)
-MoveL(Pose(xyz=[0.240, 0.112, 0.055], rpy=[3.14159, 1.309, -1.5708]), vel=0.22, acc=0.25)
+MoveL(Pose(xyz=[0.240, 0.112, 0.055], rpy=[3.14159, 1.309, -1.5708]), vel=0.5, acc=0.5)
 Gripper(action=CLOSE, wait=true)
 SetPayload(mass=0.60, com=[0.0, 0.0, 0.0])
-Wait(duration=0.25)
+Wait(duration=0.1)
 
 # 6. Large vertical MoveC arc (rise up, then descend to ~3.5 cm above tabletop)
 MoveC(
   via=Pose(xyz=[0.250, 0.020, 0.215], rpy=[3.14159, 1.309, -1.5708]),
   target=Pose(xyz=[0.240, -0.070, 0.090], rpy=[3.14159, 1.309, -1.5708]),
-  vel=0.40, acc=0.40
+  vel=0.8, acc=0.8
 )
 
 # 7. Compliant Cartesian impedance placement onto table, open gripper, reset payload, retract clear, MoveJ ZERO
@@ -171,9 +172,9 @@ ImpedanceCartesian(kt=[450, 450, 120], dt=[0.85, 0.85, 0.80], kr=[25, 25, 18], d
 }
 Gripper(action=OPEN, wait=true)
 SetPayload(mass=0.0)
-Wait(duration=0.20)
-MoveL(Pose(xyz=[0.235, -0.118, 0.090], rpy=[3.14159, 1.309, -1.5708]), vel=0.35, acc=0.35)
-MoveL(Pose(xyz=[0.200, -0.150, 0.240], rpy=[3.14159, 0.0, 0.0]), vel=0.35, acc=0.35)
-MoveJ(ZERO, vel=0.50, acc=0.50)
+Wait(duration=0.1)
+MoveL(Pose(xyz=[0.235, -0.118, 0.090], rpy=[3.14159, 1.309, -1.5708]), vel=1.0, acc=1.0, blend=0.025)
+MoveL(Pose(xyz=[0.200, -0.150, 0.240], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0)
+MoveJ(ZERO, vel=1.0, acc=1.0)
 """,
 }
