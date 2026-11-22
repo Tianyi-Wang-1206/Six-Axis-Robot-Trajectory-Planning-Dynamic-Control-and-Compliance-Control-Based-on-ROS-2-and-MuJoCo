@@ -457,6 +457,11 @@ controller_interface::return_type Lite6CTCController::fail_controller(
   integral_effort_.setZero();
   tau_point_ff_.setZero();
   tau_cmd_.setZero();
+  tau_applied_prev_.setZero();
+  has_applied_tau_ = false;
+  recovery_bias_active_ = false;
+  recovery_bias_elapsed_ = 0.0;
+  recovery_bias_init_.setZero();
   // Best effort only: an inaccessible interface cannot be made writable here.
   // ERROR asks controller_manager to deactivate this controller as well.
   for (auto & command : command_interfaces_) {
@@ -524,7 +529,9 @@ void Lite6CTCController::finish_trajectory_cycle(double dt)
         rigid_cancel_braking_ = false;
         rigid_cancel_elapsed_ = 0.0;
         tau_point_ff_.setZero();
-        if (system_state_ == SystemState::NORMAL || system_state_ == SystemState::SYS_ID) {
+        if (system_state_ == SystemState::NORMAL) {
+          bumpless_handover_to_normal(0.20);
+        } else if (system_state_ == SystemState::SYS_ID) {
           const size_t n = joint_names_.size();
           for (size_t i = 0; i < n; ++i) {
             reference_interfaces_[i] = q_[i];

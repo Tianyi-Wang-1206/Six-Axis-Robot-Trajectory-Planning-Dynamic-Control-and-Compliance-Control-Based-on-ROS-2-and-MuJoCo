@@ -217,15 +217,7 @@ void Lite6CTCController::step_compliance_stopping(double dt)
       dq_.cwiseAbs().maxCoeff() <= lite6_interfaces::contract::kPlannerSettleSpeedRadPerSec)
   {
     // Resume NORMAL at the measured resting pose, never at the old equilibrium.
-    for (size_t i = 0; i < 6; ++i) {
-      reference_interfaces_[i] = q_[i];
-      reference_interfaces_[6 + i] = 0.0;
-      reference_interfaces_[12 + i] = 0.0;
-    }
-    q_target_ = q_;
-    dq_target_.setZero();
-    ddq_target_.setZero();
-    tau_point_ff_.setZero();
+    bumpless_handover_to_normal(0.20);
     clear_estop_reason();
     compliance_stopping_elapsed_ = 0.0;
     transition_system_state(SystemState::NORMAL);

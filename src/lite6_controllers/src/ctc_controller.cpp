@@ -149,6 +149,11 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
 
   e_.setZero(); de_.setZero(); a_d_.setZero();
   tau_fric_.setZero(); tau_cmd_.setZero();
+  tau_applied_prev_.setZero();
+  has_applied_tau_ = false;
+  recovery_bias_active_ = false;
+  recovery_bias_elapsed_ = 0.0;
+  recovery_bias_init_.setZero();
   tau_point_ff_.setZero();
   integral_effort_.setZero();
   q_target_.setZero(); dq_target_.setZero(); ddq_target_.setZero();
@@ -372,6 +377,9 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   transition_slew_elapsed_ = 0.0;
   transition_slew_converged_cycles_ = 0;
   transition_last_tau_.setZero();
+  recovery_bias_active_ = false;
+  recovery_bias_elapsed_ = 0.0;
+  recovery_bias_init_.setZero();
   clear_estop_reason();
 
   for (size_t i = 0; i < n; ++i) {
@@ -430,6 +438,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
     latch_estop_reason(lite6_interfaces::msg::ControllerStatus::ESTOP_EXTERNAL);
   }
   tau_applied_prev_.setZero();
+  has_applied_tau_ = false;
   imp_ref_kinematics_cached_ = false;
   cmd_ring_.discard_all();
   cmd_gate_.store(0ULL, std::memory_order_release);
@@ -456,6 +465,10 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
 controller_interface::CallbackReturn Lite6CTCController::on_deactivate(const rclcpp_lifecycle::State &)
 {
   trajectory_enabled_.store(false, std::memory_order_release);
+  has_applied_tau_ = false;
+  recovery_bias_active_ = false;
+  recovery_bias_elapsed_ = 0.0;
+  recovery_bias_init_.setZero();
   current_mode_atomic_.store(
     lite6_interfaces::msg::ControllerStatus::MODE_UNKNOWN, std::memory_order_release);
   publish_shadow_shm(nullptr, false);
@@ -553,6 +566,69 @@ void Lite6CTCController::begin_torque_transition(double duration_sec)
   transition_slew_duration_ = std::max(0.01, duration_sec);
   transition_slew_converged_cycles_ = 0;
   transition_last_tau_ = tau_applied_prev_;
+}
+
+void Lite6CTCController::bumpless_handover_to_normal(double transition_duration_sec)
+{
+  const size_t n = joint_names_.size();
+  for (size_t i = 0; i < n; ++i) {
+    reference_interfaces_[i] = q_[i];
+    reference_interfaces_[n + i] = 0.0;
+    reference_interfaces_[2 * n + i] = 0.0;
+  }
+  q_target_ = q_;
+  dq_target_.setZero();
+  ddq_target_.setZero();
+  tau_point_ff_.setZero();
+  estop_q_ = q_;
+  estop_dq_.setZero();
+  transition_slew_active_ = false;
+  recovery_bias_active_ = false;
+  recovery_bias_elapsed_ = 0.0;
+  recovery_bias_init_.setZero();
+
+  if (has_applied_tau_ && dynamics_q_.allFinite() && dynamics_dq_.allFinite() &&
+      tau_applied_prev_.allFinite())
+  {
+    // Reconcile the torque-domain integrator so the first NORMAL cycle (with
+    // e = 0, de = -dq, dq_target = 0, ddq_target = 0) reproduces tau_applied_prev_
+    // continuously without a step kick when snapping q_target from estop_q_ to q_.
+    // Any excess beyond integral_max_effort_ (or on ki == 0 joints) is carried by a
+    // C1 raised-cosine recovery bias that decays smoothly to zero while keeping the
+    // PD damping loop fully active.
+    const Vec6d a_hold = -kv_.cwiseProduct(dq_);
+    dynamics_ddq_.head(6) = a_hold;
+    dynamics_ddq_.tail(2).setZero();
+    pinocchio::rnea(pin_model_, pin_data_, dynamics_q_, dynamics_dq_, dynamics_ddq_);
+    double max_excess = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      const Eigen::Index idx = static_cast<Eigen::Index>(i);
+      const double tau_base = pin_data_.tau[idx] + armature_[idx] * a_hold[idx];
+      const double bias = tau_applied_prev_[idx] - tau_base;
+      if (!std::isfinite(bias)) {
+        integral_effort_[idx] = 0.0;
+        recovery_bias_init_[idx] = 0.0;
+        continue;
+      }
+      if (ki_[idx] > 0.0) {
+        integral_effort_[idx] =
+          std::clamp(bias, -integral_max_effort_[idx], integral_max_effort_[idx]);
+      } else {
+        integral_effort_[idx] = 0.0;
+      }
+      const double excess = bias - integral_effort_[idx];
+      recovery_bias_init_[idx] = excess;
+      max_excess = std::max(max_excess, std::abs(excess));
+    }
+    if (max_excess > 1e-6) {
+      const double nominal_dur = std::max(0.20, transition_duration_sec);
+      recovery_bias_duration_ = std::clamp(std::max(nominal_dur, max_excess / 50.0), 0.20, 0.50);
+      recovery_bias_elapsed_ = 0.0;
+      recovery_bias_active_ = true;
+    }
+  } else {
+    integral_effort_.setZero();
+  }
 }
 
 void Lite6CTCController::apply_transition_torque_slew(
@@ -767,6 +843,23 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
     const bool use_friction_ff = (system_state_ == SystemState::NORMAL);
     const bool use_point_ff =
       (system_state_ == SystemState::NORMAL) && rigid_trajectory_active() && !rigid_cancel_braking_;
+    Vec6d rec_bias = Vec6d::Zero();
+    if (system_state_ == SystemState::NORMAL && recovery_bias_active_) {
+      if (recovery_bias_elapsed_ < recovery_bias_duration_) {
+        constexpr double kPi = 3.14159265358979323846;
+        const double phase = recovery_bias_elapsed_ / recovery_bias_duration_;
+        const double recovery_bias_scale = 0.5 * (1.0 + std::cos(kPi * phase));
+        rec_bias = recovery_bias_scale * recovery_bias_init_;
+        recovery_bias_elapsed_ += dt;
+        if (recovery_bias_elapsed_ >= recovery_bias_duration_) {
+          recovery_bias_active_ = false;
+          recovery_bias_init_.setZero();
+        }
+      } else {
+        recovery_bias_active_ = false;
+        recovery_bias_init_.setZero();
+      }
+    }
     for (size_t i = 0; i < n; ++i) {
       // Feedforward viscous and Coulomb friction along reference velocity in NORMAL only.
       // Disabled during ESTOP and COMPLIANCE_STOPPING so physical friction aids passive braking.
@@ -777,7 +870,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       if (ki_[i] == 0.0) integral_effort_[i] = 0.0;
       const double ff_i = use_point_ff ? tau_point_ff_[static_cast<Eigen::Index>(i)] : 0.0;
       tau_cmd_[i] = pin_data_.tau[i] + (armature_[i] * a_d_[i]) + tau_fric_[i] +
-          integral_effort_[i] + ff_i;
+          integral_effort_[i] + ff_i + rec_bias[static_cast<Eigen::Index>(i)];
     }
     tau_unslewed = tau_cmd_;
     if (system_state_ == SystemState::NORMAL && transition_slew_active_) {
@@ -833,6 +926,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
       return fail_controller(TrajectoryResult::COMMAND_WRITE, static_cast<int>(i));
     tau_applied_prev_[static_cast<Eigen::Index>(i)] = tau_cmd_[static_cast<Eigen::Index>(i)];
   }
+  has_applied_tau_ = true;
   transition_last_tau_ = tau_applied_prev_;
   // No success is published until this cycle's feedback and command writes pass.
   finish_trajectory_cycle(dt);
@@ -1008,6 +1102,14 @@ void Lite6CTCController::transition_system_state(SystemState next_state)
     status_publish_pending_ = true;
     if (next_state != SystemState::COMPLIANCE_STOPPING) {
       compliance_stopping_elapsed_ = 0.0;
+    }
+    if (next_state != SystemState::NORMAL) {
+      recovery_bias_active_ = false;
+      recovery_bias_elapsed_ = 0.0;
+      recovery_bias_init_.setZero();
+    }
+    if (next_state == SystemState::ESTOP) {
+      transition_slew_active_ = false;
     }
   }
 }
@@ -1344,17 +1446,7 @@ uint8_t Lite6CTCController::apply_controller_command(const PendingControllerComm
       if (max_speed > lite6_interfaces::contract::kClearEstopMaxSpeedRadPerSec) {
         return Resp::ACK_REJECTED_SPEED;
       }
-      for (size_t i = 0; i < joint_names_.size(); ++i) {
-        reference_interfaces_[i] = q_[i];
-        reference_interfaces_[joint_names_.size() + i] = 0.0;
-        reference_interfaces_[2 * joint_names_.size() + i] = 0.0;
-      }
-      q_target_ = q_;
-      dq_target_.setZero();
-      ddq_target_.setZero();
-      tau_point_ff_.setZero();
-      estop_q_ = q_;
-      estop_dq_.setZero();
+      bumpless_handover_to_normal(0.20);
       clear_estop_reason();
       transition_system_state(SystemState::NORMAL);
       return Resp::ACK_APPLIED;
@@ -1367,12 +1459,7 @@ uint8_t Lite6CTCController::apply_controller_command(const PendingControllerComm
         if (max_speed > lite6_interfaces::contract::kControllerEntryMaxSpeedRadPerSec) {
           return Resp::ACK_REJECTED_SPEED;
         }
-        for (size_t i = 0; i < joint_names_.size(); ++i) {
-          reference_interfaces_[i] = q_[i];
-          reference_interfaces_[joint_names_.size() + i] = 0.0;
-          reference_interfaces_[2 * joint_names_.size() + i] = 0.0;
-        }
-        tau_point_ff_.setZero();
+        bumpless_handover_to_normal(0.20);
         transition_system_state(SystemState::NORMAL);
         return Resp::ACK_APPLIED;
       }

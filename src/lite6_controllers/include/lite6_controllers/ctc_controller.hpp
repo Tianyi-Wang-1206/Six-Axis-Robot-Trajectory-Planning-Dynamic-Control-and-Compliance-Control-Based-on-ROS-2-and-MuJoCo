@@ -239,11 +239,20 @@ private:
   // Transition-only torque slew-rate limiter.
   void begin_torque_transition(double duration_sec);
   void apply_transition_torque_slew(double dt, double slew_rate, Vec6d & tau);
+  // Recapture the current measured pose as a stationary NORMAL reference and
+  // reconcile integral_effort_ (plus a smooth cosine recovery bias for any load
+  // exceeding integral_max_effort_) so the mode switch preserves tau_applied_prev_
+  // continuously without an impulsive step kick.
+  void bumpless_handover_to_normal(double transition_duration_sec);
   bool transition_slew_active_ = false;
   double transition_slew_elapsed_ = 0.0;
   double transition_slew_duration_ = 0.25;
   int transition_slew_converged_cycles_ = 0;
   Vec6d transition_last_tau_ = Vec6d::Zero();
+  bool recovery_bias_active_ = false;
+  double recovery_bias_elapsed_ = 0.0;
+  double recovery_bias_duration_ = 0.20;
+  Vec6d recovery_bias_init_ = Vec6d::Zero();
 
   using FollowImpedance = lite6_interfaces::action::FollowImpedanceTrajectory;
   using ImpedanceGoal = rclcpp_action::ServerGoalHandle<FollowImpedance>;
@@ -390,6 +399,7 @@ private:
   Mat6x8d tcp_jacobian_ = Mat6x8d::Zero();
   double cartesian_characteristic_length_ = 0.25;
   Vec6d tau_applied_prev_ = Vec6d::Zero();
+  bool has_applied_tau_ = false;
 
   lite6_interfaces::msg::ComplianceSettings compliance_settings_, compliance_filtered_;
   // Per-axis gains [LOCAL_WORLD_ALIGNED] and feedforward wrench used by
