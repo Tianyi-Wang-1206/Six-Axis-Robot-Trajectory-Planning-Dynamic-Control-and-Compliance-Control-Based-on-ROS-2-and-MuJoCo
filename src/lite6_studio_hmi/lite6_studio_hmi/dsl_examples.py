@@ -135,7 +135,7 @@ MoveC(
 
 # 4. Cartesian impedance descent: cylinder contacts box top (~z=0.165),
 #    while equilibrium descends to z=0.135 to clearly demonstrate compliant yielding
-ImpedanceCartesian(kt=[450, 450, 100], dt=[0.85, 0.85, 0.80], kr=[25, 25, 18], dr=[0.85, 0.85, 0.80], null_damping=0.15) {
+ImpedanceCartesian(kt=[450, 450, 100], dt=[0.85, 0.85, 0.80], kr=[25, 25, 18], dr=[0.85, 0.85, 0.80]) {
   MoveL(Pose(xyz=[0.240, 0.120, 0.135], rpy=[3.14159, 0.0, 0.0]), vel=0.18, acc=0.20)
 }
 
@@ -166,7 +166,7 @@ MoveC(
 )
 
 # 7. Compliant Cartesian impedance placement onto table, open gripper, reset payload, retract clear, MoveJ ZERO
-ImpedanceCartesian(kt=[450, 450, 120], dt=[0.85, 0.85, 0.80], kr=[25, 25, 18], dr=[0.85, 0.85, 0.80], null_damping=0.15) {
+ImpedanceCartesian(kt=[450, 450, 120], dt=[0.85, 0.85, 0.80], kr=[25, 25, 18], dr=[0.85, 0.85, 0.80]) {
   MoveL(Pose(xyz=[0.240, -0.070, 0.038], rpy=[3.14159, 1.309, -1.5708]), vel=0.18, acc=0.20)
 }
 Gripper(action=OPEN, wait=true)

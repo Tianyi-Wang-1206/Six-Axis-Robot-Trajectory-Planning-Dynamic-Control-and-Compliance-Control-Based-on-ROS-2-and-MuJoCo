@@ -97,7 +97,7 @@ _GRIPPER_STATE_NAMES = {
 _DIAG_STAGE_NAMES = {
     CompileDiagnostic.STAGE_LEX_SYNTAX: "Lex / Syntax",
     CompileDiagnostic.STAGE_SEMANTIC: "Semantic",
-    CompileDiagnostic.STAGE_PLANNING: "Optimal Planning",
+    CompileDiagnostic.STAGE_PLANNING: "Trajectory Planning",
     CompileDiagnostic.STAGE_KINEMATIC_LIMIT: "Kinematic Limit",
     CompileDiagnostic.STAGE_COLLISION: "Collision Check",
 }
@@ -967,7 +967,7 @@ class StudioMainWindow(QMainWindow):
 
     def trigger_compile(self):
         self._compile_in_flight = True
-        self.lbl_compile_summary.setText("Compiling & validating 1 kHz optimal trajectory...")
+        self.lbl_compile_summary.setText("Compiling & validating 1 kHz trajectory...")
         self.lbl_compile_summary.setStyleSheet("color: #1D4ED8; font-weight: 600;")
         self._refresh_button_states()
         source = self.editor.toPlainText()

@@ -27,18 +27,35 @@ struct SampledTrajectory1kHz
   double duration_sec = 0.0;
 };
 
-// Time-optimal path parameterization by reachability analysis (TOPP-RA) with jerk limiting.
+// Direct-transcription 3rd-order time-optimal path parameterization (TOPP) solver
+// under joint velocity, joint acceleration, joint jerk, and optional Cartesian
+// translational/rotational velocity and acceleration limits.
 //
-// 1. Adaptive grid on u in [0, 1] (density from joint/Cartesian rates and path curvature).
-// 2. TOPP-RA on (x = du/dt^2, a = d2u/dt2): backward pass builds the controllable sets
-//    K_i from the exact 2-D projection of the per-stage linear constraints (joint velocity
-//    and acceleration, polygonal inner approximations of the Cartesian translational and
-//    rotational speed/acceleration norms); a greedy forward pass then picks the maximal
-//    admissible acceleration, which is time-optimal for the discretized problem.
-// 3. A boxcar filter on the path speed makes the acceleration continuous (finite jerk).
-// 4. The 1 kHz trajectory is checked against velocity, acceleration and (discrete) jerk
-//    limits; violations tighten the speed / acceleration limits only near the offending
-//    path region and TOPP-RA is re-run. A uniform time dilation is a last-resort fallback.
+// Algorithm:
+// 1. Builds a curvature-adaptive path grid on u in [0, 1] pinning all piece boundaries
+//    and adding geometrically graded boundary intervals sized to the rest-to-rest jerk
+//    ramp distances at u = 0 and u = 1.
+// 2. Runs exact 2nd-order TOPP-RA (backward reachability via Fourier-Motzkin elimination
+//    and greedy forward pass on x = du/dt^2) to obtain a 2nd-order warm-start profile.
+// 3. Solves the exact piecewise-constant-jerk 3rd-order direct-transcription nonlinear
+//    program minimizing T = sum_i dt_i over (v_i, a_i, dt_i) subject to exact cubic-jerk
+//    transition equalities, rest-to-rest boundary conditions (v = 0, a = 0 at u = 0, 1),
+//    endpoint and Hermite-Simpson midpoint velocity/acceleration bounds, exact smooth
+//    Euclidean Cartesian acceleration norm bounds, and endpoint joint jerk bounds.
+//    Solved via a banded primal-dual interior-point Newton method (half-bandwidth 6 SQD
+//    LDL^T with inertia regularization, exact Lagrangian Hessian, filter line search,
+//    and second-order corrections) — with no post-hoc boxcar smoothing, heuristic limit
+//    tightening, or uniform time dilation.
+// 4. Evaluates the exact piecewise-cubic timing law at 1 kHz (verifying joint vel/acc,
+//    continuous and 1 ms finite-difference joint jerk, and analytic Cartesian path
+//    vel/acc). If any inter-node sample violates a bound, inserts collocation knots at
+//    the offending intervals and re-solves the warm-started interior-point problem.
+//
+// Mathematical scope:
+// - The 3rd-order jerk-constrained path parameterization NLP is non-convex; the solver
+//   converges to KKT (locally time-optimal) solutions of the discretized collocation
+//   problem with 1 kHz sampled verification, rather than proving global continuous-time
+//   optimality. Cartesian bounds are evaluated on the analytic CartesianPath derivatives.
 class TOPPJerkSolver
 {
 public:

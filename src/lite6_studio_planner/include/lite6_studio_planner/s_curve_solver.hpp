@@ -40,7 +40,7 @@ private:
 // Phase-synchronized 6-axis S-curve: every joint follows q(t) = q0 + (q1 - q0) * s(t) with
 // one shared normalized jerk-limited profile s(t) in [0, 1], so the motion is a straight line
 // in joint space. s(t) uses the tightest per-joint (v, a, j) limit mapped to the normalized
-// stroke, so it is the time-optimal straight-line profile. Duration is rounded up to 1 ms.
+// stroke (with a small numerical safety margin) and rounds duration up to 1 ms.
 class MultiAxisSCurve
 {
 public:
@@ -89,9 +89,11 @@ public:
     const std::array<double, 6> & a1,
     double duration);
 
-  // Computes the minimum feasible duration T* in (0, max_duration_sec] satisfying all
-  // 6-axis position and scaled (v_max, a_max, j_max) bounds. Handles non-monotonic
-  // feasibility under non-zero boundary (v, a). Returns false if no feasible duration exists.
+  // Searches for the shortest feasible duration T* in (0, max_duration_sec] within the
+  // fixed degree-7 zero-endpoint-jerk Hermite polynomial family that satisfies all 6-axis
+  // position and scaled (v_max, a_max, j_max) bounds on 1 kHz sampled verification.
+  // Handles non-monotonic feasibility under non-zero boundary (v, a). Returns false if no
+  // feasible duration is found.
   bool build_time_optimal(
     const std::array<double, 6> & q0,
     const std::array<double, 6> & v0,

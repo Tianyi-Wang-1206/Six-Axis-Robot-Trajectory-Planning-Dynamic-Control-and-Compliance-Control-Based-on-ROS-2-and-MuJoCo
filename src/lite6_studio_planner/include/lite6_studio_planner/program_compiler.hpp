@@ -101,7 +101,7 @@ public:
   // Executes the full 5-stage compilation & 1 kHz verification pipeline:
   //   Stage 1: Lexical & Syntax check
   //   Stage 2: Semantic & Parameter check
-  //   Stage 3: Time-Optimal Trajectory Planning & 1 kHz Discretization
+  //   Stage 3: 3rd-Order Direct-Transcription TOPP Planning & 1 kHz Discretization
   //   Stage 4: Full 1 kHz Kinematic Limits Verification (pos, vel, acc, jerk, singularity)
   //   Stage 5: Full 1 kHz Coal Self & Environment Collision Verification
   bool compile(
@@ -189,7 +189,7 @@ private:
     C3JointSpline & out_path,
     std::vector<Diagnostic> & out_diagnostics) const;
 
-  // Cartesian path -> joint path -> TOPP-RA -> 1 kHz verification.
+  // Cartesian path -> joint path -> 3rd-order TOPP -> 1 kHz verification.
   bool plan_cartesian_path(
     const CartesianPath & cart_path,
     const std::array<double, 6> & start_q,

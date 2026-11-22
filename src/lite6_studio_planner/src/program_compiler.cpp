@@ -1195,7 +1195,7 @@ bool ProgramCompiler::compile_pva_statement(
 
   if (pva.space == SpaceType::CARTESIAN) {
     // Pure (P) Cartesian MovePVA: interpolate directly in SE(3) via C3CartesianSpline and
-    // run TOPP-RA with full Cartesian and joint kinematic limits.
+    // run 3rd-order TOPP with full Cartesian and joint kinematic limits.
     if (!any_vel_or_acc_or_dt) {
       std::vector<Eigen::Matrix4d> poses;
       std::vector<SourceLocation> seg_locs;
@@ -1798,7 +1798,7 @@ bool ProgramCompiler::compile_pva_statement(
         pva.options.vel_scale, pva.options.acc_scale, pva.options.jerk_scale);
       sampled = scurve_samples(scurve, pva.waypoints.front().loc, 0.0, 1.0);
     } else {
-      // Pure (P) sequence: C^3 joint spline + TOPP-Jerk optimal time parameterization.
+      // Pure (P) sequence: C^3 joint spline + 3rd-order direct-transcription TOPP timing.
       C3JointSpline spline;
       spline.build(q_nodes);
       std::string topp_err;
