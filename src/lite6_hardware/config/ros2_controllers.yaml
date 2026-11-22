@@ -25,8 +25,8 @@ ctc_controller:
     armature: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
 
     # Identified high-speed viscous [Nm s/rad] and Coulomb [Nm] friction.
-    friction_v_nominal: [1.002, 1.009, 0.506, 0.201, 0.101, 0.051]
-    friction_c_nominal: [1.499, 1.498, 0.999, 0.499, 0.200, 0.099]
+    friction_v_nominal: [1.000, 1.000, 0.500, 0.200, 0.100, 0.050]
+    friction_c_nominal: [1.500, 1.500, 1.000, 0.500, 0.200, 0.100]
 
     # Smooth Coulomb feedforward direction along reference velocity; keep in sync with the Fourier fit if changed.
     tanh_slope: 300.0
