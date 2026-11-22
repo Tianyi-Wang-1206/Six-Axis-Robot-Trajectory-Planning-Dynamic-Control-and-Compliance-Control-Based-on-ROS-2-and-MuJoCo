@@ -67,7 +67,7 @@ private:
     uint64_t steps = 0, command_sequence = 0;
     bool started = false;
   };
-  enum class Fault {NONE, COMMAND_OVERFLOW, INVALID_COMMAND, INVALID_STATE, PHYSICS_EXCEPTION};
+  enum class Fault {NONE, COMMAND_OVERFLOW, INVALID_COMMAND, INVALID_STATE, STALE_STATE, PHYSICS_EXCEPTION};
   struct Diagnostics
   {
     // Separate consumer from read(), so publishing never races state acquisition.
@@ -107,6 +107,7 @@ private:
   int physics_thread_priority_ = 60;
   rclcpp::Clock::SharedPtr clock_;
   uint64_t command_sequence_ = 0;      // write() only, reset on activation.
+  int64_t last_joint_snapshot_ns_ = 0;  // read() only after activation.
   uint64_t joint_state_sequence_ = 0;  // read() only.
   detail::SpscQueue<EffortCommand, 4096> commands_;
   detail::LatestSnapshot<StateSnapshot> states_;

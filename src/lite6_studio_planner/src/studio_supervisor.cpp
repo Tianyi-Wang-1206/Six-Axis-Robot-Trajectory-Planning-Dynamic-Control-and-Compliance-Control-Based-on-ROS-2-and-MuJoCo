@@ -838,6 +838,7 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
         snap_.state = S::STATE_STOPPING;
         phase_deadline_ = now + kStoppingTimeout;
         res.effects.cancel_controller_goals = true;
+        res.effects.wake_worker = true;
         notify_unlocked("Stopping execution cleanly");
         res.accepted = true;
         changed = true;

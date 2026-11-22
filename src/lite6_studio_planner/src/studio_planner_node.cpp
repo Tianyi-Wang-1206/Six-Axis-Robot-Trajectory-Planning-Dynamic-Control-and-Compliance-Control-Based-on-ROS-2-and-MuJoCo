@@ -585,7 +585,7 @@ private:
     paused_mid_block_ = false;
     paused_sample_idx_ = 0;
     paused_remaining_wait_sec_ = -1.0;
-    paused_block_snapshot_ = ExecutionBlock();
+    paused_block_snapshot_.reset();
     post_impedance_offset_active_ = false;
   }
 
@@ -618,35 +618,68 @@ private:
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 
-    typename rclcpp_action::Client<ActionT>::SendGoalOptions opts;
-    auto abandoned = std::make_shared<std::atomic<bool>>(false);
-    bool waiting_on_goal_response = true;
-    ScopeExit abandon_pending{[&waiting_on_goal_response, abandoned]() {
-      if (waiting_on_goal_response) {
-        abandoned->store(true, std::memory_order_release);
+    struct FeedbackGate {
+      std::mutex mutex;
+      bool active = true;
+      bool completed = false;
+      typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr accepted_goal;
+      std::function<void(const typename ActionT::Feedback &)> callback;
+    };
+    auto feedback_gate = std::make_shared<FeedbackGate>();
+    feedback_gate->callback = std::move(on_feedback);
+    ScopeExit close_feedback{[feedback_gate, client]() {
+      typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr accepted;
+      bool completed;
+      {
+        // Wait for in-flight feedback before the caller's execution context is destroyed.
+        std::lock_guard<std::mutex> lock(feedback_gate->mutex);
+        feedback_gate->active = false;
+        feedback_gate->callback = nullptr;
+        accepted = std::move(feedback_gate->accepted_goal);
+        completed = feedback_gate->completed;
       }
-    }};
-    opts.goal_response_callback =
-      [client, this, session, abandoned](
-        const typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr & accepted_gh) {
-        if (!accepted_gh) {
-          return;
-        }
-        if (abandoned->load(std::memory_order_acquire) ||
-            session != supervisor_->active_session()) {
+      if (accepted) {
+        if (!completed) {
           try {
-            (void)client->async_cancel_goal(accepted_gh);
+            (void)client->async_cancel_goal(accepted);
           } catch (const std::exception &) {
           }
         }
+        client->stop_callbacks(accepted);
+      }
+    }};
+
+    typename rclcpp_action::Client<ActionT>::SendGoalOptions opts;
+    opts.goal_response_callback =
+      [client, feedback_gate](
+        const typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr & accepted) {
+        if (!accepted) {
+          return;
+        }
+        bool abandoned;
+        {
+          std::lock_guard<std::mutex> lock(feedback_gate->mutex);
+          abandoned = !feedback_gate->active;
+          if (!abandoned) {
+            feedback_gate->accepted_goal = accepted;
+          }
+        }
+        if (abandoned) {
+          try {
+            (void)client->async_cancel_goal(accepted);
+          } catch (const std::exception &) {
+          }
+          client->stop_callbacks(accepted);
+        }
       };
-    if (on_feedback) {
+    if (feedback_gate->callback) {
       opts.feedback_callback =
-        [on_feedback](
+        [feedback_gate](
           typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr,
           const std::shared_ptr<const typename ActionT::Feedback> feedback) {
-          if (feedback) {
-            on_feedback(*feedback);
+          std::lock_guard<std::mutex> lock(feedback_gate->mutex);
+          if (feedback && feedback_gate->active) {
+            feedback_gate->callback(*feedback);
           }
         };
     }
@@ -663,7 +696,6 @@ private:
     }
 
     auto goal_handle = gh_future.get();
-    waiting_on_goal_response = false;
     if (!goal_handle) {
       out_error = "Controller rejected trajectory goal";
       return ActionOutcome::FAULT;
@@ -740,6 +772,10 @@ private:
     }
 
     const auto wrapped = res_future.get();
+    {
+      std::lock_guard<std::mutex> lock(feedback_gate->mutex);
+      feedback_gate->completed = true;
+    }
     if (session != supervisor_->active_session()) {
       return ActionOutcome::SESSION_SUPERSEDED;
     }
@@ -773,7 +809,13 @@ private:
       }
 
       const auto [st, session] = supervisor_->state_and_session();
-      if (st == StudioState::STATE_RECOVERING) {
+      if (st == StudioState::STATE_STOPPING) {
+        if (ensure_normal_or_fault(session, -38)) {
+          std::lock_guard<std::mutex> lock(exec_mutex_);
+          reset_exec_cursor_unlocked();
+          supervisor_->on_stop_completed(session);
+        }
+      } else if (st == StudioState::STATE_RECOVERING) {
         execute_recovery(session);
       } else if (st == StudioState::STATE_RUNNING || st == StudioState::STATE_STEPPING) {
         execute_program(session);
@@ -850,13 +892,14 @@ private:
         return false;
       }
       const auto snap = supervisor_->snapshot();
-      if (snap.controller_mode == ControllerStatus::MODE_NORMAL) {
+      if (snap.controller_fresh && snap.controller_mode == ControllerStatus::MODE_NORMAL) {
         return true;
       }
       if (snap.controller_mode == ControllerStatus::MODE_ESTOP) {
         return false;
       }
-      if (snap.controller_mode == ControllerStatus::MODE_CARTESIAN_IMPEDANCE) {
+      if (snap.controller_fresh &&
+          snap.controller_mode == ControllerStatus::MODE_CARTESIAN_IMPEDANCE) {
         const auto now_tp = std::chrono::steady_clock::now();
         if (last_send == std::chrono::steady_clock::time_point{} ||
             (now_tp - last_send) > std::chrono::milliseconds(300))
@@ -883,7 +926,10 @@ private:
             return false;
           }
         }
-      } else if (snap.controller_mode != ControllerStatus::MODE_COMPLIANCE_STOPPING) {
+      } else if (snap.controller_fresh &&
+                 snap.controller_mode != ControllerStatus::MODE_COMPLIANCE_STOPPING &&
+                 snap.controller_mode != ControllerStatus::MODE_CARTESIAN_IMPEDANCE_TRAJECTORY &&
+                 snap.controller_mode != ControllerStatus::MODE_NORMAL) {
         out_err = "Controller in unexpected mode while returning to MODE_NORMAL";
         return false;
       }
@@ -921,7 +967,7 @@ private:
     size_t pause_sample = 0;
     double resume_wait_sec = -1.0;
     bool post_imp_offset = false;
-    ExecutionBlock paused_blk;
+    std::shared_ptr<const ExecutionBlock> paused_blk;
 
     {
       std::lock_guard<std::mutex> lock(exec_mutex_);
@@ -947,7 +993,7 @@ private:
       cum_weight[i + 1] = cum_weight[i] + std::max(0.05, prog->blocks[i].duration_sec);
     }
     const double total_weight = std::max(1e-6, cum_weight.back());
-    auto calc_total_pct = [&](size_t idx, double block_frac) -> double {
+    auto calc_total_pct = [cum_weight = std::move(cum_weight), total_blocks, total_weight](size_t idx, double block_frac) -> double {
       const double w0 = cum_weight[std::min(idx, total_blocks)];
       const double w1 = (idx < total_blocks) ? cum_weight[idx + 1] : total_weight;
       const double pct = 100.0 * (w0 + std::clamp(block_frac, 0.0, 1.0) * (w1 - w0)) / total_weight;
@@ -971,7 +1017,7 @@ private:
         if (!ensure_normal_or_fault(session, -38)) {
           return;
         }
-        const auto & ref_blk = resume_mid ? paused_blk : prog->blocks[block_idx];
+        const auto & ref_blk = resume_mid ? *paused_blk : prog->blocks[block_idx];
         std::lock_guard<std::mutex> lock(exec_mutex_);
         exec_block_idx_ = block_idx;
         paused_mid_block_ = resume_mid;
@@ -986,9 +1032,9 @@ private:
         return;
       }
 
-      ExecutionBlock block_to_run;
+      auto block_ptr = std::shared_ptr<const ExecutionBlock>(prog, &prog->blocks[block_idx]);
       bool used_mid_block_replan = false;
-      if (resume_mid && paused_blk.type != ExecutionBlockType::WAIT_CMD) {
+      if (resume_mid && paused_blk->type != ExecutionBlockType::WAIT_CMD) {
         std::array<double, 6> q_actual{};
         double max_dq = 0.0;
         if (!get_latest_joint_state(q_actual, max_dq)) {
@@ -998,9 +1044,10 @@ private:
           apply_effects(eff);
           return;
         }
+        auto replanned = std::make_shared<ExecutionBlock>();
         std::string replan_err;
         if (!compiler_->replan_remaining_block(
-              paused_blk, pause_sample, q_actual, block_to_run, replan_err))
+              *paused_blk, pause_sample, q_actual, *replanned, replan_err))
         {
           StudioSupervisor::Effects eff;
           supervisor_->on_execution_fault(
@@ -1008,14 +1055,16 @@ private:
           apply_effects(eff);
           return;
         }
+        block_ptr = std::move(replanned);
         used_mid_block_replan = true;
         resume_mid = false;
         pause_sample = 0;
       } else {
-        block_to_run = prog->blocks[block_idx];
-        if (resume_mid && block_to_run.type == ExecutionBlockType::WAIT_CMD && resume_wait_sec >= 0.0) {
-          block_to_run.duration_sec = resume_wait_sec;
-          block_to_run.wait_cmd.duration_sec = resume_wait_sec;
+        if (resume_mid && block_ptr->type == ExecutionBlockType::WAIT_CMD && resume_wait_sec >= 0.0) {
+          auto remaining = std::make_shared<ExecutionBlock>(*block_ptr);
+          remaining->duration_sec = resume_wait_sec;
+          remaining->wait_cmd.duration_sec = resume_wait_sec;
+          block_ptr = std::move(remaining);
         }
         resume_mid = false;
         resume_wait_sec = -1.0;
@@ -1024,8 +1073,8 @@ private:
       // If a previous ImpedanceCartesian(..., hold=true) left the controller in
       // MODE_CARTESIAN_IMPEDANCE, return cleanly to MODE_NORMAL before dispatching
       // the next rigid or impedance trajectory (or alignment bridge).
-      if (block_to_run.type == ExecutionBlockType::RIGID_TRAJECTORY ||
-          block_to_run.type == ExecutionBlockType::IMPEDANCE_TRAJECTORY)
+      if (block_ptr->type == ExecutionBlockType::RIGID_TRAJECTORY ||
+          block_ptr->type == ExecutionBlockType::IMPEDANCE_TRAJECTORY)
       {
         if (!ensure_normal_or_fault(session, -38)) {
           return;
@@ -1034,8 +1083,8 @@ private:
 
       // Pre-execution joint alignment bridge or post-impedance start-pose replanning
       if (!used_mid_block_replan &&
-          (block_to_run.type == ExecutionBlockType::RIGID_TRAJECTORY ||
-           block_to_run.type == ExecutionBlockType::IMPEDANCE_TRAJECTORY))
+          (block_ptr->type == ExecutionBlockType::RIGID_TRAJECTORY ||
+           block_ptr->type == ExecutionBlockType::IMPEDANCE_TRAJECTORY))
       {
         std::array<double, 6> q_actual{};
         double max_dq = 0.0;
@@ -1048,16 +1097,16 @@ private:
         }
         double max_diff = 0.0;
         for (size_t i = 0; i < 6; ++i) {
-          max_diff = std::max(max_diff, std::abs(q_actual[i] - block_to_run.start_joints[i]));
+          max_diff = std::max(max_diff, std::abs(q_actual[i] - block_ptr->start_joints[i]));
         }
 
         if (post_imp_offset) {
-          if (max_diff > 5e-4 && block_to_run.source_kind != BlockSourceKind::NONE) {
-            const auto orig_end_joints = block_to_run.end_joints;
+          if (max_diff > 5e-4 && block_ptr->source_kind != BlockSourceKind::NONE) {
+            const auto orig_end_joints = block_ptr->end_joints;
             ExecutionBlock replanned_blk;
             std::vector<Diagnostic> diags;
             if (!compiler_->replan_block_from_start(
-                  block_to_run, q_actual, replanned_blk, diags))
+                  *block_ptr, q_actual, replanned_blk, diags))
             {
               std::string reason = "Unknown planning error";
               for (const auto & d : diags) {
@@ -1075,25 +1124,25 @@ private:
               apply_effects(eff);
               return;
             }
-            block_to_run = std::move(replanned_blk);
-            if (block_to_run.type == ExecutionBlockType::RIGID_TRAJECTORY) {
+            block_ptr = std::make_shared<ExecutionBlock>(std::move(replanned_blk));
+            if (block_ptr->type == ExecutionBlockType::RIGID_TRAJECTORY) {
               double end_diff = 0.0;
               for (size_t i = 0; i < 6; ++i) {
                 end_diff = std::max(
-                  end_diff, std::abs(block_to_run.end_joints[i] - orig_end_joints[i]));
+                  end_diff, std::abs(block_ptr->end_joints[i] - orig_end_joints[i]));
               }
               if (end_diff <= 1e-3) {
                 post_imp_offset = false;
               }
             }
-          } else if (block_to_run.type == ExecutionBlockType::RIGID_TRAJECTORY && max_diff <= 5e-4) {
+          } else if (block_ptr->type == ExecutionBlockType::RIGID_TRAJECTORY && max_diff <= 5e-4) {
             post_imp_offset = false;
           }
         } else if (max_diff > kAlignmentThresholdRad) {
           trajectory_msgs::msg::JointTrajectory bridge_traj;
           std::string bridge_err;
           if (!compiler_->plan_alignment_bridge(
-                q_actual, block_to_run.start_joints, 0.35, 0.35, bridge_traj, bridge_err))
+                q_actual, block_ptr->start_joints, 0.35, 0.35, bridge_traj, bridge_err))
           {
             StudioSupervisor::Effects eff;
             supervisor_->on_execution_fault(
@@ -1107,7 +1156,7 @@ private:
           bridge_goal.trajectory.header.stamp.nanosec = 0;
 
           supervisor_->update_execution_progress(
-            session, block_to_run.loc.line, block_to_run.loc.statement_index,
+            session, block_ptr->loc.line, block_ptr->loc.statement_index,
             static_cast<int32_t>(block_idx), 0.0, calc_total_pct(block_idx, 0.0));
 
           const double bridge_dur =
@@ -1133,7 +1182,7 @@ private:
             paused_mid_block_ = false;
             paused_sample_idx_ = 0;
             supervisor_->on_pause_settled(
-              session, block_to_run.loc.line, block_to_run.loc.statement_index,
+              session, block_ptr->loc.line, block_ptr->loc.statement_index,
               static_cast<int32_t>(block_idx), 0.0, calc_total_pct(block_idx, 0.0));
             return;
           }
@@ -1145,25 +1194,25 @@ private:
       }
 
       // Dispatch actual execution block
-      if (block_to_run.type == ExecutionBlockType::RIGID_TRAJECTORY) {
-        if (!execute_rigid_block(session, prog, block_to_run, block_idx, calc_total_pct)) {
+      if (block_ptr->type == ExecutionBlockType::RIGID_TRAJECTORY) {
+        if (!execute_rigid_block(session, block_ptr, block_idx, calc_total_pct)) {
           return;
         }
-      } else if (block_to_run.type == ExecutionBlockType::IMPEDANCE_TRAJECTORY) {
-        if (!execute_impedance_block(session, prog, block_to_run, block_idx, calc_total_pct)) {
+      } else if (block_ptr->type == ExecutionBlockType::IMPEDANCE_TRAJECTORY) {
+        if (!execute_impedance_block(session, block_ptr, block_idx, calc_total_pct)) {
           return;
         }
         post_imp_offset = true;
-      } else if (block_to_run.type == ExecutionBlockType::GRIPPER_CMD) {
-        if (!execute_gripper_block(session, block_to_run, block_idx, calc_total_pct)) {
+      } else if (block_ptr->type == ExecutionBlockType::GRIPPER_CMD) {
+        if (!execute_gripper_block(session, *block_ptr, block_idx, calc_total_pct)) {
           return;
         }
-      } else if (block_to_run.type == ExecutionBlockType::WAIT_CMD) {
-        if (!execute_wait_block(session, block_to_run, block_idx, calc_total_pct)) {
+      } else if (block_ptr->type == ExecutionBlockType::WAIT_CMD) {
+        if (!execute_wait_block(session, block_ptr, block_idx, calc_total_pct)) {
           return;
         }
-      } else if (block_to_run.type == ExecutionBlockType::PAYLOAD_CMD) {
-        if (!execute_payload_block(session, block_to_run, block_idx, calc_total_pct)) {
+      } else if (block_ptr->type == ExecutionBlockType::PAYLOAD_CMD) {
+        if (!execute_payload_block(session, *block_ptr, block_idx, calc_total_pct)) {
           return;
         }
       }
@@ -1288,11 +1337,11 @@ private:
 
   bool execute_rigid_block(
     uint64_t session,
-    const std::shared_ptr<const CompiledProgram> &,
-    const ExecutionBlock & blk,
+    const std::shared_ptr<const ExecutionBlock> & block,
     size_t block_idx,
     const std::function<double(size_t, double)> & calc_total_pct)
   {
+    const auto & blk = *block;
     const size_t total_pts = blk.rigid_trajectory.points.size();
     std::atomic<size_t> last_sample{0};
 
@@ -1330,11 +1379,11 @@ private:
     if (outcome == ActionOutcome::SUCCEEDED && splice_end_sample.has_value()) {
       // The goal settled at the end of the stop tail: a pause in the middle of the block.
       return handle_trajectory_outcome(
-        session, blk, block_idx, *splice_end_sample, total_pts, ActionOutcome::CANCELED, err,
+        session, block, block_idx, *splice_end_sample, total_pts, ActionOutcome::CANCELED, err,
         calc_total_pct);
     }
     return handle_trajectory_outcome(
-      session, blk, block_idx, last_sample.load(), total_pts, outcome, err, calc_total_pct);
+      session, block, block_idx, last_sample.load(), total_pts, outcome, err, calc_total_pct);
   }
 
   // Plans a stop-along-path tail for the running rigid goal and splices it into the
@@ -1407,16 +1456,16 @@ private:
 
   bool execute_impedance_block(
     uint64_t session,
-    const std::shared_ptr<const CompiledProgram> &,
-    const ExecutionBlock & blk,
+    const std::shared_ptr<const ExecutionBlock> & block,
     size_t block_idx,
     const std::function<double(size_t, double)> & calc_total_pct)
   {
+    const auto & blk = *block;
     // Confirm settling below the planner bound so the CTC entry speed guard passes cleanly.
     const auto settle = wait_for_planner_settle(session, 2.0);
     if (settle == SettleOutcome::ABORTED) {
       return handle_trajectory_outcome(
-        session, blk, block_idx, 0, blk.impedance_goal.points.size(),
+        session, block, block_idx, 0, blk.impedance_goal.points.size(),
         session != supervisor_->active_session() ?
         ActionOutcome::SESSION_SUPERSEDED : ActionOutcome::CANCELED,
         "", calc_total_pct);
@@ -1455,12 +1504,12 @@ private:
       imp_client_, imp_goal, session, blk.duration_sec + 17.0, fb_cb, false, true, err);
     supervisor_->clear_impedance_errors();
     return handle_trajectory_outcome(
-      session, blk, block_idx, last_sample.load(), total_pts, outcome, err, calc_total_pct);
+      session, block, block_idx, last_sample.load(), total_pts, outcome, err, calc_total_pct);
   }
 
   bool handle_trajectory_outcome(
     uint64_t session,
-    const ExecutionBlock & blk,
+    const std::shared_ptr<const ExecutionBlock> & block,
     size_t block_idx,
     size_t sample_idx,
     size_t total_pts,
@@ -1468,6 +1517,7 @@ private:
     const std::string & err,
     const std::function<double(size_t, double)> & calc_total_pct)
   {
+    const auto & blk = *block;
     if (outcome == ActionOutcome::SESSION_SUPERSEDED) {
       return false;
     }
@@ -1497,7 +1547,7 @@ private:
         exec_block_idx_ = block_idx;
         paused_mid_block_ = true;
         paused_sample_idx_ = safe_idx;
-        paused_block_snapshot_ = blk;
+        paused_block_snapshot_ = block;
         if (blk.type == ExecutionBlockType::IMPEDANCE_TRAJECTORY) {
           post_impedance_offset_active_ = true;
         }
@@ -1594,11 +1644,17 @@ private:
       }
 
       if (have_gs && gs.applied_sequence >= target_seq) {
-        const bool seq_exact = (gs.applied_sequence == target_seq);
-        if (gs.state == GripperState::FAULT ||
-            (seq_exact &&
-             (gs.last_cmd_result == GripperState::CMD_RES_FAULT ||
-              gs.last_cmd_result == GripperState::CMD_RES_BLOCKED)))
+        if (gs.applied_sequence != target_seq || gs.last_command != req->command) {
+          StudioSupervisor::Effects eff;
+          supervisor_->on_execution_fault(
+            session, -33, "Gripper command was superseded before completion", false, eff);
+          apply_effects(eff);
+          return false;
+        }
+        if (gs.last_cmd_result == GripperState::CMD_RES_FAULT ||
+            gs.last_cmd_result == GripperState::CMD_RES_BLOCKED ||
+            (gs.last_cmd_result == GripperState::CMD_RES_STOPPED &&
+             blk.gripper_cmd.action != GripperActionType::STOP))
         {
           StudioSupervisor::Effects eff;
           supervisor_->on_execution_fault(
@@ -1606,34 +1662,9 @@ private:
           apply_effects(eff);
           return false;
         }
-        if (seq_exact &&
-            gs.last_cmd_result == GripperState::CMD_RES_STOPPED &&
-            blk.gripper_cmd.action != GripperActionType::STOP)
-        {
-          StudioSupervisor::Effects eff;
-          supervisor_->on_execution_fault(
-            session, -33, "Gripper motion stopped externally before completion", false, eff);
-          apply_effects(eff);
-          return false;
-        }
-        bool done = seq_exact && (gs.last_cmd_result == GripperState::CMD_RES_SUCCEEDED);
-        if (!done) {
-          if (blk.gripper_cmd.action == GripperActionType::OPEN &&
-              gs.state == GripperState::OPEN)
-          {
-            done = true;
-          } else if (
-            blk.gripper_cmd.action == GripperActionType::CLOSE &&
-            (gs.state == GripperState::CLOSED || gs.state == GripperState::GRASPED))
-          {
-            done = true;
-          } else if (
-            blk.gripper_cmd.action == GripperActionType::STOP &&
-            gs.state == GripperState::STOPPED)
-          {
-            done = true;
-          }
-        }
+        const bool done = gs.last_cmd_result == GripperState::CMD_RES_SUCCEEDED ||
+          (blk.gripper_cmd.action == GripperActionType::STOP &&
+           gs.last_cmd_result == GripperState::CMD_RES_STOPPED);
         if (done) {
           supervisor_->update_execution_progress(
             session, blk.loc.line, blk.loc.statement_index,
@@ -1656,10 +1687,11 @@ private:
 
   bool execute_wait_block(
     uint64_t session,
-    const ExecutionBlock & blk,
+    const std::shared_ptr<const ExecutionBlock> & block,
     size_t block_idx,
     const std::function<double(size_t, double)> & calc_total_pct)
   {
+    const auto & blk = *block;
     const double dur = std::max(0.0, blk.wait_cmd.duration_sec);
     const auto start_tp = std::chrono::steady_clock::now();
     while (rclcpp::ok() && session == supervisor_->active_session()) {
@@ -1691,7 +1723,7 @@ private:
           exec_block_idx_ = block_idx;
           paused_mid_block_ = true;
           paused_remaining_wait_sec_ = remaining;
-          paused_block_snapshot_ = blk;
+          paused_block_snapshot_ = block;
         }
         supervisor_->on_pause_settled(
           session, blk.loc.line, blk.loc.statement_index,
@@ -1836,13 +1868,13 @@ private:
   builtin_interfaces::msg::Time last_traj_start_;
   size_t paused_sample_idx_ = 0;
   double paused_remaining_wait_sec_ = -1.0;
-  ExecutionBlock paused_block_snapshot_;
+  std::shared_ptr<const ExecutionBlock> paused_block_snapshot_;
   bool post_impedance_offset_active_ = false;
 
   std::mutex worker_wake_mutex_;
   std::condition_variable worker_cv_;
   bool worker_wake_pending_ = false;
-  bool worker_exit_ = false;
+  std::atomic<bool> worker_exit_{false};
   std::thread worker_thread_;
 };
 

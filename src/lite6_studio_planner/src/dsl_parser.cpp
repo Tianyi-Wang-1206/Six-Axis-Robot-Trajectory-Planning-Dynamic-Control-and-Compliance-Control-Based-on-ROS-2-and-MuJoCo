@@ -878,14 +878,6 @@ private:
                 " must lie in [0.1, 2.0]");
           }
         }
-      } else if (key.lexeme == "null_stiffness") {
-        const Token & num = expect(TokenKind::NUMBER, "null_stiffness value", block_idx);
-        if (num.number < 0.0 || num.number > 50.0) {
-          throw ParseError(
-            D::STAGE_SEMANTIC, key.line, key.column, block_idx, "ERR_IMPEDANCE_GAIN",
-            "Parameter 'null_stiffness'=" + std::to_string(num.number) + " must lie in [0.0, 50.0]");
-        }
-        params.null_stiffness = num.number;
       } else if (key.lexeme == "null_damping") {
         const Token & num = expect(TokenKind::NUMBER, "null_damping value", block_idx);
         if (num.number < 0.0 || num.number > 20.0) {

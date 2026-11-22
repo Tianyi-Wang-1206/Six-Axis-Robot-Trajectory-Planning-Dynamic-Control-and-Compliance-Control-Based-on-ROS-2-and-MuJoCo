@@ -702,6 +702,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   update_payload_model(dt);
 
   dynamics_cached_this_cycle_ = false;
+  coriolis_cached_this_cycle_ = false;
   tcp_cached_this_cycle_ = false;
 
   // Process ordered edge-triggered ControllerCommand requests and emergency triggers.
@@ -901,17 +902,19 @@ void Lite6CTCController::publish_shadow_shm(const Vec6d * target, bool valid)
   state_shm_->shadow_state.write(pod);
 }
 
-void Lite6CTCController::ensure_dynamics_cached()
+void Lite6CTCController::ensure_dynamics_cached(bool need_coriolis)
 {
-  if (dynamics_cached_this_cycle_) {
-    return;
+  if (!dynamics_cached_this_cycle_) {
+    pinocchio::crba(pin_model_, pin_data_dynamics_, dynamics_q_);
+    pin_data_dynamics_.M.triangularView<Eigen::StrictlyLower>() =
+      pin_data_dynamics_.M.transpose().triangularView<Eigen::StrictlyLower>();
+    pinocchio::computeGeneralizedGravity(pin_model_, pin_data_dynamics_, dynamics_q_);
+    dynamics_cached_this_cycle_ = true;
   }
-  pinocchio::crba(pin_model_, pin_data_dynamics_, dynamics_q_);
-  pin_data_dynamics_.M.triangularView<Eigen::StrictlyLower>() =
-    pin_data_dynamics_.M.transpose().triangularView<Eigen::StrictlyLower>();
-  pinocchio::computeCoriolisMatrix(pin_model_, pin_data_dynamics_, dynamics_q_, dynamics_dq_);
-  pinocchio::computeGeneralizedGravity(pin_model_, pin_data_dynamics_, dynamics_q_);
-  dynamics_cached_this_cycle_ = true;
+  if (need_coriolis && !coriolis_cached_this_cycle_) {
+    pinocchio::computeCoriolisMatrix(pin_model_, pin_data_dynamics_, dynamics_q_, dynamics_dq_);
+    coriolis_cached_this_cycle_ = true;
+  }
 }
 
 void Lite6CTCController::read_cached_tcp_kinematics(
@@ -1072,12 +1075,18 @@ void Lite6CTCController::configure_command_service()
           static_cast<unsigned>(req->command), req->reason.c_str());
       }
 
-      if (!lite6_interfaces::valid_controller_command(*req)) {
+      const bool uses_compliance =
+        req->command == Cmd::CMD_ENTER_JOINT_IMPEDANCE ||
+        req->command == Cmd::CMD_ENTER_CARTESIAN_IMPEDANCE ||
+        req->command == Cmd::CMD_ENTER_TEACH ||
+        req->command == Cmd::CMD_UPDATE_COMPLIANCE_SETTINGS;
+      if (!lite6_interfaces::valid_controller_command(*req) ||
+          (uses_compliance && req->compliance.nullspace_stiffness != 0.0)) {
         resp->accepted = false;
         resp->ack_result = Resp::ACK_REJECTED_INVALID_ARG;
         resp->cmd_seq = 0;
         fill_snapshot();
-        resp->message = "Invalid ControllerCommand code or out-of-bounds parameter";
+        resp->message = "Invalid ControllerCommand parameter (nullspace_stiffness must be zero)";
         return;
       }
 
@@ -1144,7 +1153,6 @@ void Lite6CTCController::configure_command_service()
       pending.rotation_stiffness = req->compliance.rotation_stiffness;
       pending.rotation_damping = req->compliance.rotation_damping;
       pending.sensitivity = req->compliance.sensitivity;
-      pending.nullspace_stiffness = req->compliance.nullspace_stiffness;
       pending.nullspace_damping = req->compliance.nullspace_damping;
       pending.payload_mass = req->payload_mass;
       for (size_t i = 0; i < 3; ++i) {
@@ -1308,7 +1316,6 @@ uint8_t Lite6CTCController::apply_controller_command(const PendingControllerComm
     out.rotation_damping = cmd.rotation_damping;
     out.sensitivity = cmd.sensitivity;
     out.recapture = cmd.compliance_recapture;
-    out.nullspace_stiffness = cmd.nullspace_stiffness;
     out.nullspace_damping = cmd.nullspace_damping;
   };
 

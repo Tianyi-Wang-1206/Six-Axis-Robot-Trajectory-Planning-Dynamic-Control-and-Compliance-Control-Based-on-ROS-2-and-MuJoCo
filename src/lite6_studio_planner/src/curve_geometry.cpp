@@ -1521,4 +1521,89 @@ JointCompositePath JointCompositePath::restricted(double u_start) const
   return sub;
 }
 
+RestrictedCartesianPath::RestrictedCartesianPath(
+  std::shared_ptr<const CartesianPath> path, double u_start)
+: path_(std::move(path)), begin_(std::clamp(u_start, 0.0, 1.0)), span_(1.0 - begin_)
+{
+}
+
+double RestrictedCartesianPath::total_length() const
+{
+  return path_->total_length() * span_;
+}
+
+CartesianSample RestrictedCartesianPath::eval_normalized(double u) const
+{
+  auto sample = path_->eval_normalized(begin_ + span_ * std::clamp(u, 0.0, 1.0));
+  sample.p_s *= span_;
+  sample.w_s *= span_;
+  sample.p_ss *= span_ * span_;
+  sample.w_ss *= span_ * span_;
+  sample.p_sss *= span_ * span_ * span_;
+  return sample;
+}
+
+std::vector<double> RestrictedCartesianPath::piece_boundaries() const
+{
+  std::vector<double> result;
+  for (double u : path_->piece_boundaries()) {
+    if (u > begin_ && u < 1.0) {
+      result.push_back((u - begin_) / span_);
+    }
+  }
+  return result;
+}
+
+HermiteCartesianPath::HermiteCartesianPath(
+  std::vector<CartesianHermiteSegment> segments,
+  std::vector<SourceLocation> locations, const MotionOptions & options)
+: segments_(std::move(segments)), locations_(std::move(locations)), options_(options)
+{
+  times_.push_back(0.0);
+  for (const auto & segment : segments_) {
+    times_.push_back(times_.back() + segment.duration());
+    // This length only selects the initial IK mesh; adaptive residual checks refine it.
+    constexpr int kLengthSamples = 64;
+    const double dt = segment.duration() / kLengthSamples;
+    for (int i = 0; i < kLengthSamples; ++i) {
+      Eigen::Matrix4d pose;
+      Vec6 vel, acc;
+      Eigen::Vector3d jerk;
+      segment.eval((i + 0.5) * dt, pose, vel, acc, jerk);
+      length_ += dt * std::hypot(vel.head<3>().norm(), kCharLength * vel.tail<3>().norm());
+    }
+  }
+  length_ = std::max(length_, 1e-6);
+}
+
+CartesianSample HermiteCartesianPath::eval_normalized(double u) const
+{
+  const double duration = times_.back();
+  const double t = std::clamp(u, 0.0, 1.0) * duration;
+  const auto it = std::upper_bound(times_.begin() + 1, times_.end() - 1, t);
+  const size_t index = static_cast<size_t>(it - times_.begin() - 1);
+  CartesianSample result;
+  Vec6 vel, acc;
+  segments_[index].eval(t - times_[index], result.pose, vel, acc, result.p_sss);
+  result.p_s = vel.head<3>() * duration;
+  result.w_s = vel.tail<3>() * duration;
+  result.p_ss = acc.head<3>() * duration * duration;
+  result.w_ss = acc.tail<3>() * duration * duration;
+  result.p_sss *= duration * duration * duration;
+  result.vel_scale = options_.vel_scale;
+  result.acc_scale = options_.acc_scale;
+  result.jerk_scale = options_.jerk_scale;
+  result.loc = locations_[index];
+  return result;
+}
+
+std::vector<double> HermiteCartesianPath::piece_boundaries() const
+{
+  std::vector<double> result;
+  for (size_t i = 1; i + 1 < times_.size(); ++i) {
+    result.push_back(times_[i] / times_.back());
+  }
+  return result;
+}
+
 }  // namespace lite6_studio_planner

@@ -4,6 +4,7 @@
 #include "pluginlib/class_list_macros.hpp"
 #include "ament_index_cpp/get_package_share_directory.hpp"
 #include "diagnostic_msgs/msg/diagnostic_array.hpp"
+#include "lite6_interfaces/motion_contract.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -375,6 +376,16 @@ hardware_interface::return_type Lite6MujocoSystem::read(
   if (diagnostics_->fault.load() != Fault::NONE) {return hardware_interface::return_type::ERROR;}
   // Only a complete snapshot crosses threads. Never read the live mjData here.
   const auto snapshot = states_.read();
+  const int64_t observed_ns = steady_now_ns();
+  const int64_t sample_ns = snapshot.started ? snapshot.boundary_ns : snapshot.published_ns;
+  const int64_t age_ns = observed_ns - sample_ns;
+  if (diagnostics_->active.load() &&
+      (sample_ns <= 0 || age_ns < 0 ||
+       age_ns > lite6_interfaces::contract::kJointStateStaleTimeoutNs))
+  {
+    diagnostics_->fault.store(Fault::STALE_STATE);
+    return hardware_interface::return_type::ERROR;
+  }
   gripper_feedback_ = snapshot.gripper;
   for (size_t i = 0; i < kJoints; ++i) {
     hw_states_position_[i] = snapshot.position[i];
@@ -382,8 +393,7 @@ hardware_interface::return_type Lite6MujocoSystem::read(
     hw_states_effort_[i] = snapshot.effort[i];
   }
   const int64_t observed_ros_ns = clock_ ? clock_->now().nanoseconds() : 0;
-  const int64_t observed_ns = steady_now_ns();
-  write_joint_state_shm(snapshot, observed_ros_ns, observed_ns);
+  write_joint_state_shm(snapshot, observed_ros_ns - age_ns, sample_ns);
   if (snapshot.started && sysid_shm_ && sysid_shm_->valid() &&
       sysid_shm_->get()->consumer_active.load(std::memory_order_acquire) != 0)
   {
@@ -545,7 +555,9 @@ void Lite6MujocoSystem::write_visual_shm(const StateSnapshot & snapshot, bool ph
 void Lite6MujocoSystem::write_joint_state_shm(
   const StateSnapshot & snapshot, int64_t ros_stamp_ns, int64_t steady_stamp_ns)
 {
-  if (!state_shm_ || !state_shm_->valid()) {return;}
+  if (!state_shm_ || !state_shm_->valid() ||
+      snapshot.published_ns <= last_joint_snapshot_ns_) {return;}
+  last_joint_snapshot_ns_ = snapshot.published_ns;
   lite6_interfaces::shm::JointStatePod pod{};
   for (size_t i = 0; i < kJoints; ++i) {
     pod.position[i] = snapshot.position[i];
@@ -603,6 +615,7 @@ void Lite6MujocoSystem::physics_loop()
     EffortCommand applied;
     while (!stop_requested_.load() && diagnostics_->fault.load() == Fault::NONE) {
       if (!snapshot.started) {
+        publish_snapshot(snapshot, false);
         // Preserve the original startup hold so gravity does not move the arm
         // while controller_manager is still loading the effort controller.
         if (!commands_.pop(applied)) {
@@ -728,6 +741,7 @@ void Lite6MujocoSystem::configure_diagnostics()
         switch (fault) {
           case Fault::COMMAND_OVERFLOW: status.message = "Command history overflow; simulation stopped"; break;
           case Fault::INVALID_COMMAND: status.message = "Non-finite effort command; simulation stopped"; break;
+          case Fault::STALE_STATE: status.message = "Stale physics feedback; simulation stopped"; break;
           case Fault::INVALID_STATE: status.message = "Invalid/reset MuJoCo state; simulation stopped"; break;
           default: status.message = "Physics thread exception; simulation stopped"; break;
         }

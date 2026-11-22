@@ -350,6 +350,10 @@ class StudioMainWindow(QMainWindow):
         self._source_dirty = False
         self._compile_in_flight = False
         self._compiled_program_id = ""
+        self._compiled_program_revision = 0
+        self._compiled_source = None
+        self._compile_requests = {}
+        self._active_compile_request_id = None
         self._diagnostics = []
         self._last_logged_revision = None
 
@@ -469,9 +473,13 @@ class StudioMainWindow(QMainWindow):
         self.chk_use_current_start = QCheckBox("Use Live Start Pose")
         self.chk_use_current_start.setChecked(True)
         self.chk_use_current_start.setToolTip(
-            "When checked, compiles starting at measured /joint_states; uncheck for zero-pose offline dry-run."
+            "Use the measured robot pose as the start; uncheck to use the zero joint pose."
         )
         outer.addWidget(self.chk_use_current_start)
+        self.chk_auto_load = QCheckBox("Load after compile")
+        self.chk_auto_load.setChecked(True)
+        self.chk_auto_load.setToolTip("Uncheck for a dry run that leaves the loaded program unchanged.")
+        outer.addWidget(self.chk_auto_load)
         outer.addStretch(1)
         return frame
 
@@ -794,6 +802,7 @@ class StudioMainWindow(QMainWindow):
         self.worker.gripper_state_updated.connect(self.on_gripper_state)
         self.worker.telemetry_updated.connect(self.on_telemetry)
         self.worker.compile_finished.connect(self.on_compile_finished)
+        self.worker.compile_delayed.connect(self.on_compile_delayed)
         self.worker.command_finished.connect(self.on_command_finished)
         self.worker.gripper_finished.connect(self.on_gripper_finished)
         self.worker.supervisor_offline.connect(self.on_supervisor_offline)
@@ -847,7 +856,7 @@ class StudioMainWindow(QMainWindow):
             self.btn_insert_payload,
         ):
             btn.setEnabled(not active_exec)
-        self.btn_compile.setEnabled(can_compile if online else True)
+        self.btn_compile.setEnabled(can_compile if online else not self._compile_in_flight)
 
         if st == StudioState.STATE_PAUSED:
             self.btn_run_resume.setText("Resume")
@@ -855,7 +864,12 @@ class StudioMainWindow(QMainWindow):
             self.btn_step.setEnabled(True)
         elif st == StudioState.STATE_COMPILED_READY:
             self.btn_run_resume.setText("Run")
-            ready_to_run = not self._source_dirty
+            ready_to_run = (
+                not self._source_dirty and not self._compile_in_flight
+                and self._compiled_program_id == self._latest_studio_state.loaded_program_id
+                and self._compiled_program_revision == self._latest_studio_state.program_revision
+                and self._compiled_source == self.editor.toPlainText()
+            )
             self.btn_run_resume.setEnabled(ready_to_run)
             self.btn_step.setEnabled(ready_to_run)
             self.btn_run_resume.setToolTip(
@@ -956,11 +970,20 @@ class StudioMainWindow(QMainWindow):
         self.lbl_compile_summary.setText("Compiling & validating 1 kHz optimal trajectory...")
         self.lbl_compile_summary.setStyleSheet("color: #1D4ED8; font-weight: 600;")
         self._refresh_button_states()
-        self.worker.request_compile(
-            self.editor.toPlainText(),
+        source = self.editor.toPlainText()
+        auto_load = self.chk_auto_load.isChecked()
+        request_id = self.worker.request_compile(
+            source,
             use_current_robot_start=self.chk_use_current_start.isChecked(),
             custom_start=[0.0] * 6,
+            auto_load=auto_load,
         )
+        self._active_compile_request_id = request_id
+        self._compile_requests[request_id] = {
+            "source": source, "auto_load": auto_load,
+            "baseline_revision": (self._latest_studio_state.program_revision
+                                  if self._latest_studio_state else 0),
+        }
 
     def _on_run_or_resume(self):
         st = self._current_state_code()
@@ -981,7 +1004,33 @@ class StudioMainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ ROS Callbacks
 
+    def on_compile_delayed(self, request_id):
+        if request_id == self._active_compile_request_id:
+            self._compile_in_flight = False
+            self.lbl_compile_summary.setText("Compile response delayed; load outcome pending")
+            self.append_log("Compilation may still load the submitted source; awaiting response/state.")
+            self._refresh_button_states()
+
+    def _reconcile_loaded_source(self, msg):
+        request = self._compile_requests.get(int(msg.last_compile_request_id))
+        if (request and request["auto_load"] and msg.loaded_program_id
+                and msg.program_revision > request["baseline_revision"]):
+            self._compiled_program_id = msg.loaded_program_id
+            self._compiled_program_revision = int(msg.program_revision)
+            self._compiled_source = request["source"]
+            self._mark_source_dirty(self.editor.toPlainText() != self._compiled_source)
+            if int(msg.last_compile_request_id) == self._active_compile_request_id:
+                self._compile_in_flight = False
+
     def on_compile_finished(self, resp):
+        request = self._compile_requests.get(int(resp.request_id))
+        if request is None:
+            return
+        if self._latest_studio_state is not None:
+            self._reconcile_loaded_source(self._latest_studio_state)
+        if int(resp.request_id) != self._active_compile_request_id:
+            self._refresh_button_states()
+            return
         self._compile_in_flight = False
         self._diagnostics = list(resp.diagnostics)
         self.diag_table.setRowCount(0)
@@ -1013,8 +1062,6 @@ class StudioMainWindow(QMainWindow):
         self.editor.set_diagnostic_markers(err_lines, warn_lines)
 
         if resp.success:
-            self._compiled_program_id = resp.program_id
-            self._mark_source_dirty(False)
             warn_count = sum(1 for d in self._diagnostics if d.severity == CompileDiagnostic.SEVERITY_WARNING)
             warn_suffix = f" | Warnings: {warn_count}" if warn_count > 0 else ""
             summary = (
@@ -1022,6 +1069,10 @@ class StudioMainWindow(QMainWindow):
                 f"Blocks: {resp.total_blocks} | Est. Time: {resp.estimated_duration_sec:.2f} s | "
                 f"1 kHz Samples: {resp.total_samples_1khz}{warn_suffix}"
             )
+            if not request["auto_load"]:
+                summary = "Dry run (not loaded) | " + summary
+            elif self.editor.toPlainText() != request["source"]:
+                summary += " | Editor has newer changes"
             self.lbl_compile_summary.setText(summary)
             self.lbl_compile_summary.setStyleSheet(
                 "color: #B45309; font-weight: 600;" if warn_count > 0 else "color: #15803D; font-weight: 600;"
@@ -1060,6 +1111,7 @@ class StudioMainWindow(QMainWindow):
 
     def on_studio_state(self, msg):
         self._latest_studio_state = msg
+        self._reconcile_loaded_source(msg)
 
         name, bg, fg = _STATE_META.get(msg.state, (f"STATE_{msg.state}", "#64748B", "#FFFFFF"))
         self.lbl_state_badge.setText(name)

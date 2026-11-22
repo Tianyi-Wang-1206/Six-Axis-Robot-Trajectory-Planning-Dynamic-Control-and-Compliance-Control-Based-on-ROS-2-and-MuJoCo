@@ -322,14 +322,12 @@ private:
   Eigen::Vector3d imp_dt_target_ = Eigen::Vector3d::Constant(0.8);
   Eigen::Vector3d imp_kr_target_ = Eigen::Vector3d::Constant(8.0);
   Eigen::Vector3d imp_dr_target_ = Eigen::Vector3d::Constant(0.8);
-  double imp_null_stiffness_target_ = 0.0;
   double imp_null_damping_target_ = 0.15;
   Vec6d imp_wrench_ff_target_ = Vec6d::Zero();
   Eigen::Vector3d imp_kt_filtered_ = Eigen::Vector3d::Constant(200.0);
   Eigen::Vector3d imp_dt_filtered_ = Eigen::Vector3d::Constant(0.8);
   Eigen::Vector3d imp_kr_filtered_ = Eigen::Vector3d::Constant(8.0);
   Eigen::Vector3d imp_dr_filtered_ = Eigen::Vector3d::Constant(0.8);
-  double imp_null_stiffness_filtered_ = 0.0;
   double imp_null_damping_filtered_ = 0.15;
   Vec6d imp_wrench_ff_filtered_ = Vec6d::Zero();
   double imp_active_transition_time_ = 0.30;
@@ -377,7 +375,7 @@ private:
   std::array<double, 5> teach_damping_levels_{22.0, 17.5, 13.5, 11.5, 9.5};
 
   // Shared dynamics and TCP kinematics cache for compliance and impedance control.
-  void ensure_dynamics_cached();
+  void ensure_dynamics_cached(bool need_coriolis = false);
   void read_cached_tcp_kinematics(
     const pinocchio::SE3 * & out_pose, const Mat6x8d * & out_jacobian);
   void add_trajectory_friction_ff(
@@ -386,6 +384,7 @@ private:
   static Eigen::Vector3d rotational_spring_torque(
     const Eigen::Matrix3d & error_rotation, const Eigen::Vector3d & stiffness);
   bool dynamics_cached_this_cycle_ = false;
+  bool coriolis_cached_this_cycle_ = false;
   bool tcp_cached_this_cycle_ = false;
   pinocchio::Data pin_data_dynamics_;
   Mat6x8d tcp_jacobian_ = Mat6x8d::Zero();
@@ -436,7 +435,6 @@ private:
     double rotation_stiffness = 8.0;
     double rotation_damping = 0.8;
     double sensitivity = 3.0;
-    double nullspace_stiffness = 0.0;
     double nullspace_damping = 0.5;
     double payload_mass = 0.0;
     double payload_com_tcp[3]{0.0, 0.0, 0.0};

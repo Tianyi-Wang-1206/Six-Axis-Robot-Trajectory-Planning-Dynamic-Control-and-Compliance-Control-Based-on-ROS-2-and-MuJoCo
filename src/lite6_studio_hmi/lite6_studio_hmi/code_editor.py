@@ -74,7 +74,6 @@ class Lite6ScriptHighlighter(QSyntaxHighlighter):
             "dr",
             "zeta_t",
             "zeta_r",
-            "null_stiffness",
             "null_damping",
             "transition_time",
             "wrench_ff",

@@ -58,6 +58,21 @@ public:
   virtual std::vector<double> piece_boundaries() const = 0;
 };
 
+// A view of an immutable Cartesian path, retaining its exact geometry and derivatives.
+class RestrictedCartesianPath : public CartesianPath
+{
+public:
+  RestrictedCartesianPath(std::shared_ptr<const CartesianPath> path, double u_start);
+  double total_length() const override;
+  CartesianSample eval_normalized(double u) const override;
+  std::vector<double> piece_boundaries() const override;
+
+private:
+  std::shared_ptr<const CartesianPath> path_;
+  double begin_;
+  double span_;
+};
+
 // Composite C^3 continuous Cartesian path built from one or more blended motion statements.
 class CompositeCartesianPath : public CartesianPath
 {
@@ -159,6 +174,26 @@ private:
   std::array<Eigen::Vector3d, 8> p_c_{};
   std::array<Eigen::Vector3d, 8> r_c_{};
   double duration_ = 0.002;
+};
+
+// Retains the accepted PVA Hermite segments. The path parameter is original elapsed
+// time divided by total duration, so derivatives agree across segment boundaries.
+class HermiteCartesianPath : public CartesianPath
+{
+public:
+  HermiteCartesianPath(
+    std::vector<CartesianHermiteSegment> segments,
+    std::vector<SourceLocation> locations, const MotionOptions & options);
+  double total_length() const override { return length_; }
+  CartesianSample eval_normalized(double u) const override;
+  std::vector<double> piece_boundaries() const override;
+
+private:
+  std::vector<CartesianHermiteSegment> segments_;
+  std::vector<SourceLocation> locations_;
+  std::vector<double> times_;
+  MotionOptions options_;
+  double length_ = 0.0;
 };
 
 // Geometric joint-space path q(u), u in [0, 1], with analytic derivatives.

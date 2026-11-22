@@ -205,7 +205,8 @@ bool Lite6CTCController::valid_impedance_trajectory_goal(
   for (const auto & point : goal.points) {
     const double t = to_seconds(point.time_from_start);
     if (point.time_from_start.sec < 0 || point.time_from_start.nanosec >= 1000000000u ||
-        t <= previous || !lite6_interfaces::valid_impedance_trajectory_gains(point)) {
+        t <= previous || !lite6_interfaces::valid_impedance_trajectory_gains(point) ||
+        point.nullspace_stiffness != 0.0) {
       return false;
     }
     for (size_t i = 0; i < joint_names_.size(); ++i) {
@@ -355,7 +356,6 @@ void Lite6CTCController::update_impedance_trajectory_reference(
       imp_kr_filtered_[k] = first.rotation_stiffness[k];
       imp_dr_filtered_[k] = first.rotation_damping[k];
     }
-    imp_null_stiffness_filtered_ = first.nullspace_stiffness;
     imp_null_damping_filtered_ = first.nullspace_damping;
     for (int k = 0; k < 6; ++k) {
       imp_wrench_ff_filtered_[k] = first.wrench_ff[static_cast<size_t>(k)];
@@ -390,7 +390,6 @@ void Lite6CTCController::update_impedance_trajectory_reference(
     imp_kr_target_[k] = point.rotation_stiffness[k];
     imp_dr_target_[k] = point.rotation_damping[k];
   }
-  imp_null_stiffness_target_ = point.nullspace_stiffness;
   imp_null_damping_target_ = point.nullspace_damping;
   for (int k = 0; k < 6; ++k) {
     imp_wrench_ff_target_[k] = point.wrench_ff[static_cast<size_t>(k)];
@@ -447,7 +446,7 @@ void Lite6CTCController::check_impedance_trajectory_path()
 
 void Lite6CTCController::compute_impedance_trajectory(double dt)
 {
-  ensure_dynamics_cached();
+  ensure_dynamics_cached(imp_dynamics_ff_scale_ > 1e-6);
   const double tau_filt = std::min(
     imp_filter_time_constant_,
     std::max(0.02, 0.5 * imp_active_transition_time_));
@@ -455,7 +454,6 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
 
   const Eigen::Vector3d cand_dkt = alpha * (imp_kt_target_ - imp_kt_filtered_);
   const Eigen::Vector3d cand_dkr = alpha * (imp_kr_target_ - imp_kr_filtered_);
-  const double cand_dknull = alpha * (imp_null_stiffness_target_ - imp_null_stiffness_filtered_);
 
   imp_dt_filtered_ += alpha * (imp_dt_target_ - imp_dt_filtered_);
   imp_dr_filtered_ += alpha * (imp_dr_target_ - imp_dr_filtered_);
@@ -464,7 +462,6 @@ void Lite6CTCController::compute_impedance_trajectory(double dt)
 
   imp_kt_filtered_ += cand_dkt;
   imp_kr_filtered_ += cand_dkr;
-  imp_null_stiffness_filtered_ += cand_dknull;
   Vec6d tau_model = pin_data_dynamics_.g.head<6>();
   Vec6d tau_feedforward = Vec6d::Zero();
   a_d_.setZero();
@@ -798,10 +795,8 @@ void Lite6CTCController::finish_impedance_trajectory_cycle(double dt)
       cart_dr_filtered_ = imp_dr_filtered_;
       cart_wrench_ff_filtered_ = imp_wrench_ff_filtered_;
       compliance_settings_.recapture = false;
-      compliance_settings_.nullspace_stiffness = last.nullspace_stiffness;
       compliance_settings_.nullspace_damping = last.nullspace_damping;
       compliance_filtered_ = compliance_settings_;
-      compliance_filtered_.nullspace_stiffness = imp_null_stiffness_filtered_;
       compliance_filtered_.nullspace_damping = imp_null_damping_filtered_;
       begin_torque_transition(cart_imp_cfg_.transition_duration);
       compliance_saturation_time_ = 0.0;

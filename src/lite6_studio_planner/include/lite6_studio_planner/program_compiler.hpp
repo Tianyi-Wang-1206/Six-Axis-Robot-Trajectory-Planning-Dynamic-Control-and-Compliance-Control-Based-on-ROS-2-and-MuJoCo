@@ -54,6 +54,7 @@ struct ExecutionBlock
   // Original AST source group retained for dynamic post-impedance start-pose replanning
   std::vector<MotionStatement> source_motions;
   MovePVAStatement source_pva;
+  std::shared_ptr<const CartesianPath> cartesian_path;
 
   // Per-1kHz-sample source location mapping for live line highlighting and diagnostics
   std::vector<SourceLocation> sample_locations;

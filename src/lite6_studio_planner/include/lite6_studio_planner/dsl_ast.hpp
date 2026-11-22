@@ -112,7 +112,6 @@ struct ImpedanceParams
   std::array<double, 3> dt{{0.8, 0.8, 0.8}};
   std::array<double, 3> kr{{10.0, 10.0, 10.0}};
   std::array<double, 3> dr{{0.8, 0.8, 0.8}};
-  double null_stiffness = 0.0;
   double null_damping = 0.15;
   double transition_time = 0.15;
   std::array<double, 6> wrench_ff{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};

@@ -39,7 +39,6 @@ class ComplianceTab(QWidget):
                 ("translation_damping", "Translation damping ratio (ζ_t)", .1, 2.0, .8),
                 ("rotation_stiffness", "Rotation stiffness (Nm/rad)", 0, 50, 8),
                 ("rotation_damping", "Rotation damping ratio (ζ_r)", .1, 2.0, .8),
-                ("nullspace_stiffness", "Null-space stiffness (Nm/rad)", 0, 50, 0.0),
                 ("nullspace_damping", "Null-space damping (Nm s/rad)", 0, 20, 0.5)]),
             ("Teaching sensitivity (diag(M)-normalized)", [("sensitivity", "1 = firm, 5 = light", 1, 5, 3)])]
         for title, fields in definitions:

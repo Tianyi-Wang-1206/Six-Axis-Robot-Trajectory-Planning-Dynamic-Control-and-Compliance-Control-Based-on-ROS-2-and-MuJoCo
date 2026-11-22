@@ -32,6 +32,7 @@ class StudioRosWorker(QThread):
     gripper_state_updated = pyqtSignal(object)
     telemetry_updated = pyqtSignal(object, object, object)  # q_list, dq_list, tcp6_or_none
     compile_finished = pyqtSignal(object)
+    compile_delayed = pyqtSignal(object)
     command_finished = pyqtSignal(int, bool, str)
     gripper_finished = pyqtSignal(int, bool, str)
     supervisor_offline = pyqtSignal(str)
@@ -46,12 +47,13 @@ class StudioRosWorker(QThread):
         self._wake_gc = None
         self._pending = {}
         self._req_seq = 0
-        self._compile_req_seq = 0
+        self._compile_req_seq = time.time_ns()
         self._revision = -1
         self._last_studio_rx_time = 0.0
         self._boot_time = time.monotonic()
         self._direct_estop_sent = False
         self._last_studio_state_code = None
+        self._supervisor_offline_notified = False
 
     def _trigger_wake(self):
         gc = self._wake_gc
@@ -76,6 +78,7 @@ class StudioRosWorker(QThread):
             )
         )
         self._trigger_wake()
+        return self._compile_req_seq
 
     def request_command(self, command_code, reason="", expected_revision=0):
         self._req_queue.put(
@@ -218,6 +221,7 @@ class StudioRosWorker(QThread):
             return
         self._revision = int(msg.revision)
         self._last_studio_rx_time = now
+        self._supervisor_offline_notified = False
         self._last_studio_state_code = int(msg.state)
         if msg.controller_mode == 1 and msg.controller_fresh:
             self._direct_estop_sent = False
@@ -259,6 +263,8 @@ class StudioRosWorker(QThread):
                     self._send_direct_controller_estop(
                         ctc_cmd_cli, "Trajectory supervisor heartbeat lost during motion"
                     )
+            if not self._supervisor_offline_notified:
+                self._supervisor_offline_notified = True
                 self.supervisor_offline.emit(
                     f"Trajectory supervisor heartbeat lost ({age:.2f} s)"
                 )
@@ -288,9 +294,10 @@ class StudioRosWorker(QThread):
 
         self.telemetry_updated.emit(q_list, dq_list, tcp6)
 
-    def _emit_compile_error(self, stage, code, message):
+    def _emit_compile_error(self, stage, code, message, request_id):
         resp = CompileProgram.Response()
         resp.success = False
+        resp.request_id = request_id
         diag = CompileDiagnostic()
         diag.severity = CompileDiagnostic.SEVERITY_ERROR
         diag.stage = stage
@@ -317,9 +324,10 @@ class StudioRosWorker(QThread):
             res = fut.result()
         except Exception as exc:
             if kind == "compile":
-                resp = CompileProgram.Response()
-                resp.success = False
-                self.compile_finished.emit(resp)
+                self._emit_compile_error(
+                    CompileDiagnostic.STAGE_PLANNING, "ERR_COMPILE_SERVICE",
+                    str(exc), meta["request_id"],
+                )
             elif kind == "command":
                 if meta.get("code") == StudioCommand.Request.CMD_ESTOP and meta.get("ctc_cli") is not None:
                     self._send_direct_controller_estop(meta["ctc_cli"], str(exc))
@@ -349,17 +357,16 @@ class StudioRosWorker(QThread):
             if entry is None:
                 continue
             kind, meta, fut, _ = entry
+            if kind == "compile":
+                # A service timeout does not cancel server-side compilation or loading.
+                self._pending[req_id] = (kind, meta, fut, float("inf"))
+                self.compile_delayed.emit(meta["request_id"])
+                continue
             try:
                 fut.cancel()
             except Exception:
                 pass
-            if kind == "compile":
-                self._emit_compile_error(
-                    CompileDiagnostic.STAGE_PLANNING,
-                    "ERR_COMPILE_TIMEOUT",
-                    "Compilation service call timed out",
-                )
-            elif kind == "command":
+            if kind == "command":
                 if meta.get("code") == StudioCommand.Request.CMD_ESTOP:
                     self._send_direct_controller_estop(
                         ctc_cmd_cli, "StudioCommand CMD_ESTOP timed out"
@@ -381,6 +388,7 @@ class StudioRosWorker(QThread):
                         CompileDiagnostic.STAGE_SEMANTIC,
                         "ERR_SERVICE_OFFLINE",
                         "Service /studio/compile is unavailable (is lite6_studio_planner_node running?)",
+                        payload["request_id"],
                     )
                     continue
                 req = CompileProgram.Request()
@@ -390,7 +398,7 @@ class StudioRosWorker(QThread):
                 req.request_id = payload["request_id"]
                 req.auto_load = payload["auto_load"]
                 fut = compile_cli.call_async(req)
-                self._register_pending("compile", {}, fut, 20.0)
+                self._register_pending("compile", payload, fut, 20.0)
 
             elif kind == "command":
                 code = payload["code"]

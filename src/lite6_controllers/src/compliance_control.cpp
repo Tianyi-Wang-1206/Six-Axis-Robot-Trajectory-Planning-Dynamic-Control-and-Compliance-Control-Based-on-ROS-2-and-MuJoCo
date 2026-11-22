@@ -263,7 +263,6 @@ void Lite6CTCController::compute_compliance(double dt)
   smooth(s.joint_stiffness, compliance_settings_.joint_stiffness);
   smooth(s.joint_damping, compliance_settings_.joint_damping);
   smooth(s.sensitivity, compliance_settings_.sensitivity);
-  smooth(s.nullspace_stiffness, compliance_settings_.nullspace_stiffness);
   smooth(s.nullspace_damping, compliance_settings_.nullspace_damping);
   tau_cmd_ = pin_data_dynamics_.g.head<6>();
   a_d_.setZero();
