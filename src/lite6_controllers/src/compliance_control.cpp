@@ -1,8 +1,5 @@
 #include "lite6_controllers/ctc_controller.hpp"
-#include "lite6_interfaces/compliance_validation.hpp"
 #include "lite6_interfaces/motion_contract.hpp"
-#include <pinocchio/algorithm/frames.hpp>
-#include <pinocchio/algorithm/jacobian.hpp>
 #include <pinocchio/spatial/explog.hpp>
 #include <algorithm>
 #include <cmath>
@@ -162,7 +159,6 @@ bool Lite6CTCController::configure_compliance()
   if (compliance_frame_ >= static_cast<pinocchio::FrameIndex>(pin_model_.nframes)) {
     throw std::runtime_error("Missing compliance TCP frame");
   }
-  compliance_jacobian_.setZero();
   return true;
 }
 

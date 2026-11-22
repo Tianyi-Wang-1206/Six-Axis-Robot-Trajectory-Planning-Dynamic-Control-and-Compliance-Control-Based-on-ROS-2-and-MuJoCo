@@ -155,7 +155,7 @@ public:
           resp->accepted=false;resp->revision=snap.revision;resp->mode=snap.mode;
           resp->message=snap.detail;
         } else if(cmd_ok&&reply.accepted&&pending.request) {
-          // The CTC acknowledgement may have advanced the state (e.g. tare/payload result).
+          // The CTC acknowledgement may have advanced the state (e.g. payload result).
           const auto snap=supervisor_.snapshot();
           resp->revision=snap.revision;resp->mode=snap.mode;resp->message=snap.detail;
         }

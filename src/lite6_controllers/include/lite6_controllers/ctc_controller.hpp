@@ -376,7 +376,7 @@ private:
   std::array<double, 6> teach_max_joint_damping_{15.0, 15.0, 10.0, 4.0, 3.0, 1.5};
   std::array<double, 5> teach_damping_levels_{22.0, 17.5, 13.5, 11.5, 9.5};
 
-  // Shared dynamics and TCP kinematics, independent of force estimation.
+  // Shared dynamics and TCP kinematics cache for compliance and impedance control.
   void ensure_dynamics_cached();
   void read_cached_tcp_kinematics(
     const pinocchio::SE3 * & out_pose, const Mat6x8d * & out_jacobian);
@@ -409,10 +409,8 @@ private:
   Vec6d cart_wrench_ff_target_ = Vec6d::Zero();
   Vec6d cart_wrench_ff_filtered_ = Vec6d::Zero();
   Vec6d compliance_q_ = Vec6d::Zero();
-  Mat6x8d compliance_jacobian_ = Mat6x8d::Zero();
   pinocchio::SE3 compliance_pose_;
   pinocchio::FrameIndex compliance_frame_ = 0;
-  uint64_t compliance_sequence_ = 0;
   double compliance_saturation_time_ = 0.0;
   std::atomic<bool> compliance_blocks_trajectory_{false};
   std::atomic<bool> emergency_pending_{false};

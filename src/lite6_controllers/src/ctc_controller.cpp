@@ -1424,12 +1424,8 @@ uint8_t Lite6CTCController::apply_controller_command(const PendingControllerComm
       populate_compliance_settings(compliance_settings_);
       if (entering || cmd.compliance_recapture) {
         compliance_q_ = q_;
-        if (tcp_cached_this_cycle_) {
-          compliance_pose_ = pin_data_dynamics_.oMf[compliance_frame_];
-        } else {
-          pinocchio::forwardKinematics(pin_model_, pin_data_, dynamics_q_);
-          compliance_pose_ = pinocchio::updateFramePlacement(pin_model_, pin_data_, compliance_frame_);
-        }
+        pinocchio::forwardKinematics(pin_model_, pin_data_, dynamics_q_);
+        compliance_pose_ = pinocchio::updateFramePlacement(pin_model_, pin_data_, compliance_frame_);
         begin_torque_transition(target_cfg.transition_duration);
       }
       // Scalar settings replace any held per-axis gains / feedforward wrench; the filter
@@ -1452,12 +1448,8 @@ uint8_t Lite6CTCController::apply_controller_command(const PendingControllerComm
       set_cartesian_targets_from_settings(false);
       if (cmd.compliance_recapture) {
         compliance_q_ = q_;
-        if (tcp_cached_this_cycle_) {
-          compliance_pose_ = pin_data_dynamics_.oMf[compliance_frame_];
-        } else {
-          pinocchio::forwardKinematics(pin_model_, pin_data_, dynamics_q_);
-          compliance_pose_ = pinocchio::updateFramePlacement(pin_model_, pin_data_, compliance_frame_);
-        }
+        pinocchio::forwardKinematics(pin_model_, pin_data_, dynamics_q_);
+        compliance_pose_ = pinocchio::updateFramePlacement(pin_model_, pin_data_, compliance_frame_);
         begin_torque_transition(active_compliance_config().transition_duration);
       }
       return Resp::ACK_APPLIED;
