@@ -1,4 +1,4 @@
-"""Standalone bringup launch file for the Robot Industrial Trajectory Studio stack."""
+"""Standalone bringup launch file for the Robot Trajectory Programming IDE stack."""
 
 import os
 from ament_index_python.packages import get_package_share_directory
@@ -87,7 +87,7 @@ def generate_launch_description():
             'viewer', default_value='true', description='Open native MuJoCo window'
         ),
         DeclareLaunchArgument(
-            'gui', default_value='true', description='Open Robot Studio HMI PyQt5 window'
+            'gui', default_value='true', description='Open Robot Trajectory IDE PyQt5 window'
         ),
         DeclareLaunchArgument(
             'viewer_fps', default_value='60', description='Render rate, 15..240 Hz'

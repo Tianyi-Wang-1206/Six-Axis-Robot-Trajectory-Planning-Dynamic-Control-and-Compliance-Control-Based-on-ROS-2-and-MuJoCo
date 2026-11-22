@@ -1,4 +1,4 @@
-"""Main PyQt5 IDE & Execution Monitoring Window for Robot Studio (Light Theme)."""
+"""Main PyQt5 IDE & Execution Monitoring Window for Robot Trajectory IDE (Light Theme)."""
 
 from datetime import datetime
 import math
@@ -56,7 +56,7 @@ _CTRL_MODE_NAMES = {
     ControllerStatus.MODE_UNKNOWN: "UNKNOWN",
     ControllerStatus.MODE_NORMAL: "NORMAL (RIGID CTC)",
     ControllerStatus.MODE_ESTOP: "ESTOP",
-    ControllerStatus.MODE_SYSID: "SYSID",
+    ControllerStatus.MODE_SYSID: "FRICTION ID",
     ControllerStatus.MODE_JOINT_IMPEDANCE: "JOINT IMPEDANCE",
     ControllerStatus.MODE_CARTESIAN_IMPEDANCE: "CARTESIAN IMPEDANCE",
     ControllerStatus.MODE_TEACH: "TEACH",
@@ -334,12 +334,12 @@ def _key_label(text):
 
 
 class StudioMainWindow(QMainWindow):
-    """End-user industrial trajectory programming and execution Studio IDE."""
+    """End-user industrial trajectory programming and execution IDE."""
 
     def __init__(self, ros_worker, parent=None):
         super().__init__(parent)
         self.worker = ros_worker
-        self.setWindowTitle("Robot Industrial Trajectory Studio")
+        self.setWindowTitle("Robot - Trajectory Programming IDE")
         self.resize(1800, 1400)
         self.setStyleSheet(_STYLESHEET)
 
@@ -392,7 +392,7 @@ class StudioMainWindow(QMainWindow):
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(8)
 
-        title = QLabel("ROBOT STUDIO")
+        title = QLabel("TRAJECTORY IDE")
         title.setFont(QFont(_UI_FONT_FAMILY, 12, QFont.Bold))
         title.setStyleSheet("color: #1D4ED8;")
         layout.addWidget(title)
@@ -717,7 +717,7 @@ class StudioMainWindow(QMainWindow):
         layout.addWidget(grip_card)
 
         # 5. Event Console Log Card
-        log_card, l_layout = _make_card("Studio Event Log")
+        log_card, l_layout = _make_card("Execution Event Log")
         self.txt_log = QPlainTextEdit()
         self.txt_log.setObjectName("EventLog")
         self.txt_log.setReadOnly(True)
@@ -891,7 +891,7 @@ class StudioMainWindow(QMainWindow):
             self._mark_source_dirty(True)
 
     def _on_new_script(self):
-        self.editor.setPlainText("# New RobotScript program\nMoveJ([0.0, 0.35, 1.0, 0.0, 0.65, 0.0], vel=0.4, acc=0.4)\n")
+        self.editor.setPlainText("# New trajectory script\nMoveJ([0.0, 0.35, 1.0, 0.0, 0.65, 0.0], vel=0.4, acc=0.4)\n")
         self._current_file_path = None
         self.editor.set_diagnostic_markers([], [])
         self.diag_table.setRowCount(0)
@@ -899,7 +899,7 @@ class StudioMainWindow(QMainWindow):
 
     def _on_open_script(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open RobotScript Program", "", "RobotScript (*.l6 *.txt);;All Files (*)"
+            self, "Open Trajectory Script", "", "Trajectory Script (*.l6 *.txt);;All Files (*)"
         )
         if not path:
             return
@@ -912,7 +912,7 @@ class StudioMainWindow(QMainWindow):
         path = self._current_file_path
         if not path:
             path, _ = QFileDialog.getSaveFileName(
-                self, "Save RobotScript Program", "program.l6", "RobotScript (*.l6);;All Files (*)"
+                self, "Save Trajectory Script", "program.l6", "Trajectory Script (*.l6);;All Files (*)"
             )
             if not path:
                 return

@@ -15,7 +15,7 @@ class DSLParser
 public:
   using Diagnostic = lite6_interfaces::msg::CompileDiagnostic;
 
-  // Parses and semantically validates RobotScript source code.
+  // Parses and semantically validates trajectory DSL source code.
   // Returns true iff zero errors occurred across Stages 1 (Lex/Syntax) and 2 (Semantic).
   static bool parse(
     const std::string & source,

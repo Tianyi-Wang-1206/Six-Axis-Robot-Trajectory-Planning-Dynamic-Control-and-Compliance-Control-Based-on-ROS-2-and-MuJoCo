@@ -74,7 +74,7 @@ std::string mode_label(uint8_t mode) {
     case S::MODE_CARTESIAN_IMPEDANCE: return "Cartesian-space impedance";
     case S::MODE_TEACH: return "Drag teaching";
     case S::MODE_COMPLIANCE_SWITCHING: return "Compliance mode transition";
-    case S::MODE_SYSID: return "System Identification";
+    case S::MODE_SYSID: return "Friction Identification";
     case S::MODE_NORMAL: return "NORMAL";
     default: return "Active control mode";
   }
@@ -228,8 +228,8 @@ void Supervisor::complete_sysid_unlocked() {
   state_.waiting_for_settle=false;
   phase_deadline_=Clock::time_point{};
   state_.last_error_code=sysid_failure_.empty()?1:S::ERROR_SYSID_ESTIMATION;
-  changed_unlocked(sysid_failure_.empty()?"SysID completed; NORMAL and stationary":
-      "SysID estimation failed; NORMAL restored: "+sysid_failure_);
+  changed_unlocked(sysid_failure_.empty()?"Friction identification completed; NORMAL and stationary":
+      "Friction identification failed; NORMAL restored: "+sysid_failure_);
 }
 void Supervisor::clear_motion_unlocked() {
   active_key_.clear();cancel_requested_=false;
@@ -301,14 +301,14 @@ Supervisor::Effects Supervisor::observe_controller(const CS& status) {
     return fx;
   }
   if(mode==CS::MODE_SYSID&&state_.mode!=S::MODE_SYSID) {
-    fault_unlocked("CTC entered SYS_ID without supervisor authorization",true,fx,S::ESTOP_CONTROLLER_FAULT);
+    fault_unlocked("CTC entered friction identification mode without supervisor authorization",true,fx,S::ESTOP_CONTROLLER_FAULT);
   } else if(state_.mode==S::MODE_INITIALIZING) {
     sync_from_initializing_unlocked();
   } else if(state_.mode==S::MODE_SYSID&&state_.sysid_phase==S::SYSID_WAIT_CONTROLLER_MODE&&
       !state_.waiting_for_settle&&mode==CS::MODE_SYSID) {
     state_.sysid_phase=S::SYSID_READY_FOR_EXCITATION;
     settle_unlocked();
-    changed_unlocked("CTC confirmed SYS_ID; waiting for physical settling");
+    changed_unlocked("CTC confirmed friction identification mode; waiting for physical settling");
   } else if(state_.mode==S::MODE_SYSID&&state_.sysid_phase==S::SYSID_WAIT_NORMAL_MODE&&
       !state_.waiting_for_settle&&mode==CS::MODE_NORMAL) {
     state_.sysid_phase=S::SYSID_RETURN_ALIGN;
@@ -372,10 +372,10 @@ void Supervisor::on_controller_command_ack(uint8_t cmd,bool accepted,uint8_t ack
             (cmd==CTC::Request::CMD_ENTER_SYSID||cmd==CTC::Request::CMD_ENTER_NORMAL)) {
     if(ack_result==CTC::Response::ACK_REJECTED_SPEED) {
       settle_unlocked();
-      changed_unlocked("Waiting for joint speed to settle before SysID mode change");
+      changed_unlocked("Waiting for joint speed to settle before friction identification mode change");
     } else {
       Effects unused;
-      fault_unlocked("CTC rejected SysID transition: "+msg,true,unused,S::ESTOP_CONTROLLER_FAULT);
+      fault_unlocked("CTC rejected friction identification transition: "+msg,true,unused,S::ESTOP_CONTROLLER_FAULT);
     }
   }
 }
@@ -428,7 +428,7 @@ Supervisor::Effects Supervisor::watchdog() {
        (phase==S::SYSID_WAIT_NORMAL_MODE&&state_.waiting_for_settle));
     if((requires_normal&&state_.controller_mode!=CS::MODE_NORMAL)||
        (requires_sysid&&state_.controller_mode!=CS::MODE_SYSID)) {
-      fault_unlocked("Unexpected CTC mode in SysID phase",true,fx);
+      fault_unlocked("Unexpected CTC mode in friction identification phase",true,fx);
       return fx;
     }
   }
@@ -459,7 +459,7 @@ Supervisor::Effects Supervisor::watchdog() {
   }
   if(phase_deadline_!=Clock::time_point{}&&now>phase_deadline_) {
     fault_unlocked(state_.waiting_for_settle?"Physical settling timed out":
-        (state_.sysid_phase==S::SYSID_VALIDATING?"SysID trajectory validation timed out":
+        (state_.sysid_phase==S::SYSID_VALIDATING?"Friction identification trajectory validation timed out":
         "Sequence phase timed out (mode acknowledgement / client response)"),true,fx);
     return fx;
   }
@@ -471,12 +471,12 @@ Supervisor::Effects Supervisor::watchdog() {
       if(state_.sysid_phase==S::SYSID_WAIT_CONTROLLER_MODE) {
         fx.ctc_cmd=CTC::Request::CMD_ENTER_SYSID;
         fx.expected_controller_epoch=state_.controller_epoch;
-        fx.cmd_reason="SysID pre-alignment settled";
+        fx.cmd_reason="Friction identification pre-alignment settled";
         phase_deadline_=now+kModeTimeout;
       } else if(state_.sysid_phase==S::SYSID_WAIT_NORMAL_MODE) {
         fx.ctc_cmd=CTC::Request::CMD_ENTER_NORMAL;
         fx.expected_controller_epoch=state_.controller_epoch;
-        fx.cmd_reason="SysID post-alignment settled";
+        fx.cmd_reason="Friction identification post-alignment settled";
         phase_deadline_=now+kModeTimeout;
       } else if(state_.sysid_phase==S::SYSID_COMPLETING) {
         complete_sysid_unlocked();
@@ -526,16 +526,16 @@ bool Supervisor::can_start_motion_unlocked(uint8_t context,uint64_t session,std:
        !(state_.sysid_phase==S::SYSID_PRE_ALIGN||
          state_.sysid_phase==S::SYSID_POST_ALIGN||
          state_.sysid_phase==S::SYSID_RETURN_ALIGN)) {
-      why="SysID phase/session does not permit alignment";return false;
+      why="Friction identification phase/session does not permit alignment";return false;
     }
     if(state_.sysid_phase==S::SYSID_PRE_ALIGN&&state_.controller_mode!=CS::MODE_NORMAL) {
-      why="SysID pre-alignment requires normal CTC mode";return false;
+      why="Friction identification pre-alignment requires normal CTC mode";return false;
     }
     if(state_.sysid_phase==S::SYSID_POST_ALIGN&&state_.controller_mode!=CS::MODE_SYSID) {
-      why="SysID post-alignment requires SYS_ID CTC mode";return false;
+      why="Friction identification post-alignment requires friction ID CTC mode";return false;
     }
     if(state_.sysid_phase==S::SYSID_RETURN_ALIGN&&state_.controller_mode!=CS::MODE_NORMAL) {
-      why="SysID return alignment requires normal CTC mode";return false;
+      why="Friction identification return alignment requires normal CTC mode";return false;
     }
   } else {why="Unknown motion context";return false;}
   return true;
@@ -557,11 +557,11 @@ bool Supervisor::begin_excitation_validation(uint64_t session,std::string& why) 
       state_.sysid_phase!=S::SYSID_READY_FOR_EXCITATION||state_.waiting_for_settle||
       !active_key_.empty()||!fresh_joint_unlocked()||!fresh_controller_unlocked()||
       state_.controller_mode!=CS::MODE_SYSID||Clock::now()>phase_deadline_) {
-    why="Supervisor does not permit SysID validation";return false;
+    why="Supervisor does not permit friction identification validation";return false;
   }
   state_.sysid_phase=S::SYSID_VALIDATING;
   phase_deadline_=Clock::now()+kValidationTimeout;
-  changed_unlocked("Validating SysID trajectory; arm remains at alignment pose");
+  changed_unlocked("Validating friction identification trajectory; arm remains at alignment pose");
   return true;
 }
 void Supervisor::end_excitation_validation(uint64_t session) {
@@ -570,7 +570,7 @@ void Supervisor::end_excitation_validation(uint64_t session) {
       state_.sysid_phase!=S::SYSID_VALIDATING) return;
   state_.sysid_phase=S::SYSID_READY_FOR_EXCITATION;
   phase_deadline_=Clock::now()+kDispatchTimeout;
-  changed_unlocked("SysID validation rejected; waiting for client abort or retry");
+  changed_unlocked("Friction identification validation rejected; waiting for client abort or retry");
 }
 bool Supervisor::reserve_excitation(uint64_t session,std::string& key,std::string& why) {
   std::lock_guard<std::mutex> guard(mutex_);
@@ -578,7 +578,7 @@ bool Supervisor::reserve_excitation(uint64_t session,std::string& key,std::strin
       state_.sysid_phase!=S::SYSID_VALIDATING||Clock::now()>phase_deadline_||
       state_.waiting_for_settle||!active_key_.empty()||!fresh_joint_unlocked()||!fresh_controller_unlocked()||
       state_.controller_mode!=CS::MODE_SYSID) {
-    why="Supervisor does not permit SysID excitation";return false;
+    why="Supervisor does not permit friction identification excitation";return false;
   }
   key="sysid-excitation:"+std::to_string(session);
   active_key_=key;cancel_requested_=false;
@@ -586,7 +586,7 @@ bool Supervisor::reserve_excitation(uint64_t session,std::string& key,std::strin
   state_.excitation_start=builtin_interfaces::msg::Time{};
   state_.sysid_phase=S::SYSID_EXCITING;
   state_.motion_phase=S::MOTION_WAITING_CTC;
-  changed_unlocked("SysID excitation dispatched");
+  changed_unlocked("Friction identification excitation dispatched");
   return true;
 }
 bool Supervisor::permitted(const std::string& key) const {
@@ -749,7 +749,7 @@ Supervisor::Reply Supervisor::command(const Command::Request& req) {
     if(req.session_id!=0||!active_key_.empty()||!fresh_controller_unlocked()||
        state_.mode==S::MODE_INITIALIZING||state_.mode==S::MODE_COMPLIANCE_SWITCHING||
        state_.mode==S::MODE_SYSID||state_.controller_mode==CS::MODE_SYSID) {
-      reject("Payload update requires non-SysID idle state and fresh controller observation");break;
+      reject("Payload update requires idle non-identification state and fresh controller observation");break;
     }
     if(!lite6_interfaces::valid_payload_params(req.payload_mass,req.payload_com_tcp)) {
       reject("Payload parameters out of bounds");break;
@@ -795,10 +795,10 @@ Supervisor::Reply Supervisor::command(const Command::Request& req) {
     if(state_.mode!=S::MODE_NORMAL||state_.estop_latched||req.session_id!=0||
        !active_key_.empty()||!fresh_joint_unlocked()||!fresh_controller_unlocked()||
        state_.controller_mode!=CS::MODE_NORMAL) {
-      reject("SysID requires idle NORMAL mode and fresh observations");break;
+      reject("Friction identification requires idle NORMAL mode and fresh observations");break;
     }
     if(state_.payload_mass>1e-6) {
-      reject("SysID is prohibited when payload is attached ("+
+      reject("Friction identification is prohibited when payload is attached ("+
         format_fixed(state_.payload_mass,3)+" kg > 0.0 kg); reset payload to 0 kg first");
       break;
     }
@@ -808,7 +808,7 @@ Supervisor::Reply Supervisor::command(const Command::Request& req) {
     state_.excitation_start=builtin_interfaces::msg::Time{};
     sysid_failure_.clear();
     settle_unlocked();
-    changed_unlocked("Waiting for settling before SysID pre-alignment");
+    changed_unlocked("Waiting for settling before friction identification pre-alignment");
     r.accepted=true;
     break;
   case C::Request::CMD_SYSID_CALCULATION_DONE:
@@ -818,18 +818,18 @@ Supervisor::Reply Supervisor::command(const Command::Request& req) {
       reject("Calculation-done event out of phase/session");break;
     }
     if(req.command==C::Request::CMD_SYSID_CALCULATION_FAILED)
-      sysid_failure_=req.reason.empty()?"Parameter estimation failed":req.reason;
+      sysid_failure_=req.reason.empty()?"Friction estimation failed":req.reason;
     state_.sysid_phase=S::SYSID_POST_ALIGN;
     settle_unlocked();
-    changed_unlocked(sysid_failure_.empty()?"Waiting for SysID post-alignment settling":
+    changed_unlocked(sysid_failure_.empty()?"Waiting for friction identification post-alignment settling":
         "Estimation failed; controlled return to NORMAL: "+sysid_failure_);
     r.accepted=true;
     break;
   case C::Request::CMD_ABORT_SYSID:
     if(state_.mode!=S::MODE_SYSID||req.session_id==0||req.session_id!=state_.session_id) {
-      reject("Invalid SysID abort session");break;
+      reject("Invalid friction identification abort session");break;
     }
-    fault_unlocked("SysID aborted: "+req.reason,true,r.effects);
+    fault_unlocked("Friction identification aborted: "+req.reason,true,r.effects);
     r.accepted=true;
     break;
   default: reject("Unknown supervisor event");break;

@@ -46,12 +46,12 @@ class Lite6StateMachine:
     ERROR = "HARDWARE E-STOP!"
     RECOVERING = "RECOVERING..."
     SOFT_ERROR = "SOFTWARE FAULT"
-    SYSID_PRE_ALIGN = "SYSID: PRE-ALIGNING..."
-    SYSID_SEND_CMD = "SYSID: CONFIGURING HARDWARE..."
-    SYSID_RUNNING = "SYSID: EXCITING TRAJECTORY..."
-    SYSID_CALC = "SYSID: LEAST SQUARES SOLVING..."
-    SYSID_POST_ALIGN = "SYSID: ALIGNING CTC TARGETS..."
-    SYSID_RESTORE = "SYSID: RESTORING CLOSED-LOOP..."
+    SYSID_PRE_ALIGN = "FRICTION ID: PRE-ALIGNING..."
+    SYSID_SEND_CMD = "FRICTION ID: CONFIGURING HARDWARE..."
+    SYSID_RUNNING = "FRICTION ID: EXCITING TRAJECTORY..."
+    SYSID_CALC = "FRICTION ID: ESTIMATING FRICTION..."
+    SYSID_POST_ALIGN = "FRICTION ID: ALIGNING CTC TARGETS..."
+    SYSID_RESTORE = "FRICTION ID: RESTORING CLOSED-LOOP..."
 
 
 def _view_state(msg):
@@ -75,21 +75,21 @@ def _view_state(msg):
         return compliance_labels[msg.mode]
     if msg.mode == S.MODE_SYSID:
         if msg.waiting_for_settle:
-            return "SYSID: WAITING FOR PHYSICAL SETTLING..."
+            return "FRICTION ID: WAITING FOR PHYSICAL SETTLING..."
         p = msg.sysid_phase
         labels = {
             S.SYSID_PRE_ALIGN: Lite6StateMachine.SYSID_PRE_ALIGN,
             S.SYSID_WAIT_CONTROLLER_MODE: Lite6StateMachine.SYSID_SEND_CMD,
-            S.SYSID_READY_FOR_EXCITATION: "SYSID: READY FOR EXCITATION...",
-            S.SYSID_VALIDATING: "SYSID: VALIDATING TRAJECTORY...",
+            S.SYSID_READY_FOR_EXCITATION: "FRICTION ID: READY FOR EXCITATION...",
+            S.SYSID_VALIDATING: "FRICTION ID: VALIDATING TRAJECTORY...",
             S.SYSID_EXCITING: Lite6StateMachine.SYSID_RUNNING,
             S.SYSID_CALCULATING: Lite6StateMachine.SYSID_CALC,
             S.SYSID_POST_ALIGN: Lite6StateMachine.SYSID_POST_ALIGN,
             S.SYSID_WAIT_NORMAL_MODE: Lite6StateMachine.SYSID_RESTORE,
-            S.SYSID_RETURN_ALIGN: "SYSID: RETURNING TO ALIGNMENT POSE...",
-            S.SYSID_COMPLETING: "SYSID: CONFIRMING COMPLETION...",
+            S.SYSID_RETURN_ALIGN: "FRICTION ID: RETURNING TO ALIGNMENT POSE...",
+            S.SYSID_COMPLETING: "FRICTION ID: CONFIRMING COMPLETION...",
         }
-        return labels.get(p, "SYSID: WAITING...")
+        return labels.get(p, "FRICTION ID: WAITING...")
     if msg.motion_phase == S.MOTION_PLANNING:
         return Lite6StateMachine.PLANNING
     if msg.motion_phase == S.MOTION_WAITING_CTC:
@@ -679,7 +679,7 @@ class ROS2Worker(QThread):
             return "A motion request is already awaiting an Action response"
         if goal.context == IndustrialMotion.Goal.CONTEXT_NORMAL:
             if self._begin_pending:
-                return "Wait for SysID preparation before requesting manual motion"
+                return "Wait for friction identification preparation before requesting manual motion"
             if snap is None or not snap.motion_allowed:
                 return "Supervisor does not currently permit manual motion"
             return None
@@ -961,7 +961,7 @@ class ROS2Worker(QThread):
 
     def start_sysid_sequence(self, prep_pose, max_limits):
         if self.sysid_calc is None:
-            self._report_error("System identification engine is unavailable")
+            self._report_error("Friction identification engine is unavailable")
             return
         not_ready = False
         has_payload = False
@@ -979,11 +979,11 @@ class ROS2Worker(QThread):
                 revision = snap.revision
         if has_payload:
             self._report_error(
-                "System Identification is not allowed while payload mass > 0 kg.\n"
+                "Friction Identification is not allowed while payload mass > 0 kg.\n"
                 "Unload the robot and set Payload Mass to 0.0 kg in Manual Control first.")
             return
         if not_ready:
-            self._report_error("Supervisor or identification worker is not ready")
+            self._report_error("Supervisor or friction identification worker is not ready")
             return
         # At 1 ms the full trajectory has tens of thousands of points. Preflight
         # and ROS message construction must block neither Qt nor ROS callbacks.
@@ -999,7 +999,7 @@ class ROS2Worker(QThread):
     def _sysid_preparation_progress(self, epoch, status):
         with self.state_lock:
             if self._stopping or epoch != self._prepare_epoch:
-                raise InterruptedError("SysID preparation canceled")
+                raise InterruptedError("Friction identification preparation canceled")
             self._set_sysid_preparation_status(status)
 
     def _prepare_sysid(self, epoch, revision, prep_pose, max_limits):
@@ -1045,13 +1045,13 @@ class ROS2Worker(QThread):
                     self._set_sysid_preparation_status("Waiting for Supervisor acceptance...")
                     proceed_send = True
             if state_changed_err:
-                self._report_error("System state changed during SysID preparation; start again when ready")
+                self._report_error("System state changed during friction identification preparation; start again when ready")
                 return
             if proceed_send:
                 if not self._stopping:
                     self.node.get_logger().info(engine.trajectory_summary + '; reference period 1 ms')
                     self.node.get_logger().info(
-                        f'SysID preparation: model/validation {generated - started:.3f} s, '
+                        f'Friction ID preparation: model/validation {generated - started:.3f} s, '
                         f'samples/message {time.monotonic() - generated:.3f} s, '
                         f'{len(trajectory.points)} points')
                 if not self._send_command(SupervisorCommand.Request.CMD_BEGIN_SYSID,
@@ -1066,7 +1066,7 @@ class ROS2Worker(QThread):
                 if self._stopping or epoch != self._prepare_epoch:
                     return
                 self._set_sysid_preparation_status("")
-            self._report_error(f"System identification setup failed: {exc}")
+            self._report_error(f"Friction identification setup failed: {exc}")
 
     def _begin_sysid_reply(self, resp, epoch):
         with self.state_lock:
@@ -1091,7 +1091,7 @@ class ROS2Worker(QThread):
                 return
             trajectory = self._prepared_trajectory
         if trajectory is None:
-            self._report_error("Prepared SysID trajectory unavailable")
+            self._report_error("Prepared friction identification trajectory unavailable")
             self._abort_sysid(session, "Excitation submission unavailable")
             return
         req = SubmitSysIdTrajectory.Request()
@@ -1104,7 +1104,7 @@ class ROS2Worker(QThread):
         if not self._sysid_phase_is(session, SupervisorState.SYSID_READY_FOR_EXCITATION):
             return
         if not self.sysid_client.service_is_ready():
-            self._report_error("Supervisor SysID trajectory service unavailable")
+            self._report_error("Supervisor friction identification trajectory service unavailable")
             self._abort_sysid(session, "Excitation submission unavailable")
             return
         try:
@@ -1127,10 +1127,10 @@ class ROS2Worker(QThread):
         try:
             resp = future.result()
             if not resp.accepted:
-                self._report_error(f"SysID trajectory rejected: {resp.message}")
+                self._report_error(f"Friction identification trajectory rejected: {resp.message}")
                 self._abort_sysid(session, resp.message)
         except Exception as exc:
-            self._report_error(f"SysID submission response failed: {exc}")
+            self._report_error(f"Friction identification submission response failed: {exc}")
             self._abort_sysid(session, "No trajectory acceptance response")
 
     def run_sysid_calculation(self, session):
@@ -1156,10 +1156,10 @@ class ROS2Worker(QThread):
             try:
                 archive = engine.save_recording(session, origin)
                 if not self._stopping:
-                    self.node.get_logger().info(f'SysID raw recording: {archive}')
+                    self.node.get_logger().info(f'Friction ID raw recording: {archive}')
             except Exception as exc:
                 if not self._stopping:
-                    self.node.get_logger().warn(f'Could not archive SysID recording: {exc}')
+                    self.node.get_logger().warn(f'Could not archive friction ID recording: {exc}')
             if origin is None:
                 raise ValueError("No CTC excitation start timestamp received")
             if not recorded:
@@ -1181,19 +1181,19 @@ class ROS2Worker(QThread):
                 # performs the same guarded return sequence and retains the cause.
                 archive_note = f'\n# Raw recording: {archive}' if archive is not None else ''
                 self.sysid_yaml_signal.emit('# Calculation Failed: ' + str(exc).replace('\n', '\n# ') + archive_note)
-                self._report_error(f"SysID estimation failed; restoring NORMAL: {exc}")
+                self._report_error(f"Friction identification failed; restoring NORMAL: {exc}")
                 if not self._send_command(
                         SupervisorCommand.Request.CMD_SYSID_CALCULATION_FAILED,
                         session=session, reason='\n'.join(str(exc).splitlines()[:2])[:1500],
                         done=lambda resp: self._calculation_done_reply(resp, session)):
-                    self._abort_sysid(session, "Cannot request controlled SysID exit")
+                    self._abort_sysid(session, "Cannot request controlled friction identification exit")
         finally:
             if archive is not None:
                 try:
                     archive.with_suffix('.txt').write_text(outcome, encoding='utf-8')
                 except OSError as exc:
                     if not self._stopping:
-                        self.node.get_logger().warn(f'Could not save SysID result: {exc}')
+                        self.node.get_logger().warn(f'Could not save friction ID result: {exc}')
             with self.state_lock:
                 self._calculation_active = False
 

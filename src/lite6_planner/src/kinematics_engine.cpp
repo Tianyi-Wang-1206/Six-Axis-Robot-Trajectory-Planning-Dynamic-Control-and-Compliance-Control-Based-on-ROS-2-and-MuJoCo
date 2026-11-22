@@ -223,7 +223,7 @@ void KinematicsEngine::raw_inverse_kinematics(const Eigen::Matrix4d& T, double c
     double t21, t22, t23, t24, t25, t26, t27, t28, t29, t30;
     double t31, t32, t33, t34, t35, t36, t37, t38, t39, t40, t41;
 
-    // Inverse kinematics calculations (Maple generated)
+    // Closed-form analytical inverse kinematics (symbolically derived)
     t1 = 0.1e1 / 0.16e2;
     t2 = R23 * t1 - Yt;
     t3 = R13 * t1 - Xt;
@@ -479,7 +479,7 @@ IKResult KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
     if(!valid) continue;
     if(branch_jump) {reject("branch jump",jump_detail);jumped=true;continue;}
     if(!joint_valid(q)) {reject_invalid(q);blocked=true;continue;}
-    // Seeded closed-loop pose correction (CLIK): keep the Maple branch,
+    // Seeded closed-loop pose correction (CLIK): keep the analytical IK branch,
     // but correct finite symbolic/model mismatch using a normalized SVD-DLS step.
     // Only a small local correction is permitted; this is NOT a new global IK.
     for(int iteration=0;iteration<8;++iteration) {

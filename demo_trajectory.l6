@@ -44,10 +44,11 @@ MoveC(
   vel=0.35, acc=0.35
 )
 
-# Approach from the side without palm collision and close gripper across the 30 mm X-width (0.30 kg box)
+# Approach from the side at z=55 mm without touching the stacked cylinder,
+# then close gripper across the 30 mm X-width (0.30 kg box + 0.30 kg stacked cylinder = 0.60 kg)
 MoveL(Pose(xyz=[0.240, 0.112, 0.055], rpy=[3.14159, 1.309, -1.5708]), vel=0.22, acc=0.25)
 Gripper(action=CLOSE, wait=true)
-SetPayload(mass=0.30, com=[0.0, 0.0, 0.0])
+SetPayload(mass=0.60, com=[0.0, 0.0, 0.0])
 Wait(duration=0.25)
 
 # 6. Large vertical MoveC arc (rise up, then descend to ~3.5 cm above tabletop)

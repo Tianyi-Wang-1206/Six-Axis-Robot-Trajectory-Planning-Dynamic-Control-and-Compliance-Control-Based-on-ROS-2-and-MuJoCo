@@ -1,4 +1,4 @@
-"""Background ROS 2 QThread client bridging Studio services/topics and PyQt5 signals."""
+"""Background ROS 2 QThread client bridging trajectory planner services/topics and PyQt5 signals."""
 
 import math
 import os
@@ -228,7 +228,7 @@ class StudioRosWorker(QThread):
 
         force=True bypasses the one-shot fallback latch; used for operator E-STOP
         requests, which are always sent to the controller in parallel with the
-        StudioCommand so a busy or hung Studio planner can never delay them.
+        StudioCommand so a busy or hung trajectory planner can never delay them.
         """
         if self._direct_estop_sent and not force:
             return
@@ -257,10 +257,10 @@ class StudioRosWorker(QThread):
                     StudioState.STATE_RECOVERING,
                 ):
                     self._send_direct_controller_estop(
-                        ctc_cmd_cli, "Studio supervisor heartbeat lost during motion"
+                        ctc_cmd_cli, "Trajectory supervisor heartbeat lost during motion"
                     )
                 self.supervisor_offline.emit(
-                    f"Studio supervisor heartbeat lost ({age:.2f} s)"
+                    f"Trajectory supervisor heartbeat lost ({age:.2f} s)"
                 )
 
     def _emit_telemetry(self, shm_reader, pin_model, pin_data, eef_frame_id):
@@ -395,14 +395,14 @@ class StudioRosWorker(QThread):
             elif kind == "command":
                 code = payload["code"]
                 if code == StudioCommand.Request.CMD_ESTOP:
-                    # CTC E-STOP is idempotent; the Studio supervisor follows by observation.
+                    # CTC E-STOP is idempotent; the trajectory supervisor follows by observation.
                     self._send_direct_controller_estop(
                         ctc_cmd_cli, payload["reason"] or "Operator E-STOP", force=True
                     )
                 if not command_cli.service_is_ready():
                     if code == StudioCommand.Request.CMD_ESTOP:
                         self._send_direct_controller_estop(
-                            ctc_cmd_cli, payload["reason"] or "Studio service unavailable"
+                            ctc_cmd_cli, payload["reason"] or "Trajectory planner service unavailable"
                         )
                     self.command_finished.emit(
                         code, False, "Service /studio/command is unavailable"

@@ -15,7 +15,7 @@ setup(
     zip_safe=True,
     maintainer='developer',
     maintainer_email='developer@robot.local',
-    description='Industrial trajectory programming Studio HMI for 6-DOF Robot',
+    description='Industrial trajectory programming IDE and HMI for 6-DOF Robot',
     license='BSD-3-Clause',
     entry_points={
         'console_scripts': [

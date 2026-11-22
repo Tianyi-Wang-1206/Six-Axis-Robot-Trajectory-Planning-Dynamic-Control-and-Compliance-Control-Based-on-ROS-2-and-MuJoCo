@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import QPlainTextEdit, QTextEdit, QWidget
 
 
 class Lite6ScriptHighlighter(QSyntaxHighlighter):
-    """Syntax highlighter for RobotScript motion programming DSL (light theme)."""
+    """Syntax highlighter for the trajectory programming DSL (light theme)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)

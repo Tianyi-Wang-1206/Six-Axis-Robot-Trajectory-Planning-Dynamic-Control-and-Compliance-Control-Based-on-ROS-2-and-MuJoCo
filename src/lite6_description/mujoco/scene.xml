@@ -1,4 +1,4 @@
-<mujoco model="Robot | Warm Studio">
+<mujoco model="Robot | Simulation Scene">
   <!-- The robot model is included unchanged. -->
   <include file="lite6.xml"/>
 
@@ -69,7 +69,7 @@
     <!-- Original 2.4 x 1.5 m bench. Its TOP surface is exactly z=0. -->
     <geom name="workbench_top" type="box" pos="0.3 0 -0.045"
           size="1.2 0.75 0.045" material="worktop"
-          solimp="0.99 0.999 0.0001" solref="0.002 1"/>
+          solimp="0.90 0.95 0.001" solref="0.004 1"/>
     <!-- Match the gripper contact impedance/reference time: equal-priority
          geoms blend solver parameters, so changing pads alone is insufficient.
          Keep zero contact margin, especially for cylinder/box support. -->
@@ -82,7 +82,7 @@
       <geom name="grasp_cylinder_geom" type="cylinder" size="0.015 0.05"
             group="4" mass="0.3" rgba="0.23 0.48 0.72 1" condim="4"
             friction="1 0.005 0.0001"
-            solimp="0.99 0.999 0.0001" solref="0.002 1"/>
+            solimp="0.90 0.95 0.001" solref="0.004 1"/>
     </body>
     <body name="grasp_box" pos="0.24 0.12 0.04" quat="0.707107 0 0 0.707107">
       <freejoint name="grasp_box_free"/>
@@ -90,7 +90,7 @@
       <geom name="grasp_box_geom" type="box" size="0.02 0.015 0.04"
             group="4" mass="0.3" rgba="0.82 0.43 0.18 1" condim="4"
             friction="1 0.005 0.0001"
-            solimp="0.99 0.999 0.0001" solref="0.002 1"/>
+            solimp="0.90 0.95 0.001" solref="0.004 1"/>
     </body>
     <geom class="studio_decor" type="box" pos="0.3 0 -0.105"
           size="1.16 0.71 0.015" material="frame"/>

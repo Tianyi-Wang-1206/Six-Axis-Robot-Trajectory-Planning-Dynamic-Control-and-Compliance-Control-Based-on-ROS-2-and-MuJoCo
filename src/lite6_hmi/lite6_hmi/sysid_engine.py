@@ -151,12 +151,12 @@ class SysIdEngine:
         if (q0.shape != (6,) or amplitudes.shape != (6,) or
                 not np.isfinite(q0).all() or not np.isfinite(amplitudes).all() or
                 np.any(amplitudes <= 0)):
-            raise ValueError('SysID needs six finite positions and positive amplitudes')
+            raise ValueError('Friction identification needs six finite positions and positive amplitudes')
         room = np.minimum(q0 - self.limits[:, 0], self.limits[:, 1] - q0)
         if np.any(room <= 0):
-            raise ValueError('SysID center must be strictly inside every joint limit')
+            raise ValueError('Friction identification center must be strictly inside every joint limit')
         if self._in_collision(q0):
-            raise ValueError('SysID center is in collision')
+            raise ValueError('Friction identification center is in collision')
         amplitudes = np.minimum(amplitudes, room) * self.LIMIT_MARGIN
         rng = np.random.RandomState(42)  # Local, reproducible candidate search.
         base_duration = 10.0
@@ -241,10 +241,10 @@ class SysIdEngine:
                 self.f0 = frequency / (2 * np.pi)
                 self.record_data.clear()
                 self.trajectory_summary = (
-                    f'Adaptive SysID: {duration:.2f} s, peak excursions [rad] '
+                    f'Adaptive Friction ID: {duration:.2f} s, peak excursions [rad] '
                     f'{np.round(np.max(np.abs(offsets), axis=0), 4).tolist()}')
                 return
-        raise ValueError('No sufficiently exciting collision-free SysID trajectory within limits; '
+        raise ValueError('No sufficiently exciting collision-free friction identification trajectory within limits; '
                          'choose a different center or larger excitation bounds')
 
     def generate_identification_trajectory(self, q0, max_pos_limits, progress=None):
@@ -261,7 +261,7 @@ class SysIdEngine:
     def _sample_times(cls, duration):
         ticks = int(round(duration / cls.SAMPLE_PERIOD))
         if abs(ticks * cls.SAMPLE_PERIOD - duration) > 1e-8:
-            raise ValueError('SysID duration must be an integer number of control ticks')
+            raise ValueError('Friction identification duration must be an integer number of control ticks')
         return np.arange(ticks + 1, dtype=np.int64) * cls.SAMPLE_PERIOD
 
     def trajectory_times(self):
@@ -306,7 +306,7 @@ class SysIdEngine:
         """Integrate on exact physics time; use ROS time only to locate the experiment."""
         samples = self.record_data
         if len(samples) < 5:
-            raise ValueError('Insufficient physical snapshots for system identification')
+            raise ValueError('Insufficient physical snapshots for friction identification')
         steps = np.array([d['step'] for d in samples], dtype=np.int64)
         command_seq = np.array([d['command_sequence'] for d in samples], dtype=np.int64)
         simulation = np.array([d['simulation_time'] for d in samples], dtype=float)
@@ -381,7 +381,7 @@ class SysIdEngine:
         if (not np.isfinite(t_seq).all() or np.any(np.diff(t_seq) <= 0) or
                 any(x.shape != (len(t_seq), 6) or not np.isfinite(x).all()
                     for x in (q_seq, dq_seq, tau_seq))):
-            raise ValueError('Invalid SysID samples or non-increasing timestamps')
+            raise ValueError('Invalid friction identification samples or non-increasing timestamps')
         if any(x.shape != (len(t_seq), 2) or not np.isfinite(x).all()
                for x in (gq_seq, gv_seq, ga_seq)):
             raise ValueError('Missing or invalid gripper dynamics feedback')
@@ -391,7 +391,7 @@ class SysIdEngine:
         dt_seq = np.diff(t_seq)
         dt_med = float(np.median(dt_seq))
         if np.max(dt_seq) > max(0.05, 5.0 * dt_med):
-            raise ValueError('SysID recording has telemetry gaps; refusing to interpolate missing experiments')
+            raise ValueError('Friction identification recording has telemetry gaps; refusing to interpolate missing experiments')
 
         n_samples = len(t_seq)
         full_q = np.column_stack((q_seq, gq_seq))

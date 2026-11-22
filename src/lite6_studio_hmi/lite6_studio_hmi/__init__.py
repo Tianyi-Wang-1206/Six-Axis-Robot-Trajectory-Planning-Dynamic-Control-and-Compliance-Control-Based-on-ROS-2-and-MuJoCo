@@ -1,1 +1,1 @@
-"""Robot Studio HMI package."""
+"""Robot Trajectory IDE HMI package."""

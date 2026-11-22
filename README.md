@@ -13,7 +13,7 @@
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-yellow.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 
-**Six-Axis Robot Simulation Framework** is an integrated **ROS 2 robot software architecture** for a six-axis robotic arm. It brings together **motion planning**, **computed torque control**, **robot dynamics**, **system identification**, a **PyQt5 GUI**, **gripper control**, and **MuJoCo physics simulation** in one inspectable stack. The project uses a simulated six-axis arm to study how a complete robot control system connects user commands to motion execution and feedback.
+**Six-Axis Robot Simulation Framework** is an integrated **ROS 2 robot software architecture** for a six-axis robotic arm. It brings together **motion planning**, **computed torque control**, **robot dynamics**, **friction identification**, a **PyQt5 GUI**, **gripper control**, and **MuJoCo physics simulation** in one inspectable stack. The project uses a simulated six-axis arm to study how a complete robot control system connects user commands to motion execution and feedback.
 
 A custom C++ planner implements **MoveJ, MoveP, MoveL and MoveC** with **analytical inverse kinematics**, **Coal / HPP-FCL collision detection**, singularity checks and **Ruckig jerk-limited trajectory generation**, without a MoveIt 2 dependency. An event-driven **Supervisor state machine** coordinates planning, execution, cancellation, software emergency stop, recovery and identification. A custom **ros2_control** controller runs **Computed Torque Control (CTC)** with **Pinocchio inverse dynamics**, rotor inertia compensation, **friction compensation**, and **integral control with anti-windup**.
 
@@ -243,22 +243,22 @@ Heartbeat monitoring, bounded waits and diagnostic propagation prevent missing f
   <img src="media/demo_estop.gif" width="1080" alt="Supervised software emergency stop and robot recovery"/>
 </p>
 
-### 4. Automated Friction System Identification
+### 4. Automated Friction Identification
 
-The **system identification (SysID)** workflow generates bounded **Fourier excitation trajectories**, checks motion limits and collisions, records physical samples, and fits joint **viscous and Coulomb friction** using nonnegative least squares. Known rigid-body torque and rotor inertia are subtracted before fitting. Rotor inertia and LuGre dynamic parameters are not estimated by this workflow.
+The **friction identification** workflow (internal protocol mode `SYSID`) generates bounded **Fourier excitation trajectories**, checks motion limits and collisions, records physical samples, and fits joint **viscous and Coulomb friction** using bounded least squares on generalized momentum integrals. Known rigid-body dynamics and rotor inertia are accounted for directly in the momentum balance; rotor inertia and LuGre dynamic parameters are not estimated by this workflow.
 
-Preparation and message construction run in the background with GUI progress updates. The Supervisor handles alignment, controller-mode changes, planner validation, excitation and the guarded return to NORMAL. Excitation references use a 1 ms grid. SYS_ID has separate endpoint tolerances because friction compensation and integral action are intentionally disabled.
+Preparation and message construction run in the background with GUI progress updates. The Supervisor handles alignment, controller-mode changes, planner validation, excitation and the guarded return to NORMAL. Excitation references use a 1 ms grid. Friction identification mode has separate endpoint tolerances because friction compensation and integral action are intentionally disabled.
 
 The `/simulation/sysid_samples` stream records physical step numbers, simulation time, ROS-mapped timestamps, position, velocity, applied effort, control period, physics lag and command age. It is separate from `/joint_states` and published only while subscribed. Experiment windows align to the first CTC execution cycle using the excitation action UUID.
 
-Repeated physical steps are removed before differentiation. A 0.1 s Savitzky–Golay derivative estimates acceleration; the first and last second are excluded from fitting. Useful samples require `|velocity| >= 0.05 rad/s`, with at least 200 samples and sufficient velocity variation per axis. Timing discontinuities, telemetry gaps and poor data quality are reported instead of silently producing parameters.
+Repeated physical steps are removed before integration. Generalized momentum balance is integrated directly on exact non-uniform `simulation_time` intervals (using piecewise-constant ZOH actuator torque from `command_sequence` and `command_age`), avoiding numerical acceleration differentiation. The first and last second are excluded from fitting, and post-reversal settled sliding windows require `|velocity| >= 0.08 rad/s` and `>= 0.008 rad` of unidirectional travel past reversal to avoid LuGre bristle transients. Timing discontinuities, telemetry gaps and poor data quality are reported instead of silently producing parameters.
 
 Raw experiments are saved as pickle-free `.npz` archives in a project-specific subdirectory of `ROS_HOME` (default `~/.ros`), together with a `.txt` result or failure report. The reported archive path identifies each recording. Output includes residuals, timing diagnostics and the YAML arrays `friction_v_nominal` (Nm·s/rad) and `friction_c_nominal` (Nm). Copy accepted results into the controller configuration and restart/reconfigure; estimation does not automatically retune the controller.
 
 An estimation-quality failure follows a supervised return to NORMAL while retaining its diagnostic. Motion failures, missing feedback and transition timeouts follow the protective state-machine handling.
 
 <p align="center">
-  <img src="media/demo_SYSID.gif" width="1080" alt="Fourier excitation and robot friction system identification"/>
+  <img src="media/demo_SYSID.gif" width="1080" alt="Fourier excitation and robot friction identification"/>
 </p>
 
 ### 5. PyQt5 GUI & Shadow Robot Visualization
@@ -404,7 +404,7 @@ Configuration entries below use actual basenames where applicable; the robot XML
 
 Application clients should use the supervised motion and command interfaces. Directly sending controller trajectories or mode commands bypasses parts of the orchestration contract.
 
-### Native MuJoCo Studio
+### Native MuJoCo Viewer
 
 The native MuJoCo/GLFW viewer uses MuJoCo's `mjv` / `mjr` renderer and perturbation APIs. The scene places the robot on a 2.4 × 1.5 m workbench, with the tabletop at `z=0` and floor 0.8 m below it. Tabletop and floor have physics collision geometry; decorative geometry is not automatically a planner obstacle. The HMI remains responsible for robot commands.
 

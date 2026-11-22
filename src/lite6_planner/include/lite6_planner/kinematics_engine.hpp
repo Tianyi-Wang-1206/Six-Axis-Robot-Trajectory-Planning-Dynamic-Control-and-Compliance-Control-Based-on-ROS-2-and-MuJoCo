@@ -81,7 +81,7 @@ public:
   double get_singularity_threshold() const { return singularity_threshold_; }
 
 private:
-  // Original Maple-generated closed-form IK is retained unchanged.
+  // Original symbolically derived closed-form IK is retained unchanged.
   void raw_inverse_kinematics(const Eigen::Matrix4d& T, double solutions[8][6]) const;
   std::array<JointLimit,6> joint_limits_{};
   CartesianLimit cart_limits_{};

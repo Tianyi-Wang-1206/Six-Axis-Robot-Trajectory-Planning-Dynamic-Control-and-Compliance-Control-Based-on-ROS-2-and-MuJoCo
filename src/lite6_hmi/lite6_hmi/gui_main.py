@@ -295,9 +295,9 @@ class PyQtHMI(QMainWindow):
         self.tabs.addTab(tab_manual, "Manual Control")
         self.setup_manual_tab(tab_manual)
 
-        # Tab B: System ID
+        # Tab B: Friction Identification
         tab_sysid = QWidget()
-        self.tabs.addTab(tab_sysid, "System Identification")
+        self.tabs.addTab(tab_sysid, "Friction Identification")
         self.setup_sysid_tab(tab_sysid)
 
         tab_gripper = QWidget()
@@ -624,7 +624,7 @@ class PyQtHMI(QMainWindow):
         tab_layout.setContentsMargins(10, 10, 10, 10)
         tab_layout.setSpacing(10)
 
-        ctl_group = QGroupBox("Trajectory Alignment and Excitation Bounds")
+        ctl_group = QGroupBox("Friction Identification: Alignment and Excitation Bounds")
         tab_layout.addWidget(ctl_group)
         ctl_layout = QVBoxLayout(ctl_group)
         ctl_layout.setSpacing(15)
@@ -633,7 +633,7 @@ class PyQtHMI(QMainWindow):
         prep_widget = QWidget()
         prep_layout = QVBoxLayout(prep_widget)
         prep_layout.setContentsMargins(0, 0, 0, 0)
-        prep_layout.addWidget(QLabel("Identification Workspace Center (degrees)", font=QFont("Segoe UI", 11, QFont.Bold)))
+        prep_layout.addWidget(QLabel("Friction Identification Workspace Center (degrees)", font=QFont("Segoe UI", 11, QFont.Bold)))
 
         prep_inputs_container = QWidget()
         prep_inputs_layout = QHBoxLayout(prep_inputs_container)
@@ -709,13 +709,13 @@ class PyQtHMI(QMainWindow):
         self.btn_sys_prep.clicked.connect(self.cmd_sysid_prep_align)
         ctl_layout.addWidget(self.btn_sys_prep)
 
-        self.btn_run_sysid = QPushButton("Start Automated Identification Routine")
+        self.btn_run_sysid = QPushButton("Start Automated Friction Identification")
         self.btn_run_sysid.setStyleSheet("background-color: #e74c3c; height: 40px; font-size: 12pt;")
         self.btn_run_sysid.clicked.connect(self.cmd_run_sysid)
         ctl_layout.addWidget(self.btn_run_sysid)
 
         # Output terminal representation
-        out_group = QGroupBox("Identified Matrix Parameters (YAML)")
+        out_group = QGroupBox("Identified Friction Parameters (YAML)")
         tab_layout.addWidget(out_group)
         out_layout = QVBoxLayout(out_group)
         out_layout.setContentsMargins(10, 15, 10, 10)
@@ -961,13 +961,13 @@ class PyQtHMI(QMainWindow):
         can_sysid = (state == Lite6StateMachine.IDLE) and (not preparation) and (not has_payload)
         self.btn_run_sysid.setEnabled(can_sysid)
         if has_payload and not preparation:
-            self.btn_run_sysid.setText("SysID Disabled (Payload > 0 kg)")
+            self.btn_run_sysid.setText("Friction ID Disabled (Payload > 0 kg)")
             self.btn_run_sysid.setToolTip(
-                "System Identification is disabled when payload is non-zero. Reset payload to 0 kg first."
+                "Friction Identification is disabled when payload is non-zero. Reset payload to 0 kg first."
             )
         else:
             self.btn_run_sysid.setText(
-                preparation if preparation else "Start Automated Identification Routine"
+                preparation if preparation else "Start Automated Friction Identification"
             )
             self.btn_run_sysid.setToolTip("")
 
@@ -981,10 +981,10 @@ class PyQtHMI(QMainWindow):
             state == Lite6StateMachine.IDLE and not preparation and not has_payload
         )
         if has_payload and not preparation:
-            self.btn_run_sysid.setText("SysID Disabled (Payload > 0 kg)")
+            self.btn_run_sysid.setText("Friction ID Disabled (Payload > 0 kg)")
         else:
             self.btn_run_sysid.setText(
-                preparation if preparation else "Start Automated Identification Routine")
+                preparation if preparation else "Start Automated Friction Identification")
         # Keep long per-branch diagnostics readable without expanding the banner.
         self.state_banner.setToolTip(error_msg)
         error_summary = error_msg.splitlines()[0] if error_msg else ""
@@ -993,7 +993,7 @@ class PyQtHMI(QMainWindow):
         if state == Lite6StateMachine.IDLE:
             if preparation:
                 self.set_banner_color("#8e44ad")
-                self.state_banner.setText(f"SYSID PREPARATION: {preparation}")
+                self.state_banner.setText(f"FRICTION ID PREPARATION: {preparation}")
             else:
                 self.set_banner_color("#27ae60") # Emerald
                 self.state_banner.setText("SYSTEM READY")
@@ -1003,7 +1003,7 @@ class PyQtHMI(QMainWindow):
         elif state == Lite6StateMachine.SOFT_ERROR:
             self.set_banner_color("#d35400") # Pumpkin Orange
             self.state_banner.setText(f"WARNING: {error_summary}")
-        elif state.startswith("SYSID"):
+        elif state.startswith("FRICTION ID"):
             self.set_banner_color("#8e44ad") # Amethyst purple
             self.state_banner.setText(state)
         else:
@@ -1174,7 +1174,7 @@ class PyQtHMI(QMainWindow):
             self.j_sliders[i].setValue(int(home_deg[i] * 100))
         self.cmd_move_j()
 
-    # === Automated SysID Sequencer Calls ===
+    # === Automated Friction Identification Sequencer Calls ===
     def _parse_sysid_inputs(self):
         prep_pose = []
         for i, entry in enumerate(self.sysid_prep_entries):
@@ -1220,7 +1220,7 @@ class PyQtHMI(QMainWindow):
         current_offset = np.abs(np.array(q_curr_copy) - np.array(prep_pose)).max()
         if current_offset > 0.02:
             res = QMessageBox.question(
-                self, "SysID Alignment",
+                self, "Friction Identification Alignment",
                 "Robot is not aligned with workspace center.\nPlan and align now?",
                 QMessageBox.Yes | QMessageBox.No
             )

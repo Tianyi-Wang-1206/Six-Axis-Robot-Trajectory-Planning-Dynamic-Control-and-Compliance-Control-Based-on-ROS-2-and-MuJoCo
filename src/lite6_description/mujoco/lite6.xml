@@ -1,4 +1,4 @@
-<mujoco model="ufactory_lite6">
+<mujoco model="robot_6dof">
   <compiler angle="radian" meshdir="assets" autolimits="true"/>
 
   <option
@@ -30,11 +30,12 @@
       </default>
       <default class="collision">
         <geom group="3" mass="0" density="0"/>
-        <!-- Stiff, critically damped pad/housing contact at the 0.1 ms physics
-             step. Keep impedance in (0,1) and match the grasp objects/table.
+        <!-- Well-conditioned, critically damped pad/housing contact at 0.1 ms step.
+             Matches grasp objects/table; avoids near-singular dmax=0.999 elliptic
+             solver spikes during stacked-object transport and settling.
              Zero margin preserves native mesh/cylinder contact generation. -->
         <default class="gripper_contact">
-          <geom solimp="0.99 0.999 0.0001" solref="0.002 1"/>
+          <geom solimp="0.90 0.95 0.001" solref="0.004 1"/>
         </default>
       </default>
       <site size="0.001" rgba="0.5 0.5 0.5 0.3" group="4"/>
@@ -164,7 +165,7 @@
   <!-- Mechanical jaw coupling only. STOP removes drive; no unlimited brake. -->
   <equality>
     <joint name="gripper_coupling" joint1="gripper_left_finger" joint2="gripper_right_finger" polycoef="0 -1 0 0 0"
-           solimp="0.99 0.999 0.0001" solref="0.002 1"/>
+           solimp="0.90 0.95 0.001" solref="0.004 1"/>
   </equality>
   <keyframe>
     <key name="home" qpos="0 0 0 0 0 0 -0.0081 0.0081" ctrl="0 0 0 0 0 0 0"/>

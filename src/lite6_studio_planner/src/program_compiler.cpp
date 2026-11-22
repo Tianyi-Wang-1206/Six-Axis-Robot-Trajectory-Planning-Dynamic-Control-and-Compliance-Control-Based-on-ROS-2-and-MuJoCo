@@ -1251,8 +1251,11 @@ bool ProgramCompiler::compile_pva_statement(
       T_nodes[k + 1] = wp.cart_pose;
       std::vector<std::array<double, 6>> sols;
       lite6_planner::IKDiagnostics ik_diag;
+      // Sparse MovePVA waypoints may span the full workspace (well beyond the per-step
+      // quadrant_jump_threshold); branch continuity is enforced densely along each
+      // interpolated segment inside eval_cart_segment().
       const auto status = engine_.solve_optimal_ik(
-        wp.cart_pose, q_nodes[k], sols, /*continuous=*/true, workspace, &ik_diag);
+        wp.cart_pose, q_nodes[k], sols, /*continuous=*/false, workspace, &ik_diag);
       if (status != IKResult::SUCCESS) {
         add_diag(
           out_diagnostics, D::STAGE_PLANNING, wp.loc, ik_error_code(status),
@@ -1380,7 +1383,7 @@ bool ProgramCompiler::compile_pva_statement(
           return false;
         }
         const int ticks = std::max(2, static_cast<int>(std::llround(seg.duration() * 1000.0)));
-        const int steps = full_1khz ? ticks : std::clamp(ticks, 16, 40);
+        const int steps = full_1khz ? ticks : std::clamp(ticks, 24, 64);
         const double dt_step = seg.duration() / static_cast<double>(steps);
 
         // Allow exact boundary speeds/accels that lie in (safety, 1.0] of the scaled limit.
@@ -1727,6 +1730,9 @@ bool ProgramCompiler::compile_pva_statement(
         sampled.samples.push_back(seg_samples[k]);
       }
       running_q = seg_samples.back().q;
+      q_nodes[seg_idx + 1] = running_q;
+      dq_nodes[seg_idx + 1] = seg_samples.back().dq;
+      ddq_nodes[seg_idx + 1] = seg_samples.back().ddq;
       t_accum = seg_samples.back().time_sec;
     }
     sampled.duration_sec = t_accum;

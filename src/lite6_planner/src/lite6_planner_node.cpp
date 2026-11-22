@@ -612,17 +612,17 @@ private:
             state.session_id==req.session_id&&state.sysid_phase==S::SYSID_VALIDATING&&
             !state.waiting_for_settle;
       };
-      if(!authorized()) throw std::runtime_error("SysID session is no longer ready");
+      if(!authorized()) throw std::runtime_error("Friction identification session is no longer ready");
       planner_.verify_trajectory(req.trajectory,true,[&authorized]{return !authorized();});
       for(size_t tick=0;tick<req.trajectory.points.size();++tick) {
         const auto& t=req.trajectory.points[tick].time_from_start;
         if(static_cast<int64_t>(t.sec)*1000000000LL+t.nanosec!=
             static_cast<int64_t>(tick)*1000000LL)
-          throw std::runtime_error("SysID references must use an exact 1 ms grid starting at zero");
+          throw std::runtime_error("Friction identification references must use an exact 1 ms grid starting at zero");
       }
     } catch(const std::exception& e) {
       supervisor_.end_excitation_validation(req.session_id);
-      resp.accepted=false;resp.message=std::string("SysID trajectory rejected: ")+e.what();
+      resp.accepted=false;resp.message=std::string("Friction identification trajectory rejected: ")+e.what();
       resp.revision=supervisor_.snapshot().revision;return;
     }
     // The Fourier reference must start at the current physical pose; no jump.
@@ -637,7 +637,7 @@ private:
         if(std::abs(req.trajectory.points.front().positions[i]-current.q[i])>0.05||
            std::abs(current.dq[i])>0.02) {
           resp.accepted=false;
-          resp.message="SysID reference start differs from stationary physical state";
+          resp.message="Friction identification reference start differs from stationary physical state";
           supervisor_.end_excitation_validation(req.session_id);
           resp.revision=supervisor_.snapshot().revision;
           return;

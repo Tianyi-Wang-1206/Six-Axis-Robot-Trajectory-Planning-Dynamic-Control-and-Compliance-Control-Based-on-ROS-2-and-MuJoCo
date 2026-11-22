@@ -22,7 +22,7 @@ constexpr auto kStoppingTimeout = std::chrono::seconds(5);
 // Bound for the controller to return to NORMAL after an accepted RESET_FAULT.
 constexpr auto kFaultResetTimeout = std::chrono::seconds(3);
 // An RT fault (fail_controller) makes controller_manager deactivate the CTC; it then
-// stops publishing status and no Studio command can bring it back.
+// stops publishing status and no trajectory command can bring it back.
 constexpr const char * kControllerLostHint =
   "No /ctc_controller/status heartbeat: ctc_controller may have been deactivated by "
   "controller_manager after an RT fault (non-finite feedback, effort write failure or "
@@ -297,11 +297,11 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
         effects.cancel_controller_goals = true;
         effects.send_estop_cmd = true;
         enter_estop_unlocked(
-          "Unexpected controller mode during active studio execution",
+          "Unexpected controller mode during active trajectory execution",
           CS::ESTOP_TRAJECTORY_MODE_CHANGED, effects);
         changed = true;
       } else if (snap_.state != S::STATE_ESTOP && snap_.state != S::STATE_FAULT) {
-        enter_fault_unlocked(-11, "Controller is in incompatible mode for Studio execution");
+        enter_fault_unlocked(-11, "Controller is in incompatible mode for trajectory execution");
         changed = true;
       }
     }

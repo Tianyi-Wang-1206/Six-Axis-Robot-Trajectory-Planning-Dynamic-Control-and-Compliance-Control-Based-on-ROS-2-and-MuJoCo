@@ -3,7 +3,7 @@
 <package format="3">
   <name>lite6_studio_hmi</name>
   <version>0.1.0</version>
-  <description>Industrial trajectory programming Studio HMI for 6-DOF Robot</description>
+  <description>Industrial trajectory programming IDE and HMI for 6-DOF Robot</description>
   <maintainer email="developer@robot.local">developer</maintainer>
   <license>BSD-3-Clause</license>
 

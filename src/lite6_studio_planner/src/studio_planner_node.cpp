@@ -154,7 +154,7 @@ public:
 
     worker_thread_ = std::thread([this]() { worker_loop(); });
     publish_snapshot(supervisor_->snapshot());
-    RCLCPP_INFO(get_logger(), "Robot Studio Planner node started");
+    RCLCPP_INFO(get_logger(), "Trajectory Programming Planner node started");
   }
 
   ~StudioPlannerNode() override
@@ -279,12 +279,12 @@ private:
   {
     if (effects.send_estop_cmd) {
       send_controller_command_async(
-        ControllerCommand::Request::CMD_ESTOP, 0, "StudioSupervisor E-STOP");
+        ControllerCommand::Request::CMD_ESTOP, 0, "Trajectory supervisor E-STOP");
     }
     if (effects.send_enter_normal_cmd) {
       send_controller_command_async(
         ControllerCommand::Request::CMD_ENTER_NORMAL, effects.controller_epoch,
-        "StudioSupervisor enter NORMAL");
+        "Trajectory supervisor enter NORMAL");
     }
     if (effects.cancel_controller_goals) {
       cancel_active_controller_goals();
@@ -809,7 +809,7 @@ private:
           const bool ok = send_controller_command_sync(
             ControllerCommand::Request::CMD_CLEAR_ESTOP,
             epoch,
-            "Studio E-STOP recovery via CMD_CLEAR_ESTOP",
+            "Trajectory planner E-STOP recovery via CMD_CLEAR_ESTOP",
             ack,
             err,
             &ack_mode);
@@ -867,7 +867,7 @@ private:
           const bool ok = send_controller_command_sync(
             ControllerCommand::Request::CMD_ENTER_NORMAL,
             snap.controller_epoch,
-            "Studio exiting held Cartesian impedance to MODE_NORMAL",
+            "Trajectory planner exiting held Cartesian impedance to MODE_NORMAL",
             ack, msg, &ack_mode);
           last_send = now_tp;
           const bool transient =
@@ -1751,7 +1751,7 @@ private:
     req->expected_epoch = supervisor_->snapshot().controller_epoch;
     req->payload_mass = blk.payload_cmd.mass_kg;
     req->payload_com_tcp = blk.payload_cmd.com_tcp;
-    req->reason = "Studio DSL SetPayload";
+    req->reason = "Trajectory DSL SetPayload";
 
     auto future = ctc_cmd_client_->async_send_request(req);
     if (future.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready) {

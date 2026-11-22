@@ -143,7 +143,7 @@ bool Lite6CTCController::valid_splice_goal(const FollowTrajectory::Goal & goal) 
     return false;
   }
   // Seamless switch: the first splice sample must equal the parent sample at the same
-  // time (Studio copies it verbatim), and must lie strictly before the parent's end.
+  // time (the trajectory planner copies it verbatim), and must lie strictly before the parent's end.
   const auto & parent_points = parent->goal->get_goal()->trajectory.points;
   const auto & first = goal.trajectory.points.front();
   const double t_switch = seconds(first.time_from_start);

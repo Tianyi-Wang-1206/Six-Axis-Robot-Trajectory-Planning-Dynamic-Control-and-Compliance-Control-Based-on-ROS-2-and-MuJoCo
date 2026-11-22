@@ -107,7 +107,7 @@ public:
         }
       }
     }
-    window_.reset(glfwCreateWindow(width, height, "Robot | MuJoCo Studio", nullptr, nullptr));
+    window_.reset(glfwCreateWindow(width, height, "Robot | MuJoCo Viewer", nullptr, nullptr));
     if (!window_) {throw std::runtime_error("Cannot create an OpenGL window (check DISPLAY)");}
     glfwMakeContextCurrent(window_.get());
     glfwSwapInterval(1);
@@ -194,7 +194,7 @@ public:
           !fresh ? "CONNECTING" : (active_ ? "LIVE" : "PHYSICS STOPPED"),
           fps, data_->time, perturb_.active ? "  |  MOUSE FORCE" : "");
         mjr_overlay(mjFONT_NORMAL, mjGRID_TOPLEFT, viewport,
-          "ROBOT / MUJOCO STUDIO", status, &context_);
+          "ROBOT / MUJOCO VIEWER", status, &context_);
         if (help_) {
           mjr_overlay(mjFONT_NORMAL, mjGRID_BOTTOMLEFT, viewport,
             "Orbit / pan / zoom\nSelect body\nApply force / torque\nView / shadow / help",

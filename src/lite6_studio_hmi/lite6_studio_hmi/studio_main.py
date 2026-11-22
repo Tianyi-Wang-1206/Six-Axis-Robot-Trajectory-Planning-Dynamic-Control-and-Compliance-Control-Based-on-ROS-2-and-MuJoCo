@@ -1,4 +1,4 @@
-"""Entry point for Robot Studio HMI Qt5 application."""
+"""Entry point for the Robot Trajectory IDE Qt5 application."""
 
 import signal
 import sys
@@ -46,7 +46,7 @@ def main(args=None):
     except AttributeError:
         pass
     app = QApplication(sys.argv)
-    app.setApplicationName("Robot Industrial Studio")
+    app.setApplicationName("Robot Trajectory IDE")
     _apply_light_palette(app)
 
     worker = StudioRosWorker()

@@ -1,108 +1,109 @@
-"""Built-in RobotScript example programs for Robot Studio HMI."""
+"""Built-in trajectory script example programs for the Robot Trajectory IDE."""
 
 PRESET_PROGRAMS = {
-    "1. Chaotic 10-Point Cartesian PVA (MovePVA)": """# 10-point Cartesian (P, V, A) C3 Septic Hermite interpolation demo.
-# Waypoints 1-9 specify varied chaotic 6-DOF poses, twists, and accelerations;
-# waypoint 10 brings the robot smoothly to rest at the ready pose.
+    "1. Chaotic 10-Point Cartesian PVA (Full Workspace)": """# 10-point full-workspace Cartesian (P, V, A) C3 Septic Hermite demo.
+# Waypoints 1-9 whip across front, left, behind (-X), right, and high overhead (z up to 0.63 m)
+# with varied chaotic 6-DOF poses, twists, and accelerations; waypoint 10 brings the robot smoothly to rest.
 joint READY = [0.0, 0.35, 1.0, 0.0, 0.65, 0.0]
 
 SetPayload(mass=0.0)
-MoveJ(READY, vel=0.55, acc=0.55)
+MoveJ(READY, vel=0.60, acc=0.60)
 
-MovePVA(space=CARTESIAN, vel=0.85, acc=0.85) {
+MovePVA(space=CARTESIAN, vel=0.90, acc=0.90) {
   point(
-    p=Pose(xyz=[0.2124,  0.1338, 0.2533], rpy=[-2.8336, -0.1187,  0.5317]),
-    v=[ 0.031,  0.070,  0.003,  0.107, -0.265,  0.482],
-    a=[ 0.206, -0.043, -0.125, -0.262, -0.303, -0.853]
+    p=Pose(xyz=[ 0.1729,  0.2923,  0.5212], rpy=[-2.5877, -1.1256,  0.7407]),
+    v=[-0.125,  0.088,  0.018,  0.016, -0.077,  0.357],
+    a=[ 0.096, -0.019, -0.270, -0.627,  0.651, -0.452]
   )
   point(
-    p=Pose(xyz=[0.2587,  0.2382, 0.2156], rpy=[ 2.9115, -0.2390,  1.5524]),
-    v=[-0.027,  0.003, -0.005, -0.172, -0.202,  0.349],
-    a=[ 0.020, -0.129,  0.145,  0.057, -0.109, -0.288]
+    p=Pose(xyz=[-0.0818,  0.2619,  0.1772], rpy=[ 2.7891,  0.0936,  1.9541]),
+    v=[-0.085, -0.049, -0.010, -0.087, -0.103,  0.468],
+    a=[ 0.035,  0.101,  0.043,  0.319,  0.528,  0.050]
   )
   point(
-    p=Pose(xyz=[0.2307,  0.0416, 0.2331], rpy=[ 2.8858,  0.1584,  0.9546]),
-    v=[ 0.003, -0.083, -0.050, -0.226,  0.138, -0.193],
-    a=[-0.037,  0.058, -0.046,  0.240,  0.158, -0.150]
+    p=Pose(xyz=[-0.2934, -0.0279,  0.5823], rpy=[-2.4233, -1.3333,  2.7146]),
+    v=[-0.055, -0.052, -0.077,  0.110, -0.201,  0.195],
+    a=[-0.136, -0.028, -0.292,  0.067, -0.865, -0.006]
   )
   point(
-    p=Pose(xyz=[0.3409, -0.0639, 0.1991], rpy=[ 2.6372, -0.0843,  0.5830]),
-    v=[ 0.027, -0.071,  0.063,  0.084, -0.363, -0.266],
-    a=[-0.230, -0.129, -0.096,  0.087,  0.647, -0.780]
+    p=Pose(xyz=[-0.1894, -0.2092,  0.1770], rpy=[ 2.6821,  0.0435, -2.2083]),
+    v=[ 0.008, -0.009,  0.037, -0.145,  0.164, -0.058],
+    a=[-0.045, -0.179,  0.201, -1.253, -0.065, -0.113]
   )
   point(
-    p=Pose(xyz=[0.1890, -0.1308, 0.2240], rpy=[ 2.8432, -0.0359, -0.6136]),
-    v=[ 0.006, -0.016,  0.062,  0.080, -0.352, -0.816],
-    a=[ 0.115, -0.048, -0.159,  0.070, -0.012,  0.572]
+    p=Pose(xyz=[-0.2256, -0.0067,  0.6276], rpy=[-2.0318, -1.4591,  2.1900]),
+    v=[ 0.035,  0.126,  0.052, -0.046,  0.189, -0.608],
+    a=[ 0.011, -0.044, -0.074,  0.366, -0.194, -0.143]
   )
   point(
-    p=Pose(xyz=[0.2535, -0.2487, 0.2100], rpy=[-2.8741, -0.2128, -1.6644]),
-    v=[ 0.028, -0.043,  0.071, -0.165, -0.290, -0.150],
-    a=[-0.182,  0.200, -0.139,  0.934,  0.783,  0.266]
+    p=Pose(xyz=[ 0.0620,  0.2693,  0.1736], rpy=[ 2.7415,  0.1139,  1.5819]),
+    v=[ 0.098, -0.063, -0.005, -0.169, -0.107, -0.340],
+    a=[-0.203,  0.057,  0.150,  0.473,  0.524,  0.197]
   )
   point(
-    p=Pose(xyz=[0.2363, -0.0442, 0.2393], rpy=[-2.8578,  0.1770, -1.0515]),
-    v=[ 0.022,  0.036, -0.007,  0.246, -0.066,  0.199],
-    a=[ 0.206, -0.138,  0.128, -0.441, -1.141, -0.318]
+    p=Pose(xyz=[ 0.2180,  0.1096,  0.6175], rpy=[-2.4493, -1.4760, -0.0711]),
+    v=[-0.043, -0.089,  0.067,  0.001, -0.274, -0.329],
+    a=[ 0.230,  0.077, -0.308, -0.281,  1.314, -0.093]
   )
   point(
-    p=Pose(xyz=[0.3449,  0.0443, 0.1998], rpy=[-2.6216, -0.0266, -0.7454]),
-    v=[ 0.000,  0.060,  0.036,  0.005, -0.118,  0.390],
-    a=[-0.116, -0.020,  0.057,  0.157,  0.256,  0.461]
+    p=Pose(xyz=[ 0.0873, -0.2605,  0.1795], rpy=[ 2.7538,  0.1271, -1.0711]),
+    v=[-0.142, -0.106,  0.047, -0.261, -0.176, -0.492],
+    a=[-0.055, -0.092,  0.087, -0.614, -0.415, -0.080]
   )
   point(
-    p=Pose(xyz=[0.2009,  0.1058, 0.2102], rpy=[-2.8422,  0.0354,  0.3925]),
-    v=[-0.035, -0.063, -0.050, -0.345, -0.002,  0.204],
-    a=[ 0.248, -0.064,  0.045, -0.046, -0.545, -0.968]
+    p=Pose(xyz=[-0.1371, -0.3031,  0.5162], rpy=[-2.8316, -1.1182, -2.0895]),
+    v=[ 0.133, -0.051,  0.071, -0.328, -0.181,  0.382],
+    a=[ 0.009, -0.085, -0.305,  0.986, -0.200,  0.223]
   )
   point(
-    p=Pose(xyz=[0.2757,  0.0000, 0.1594], rpy=[ 3.14159, 0.0,    0.0]),
+    p=Pose(xyz=[ 0.2757,  0.0000,  0.1594], rpy=[ 3.14159, 0.0,    0.0]),
     v=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     a=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   )
 }
 """,
-    "2. Cartesian Path Blending (Stop-and-Go vs Smooth)": """# Cartesian trajectory splicing comparison in robot base frame (+Y is left, -Y is right):
-# 1. Leave ZERO and move to READY joint configuration.
-# 2. Loop 1 (no blending): zigzag MoveL to the left (+Y), MoveC arc across to the right (-Y),
-#    and zigzag MoveL back to READY, stopping at every corner (rest-to-rest).
-# 3. Loop 2 (smooth C3 corner blending): exact same geometric route in one continuous motion.
-joint READY = [0.0, 0.35, 1.0, 0.0, 0.65, 0.0]
+    "2. Horizontal Cartesian Path Blending (Stop-and-Go vs Smooth)": """# Large horizontal-plane (z = 0.250 m) Cartesian trajectory splicing comparison
+# in robot base frame (+Y is left, -Y is right):
+# 1. Leave ZERO and move to READY on the z = 0.250 m plane ([0.260, 0.000, 0.250]).
+# 2. Loop 1 (no blending): wide horizontal zigzag MoveL left (+Y), wide MoveC arc
+#    across to the right (-Y), and zigzag MoveL back to READY, stopping at every corner.
+# 3. Loop 2 (smooth C3 corner blending): exact same horizontal route in one continuous motion.
+joint READY = [0.0, 0.1066, 1.1100, 0.0, 1.0034, 0.0]
 
 SetPayload(mass=0.0)
-MoveJ(READY, vel=0.55, acc=0.55)
+MoveJ(READY, vel=0.60, acc=0.60)
 
-# --- Loop 1: Exact stop-and-go at every corner (blend = 0) ---
-MoveL(Pose(xyz=[0.220,  0.040, 0.210], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55)
-MoveL(Pose(xyz=[0.310,  0.080, 0.165], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55)
-MoveL(Pose(xyz=[0.220,  0.120, 0.215], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55)
-MoveL(Pose(xyz=[0.295,  0.160, 0.180], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55)
+# --- Loop 1: Exact stop-and-go at every corner on z = 0.250 m plane (blend = 0) ---
+MoveL(Pose(xyz=[0.165,  0.070, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
+MoveL(Pose(xyz=[0.335,  0.135, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
+MoveL(Pose(xyz=[0.165,  0.200, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
+MoveL(Pose(xyz=[0.240,  0.275, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
 MoveC(
-  via=[0.345, 0.000, 0.245],
-  target=Pose(xyz=[0.295, -0.160, 0.180], rpy=[3.14159, 0.0, 0.0]),
-  vel=0.55, acc=0.55
+  via=[0.370, 0.000, 0.250],
+  target=Pose(xyz=[0.240, -0.275, 0.250], rpy=[3.14159, 0.0, 0.0]),
+  vel=0.65, acc=0.65
 )
-MoveL(Pose(xyz=[0.220, -0.120, 0.215], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55)
-MoveL(Pose(xyz=[0.310, -0.080, 0.165], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55)
-MoveL(Pose(xyz=[0.220, -0.040, 0.210], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55)
-MoveL(Pose(xyz=[0.2757, 0.000, 0.1594], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55)
+MoveL(Pose(xyz=[0.165, -0.200, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
+MoveL(Pose(xyz=[0.335, -0.135, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
+MoveL(Pose(xyz=[0.165, -0.070, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
+MoveL(Pose(xyz=[0.260,  0.000, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
 
 Wait(duration=0.50)
 
-# --- Loop 2: Same route with smooth C3 corner blending ---
-MoveL(Pose(xyz=[0.220,  0.040, 0.210], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55, blend=0.018)
-MoveL(Pose(xyz=[0.310,  0.080, 0.165], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55, blend=0.018)
-MoveL(Pose(xyz=[0.220,  0.120, 0.215], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55, blend=0.018)
-MoveL(Pose(xyz=[0.295,  0.160, 0.180], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55, blend=0.018)
+# --- Loop 2: Same horizontal route with smooth C3 corner blending ---
+MoveL(Pose(xyz=[0.165,  0.070, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65, blend=0.025)
+MoveL(Pose(xyz=[0.335,  0.135, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65, blend=0.025)
+MoveL(Pose(xyz=[0.165,  0.200, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65, blend=0.025)
+MoveL(Pose(xyz=[0.240,  0.275, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65, blend=0.025)
 MoveC(
-  via=[0.345, 0.000, 0.245],
-  target=Pose(xyz=[0.295, -0.160, 0.180], rpy=[3.14159, 0.0, 0.0]),
-  vel=0.55, acc=0.55, blend=0.018
+  via=[0.370, 0.000, 0.250],
+  target=Pose(xyz=[0.240, -0.275, 0.250], rpy=[3.14159, 0.0, 0.0]),
+  vel=0.65, acc=0.65, blend=0.025
 )
-MoveL(Pose(xyz=[0.220, -0.120, 0.215], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55, blend=0.018)
-MoveL(Pose(xyz=[0.310, -0.080, 0.165], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55, blend=0.018)
-MoveL(Pose(xyz=[0.220, -0.040, 0.210], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55, blend=0.018)
-MoveL(Pose(xyz=[0.2757, 0.000, 0.1594], rpy=[3.14159, 0.0, 0.0]), vel=0.55, acc=0.55)
+MoveL(Pose(xyz=[0.165, -0.200, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65, blend=0.025)
+MoveL(Pose(xyz=[0.335, -0.135, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65, blend=0.025)
+MoveL(Pose(xyz=[0.165, -0.070, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65, blend=0.025)
+MoveL(Pose(xyz=[0.260,  0.000, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=0.65, acc=0.65)
 """,
     "3. Compliant Stack & Side-Grasp Arc (300 g Objects)": """# Full physical manipulation demo matching scene.xml object positions:
 # - Cylinder at [0.24, -0.15, 0.05] (height 100 mm, dia 30 mm, mass 0.30 kg)
@@ -150,10 +151,11 @@ MoveC(
   vel=0.35, acc=0.35
 )
 
-# Approach from the side without palm collision and close gripper across the 30 mm X-width (0.30 kg box)
+# Approach from the side at z=55 mm without touching the stacked cylinder,
+# then close gripper across the 30 mm X-width (0.30 kg box + 0.30 kg stacked cylinder = 0.60 kg)
 MoveL(Pose(xyz=[0.240, 0.112, 0.055], rpy=[3.14159, 1.309, -1.5708]), vel=0.22, acc=0.25)
 Gripper(action=CLOSE, wait=true)
-SetPayload(mass=0.30, com=[0.0, 0.0, 0.0])
+SetPayload(mass=0.60, com=[0.0, 0.0, 0.0])
 Wait(duration=0.25)
 
 # 6. Large vertical MoveC arc (rise up, then descend to ~3.5 cm above tabletop)
