@@ -48,7 +48,7 @@ public:
   // else from the default scales and location.
   static bool solve(
     const JointPath & path,
-    const CompositeCartesianPath * cart_path,
+    const CartesianPath * cart_path,
     const std::array<lite6_planner::JointLimit, 6> & joint_limits,
     const lite6_planner::CartesianLimit & cart_limits,
     double default_vel_scale,

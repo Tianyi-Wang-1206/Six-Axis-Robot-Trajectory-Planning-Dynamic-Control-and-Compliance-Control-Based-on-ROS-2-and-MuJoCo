@@ -1015,13 +1015,17 @@ class StudioMainWindow(QMainWindow):
         if resp.success:
             self._compiled_program_id = resp.program_id
             self._mark_source_dirty(False)
+            warn_count = sum(1 for d in self._diagnostics if d.severity == CompileDiagnostic.SEVERITY_WARNING)
+            warn_suffix = f" | Warnings: {warn_count}" if warn_count > 0 else ""
             summary = (
                 f"Compile OK | Statements: {resp.total_statements} | "
                 f"Blocks: {resp.total_blocks} | Est. Time: {resp.estimated_duration_sec:.2f} s | "
-                f"1 kHz Samples: {resp.total_samples_1khz}"
+                f"1 kHz Samples: {resp.total_samples_1khz}{warn_suffix}"
             )
             self.lbl_compile_summary.setText(summary)
-            self.lbl_compile_summary.setStyleSheet("color: #15803D; font-weight: 600;")
+            self.lbl_compile_summary.setStyleSheet(
+                "color: #B45309; font-weight: 600;" if warn_count > 0 else "color: #15803D; font-weight: 600;"
+            )
             self.append_log(summary)
         else:
             err_count = sum(1 for d in self._diagnostics if d.severity == CompileDiagnostic.SEVERITY_ERROR)

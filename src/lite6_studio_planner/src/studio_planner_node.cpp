@@ -1059,8 +1059,16 @@ private:
             if (!compiler_->replan_block_from_start(
                   block_to_run, q_actual, replanned_blk, diags))
             {
-              const std::string reason = diags.empty() ?
-                "Unknown planning error" : diags.front().message;
+              std::string reason = "Unknown planning error";
+              for (const auto & d : diags) {
+                if (d.severity == Diagnostic::SEVERITY_ERROR) {
+                  reason = d.message;
+                  break;
+                }
+              }
+              if (reason == "Unknown planning error" && !diags.empty()) {
+                reason = diags.front().message;
+              }
               StudioSupervisor::Effects eff;
               supervisor_->on_execution_fault(
                 session, -5, "Post-impedance trajectory replanning failed: " + reason, false, eff);

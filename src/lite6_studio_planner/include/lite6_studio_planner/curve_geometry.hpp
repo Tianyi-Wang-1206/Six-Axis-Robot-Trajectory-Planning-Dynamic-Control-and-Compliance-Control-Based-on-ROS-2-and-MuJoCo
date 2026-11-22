@@ -41,14 +41,31 @@ public:
   virtual MotionOptions options() const = 0;
 };
 
+// Abstract normalized Cartesian path parameterized on u in [0, 1].
+class CartesianPath
+{
+public:
+  virtual ~CartesianPath() = default;
+
+  // Length of the path in pseudo arc length [m].
+  virtual double total_length() const = 0;
+
+  // Evaluates the path at normalized parameter u in [0, 1].
+  // Derivatives in the returned CartesianSample are taken with respect to u.
+  virtual CartesianSample eval_normalized(double u) const = 0;
+
+  // Normalized parameters in (0, 1) where one piece or spline segment ends and the next begins.
+  virtual std::vector<double> piece_boundaries() const = 0;
+};
+
 // Composite C^3 continuous Cartesian path built from one or more blended motion statements.
-class CompositeCartesianPath
+class CompositeCartesianPath : public CartesianPath
 {
 public:
   CompositeCartesianPath() = default;
 
   // Builds a composite Cartesian path from a sequence of MoveL / MoveC statements
-  // starting from initial_pose, inserting C^3 septic corner blends (position and
+  // starting from initial_pose, inserting C^3 Bernstein/Bezier corner blends (position and
   // orientation) wherever blend_radius > 0 between consecutive segments.
   bool build(
     const Eigen::Matrix4d & initial_pose,
@@ -57,15 +74,11 @@ public:
     std::string & err_code,
     std::string & err_msg);
 
-  // Length of the (possibly restricted) path in pseudo arc length [m].
-  double total_length() const { return total_length_; }
+  double total_length() const override { return total_length_; }
 
-  // Evaluates the path at normalized parameter u in [0, 1].
-  // Derivatives in the returned CartesianSample are taken with respect to u.
-  CartesianSample eval_normalized(double u) const;
+  CartesianSample eval_normalized(double u) const override;
 
-  // Normalized parameters in (0, 1) where one curve piece ends and the next begins.
-  std::vector<double> piece_boundaries() const;
+  std::vector<double> piece_boundaries() const override;
 
   // Returns the sub-path [u_start, 1] of this path, re-normalized to [0, 1].
   CompositeCartesianPath restricted(double u_start) const;
@@ -77,12 +90,85 @@ private:
   double total_length_ = 0.0;
 };
 
+// Smooth Cartesian spline through a sequence of SE(3) poses:
+//   - Position: globally C^3 natural septic spline parameterized by pseudo arc length.
+//   - Orientation: piecewise Lie-algebra septic Hermite spline matching continuous world
+//     angular velocity and angular acceleration across all interior waypoints.
+class C3CartesianSpline : public CartesianPath
+{
+public:
+  C3CartesianSpline() = default;
+
+  bool build(
+    const std::vector<Eigen::Matrix4d> & poses,
+    const std::vector<SourceLocation> & seg_locs,
+    const MotionOptions & opts,
+    std::string & err_msg);
+
+  double total_length() const override { return total_length_; }
+
+  CartesianSample eval_normalized(double u) const override;
+
+  std::vector<double> piece_boundaries() const override;
+
+private:
+  struct Segment
+  {
+    double u0 = 0.0;
+    double h = 1.0;
+    Eigen::Matrix3d R0 = Eigen::Matrix3d::Identity();
+    std::array<Eigen::Vector3d, 8> p_c{};
+    std::array<Eigen::Vector3d, 8> r_c{};
+    SourceLocation loc;
+  };
+  std::vector<Segment> segments_;
+  MotionOptions opts_;
+  double total_length_ = 1e-6;
+};
+
+// Timed C^3 Cartesian Hermite segment in SE(3) matching
+//   (T0, V0=[v0;w0], A0=[a0;alpha0], j0=0) -> (T1, V1=[v1;w1], A1=[a1;alpha1], j1=0)
+// over [0, T], with analytic position and SO(3) Lie-algebra derivatives.
+class CartesianHermiteSegment
+{
+public:
+  CartesianHermiteSegment() = default;
+
+  // Returns false if relative orientation angle is too close to pi (SO(3) cut-locus)
+  // or inputs are non-finite.
+  bool build_with_duration(
+    const Eigen::Matrix4d & T0,
+    const Vec6 & V0,
+    const Vec6 & A0,
+    const Eigen::Matrix4d & T1,
+    const Vec6 & V1,
+    const Vec6 & A1,
+    double duration);
+
+  double duration() const { return duration_; }
+
+  void eval(
+    double t,
+    Eigen::Matrix4d & pose,
+    Vec6 & vel,
+    Vec6 & acc,
+    Eigen::Vector3d & pos_jrk) const;
+
+private:
+  Eigen::Matrix3d R0_ = Eigen::Matrix3d::Identity();
+  std::array<Eigen::Vector3d, 8> p_c_{};
+  std::array<Eigen::Vector3d, 8> r_c_{};
+  double duration_ = 0.002;
+};
+
 // Geometric joint-space path q(u), u in [0, 1], with analytic derivatives.
 class JointPath
 {
 public:
   virtual ~JointPath() = default;
   virtual void eval(double u, Vec6 & q, Vec6 & q_u, Vec6 & q_uu, Vec6 & q_uuu) const = 0;
+  // Normalized parameters in (0, 1) where geometric pieces meet.
+  virtual std::vector<double> piece_boundaries() const { return {}; }
   // Per-u motion options and source location; returns false to use caller defaults.
   virtual bool options_at(double u, MotionOptions & opts, SourceLocation & loc) const
   {
@@ -120,10 +206,6 @@ public:
 
   void eval(double u, Vec6 & q, Vec6 & q_u, Vec6 & q_uu, Vec6 & q_uuu) const override;
 
-  const Vec6 & max_q1() const { return max_q1_; }
-  const Vec6 & max_q2() const { return max_q2_; }
-  const Vec6 & max_q3() const { return max_q3_; }
-
 private:
   struct Segment
   {
@@ -131,17 +213,12 @@ private:
     double h = 1.0;
     std::array<Vec6, 8> c{};
   };
-  void finalize_bounds();
   std::vector<Segment> segments_;
-  Vec6 max_q1_ = Vec6::Zero();
-  Vec6 max_q2_ = Vec6::Zero();
-  Vec6 max_q3_ = Vec6::Zero();
 };
 
-// Joint-space polyline through waypoints with explicit C^3 septic corner blends,
-// parameterized by joint-space arc length (normalized to u in [0, 1]).
-// Straight pieces have |dq/ds| = 1; blend pieces replace each corner region
-// [W_k - trim_in * e_in, W_k + trim_out * e_out].
+// Joint-space polyline through waypoints with explicit C^3 degree-7 Bernstein/Bezier
+// corner blends whose control points lie inside each corner triangle [a, W, b]
+// (guaranteeing the convex-hull property and preventing corner overshoot).
 class JointCompositePath : public JointPath
 {
 public:
@@ -163,6 +240,7 @@ public:
   double total_length() const { return total_length_; }
 
   void eval(double u, Vec6 & q, Vec6 & q_u, Vec6 & q_uu, Vec6 & q_uuu) const override;
+  std::vector<double> piece_boundaries() const override;
   bool options_at(double u, MotionOptions & opts, SourceLocation & loc) const override;
 
   // Returns the sub-path [u_start, 1], re-normalized to [0, 1].
@@ -175,7 +253,7 @@ private:
     double length = 0.0;
     Vec6 start = Vec6::Zero();
     Vec6 dir = Vec6::Zero();
-    std::array<Vec6, 8> c{};  // septic coefficients in tau = s / length (blend pieces)
+    std::array<Vec6, 8> bezier{};  // degree-7 Bernstein/Bezier control points (blend pieces)
     MotionOptions opts;
     SourceLocation loc;
   };

@@ -89,8 +89,10 @@ public:
     const std::array<double, 6> & a1,
     double duration);
 
-  // Computes the minimum feasible duration T* satisfying all 6-axis (v_max, a_max, j_max) bounds.
-  void build_time_optimal(
+  // Computes the minimum feasible duration T* in (0, max_duration_sec] satisfying all
+  // 6-axis position and scaled (v_max, a_max, j_max) bounds. Handles non-monotonic
+  // feasibility under non-zero boundary (v, a). Returns false if no feasible duration exists.
+  bool build_time_optimal(
     const std::array<double, 6> & q0,
     const std::array<double, 6> & v0,
     const std::array<double, 6> & a0,
@@ -100,7 +102,8 @@ public:
     const std::array<lite6_planner::JointLimit, 6> & limits,
     double vel_scale,
     double acc_scale,
-    double jerk_scale = 1.0);
+    double jerk_scale = 1.0,
+    double max_duration_sec = 60.0);
 
   double duration() const { return duration_; }
 

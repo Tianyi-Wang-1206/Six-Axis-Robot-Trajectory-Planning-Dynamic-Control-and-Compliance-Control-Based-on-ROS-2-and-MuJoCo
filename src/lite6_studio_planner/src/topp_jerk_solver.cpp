@@ -20,6 +20,8 @@ constexpr double kCheckMargin = 0.995;
 // Heuristic jerk-aware speed cap: |q'''| * sdot^3 <= kJerkCapShare * j_max.
 constexpr double kJerkCapShare = 0.6;
 constexpr int kFineSamples = 2048;
+constexpr int kMinFinePerPiece = 16;
+constexpr int kMinGridPerPiece = 4;
 constexpr int kMinGrid = 64;
 constexpr int kMaxGrid = 6000;
 constexpr int kMaxRefinePasses = 24;
@@ -30,7 +32,9 @@ constexpr double kMaxDurationSec = 300.0;
 constexpr double kGridJointStep = 0.003;       // rad
 constexpr double kGridJointCurvature = 0.006;  // rad (chord sag scale)
 constexpr double kGridTransStep = 0.002;       // m
+constexpr double kGridTransCurvature = 0.004;  // m
 constexpr double kGridRotStep = 0.005;         // rad
+constexpr double kGridRotCurvature = 0.01;     // rad
 
 struct PathPoint
 {
@@ -46,7 +50,7 @@ class PathSampler
 {
 public:
   PathSampler(
-    const JointPath & path, const CompositeCartesianPath * cart,
+    const JointPath & path, const CartesianPath * cart,
     double vs, double as, double js, const SourceLocation & loc)
   : path_(path), cart_(cart), vs_(vs), as_(as), js_(js), loc_(loc) {}
 
@@ -85,7 +89,7 @@ public:
 
 private:
   const JointPath & path_;
-  const CompositeCartesianPath * cart_;
+  const CartesianPath * cart_;
   double vs_, as_, js_;
   SourceLocation loc_;
 };
@@ -182,6 +186,7 @@ bool project_x(
   static thread_local std::vector<std::pair<double, double>> uppers, lowers;
   uppers.clear();
   lowers.clear();
+  bool infeasible = false;
   auto add = [&](const LinCon & k) {
     if (k.a > 1e-14) {
       uppers.emplace_back(k.c / k.a, -k.b / k.a);
@@ -191,6 +196,8 @@ bool project_x(
       hi = std::min(hi, k.c / k.b);
     } else if (k.b < -1e-14) {
       lo = std::max(lo, k.c / k.b);
+    } else if (k.c < -1e-12) {
+      infeasible = true;
     }
   };
   for (const auto & k : cons) {
@@ -198,6 +205,9 @@ bool project_x(
   }
   for (size_t i = 0; i < n_extra; ++i) {
     add(extra[i]);
+  }
+  if (infeasible) {
+    return false;
   }
   for (const auto & l : lowers) {
     for (const auto & u : uppers) {
@@ -207,6 +217,8 @@ bool project_x(
         hi = std::min(hi, rhs / coef);
       } else if (coef < -1e-14) {
         lo = std::max(lo, rhs / coef);
+      } else if (rhs < -1e-12 * (1.0 + std::abs(u.first) + std::abs(l.first))) {
+        return false;
       }
     }
   }
@@ -234,18 +246,33 @@ void sdd_range(
 }
 
 // TOPP-RA: returns x_i = sdot^2 on the grid (rest at both ends).
+// Enforces stages[0..N-1] at left interval endpoints and stages[N] at the terminal rest
+// state x[N] = 0 on the final interval [N-1, N].
 bool topp_ra(
   const std::vector<double> & grid, const std::vector<Stage> & stages,
   std::vector<double> & x, std::string & err)
 {
   const size_t N = grid.size() - 1;
+  double s_lo_end = -std::numeric_limits<double>::infinity();
+  double s_hi_end = std::numeric_limits<double>::infinity();
+  sdd_range(stages[N].cons, 0.0, s_lo_end, s_hi_end);
+
   std::vector<double> k_lo(N + 1, 0.0), k_hi(N + 1, 0.0);
   for (size_t ii = N; ii-- > 0;) {
     const double delta = grid[ii + 1] - grid[ii];
-    const LinCon extra[2] = {
-      {2.0 * delta, 1.0, k_hi[ii + 1]},
-      {-2.0 * delta, -1.0, -k_lo[ii + 1]}};
-    if (!project_x(stages[ii].cons, extra, 2, 0.0, stages[ii].x_cap, k_lo[ii], k_hi[ii])) {
+    LinCon extra[4];
+    size_t n_extra = 2;
+    extra[0] = {2.0 * delta, 1.0, k_hi[ii + 1]};
+    extra[1] = {-2.0 * delta, -1.0, -k_lo[ii + 1]};
+    if (ii + 1 == N) {
+      if (std::isfinite(s_hi_end)) {
+        extra[n_extra++] = {1.0, 0.0, s_hi_end};
+      }
+      if (std::isfinite(s_lo_end)) {
+        extra[n_extra++] = {-1.0, 0.0, -s_lo_end};
+      }
+    }
+    if (!project_x(stages[ii].cons, extra, n_extra, 0.0, stages[ii].x_cap, k_lo[ii], k_hi[ii])) {
       err = "TOPP-RA controllable set is empty at path parameter u=" + std::to_string(grid[ii]);
       return false;
     }
@@ -259,6 +286,10 @@ bool topp_ra(
     const double delta = grid[i + 1] - grid[i];
     double s_lo = 0.0, s_hi = 0.0;
     sdd_range(stages[i].cons, x[i], s_lo, s_hi);
+    if (i + 1 == N) {
+      s_lo = std::max(s_lo, s_lo_end);
+      s_hi = std::min(s_hi, s_hi_end);
+    }
     s_hi = std::min(s_hi, (k_hi[i + 1] - x[i]) / (2.0 * delta));
     s_lo = std::max(s_lo, (k_lo[i + 1] - x[i]) / (2.0 * delta));
     const double sdd = std::max(s_lo, s_hi);
@@ -448,11 +479,71 @@ EvalResult evaluate(
   return res;
 }
 
+// Collect sorted deduplicated piece boundaries in (0, 1) from Cartesian and joint paths.
+std::vector<double> collect_boundaries(const JointPath & path, const CartesianPath * cart_path)
+{
+  std::vector<double> b{0.0, 1.0};
+  if (cart_path != nullptr) {
+    for (double u : cart_path->piece_boundaries()) {
+      if (u > 1e-8 && u < 1.0 - 1e-8) {
+        b.push_back(u);
+      }
+    }
+  }
+  for (double u : path.piece_boundaries()) {
+    if (u > 1e-8 && u < 1.0 - 1e-8) {
+      b.push_back(u);
+    }
+  }
+  std::sort(b.begin(), b.end());
+  b.erase(
+    std::unique(b.begin(), b.end(), [](double a, double c) { return std::abs(a - c) < 1e-7; }),
+    b.end());
+  b.front() = 0.0;
+  b.back() = 1.0;
+  return b;
+}
+
+// Computes the required boxcar width directly from actual raw TOPP-RA acceleration jumps
+// across grid nodes so weakly excited axes do not over-smear corners.
+double compute_required_t_fir(
+  const std::vector<double> & grid,
+  const std::vector<PathPoint> & points,
+  const std::vector<double> & x,
+  const std::array<lite6_planner::JointLimit, 6> & jl)
+{
+  const size_t N = grid.size() - 1;
+  double t_req = 0.0;
+  Vec6 prev_ddq_r = Vec6::Zero();
+  for (size_t i = 0; i < N; ++i) {
+    const double delta = grid[i + 1] - grid[i];
+    const double sdd = (delta > 1e-15) ? ((x[i + 1] - x[i]) / (2.0 * delta)) : 0.0;
+    const Vec6 ddq_l = points[i].q2 * x[i] + points[i].q1 * sdd;
+    const Vec6 ddq_r = points[i + 1].q2 * x[i + 1] + points[i + 1].q1 * sdd;
+    const Vec6 jump = ddq_l - prev_ddq_r;
+    for (int j = 0; j < 6; ++j) {
+      const double j_lim = 0.85 * points[i].js * jl[static_cast<size_t>(j)].max_jerk;
+      if (j_lim > 1e-9) {
+        t_req = std::max(t_req, std::abs(jump[j]) / j_lim);
+      }
+    }
+    prev_ddq_r = ddq_r;
+  }
+  // Terminal deceleration jump back to rest (ddq = 0) at u = 1.
+  for (int j = 0; j < 6; ++j) {
+    const double j_lim = 0.85 * points[N].js * jl[static_cast<size_t>(j)].max_jerk;
+    if (j_lim > 1e-9) {
+      t_req = std::max(t_req, std::abs(prev_ddq_r[j]) / j_lim);
+    }
+  }
+  return t_req;
+}
+
 }  // namespace
 
 bool TOPPJerkSolver::solve(
   const JointPath & path,
-  const CompositeCartesianPath * cart_path,
+  const CartesianPath * cart_path,
   const std::array<lite6_planner::JointLimit, 6> & joint_limits,
   const lite6_planner::CartesianLimit & cart_limits,
   double default_vel_scale,
@@ -467,31 +558,47 @@ bool TOPPJerkSolver::solve(
   const PathSampler sampler(
     path, cart_path, default_vel_scale, default_acc_scale, default_jerk_scale, default_loc);
 
-  // Fine scan: motion detection, grid density and boxcar length.
-  std::vector<double> fine_u(kFineSamples + 1), density(kFineSamples + 1);
-  double max_motion = 0.0;
-  double t_ratio = 0.0;
+  // Fine scan: always include all piece boundaries plus >= kMinFinePerPiece samples inside
+  // every piece so narrow corner blends in long paths are never skipped.
+  const std::vector<double> boundaries = collect_boundaries(path, cart_path);
+  std::vector<double> fine_u;
+  fine_u.reserve(static_cast<size_t>(kFineSamples) + boundaries.size() * kMinFinePerPiece + 2);
   for (int k = 0; k <= kFineSamples; ++k) {
-    const double u = static_cast<double>(k) / kFineSamples;
-    const PathPoint pp = sampler.eval(u);
-    fine_u[static_cast<size_t>(k)] = u;
+    fine_u.push_back(static_cast<double>(k) / kFineSamples);
+  }
+  for (size_t b = 0; b + 1 < boundaries.size(); ++b) {
+    const double u0 = boundaries[b];
+    const double span = boundaries[b + 1] - u0;
+    for (int m = 0; m <= kMinFinePerPiece; ++m) {
+      fine_u.push_back(u0 + span * static_cast<double>(m) / kMinFinePerPiece);
+    }
+  }
+  std::sort(fine_u.begin(), fine_u.end());
+  fine_u.erase(
+    std::unique(fine_u.begin(), fine_u.end(), [](double a, double c) { return std::abs(a - c) < 1e-10; }),
+    fine_u.end());
+  fine_u.front() = 0.0;
+  fine_u.back() = 1.0;
+
+  std::vector<double> density(fine_u.size(), 0.0);
+  double max_motion = 0.0;
+  for (size_t k = 0; k < fine_u.size(); ++k) {
+    const PathPoint pp = sampler.eval(fine_u[k]);
     double rho = 0.0;
     for (int j = 0; j < 6; ++j) {
       const double d1 = std::abs(pp.q1[j]);
       rho = std::max(rho, d1 / kGridJointStep);
       rho = std::max(rho, std::sqrt(std::abs(pp.q2[j]) / kGridJointCurvature));
       max_motion = std::max(max_motion, d1);
-      if (d1 > 1e-9) {
-        const auto & lim = joint_limits[static_cast<size_t>(j)];
-        t_ratio = std::max(t_ratio, (pp.as * lim.max_acc) / (pp.js * lim.max_jerk));
-      }
     }
     if (pp.cart) {
       rho = std::max(rho, pp.p1.norm() / kGridTransStep);
+      rho = std::max(rho, std::sqrt(pp.p2.norm() / kGridTransCurvature));
       rho = std::max(rho, pp.w1.norm() / kGridRotStep);
+      rho = std::max(rho, std::sqrt(pp.w2.norm() / kGridRotCurvature));
       max_motion = std::max({max_motion, pp.p1.norm(), pp.w1.norm()});
     }
-    density[static_cast<size_t>(k)] = rho;
+    density[k] = rho;
   }
 
   if (max_motion < 1e-10) {
@@ -511,35 +618,42 @@ bool TOPPJerkSolver::solve(
     return true;
   }
 
-  // Adaptive grid: equal increments of the integrated density.
-  std::vector<double> cum(kFineSamples + 1, 0.0);
-  for (int k = 0; k < kFineSamples; ++k) {
-    const size_t i = static_cast<size_t>(k);
-    cum[i + 1] = cum[i] + 0.5 * (density[i] + density[i + 1]) / kFineSamples;
+  // Adaptive grid: non-uniform trapezoid density integration with all piece boundaries pinned
+  // and at least kMinGridPerPiece intervals inside every piece.
+  std::vector<double> cum(fine_u.size(), 0.0);
+  for (size_t i = 0; i + 1 < fine_u.size(); ++i) {
+    cum[i + 1] = cum[i] + 0.5 * (density[i] + density[i + 1]) * (fine_u[i + 1] - fine_u[i]);
   }
-  const int N = std::clamp(static_cast<int>(std::ceil(cum.back())), kMinGrid, kMaxGrid);
-  std::vector<double> grid(static_cast<size_t>(N) + 1, 0.0);
+  const int N_density = std::clamp(static_cast<int>(std::ceil(cum.back())), kMinGrid, kMaxGrid);
+  std::vector<double> grid;
+  grid.reserve(static_cast<size_t>(N_density) + boundaries.size() * kMinGridPerPiece + 2);
+  grid.push_back(0.0);
   {
     size_t k = 0;
-    for (int i = 1; i < N; ++i) {
-      const double target = cum.back() * i / N;
+    for (int i = 1; i < N_density; ++i) {
+      const double target = cum.back() * i / N_density;
       while (k + 1 < cum.size() && cum[k + 1] < target) {
         ++k;
       }
       const double span = cum[k + 1] - cum[k];
       const double frac = span > 1e-15 ? (target - cum[k]) / span : 0.0;
-      grid[static_cast<size_t>(i)] = fine_u[k] + frac * (fine_u[k + 1] - fine_u[k]);
-    }
-    grid.back() = 1.0;
-    for (size_t i = 1; i < grid.size(); ++i) {
-      grid[i] = std::max(grid[i], grid[i - 1] + 1e-9);
-    }
-    grid.back() = std::max(grid.back(), 1.0);
-    const double scale = 1.0 / grid.back();
-    for (auto & g : grid) {
-      g *= scale;
+      grid.push_back(fine_u[k] + frac * (fine_u[k + 1] - fine_u[k]));
     }
   }
+  for (size_t b = 0; b + 1 < boundaries.size(); ++b) {
+    const double u0 = boundaries[b];
+    const double span = boundaries[b + 1] - u0;
+    for (int m = 0; m <= kMinGridPerPiece; ++m) {
+      grid.push_back(u0 + span * static_cast<double>(m) / kMinGridPerPiece);
+    }
+  }
+  grid.push_back(1.0);
+  std::sort(grid.begin(), grid.end());
+  grid.erase(
+    std::unique(grid.begin(), grid.end(), [](double a, double c) { return std::abs(a - c) < 1e-8; }),
+    grid.end());
+  grid.front() = 0.0;
+  grid.back() = 1.0;
 
   std::vector<PathPoint> points(grid.size());
   for (size_t i = 0; i < grid.size(); ++i) {
@@ -549,6 +663,7 @@ bool TOPPJerkSolver::solve(
   std::vector<Stage> stages(grid.size());
 
   SmoothedProfile prof;
+  double prev_t_fir = 0.0;
   double final_T = 0.0;
   EvalResult res;
   bool accepted = false;
@@ -581,8 +696,17 @@ bool TOPPJerkSolver::solve(
       err_msg = "TOPP-RA duration=" + std::to_string(prof.T_topp) + " s is out of range";
       return false;
     }
-    // Boxcar length bounds the jerk of a full +a -> -a acceleration reversal.
-    prof.T_fir = std::clamp(2.0 * t_ratio, 0.01, std::max(0.02, 0.6 * prof.T_topp));
+
+    // Boxcar width sized directly from actual raw TOPP-RA acceleration jumps; kept
+    // non-decreasing across jerk-tightening passes so refinement converges monotonically.
+    const double max_t_fir = std::max(0.02, 0.5 * prof.T_topp);
+    double cand_t_fir = std::clamp(
+      compute_required_t_fir(grid, points, x, joint_limits), 0.008, max_t_fir);
+    if (pass > 0) {
+      cand_t_fir = std::max(cand_t_fir, std::min(prev_t_fir, max_t_fir));
+    }
+    prof.T_fir = cand_t_fir;
+    prev_t_fir = prof.T_fir;
     prof.precompute_integrals();
 
     final_T = std::ceil(prof.raw_duration() * 1000.0 - 1e-9) * 0.001;

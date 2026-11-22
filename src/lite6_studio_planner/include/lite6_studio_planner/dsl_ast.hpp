@@ -58,6 +58,7 @@ struct MotionStatement
   std::array<double, 6> joint_target{};
   Eigen::Matrix4d pose_target = Eigen::Matrix4d::Identity();
   Eigen::Matrix4d pose_via = Eigen::Matrix4d::Identity();
+  bool via_has_orientation = false;
   Eigen::Vector3d circle_center = Eigen::Vector3d::Zero();
   Eigen::Vector3d circle_axis = Eigen::Vector3d::UnitZ();
   double circle_angle_rad = 0.0;

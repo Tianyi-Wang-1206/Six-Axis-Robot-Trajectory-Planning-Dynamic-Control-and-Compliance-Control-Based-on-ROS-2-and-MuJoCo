@@ -183,14 +183,14 @@ private:
   // dq/du, d2q/du2 come from differential kinematics on the analytic Cartesian path
   // derivatives (d3q/du3 by central difference of the analytic d2q/du2).
   bool build_cartesian_joint_path(
-    const CompositeCartesianPath & cart_path,
+    const CartesianPath & cart_path,
     const std::array<double, 6> & start_q,
     C3JointSpline & out_path,
     std::vector<Diagnostic> & out_diagnostics) const;
 
   // Cartesian path -> joint path -> TOPP-RA -> 1 kHz verification.
   bool plan_cartesian_path(
-    const CompositeCartesianPath & cart_path,
+    const CartesianPath & cart_path,
     const std::array<double, 6> & start_q,
     const MotionOptions & default_options,
     const SourceLocation & default_loc,

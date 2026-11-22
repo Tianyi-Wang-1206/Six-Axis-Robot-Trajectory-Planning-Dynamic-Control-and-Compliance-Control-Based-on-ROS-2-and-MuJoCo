@@ -635,7 +635,17 @@ private:
         const Token & key = expect(TokenKind::IDENT, "MoveC parameter name", stmt_idx);
         expect(TokenKind::EQUALS, "'=' after MoveC parameter '" + key.lexeme + "'", stmt_idx);
         if (key.lexeme == "via") {
-          m.pose_via = parse_pose_value(stmt_idx);
+          if (peek().kind == TokenKind::LBRACKET) {
+            const auto p = parse_fixed_vector<3>(stmt_idx);
+            m.pose_via = Eigen::Matrix4d::Identity();
+            m.pose_via(0, 3) = p[0];
+            m.pose_via(1, 3) = p[1];
+            m.pose_via(2, 3) = p[2];
+            m.via_has_orientation = false;
+          } else {
+            m.pose_via = parse_pose_value(stmt_idx);
+            m.via_has_orientation = true;
+          }
           has_via = true;
         } else if (key.lexeme == "target") {
           m.pose_target = parse_pose_value(stmt_idx);
@@ -1205,15 +1215,21 @@ bool DSLParser::parse(
   out_program = ASTProgram{};
   out_diagnostics.clear();
 
+  auto has_error = [](const std::vector<Diagnostic> & diags) {
+    return std::any_of(diags.begin(), diags.end(), [](const Diagnostic & d) {
+      return d.severity == Diagnostic::SEVERITY_ERROR;
+    });
+  };
+
   const auto lines = split_lines(source);
   const auto tokens = tokenize(source, lines, out_diagnostics);
-  if (!out_diagnostics.empty()) {
+  if (has_error(out_diagnostics)) {
     return false;
   }
 
   ParserImpl parser(tokens, lines);
   parser.parse_program(out_program, out_diagnostics);
-  if (!out_diagnostics.empty()) {
+  if (has_error(out_diagnostics)) {
     return false;
   }
 
