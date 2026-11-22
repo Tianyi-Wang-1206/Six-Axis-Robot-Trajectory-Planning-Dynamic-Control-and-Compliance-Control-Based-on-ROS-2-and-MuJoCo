@@ -8,17 +8,22 @@ import numpy as np
 import pinocchio as pin
 import yaml
 from ament_index_python.packages import get_package_share_directory
-from scipy.interpolate import interp1d
 from scipy.optimize import lsq_linear
-from scipy.signal import savgol_filter
 
 
 class SysIdEngine:
-    """Fourier identification of viscous and Coulomb friction."""
+    """Fourier identification of viscous and Coulomb friction via momentum integral."""
 
     ARMATURE = 0.1  # Known factory inertia [kg m^2], identical on all six axes.
     SAMPLE_PERIOD = 0.001  # Same 1 ms grid as the CTC control loop and planner.
-    MIN_FIT_SPEED = 0.05
+    PHYSICS_STEP = 0.0001  # Fixed 0.1 ms MuJoCo physics step.
+    MIN_FIT_SPEED = 0.08  # rad/s; Stribeck excess < 2e-8 above this threshold.
+    SETTLE_DISPLACEMENT = 0.008  # rad; unidirectional travel past reversal for LuGre bristle settling.
+    REVERSAL_SPEED_EPS = 1e-4  # rad/s; near-zero speed boundary for reversal tracking.
+    WINDOW_DURATION = 0.04  # s; momentum-integral regression window width.
+    WINDOW_STRIDE = 0.02  # s; step between consecutive regression windows.
+    MIN_WINDOW_DURATION = 0.02  # s; minimum contiguous window length inside a settled run.
+    MIN_FIT_WINDOWS = 40  # Minimum settled momentum-integral windows per joint.
     TANH_SLOPE = 300.0
     LIMIT_MARGIN = 0.90
     MIN_DURATION = 6.0  # Keep useful recording time after the 1 s end trims.
@@ -111,6 +116,29 @@ class SysIdEngine:
             previous = q
         return True
 
+    @classmethod
+    def _settled_sliding_mask(cls, positions, velocities):
+        """Return mask of samples with speed >= MIN_FIT_SPEED and settled post-reversal travel."""
+        n_samples, n_joints = velocities.shape
+        mask = np.zeros((n_samples, n_joints), dtype=bool)
+        for i in range(n_joints):
+            last_rev_q = positions[0, i]
+            current_sign = 0
+            for k in range(n_samples):
+                v = velocities[k, i]
+                if abs(v) < cls.REVERSAL_SPEED_EPS:
+                    last_rev_q = positions[k, i]
+                    current_sign = 0
+                else:
+                    sign = 1 if v > 0.0 else -1
+                    if sign != current_sign:
+                        last_rev_q = positions[k, i]
+                        current_sign = sign
+                    if (abs(v) >= cls.MIN_FIT_SPEED and
+                            abs(positions[k, i] - last_rev_q) >= cls.SETTLE_DISPLACEMENT):
+                        mask[k, i] = True
+        return mask
+
     def generate_fourier_coefficients(self, q0, max_pos_limits):
         """Choose an informative, collision-free shape and adapt amplitude/time.
 
@@ -137,12 +165,16 @@ class SysIdEngine:
         half_step = (times[1] - times[0]) / 2
         wl = w * np.arange(1, self.N_f + 1)
         shapes = []
-        for _ in range(16):
+        # Generate a diverse pool mixing smoother (1/l) and richer (1/sqrt(l)) harmonic
+        # spectra so every axis gets clean settled sliding windows across speed magnitudes.
+        for candidate_idx in range(64):
             a = np.zeros_like(self.a)
             b = np.zeros_like(self.b)
+            decay = 1.0 if candidate_idx < 32 else 0.5
+            weights = np.arange(1, self.N_f + 1, dtype=float) ** (-decay)
             for i in range(6):
-                a[i, :-1] = rng.uniform(-1, 1, self.N_f - 1)
-                b[i, :-2] = rng.uniform(-1, 1, self.N_f - 2)
+                a[i, :-1] = rng.uniform(-1, 1, self.N_f - 1) * weights[:-1]
+                b[i, :-2] = rng.uniform(-1, 1, self.N_f - 2) * weights[:-2]
                 a[i, -1] = -a[i, :-1].sum()
                 harmonics = np.arange(1, self.N_f - 1)
                 b[i, -2:] = np.linalg.solve(
@@ -162,7 +194,7 @@ class SysIdEngine:
             candidates = []
             for base_a, base_b in shapes:
                 a, b = base_a * contraction, base_b * contraction
-                _, v, acc, jerk = self._wave(a, b, w, times)
+                q_cand, v, acc, jerk = self._wave(a, b, w, times)
                 radius = np.hypot(a, b)
                 peaks = np.array([
                     np.max(np.abs(v), axis=0) + (radius * wl).sum(axis=1) * half_step,
@@ -177,16 +209,15 @@ class SysIdEngine:
                     continue
                 stretch = duration / base_duration
                 speed = v / stretch
-                # E-optimal score of [velocity, smooth sign], scaled by each
-                # axis speed limit. Favor the weakest joint's information.
+                t_scaled = times * stretch
+                time_window = (t_scaled > 1.0) & (t_scaled < duration - 1.0)
+                settled = self._settled_sliding_mask(q_cand, speed) & time_window[:, None]
+                # E-optimal score of [velocity, smooth sign] on settled post-reversal
+                # sliding samples, scaled by each axis speed limit.
                 score = np.inf
+                sample_dt = duration / (len(times) - 1)
                 for i in range(6):
-                    valid = ((np.abs(speed[:, i]) >= self.MIN_FIT_SPEED) &
-                             (times * stretch > 1) & (times * stretch < duration - 1))
-                    vi = speed[valid, i]
-                    # At nominal 200 Hz this leaves ~300 useful samples,
-                    # above the estimator's 200-sample minimum after trimming.
-                    sample_dt = duration / (len(times) - 1)
+                    vi = speed[settled[:, i], i]
                     if (len(vi) * sample_dt < 1.5 or
                             np.count_nonzero(vi > 0) * sample_dt < 0.25 or
                             np.count_nonzero(vi < 0) * sample_dt < 0.25):
@@ -272,11 +303,12 @@ class SysIdEngine:
         return path
 
     def _physical_samples(self):
-        """Differentiate on physics time; use ROS time only to locate the experiment."""
+        """Integrate on exact physics time; use ROS time only to locate the experiment."""
         samples = self.record_data
         if len(samples) < 5:
             raise ValueError('Insufficient physical snapshots for system identification')
         steps = np.array([d['step'] for d in samples], dtype=np.int64)
+        command_seq = np.array([d['command_sequence'] for d in samples], dtype=np.int64)
         simulation = np.array([d['simulation_time'] for d in samples], dtype=float)
         phase = np.array([d['t'] for d in samples], dtype=float)
         timing = np.array([[d[k] for k in ('control_period', 'physics_lag', 'command_age')]
@@ -285,7 +317,7 @@ class SysIdEngine:
                 not np.isfinite(timing).all() or np.any(timing < 0) or
                 np.any(np.diff(steps) < 0) or np.any(np.diff(simulation) < 0)):
             raise ValueError('Invalid or reset physical snapshot clock')
-        if not np.allclose(np.diff(simulation), np.diff(steps) * 0.0001,
+        if not np.allclose(np.diff(simulation), np.diff(steps) * self.PHYSICS_STEP,
                            rtol=0, atol=1e-7):
             raise ValueError('Physical time does not match the fixed 0.1 ms step sequence')
         # ROS-to-steady pairing has small measurement jitter; never differentiate
@@ -299,14 +331,51 @@ class SysIdEngine:
             f'max physics lag={timing[:, 1].max():.6f} s, '
             f'max control period={timing[:, 0].max():.6f} s, '
             f'max applied command age={timing[:, 2].max():.6f} s')
-        return (simulation[unique] + offset, *(
+        return (simulation[unique] + offset, command_seq[unique], timing[unique, 2], *(
             np.array([d[key] for d in samples], dtype=float)[unique]
             for key in ('q', 'dq', 'tau_cmd', 'gripper_q', 'gripper_dq', 'gripper_ddq')))
 
+    @classmethod
+    def _integrate_zoh_torque(cls, dt_seq, cmd_seq, cmd_age, tau_seq):
+        """Integrate piecewise-constant actuator torque across exact physics intervals.
+
+        Between distinct snapshots k and k+1, actuator effort is held constant per
+        controller command_sequence. When exactly one command transition occurs in
+        (t_k, t_{k+1}], command_age[k+1] locates the sub-millisecond switch to the
+        exact 0.1 ms physics substep.
+        """
+        dseq = np.diff(cmd_seq)
+        tau_int = 0.5 * (tau_seq[:-1] + tau_seq[1:]) * dt_seq[:, None]
+
+        same = (dseq == 0)
+        if np.any(same):
+            tau_int[same] = tau_seq[1:][same] * dt_seq[same, None]
+
+        single_switch = (dseq == 1)
+        if np.any(single_switch):
+            dt_new = np.clip(
+                np.floor(cmd_age[1:][single_switch] / cls.PHYSICS_STEP + 1e-9) * cls.PHYSICS_STEP,
+                cls.PHYSICS_STEP,
+                dt_seq[single_switch],
+            )
+            dt_old = dt_seq[single_switch] - dt_new
+            tau_int[single_switch] = (
+                tau_seq[:-1][single_switch] * dt_old[:, None] +
+                tau_seq[1:][single_switch] * dt_new[:, None]
+            )
+        return tau_int
+
     def calculate_least_squares(self) -> str:
-        """Fit nonnegative Fv/Fc from measured Fourier excitation data."""
+        """Fit nonnegative Fv/Fc from measured Fourier data using generalized momentum integrals.
+
+        Using Euler-Lagrange momentum balance p = (M(Q)V)[:6] + J_a dq:
+          dp/dt = tau_act - tau_f - g(Q)[:6] + (C(Q, V)^T V)[:6]
+        integrating over contiguous post-reversal settled sliding windows removes
+        acceleration differentiation bias, reversal-kink smearing, and ZOH phase lag.
+        """
         self.fit_diagnostics = []
-        t_seq, q_seq, dq_seq, tau_seq, gq_seq, gv_seq, ga_seq = self._physical_samples()
+        (t_seq, cmd_seq, cmd_age, q_seq, dq_seq, tau_seq,
+         gq_seq, gv_seq, ga_seq) = self._physical_samples()
         if len(t_seq) < 5:
             raise ValueError('Fewer than five distinct physical snapshots')
         if (not np.isfinite(t_seq).all() or np.any(np.diff(t_seq) <= 0) or
@@ -319,47 +388,104 @@ class SysIdEngine:
         if t_seq[0] > 0.25 or t_seq[-1] < self.T_total - 0.25:
             raise ValueError(f'Incomplete excitation recording: {t_seq[0]:.4f}..{t_seq[-1]:.4f} s; '
                              f'expected 0..{self.T_total:.4f} s on the CTC clock')
-        dt = float(np.median(np.diff(t_seq)))
-        if np.max(np.diff(t_seq)) > max(0.05, 5.0 * dt):
+        dt_seq = np.diff(t_seq)
+        dt_med = float(np.median(dt_seq))
+        if np.max(dt_seq) > max(0.05, 5.0 * dt_med):
             raise ValueError('SysID recording has telemetry gaps; refusing to interpolate missing experiments')
-        t_uniform = np.arange(t_seq[0], t_seq[-1], dt)
-        q, dq, tau = [interp1d(t_seq, values, axis=0)(t_uniform)
-                      for values in (q_seq, dq_seq, tau_seq)]
-        window = max(5, int(0.1 / dt) | 1)
-        if len(t_uniform) < window:
-            raise ValueError('Recording is too short for acceleration estimation')
-        ddq = savgol_filter(dq, window, polyorder=3, deriv=1, delta=dt, axis=0)
-        gq, gv, ga = [interp1d(t_seq, values, axis=0)(t_uniform)
-                      for values in (gq_seq, gv_seq, ga_seq)]
-        full_q = np.column_stack((q, gq))
-        full_v = np.column_stack((dq, gv))
-        full_a = np.column_stack((ddq, ga))
-        rigid_torque = np.array([
-            pin.rnea(self.dynamics_model, self.dynamics_data, qi, vi, ai)[:6].copy()
-            for qi, vi, ai in zip(full_q, full_v, full_a)])
-        residual = tau - rigid_torque - self.ARMATURE * ddq
+
+        n_samples = len(t_seq)
+        full_q = np.column_stack((q_seq, gq_seq))
+        full_v = np.column_stack((dq_seq, gv_seq))
+
+        # Compute exact arm generalized momentum p_k and conservative/Coriolis terms h_k = C^T V - g.
+        momentum = np.empty((n_samples, 6), dtype=float)
+        ctv_minus_g = np.empty((n_samples, 6), dtype=float)
+        for k in range(n_samples):
+            qi = full_q[k]
+            vi = full_v[k]
+            mass_mat = pin.crba(self.dynamics_model, self.dynamics_data, qi)
+            mass_mat = np.triu(mass_mat) + np.triu(mass_mat, 1).T
+            coriolis = pin.computeCoriolisMatrix(self.dynamics_model, self.dynamics_data, qi, vi)
+            gravity = pin.computeGeneralizedGravity(self.dynamics_model, self.dynamics_data, qi)
+            momentum[k] = (mass_mat @ vi)[:6] + self.ARMATURE * dq_seq[k]
+            ctv_minus_g[k] = (coriolis.T @ vi - gravity)[:6]
+
+        # Exact cumulative integrals directly on non-uniform physics timestamps.
+        tau_int = self._integrate_zoh_torque(dt_seq, cmd_seq, cmd_age, tau_seq)
+        ctv_g_int = 0.5 * (ctv_minus_g[:-1] + ctv_minus_g[1:]) * dt_seq[:, None]
+        tanh_vals = np.tanh(self.TANH_SLOPE * dq_seq)
+        tanh_int = 0.5 * (tanh_vals[:-1] + tanh_vals[1:]) * dt_seq[:, None]
+
+        cum_rhs = np.vstack((np.zeros((1, 6)), np.cumsum(tau_int + ctv_g_int, axis=0)))
+        cum_tanh = np.vstack((np.zeros((1, 6)), np.cumsum(tanh_int, axis=0)))
+
+        time_mask = (t_seq > 1.0) & (t_seq < self.T_total - 1.0)
+        settled_mask = self._settled_sliding_mask(q_seq, dq_seq) & time_mask[:, None]
+        good_step = dt_seq <= max(0.01, 4.0 * dt_med)
+
         friction = np.zeros((6, 2))
         report = []
         failures = []
         for i in range(6):
             try:
-                # Retain the original Fourier-stage speed cutoff and linear solver.
-                valid = ((t_uniform > 1.0) & (t_uniform < self.T_total - 1.0) &
-                         (np.abs(dq[:, i]) >= self.MIN_FIT_SPEED))
-                if np.count_nonzero(valid) < 200:
-                    raise ValueError(f'Joint {i+1}: fewer than 200 useful high-speed friction samples')
-                velocity = dq[valid, i]
-                design = np.column_stack((velocity, np.tanh(self.TANH_SLOPE * velocity)))
-                scaled = design / np.linalg.norm(design, axis=0)
+                sample_count = int(np.count_nonzero(settled_mask[:, i]))
+                if sample_count < 200:
+                    raise ValueError(
+                        f'Joint {i+1}: fewer than 200 settled high-speed friction samples '
+                        f'({sample_count})')
+
+                rows_x = []
+                rows_y = []
+                k = 0
+                while k < n_samples:
+                    if not settled_mask[k, i]:
+                        k += 1
+                        continue
+                    run_start = k
+                    while k + 1 < n_samples and settled_mask[k + 1, i] and good_step[k]:
+                        k += 1
+                    run_end = k
+                    a_idx = run_start
+                    while a_idx < run_end:
+                        b_idx = a_idx + 1
+                        while b_idx < run_end and (t_seq[b_idx] - t_seq[a_idx]) < self.WINDOW_DURATION:
+                            b_idx += 1
+                        dt_w = t_seq[b_idx] - t_seq[a_idx]
+                        if dt_w >= self.MIN_WINDOW_DURATION:
+                            mean_v = (q_seq[b_idx, i] - q_seq[a_idx, i]) / dt_w
+                            mean_tanh = (cum_tanh[b_idx, i] - cum_tanh[a_idx, i]) / dt_w
+                            mean_tau_f = (
+                                (cum_rhs[b_idx, i] - cum_rhs[a_idx, i]) -
+                                (momentum[b_idx, i] - momentum[a_idx, i])
+                            ) / dt_w
+                            rows_x.append((mean_v, mean_tanh))
+                            rows_y.append(mean_tau_f)
+                        next_a = a_idx + 1
+                        while next_a < run_end and (t_seq[next_a] - t_seq[a_idx]) < self.WINDOW_STRIDE:
+                            next_a += 1
+                        a_idx = next_a
+                    k += 1
+
+                if len(rows_x) < self.MIN_FIT_WINDOWS:
+                    raise ValueError(
+                        f'Joint {i+1}: fewer than {self.MIN_FIT_WINDOWS} settled integral windows '
+                        f'({len(rows_x)})')
+
+                design = np.asarray(rows_x, dtype=float)
+                target = np.asarray(rows_y, dtype=float)
+                norms = np.linalg.norm(design, axis=0)
+                if np.any(norms <= 0.0):
+                    raise ValueError(f'Joint {i+1}: degenerate excitation design matrix')
+                scaled = design / norms
                 if np.linalg.cond(scaled) > 1000:
                     raise ValueError(f'Joint {i+1}: insufficient velocity variation for Fv/Fc fit')
-                result = lsq_linear(design, residual[valid, i], bounds=(0.0, np.inf))
+                result = lsq_linear(design, target, bounds=(0.0, np.inf))
                 if not result.success or not np.isfinite(result.x).all():
                     raise ValueError(f'Joint {i+1}: friction fit failed')
                 friction[i] = result.x
-                high_rmse = np.sqrt(np.mean((design @ result.x - residual[valid, i])**2))
+                high_rmse = np.sqrt(np.mean((design @ result.x - target)**2))
                 report.append(f'# joint{i+1}: RMSE={high_rmse:.6g} Nm '
-                              f'({valid.sum()} samples)')
+                              f'({len(rows_x)} windows, {sample_count} settled samples)')
             except ValueError as exc:
                 failures.append(str(exc))
         if failures:
@@ -370,7 +496,7 @@ class SysIdEngine:
             return '[' + ', '.join(f'{value:.8g}' for value in values) + ']'
 
         return ('# --- Identified friction parameters (not automatically applied) ---\n'
-                '# Fourier excitation: viscous Fv and Coulomb Fc.\n'
+                '# Fourier excitation: viscous Fv and Coulomb Fc (momentum-integral fit).\n'
                 f'friction_v_nominal: {format_list(friction[:, 0])}\n'
                 f'friction_c_nominal: {format_list(friction[:, 1])}\n'
                 + '\n'.join(report) + '\n'

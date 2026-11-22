@@ -78,9 +78,9 @@
          bodies are not part of the planner's URDF collision model. -->
     <body name="grasp_cylinder" pos="0.24 -0.15 0.05">
       <freejoint name="grasp_cylinder_free"/>
-      <!-- Diameter 30 mm, height 100 mm, mass 500 g. -->
+      <!-- Diameter 30 mm, height 100 mm, mass 300 g. -->
       <geom name="grasp_cylinder_geom" type="cylinder" size="0.015 0.05"
-            group="4" mass="0.5" rgba="0.23 0.48 0.72 1" condim="4"
+            group="4" mass="0.3" rgba="0.23 0.48 0.72 1" condim="4"
             friction="1 0.005 0.0001"
             solimp="0.99 0.999 0.0001" solref="0.002 1"/>
     </body>

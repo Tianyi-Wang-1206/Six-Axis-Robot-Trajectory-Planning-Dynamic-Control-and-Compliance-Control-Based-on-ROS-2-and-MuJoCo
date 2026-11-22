@@ -635,13 +635,13 @@ class StudioMainWindow(QMainWindow):
         self.lbl_ctrl_mode.setWordWrap(True)
         self.lbl_estop_reason = QLabel("None")
         self.lbl_estop_reason.setWordWrap(True)
-        self.lbl_pos_err = QLabel("0.00 mm  [0.0, 0.0, 0.0]")
+        self.lbl_pos_err = QLabel("0.00 mm  [+0.00, +0.00, +0.00] mm")
         self.lbl_pos_err.setFont(QFont(_MONO_FONT_FAMILY, 9))
         self.lbl_pos_err.setWordWrap(True)
-        self.lbl_rot_err = QLabel("0.00 deg [0.0, 0.0, 0.0]")
+        self.lbl_rot_err = QLabel("0.00 deg [+0.00, +0.00, +0.00] deg")
         self.lbl_rot_err.setFont(QFont(_MONO_FONT_FAMILY, 9))
         self.lbl_rot_err.setWordWrap(True)
-        self.lbl_payload_info = QLabel("0.000 kg | CoM: [0.0, 0.0, 0.0] mm")
+        self.lbl_payload_info = QLabel("0.00 kg | CoM: [+0.00, +0.00, +0.00] mm")
         self.lbl_payload_info.setFont(QFont(_MONO_FONT_FAMILY, 9))
         self.lbl_payload_info.setWordWrap(True)
 
@@ -661,7 +661,7 @@ class StudioMainWindow(QMainWindow):
         # 3. Live Robot Joint & TCP Telemetry Card
         rob_card, r_layout = _make_card("Live Robot Feedback")
 
-        self.lbl_tcp_pose = QLabel("TCP: awaiting TF link_base -> link_eef...")
+        self.lbl_tcp_pose = QLabel("TCP: awaiting live joint feedback...")
         self.lbl_tcp_pose.setFont(QFont(_MONO_FONT_FAMILY, 9))
         self.lbl_tcp_pose.setStyleSheet("color: #0369A1; font-weight: 600;")
         self.lbl_tcp_pose.setWordWrap(True)
@@ -678,7 +678,7 @@ class StudioMainWindow(QMainWindow):
             row = idx // 2
             col_base = (idx % 2) * 2
             name_lbl = _key_label(f"J{idx + 1}:")
-            val_lbl = QLabel("+0.000 rad (+0.0 deg)")
+            val_lbl = QLabel("+0.00 deg")
             val_lbl.setFont(mono_joint_font)
             j_grid.addWidget(name_lbl, row, col_base)
             j_grid.addWidget(val_lbl, row, col_base + 1)
@@ -693,7 +693,7 @@ class StudioMainWindow(QMainWindow):
         g_info.setSpacing(10)
         self.lbl_gripper_state = QLabel("OFFLINE")
         self.lbl_gripper_state.setStyleSheet(_styled_pill("#64748B"))
-        self.lbl_gripper_metrics = QLabel("Opening: -- mm | Effort: -- N")
+        self.lbl_gripper_metrics = QLabel("Opening: --.-- mm | Effort: --.-- N")
         self.lbl_gripper_metrics.setFont(QFont(_MONO_FONT_FAMILY, 9))
         g_info.addWidget(self.lbl_gripper_state)
         g_info.addWidget(self.lbl_gripper_metrics, 1)
@@ -939,7 +939,7 @@ class StudioMainWindow(QMainWindow):
 
     def _on_insert_pose(self):
         if self._latest_tcp is None:
-            QMessageBox.information(self, "No TCP TF", "Waiting for link_base -> link_eef TF.")
+            QMessageBox.information(self, "No TCP Pose", "Waiting for fresh live joint feedback.")
             return
         x, y, z, r, p, w = self._latest_tcp
         snippet = (
@@ -949,7 +949,7 @@ class StudioMainWindow(QMainWindow):
         self.editor.insert_snippet_at_cursor(snippet)
 
     def _on_insert_payload(self):
-        self.editor.insert_snippet_at_cursor("SetPayload(mass=0.50, com=[0.0, 0.0, 0.0])\n")
+        self.editor.insert_snippet_at_cursor("SetPayload(mass=0.30, com=[0.0, 0.0, 0.0])\n")
 
     def trigger_compile(self):
         self._compile_in_flight = True
@@ -1119,10 +1119,12 @@ class StudioMainWindow(QMainWindow):
         p_norm_mm = math.sqrt(pe[0] ** 2 + pe[1] ** 2 + pe[2] ** 2) * 1000.0
         r_norm_deg = math.degrees(math.sqrt(re[0] ** 2 + re[1] ** 2 + re[2] ** 2))
         self.lbl_pos_err.setText(
-            f"{p_norm_mm:5.2f} mm  [{pe[0]*1000:5.1f}, {pe[1]*1000:5.1f}, {pe[2]*1000:5.1f}]"
+            f"{p_norm_mm:6.2f} mm  "
+            f"[{pe[0]*1000.0:+6.2f}, {pe[1]*1000.0:+6.2f}, {pe[2]*1000.0:+6.2f}] mm"
         )
         self.lbl_rot_err.setText(
-            f"{r_norm_deg:5.2f} deg [{math.degrees(re[0]):5.1f}, {math.degrees(re[1]):5.1f}, {math.degrees(re[2]):5.1f}]"
+            f"{r_norm_deg:6.2f} deg "
+            f"[{math.degrees(re[0]):+6.2f}, {math.degrees(re[1]):+6.2f}, {math.degrees(re[2]):+6.2f}] deg"
         )
         if msg.revision != self._last_logged_revision and msg.detail:
             self._last_logged_revision = msg.revision
@@ -1144,25 +1146,27 @@ class StudioMainWindow(QMainWindow):
         mass = float(msg.payload_mass)
         com = list(msg.payload_com_tcp)
         self.lbl_payload_info.setText(
-            f"{mass:.3f} kg | CoM: [{com[0]*1000.0:+.1f}, {com[1]*1000.0:+.1f}, {com[2]*1000.0:+.1f}] mm"
+            f"{mass:.2f} kg | CoM: [{com[0]*1000.0:+.2f}, {com[1]*1000.0:+.2f}, {com[2]*1000.0:+.2f}] mm"
         )
 
     def on_gripper_state(self, msg):
         gname, gbg = _GRIPPER_STATE_NAMES.get(msg.state, (f"STATE_{msg.state}", "#64748B"))
         self.lbl_gripper_state.setText(gname)
         self.lbl_gripper_state.setStyleSheet(_styled_pill(gbg))
-        pos_mm = (msg.position[0] - msg.position[1]) * 1000.0
-        self.lbl_gripper_metrics.setText(f"Opening: {pos_mm:5.1f} mm | Effort: {msg.effort:5.1f} N")
+        pos_mm = max(0.0, (msg.position[1] - msg.position[0]) * 1000.0)
+        self.lbl_gripper_metrics.setText(
+            f"Opening: {pos_mm:5.2f} mm | Effort: {msg.effort:+6.2f} N"
+        )
 
     def on_telemetry(self, q_list, _dq_list, tcp6):
         if q_list is not None:
             self._latest_q = q_list
             for idx, val in enumerate(q_list):
-                self._joint_labels[idx].setText(f"{val:+6.3f} rad ({math.degrees(val):+5.1f} deg)")
+                self._joint_labels[idx].setText(f"{math.degrees(val):+7.2f} deg")
         if tcp6 is not None:
             self._latest_tcp = tcp6
             x, y, z, r, p, w = tcp6
             self.lbl_tcp_pose.setText(
-                f"XYZ: [{x:6.4f}, {y:6.4f}, {z:6.4f}] m\n"
-                f"RPY: [{r:6.3f}, {p:6.3f}, {w:6.3f}] rad"
+                f"XYZ: [{x*1000.0:+7.2f}, {y*1000.0:+7.2f}, {z*1000.0:+7.2f}] mm\n"
+                f"RPY: [{math.degrees(r):+7.2f}, {math.degrees(p):+7.2f}, {math.degrees(w):+7.2f}] deg"
             )

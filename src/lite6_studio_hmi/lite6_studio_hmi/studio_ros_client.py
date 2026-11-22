@@ -260,7 +260,7 @@ class StudioRosWorker(QThread):
                         ctc_cmd_cli, "Studio supervisor heartbeat lost during motion"
                     )
                 self.supervisor_offline.emit(
-                    f"Studio supervisor heartbeat lost ({age:.1f}s)"
+                    f"Studio supervisor heartbeat lost ({age:.2f} s)"
                 )
 
     def _emit_telemetry(self, shm_reader, pin_model, pin_data, eef_frame_id):

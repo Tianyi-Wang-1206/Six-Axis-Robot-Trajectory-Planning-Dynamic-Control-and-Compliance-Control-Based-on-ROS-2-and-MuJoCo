@@ -1,19 +1,21 @@
 # Full physical manipulation demo matching scene.xml object positions:
-# - Cylinder at [0.24, -0.15, 0.05] (height 100 mm, dia 30 mm)
-# - Box at [0.24, 0.12, 0.04] (30 x 40 x 80 mm)
+# - Cylinder at [0.24, -0.15, 0.05] (height 100 mm, dia 30 mm, mass 0.30 kg)
+# - Box at [0.24, 0.12, 0.04] (30 x 40 x 80 mm, mass 0.30 kg)
 joint ZERO = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 # Exit wrist singularity (joint5=0 at ZERO) before running Cartesian MoveL
 joint READY = [0.0, 0.35, 1.0, 0.0, 0.65, 0.0]
 
+SetPayload(mass=0.0)
 MoveJ(READY, vel=0.55, acc=0.55)
 Gripper(action=OPEN, wait=true)
 
 # 1. MoveL directly above cylinder and stop
 MoveL(Pose(xyz=[0.240, -0.150, 0.160], rpy=[3.14159, 0.0, 0.0]), vel=0.45, acc=0.45)
 
-# 2. Descend to z=85 mm and close gripper to pick cylinder
+# 2. Descend to z=85 mm and close gripper to pick 0.30 kg cylinder
 MoveL(Pose(xyz=[0.240, -0.150, 0.085], rpy=[3.14159, 0.0, 0.0]), vel=0.28, acc=0.30)
 Gripper(action=CLOSE, wait=true)
+SetPayload(mass=0.30, com=[0.0, 0.0, 0.0])
 Wait(duration=0.20)
 
 # 3. Lift to z=200 mm and smoothly blend into a long MoveC arc above the box
@@ -26,24 +28,26 @@ MoveC(
 
 # 4. Cartesian impedance descent: cylinder contacts box top (~z=0.165),
 #    while equilibrium descends to z=0.135 to clearly demonstrate compliant yielding
-ImpedanceCartesian(kt=[450, 450, 100], dt=[40, 40, 20], kr=[25, 25, 18], dr=[3.0, 3.0, 2.5], null_damping=0.15) {
+ImpedanceCartesian(kt=[450, 450, 100], dt=[0.85, 0.85, 0.80], kr=[25, 25, 18], dr=[0.85, 0.85, 0.80], null_damping=0.15) {
   MoveL(Pose(xyz=[0.240, 0.120, 0.135], rpy=[3.14159, 0.0, 0.0]), vel=0.18, acc=0.20)
 }
 
-# 5. Stop, open gripper, lift to z=200 mm, and blend MoveC to approach box from -Y side
+# 5. Stop, open gripper, reset payload, lift to z=200 mm, and blend MoveC to approach box from -Y side
 Wait(duration=0.30)
 Gripper(action=OPEN, wait=true)
+SetPayload(mass=0.0)
 Wait(duration=0.20)
 MoveL(Pose(xyz=[0.240, 0.120, 0.200], rpy=[3.14159, 0.0, 0.0]), vel=0.40, acc=0.40, blend=0.025)
 MoveC(
   via=Pose(xyz=[0.240, 0.055, 0.140], rpy=[3.14159, 1.309, -1.5708]),
   target=Pose(xyz=[0.240, 0.045, 0.055], rpy=[3.14159, 1.309, -1.5708]),
-  vel=0.35, acc=0.35, blend=0.025
+  vel=0.35, acc=0.35
 )
-MoveL(Pose(xyz=[0.240, 0.112, 0.035], rpy=[3.14159, 1.309, -1.5708]), vel=0.22, acc=0.25)
-# Approach from the side without palm collision and close gripper across the 30 mm X-width
 
+# Approach from the side without palm collision and close gripper across the 30 mm X-width (0.30 kg box)
+MoveL(Pose(xyz=[0.240, 0.112, 0.055], rpy=[3.14159, 1.309, -1.5708]), vel=0.22, acc=0.25)
 Gripper(action=CLOSE, wait=true)
+SetPayload(mass=0.30, com=[0.0, 0.0, 0.0])
 Wait(duration=0.25)
 
 # 6. Large vertical MoveC arc (rise up, then descend to ~3.5 cm above tabletop)
@@ -53,11 +57,12 @@ MoveC(
   vel=0.40, acc=0.40
 )
 
-# 7. Compliant Cartesian impedance placement onto table, open gripper, retract clear, MoveJ ZERO
-ImpedanceCartesian(kt=[450, 450, 120], dt=[40, 40, 22], kr=[25, 25, 18], dr=[3.0, 3.0, 2.5], null_damping=0.15) {
+# 7. Compliant Cartesian impedance placement onto table, open gripper, reset payload, retract clear, MoveJ ZERO
+ImpedanceCartesian(kt=[450, 450, 120], dt=[0.85, 0.85, 0.80], kr=[25, 25, 18], dr=[0.85, 0.85, 0.80], null_damping=0.15) {
   MoveL(Pose(xyz=[0.240, -0.070, 0.038], rpy=[3.14159, 1.309, -1.5708]), vel=0.18, acc=0.20)
 }
 Gripper(action=OPEN, wait=true)
+SetPayload(mass=0.0)
 Wait(duration=0.20)
 MoveL(Pose(xyz=[0.235, -0.118, 0.090], rpy=[3.14159, 1.309, -1.5708]), vel=0.35, acc=0.35)
 MoveL(Pose(xyz=[0.200, -0.150, 0.240], rpy=[3.14159, 0.0, 0.0]), vel=0.35, acc=0.35)
