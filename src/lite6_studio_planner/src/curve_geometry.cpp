@@ -572,11 +572,15 @@ bool CompositeCartesianPath::build(
   const std::vector<MotionStatement> & statements,
   SourceLocation & err_loc,
   std::string & err_code,
-  std::string & err_msg)
+  std::string & err_msg,
+  std::vector<BlendWarning> * out_warnings)
 {
   pieces_.clear();
   s_cum_.clear();
   total_length_ = 0.0;
+  if (out_warnings != nullptr) {
+    out_warnings->clear();
+  }
 
   if (statements.empty()) {
     err_code = "ERR_EMPTY_PATH";
@@ -629,10 +633,36 @@ bool CompositeCartesianPath::build(
       // they cannot silently kill blending or inject a zero-tangent discontinuity.
       if (statements.size() > 1 && trans_len < 1e-7 && rot_len < 1e-7) {
         if (!raw_prims.empty()) {
-          raw_prims.back().blend_after =
-            (idx + 1 < statements.size()) ?
-            std::min(raw_prims.back().blend_after, next_blend) :
+          const double prev_req = raw_prims.back().blend_after;
+          const double eff = (idx + 1 < statements.size()) ?
+            std::min(prev_req, next_blend) :
             0.0;
+          if (out_warnings != nullptr && prev_req > 1e-5 && eff < prev_req - 1e-5) {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(4)
+                << "Cartesian blend radius " << (eff <= 1e-5 ? "ignored" : "clamped")
+                << " because following MoveL is zero-length (requested=" << prev_req
+                << " m, effective=" << eff << " m)";
+            out_warnings->push_back({
+              raw_prims.back().loc,
+              eff <= 1e-5 ? "WARN_BLEND_IGNORED" : "WARN_BLEND_CLAMPED",
+              oss.str()});
+          }
+          raw_prims.back().blend_after = eff;
+        }
+        if (out_warnings != nullptr && next_blend > 1e-5) {
+          const double eff_st = raw_prims.empty() ? 0.0 : raw_prims.back().blend_after;
+          if (eff_st < next_blend - 1e-5) {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(4)
+                << "Cartesian blend radius " << (eff_st <= 1e-5 ? "ignored" : "clamped")
+                << " on skipped zero-length MoveL (requested=" << next_blend
+                << " m, effective=" << eff_st << " m)";
+            out_warnings->push_back({
+              st.loc,
+              eff_st <= 1e-5 ? "WARN_BLEND_IGNORED" : "WARN_BLEND_CLAMPED",
+              oss.str()});
+          }
         }
         curr_pose = st.pose_target;
         continue;
@@ -802,6 +832,19 @@ bool CompositeCartesianPath::build(
         return false;
       }
       trim_len[i] = std::min({r, 0.42 * raw_prims[i].full_len, 0.42 * raw_prims[i + 1].full_len});
+      if (out_warnings != nullptr && trim_len[i] < r - 1e-5) {
+        const double eff = (trim_len[i] > 1e-5) ? trim_len[i] : 0.0;
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(4)
+            << "Cartesian blend radius " << (eff <= 1e-5 ? "ignored" : "clamped")
+            << " to 42% of adjacent segment length (requested=" << r
+            << " m, effective=" << eff << " m; segment lengths="
+            << raw_prims[i].full_len << " m, " << raw_prims[i + 1].full_len << " m)";
+        out_warnings->push_back({
+          raw_prims[i].loc,
+          eff <= 1e-5 ? "WARN_BLEND_IGNORED" : "WARN_BLEND_CLAMPED",
+          oss.str()});
+      }
       raw_prims[i].trim_end -= trim_len[i];
       raw_prims[i + 1].trim_start += trim_len[i];
     }
@@ -1296,6 +1339,7 @@ void C3JointSpline::build_hermite(
   const std::vector<double> & u)
 {
   segments_.clear();
+  pinned_boundaries_.clear();
   const size_t n = q.size();
   if (n < 2 || m1.size() != n || m2.size() != n || m3.size() != n || u.size() != n) {
     return;
@@ -1342,12 +1386,16 @@ bool JointCompositePath::build(
   const std::vector<MotionOptions> & segment_opts,
   const std::vector<SourceLocation> & segment_locs,
   const std::vector<Corner> & corners,
-  std::string & err_msg)
+  std::string & err_msg,
+  std::vector<double> * out_corner_trims)
 {
   pieces_.clear();
   s_cum_.clear();
   s_begin_ = 0.0;
   total_length_ = 0.0;
+  if (out_corner_trims != nullptr) {
+    out_corner_trims->clear();
+  }
   if (waypoints.size() < 2) {
     err_msg = "Joint path requires at least two waypoints";
     return false;
@@ -1449,6 +1497,9 @@ bool JointCompositePath::build(
     s_cum_[i + 1] = s_cum_[i] + pieces_[i].length;
   }
   total_length_ = s_cum_.back();
+  if (out_corner_trims != nullptr) {
+    *out_corner_trims = std::move(corner_trim);
+  }
   return true;
 }
 

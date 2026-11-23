@@ -22,6 +22,7 @@
   <depend>yaml-cpp</depend>
   <depend>pinocchio</depend>
   <depend>coal</depend>
+  <depend>ruckig</depend>
 
   <export>
     <build_type>ament_cmake</build_type>

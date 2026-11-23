@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -531,6 +532,8 @@ struct ProblemCache
   {
     int n_left = 0;
     JointJerkCon left[6];
+    int n_mid = 0;
+    JointJerkCon mid[6];
     int n_right = 0;
     JointJerkCon right[6];
   };
@@ -636,8 +639,10 @@ ProblemCache build_problem_cache(
       }
     };
     fill_jerk(nodes[i].p_right, pc.int_jerk[i].left, pc.int_jerk[i].n_left);
+    fill_jerk(mids[i].p_mid, pc.int_jerk[i].mid, pc.int_jerk[i].n_mid);
     fill_jerk(nodes[i + 1].p_left, pc.int_jerk[i].right, pc.int_jerk[i].n_right);
-    count += static_cast<size_t>(2 * (pc.int_jerk[i].n_left + pc.int_jerk[i].n_right));
+    count += static_cast<size_t>(
+      2 * (pc.int_jerk[i].n_left + pc.int_jerk[i].n_mid + pc.int_jerk[i].n_right));
   }
   pc.n_ineq = count;
   return pc;
@@ -876,6 +881,88 @@ void for_each_ineq(
     };
     visit_cart_mid(ma.trans);
     visit_cart_mid(ma.rot);
+
+    // 3d. Midpoint joint jerk at exact time midpoint (u_{m,i}, v_m, a_m)
+    {
+      const double dti = dt[i];
+      const double da_i = a[i + 1] - a[i];
+      const double dt_bar_i = dti * inv_ts;
+      const double vm3 = vm2 * vm;
+      const auto & mj = pc.int_jerk[i];
+      for (int k = 0; k < mj.n_mid; ++k) {
+        const auto & jc = mj.mid[k];
+        const double S_sc = jc.c2 * vm * am + jc.c3 * vm3;
+        const double F_val = jc.c1 * da_i + S_sc * dti;
+        const double g_pos = F_val - dt_bar_i;
+        const double g_neg = -F_val - dt_bar_i;
+
+        int nh = 0;
+        if constexpr (NeedGrad) {
+          const double Sv = jc.c2 * am + 3.0 * jc.c3 * vm2;
+          const double Sa = jc.c2 * vm;
+          double dF[5] = {};
+          for (int q = 0; q < nl; ++q) {
+            dF[q] = dti * (Sv * dvm[q] + Sa * dam[q]);
+          }
+          if (pos_ai >= 0) {
+            dF[pos_ai] -= jc.c1 * A_s;
+          }
+          if (pos_ai1 >= 0) {
+            dF[pos_ai1] += jc.c1 * A_s;
+          }
+          dF[pos_t] += S_sc * tau_s;
+
+          for (int q = 0; q < nl; ++q) {
+            grad[q] = dF[q] - ((q == pos_t) ? 1.0 : 0.0);
+          }
+
+          if constexpr (NeedHess) {
+            const double Svv = 6.0 * jc.c3 * vm;
+            const double Sva = jc.c2;
+            double dS[5] = {};
+            for (int q = 0; q < nl; ++q) {
+              dS[q] = Sv * dvm[q] + Sa * dam[q];
+            }
+            for (int p = 0; p < nl; ++p) {
+              for (int q = p; q < nl; ++q) {
+                double val_h = dti * (
+                  Svv * dvm[p] * dvm[q] +
+                  Sva * (dvm[p] * dam[q] + dam[p] * dvm[q]));
+                if ((p == pos_ai && q == pos_t) || (p == pos_t && q == pos_ai)) {
+                  val_h += dti * Sv * h_vm_at;
+                }
+                if ((p == pos_ai1 && q == pos_t) || (p == pos_t && q == pos_ai1)) {
+                  val_h -= dti * Sv * h_vm_at;
+                }
+                if (q == pos_t) {
+                  val_h += dS[p] * tau_s;
+                }
+                if (p == pos_t) {
+                  val_h += dS[q] * tau_s;
+                }
+                if (std::abs(val_h) > 1e-16) {
+                  hr[nh] = idx[p]; hc[nh] = idx[q]; hv[nh] = val_h; ++nh;
+                }
+              }
+            }
+          }
+          fn(m++, g_pos, nl, idx, grad, nh, hr, hc, hv);
+
+          for (int q = 0; q < nl; ++q) {
+            grad[q] = -dF[q] - ((q == pos_t) ? 1.0 : 0.0);
+          }
+          if constexpr (NeedHess) {
+            for (int q = 0; q < nh; ++q) {
+              hv[q] = -hv[q];
+            }
+          }
+          fn(m++, g_neg, nl, idx, grad, nh, hr, hc, hv);
+        } else {
+          fn(m++, g_pos, 0, idx, grad, 0, hr, hc, hv);
+          fn(m++, g_neg, 0, idx, grad, 0, hr, hc, hv);
+        }
+      }
+    }
   }
 
   // 4. Endpoint joint jerk constraints at both ends of every interval i = 0..N-1
@@ -1105,10 +1192,13 @@ void build_initial_guess(
 struct IPMResult
 {
   bool converged = false;
+  bool kkt_optimal = false;
   double eq_inf = 0.0;
   double ineq_inf = 0.0;
   double dual_inf = 0.0;
   double compl_inf = 0.0;
+  double mu = 0.0;
+  std::string fallback_reason;
 };
 
 IPMResult solve_3rd_order_ipm(
@@ -1122,7 +1212,8 @@ IPMResult solve_3rd_order_ipm(
   std::vector<double> & y1,
   std::vector<double> & y2,
   double T_ref,
-  bool warm_polish)
+  bool warm_polish,
+  int max_ipm_iters_override = 0)
 {
   const size_t N = nodes.size() - 1;
   double V_s = 0.0, A_s = 0.0;
@@ -1241,7 +1332,9 @@ IPMResult solve_3rd_order_ipm(
   double last_delta_w = 0.0;
   double prev_T = std::numeric_limits<double>::infinity();
   IPMResult res;
-  const int max_iters = warm_polish ? 80 : 120;
+  const int max_iters = (max_ipm_iters_override > 0)
+    ? max_ipm_iters_override
+    : (warm_polish ? 80 : 120);
 
   for (int iter = 0; iter < max_iters; ++iter) {
     eval_eq(v, a, dt, e1, e2);
@@ -1367,6 +1460,7 @@ IPMResult solve_3rd_order_ipm(
     res.ineq_inf = ineq_inf;
     res.dual_inf = d_sc;
     res.compl_inf = c0_sc;
+    res.mu = mu;
 
     const double dT_rel = std::abs(T_cur - prev_T) / std::max(T_cur, 1e-6);
     if ((E_0 < 2e-5 && eq_inf < 1e-6 && ineq_inf < 1e-5) ||
@@ -1374,13 +1468,19 @@ IPMResult solve_3rd_order_ipm(
          d_sc < 2e-4 && dT_rel < 5e-5))
     {
       res.converged = true;
+      res.kkt_optimal = true;
       break;
     }
     prev_T = T_cur;
 
-    // Monotone barrier update: when barrier subproblem is solved tightly, decrease mu and
-    // refresh the RHS barrier term directly before factoring.
-    if (E_mu <= 20.0 * mu && mu > 1e-8) {
+    // Monotone barrier update: when barrier subproblem is solved tightly (or primal +
+    // complementarity have already converged while dual_inf sits near the regularization floor),
+    // decrease mu and refresh the RHS barrier term directly before factoring.
+    const bool barrier_ready =
+      (E_mu <= 20.0 * mu) ||
+      (eq_inf < 1e-7 && prim_slack_inf < 1e-6 && (compl_mu_inf / s_d) <= 5.0 * mu &&
+       d_sc < 1e-4 && dT_rel < 1e-5);
+    if (barrier_ready && mu > 1e-8) {
       const double mu_new = std::max(1e-8, std::min(0.2 * mu, std::pow(mu, 1.4)));
       const double dmu = mu_new - mu;
       for_each_ineq<true, false>(
@@ -1394,6 +1494,7 @@ IPMResult solve_3rd_order_ipm(
           }
         });
       mu = mu_new;
+      res.mu = mu;
       filter.clear();
     }
 
@@ -1627,6 +1728,8 @@ IPMResult solve_3rd_order_ipm(
     if (!accepted) {
       if (eq_inf < 1e-5 && ineq_inf < 1e-4) {
         res.converged = true;
+        res.kkt_optimal = false;
+        res.fallback_reason = "line-search stall primal-feasible fallback";
         break;
       }
       // Feasibility restoration fallback: reset filter and take a small damped primal step.
@@ -1661,8 +1764,27 @@ IPMResult solve_3rd_order_ipm(
     }
   }
 
-  if (!res.converged && res.eq_inf < 1e-4 && res.ineq_inf < 5e-3) {
-    res.converged = true;
+  if (!res.converged) {
+    // Re-evaluate primal residuals on the final iterate before checking primal-feasible fallback.
+    eval_eq(v, a, dt, e1, e2);
+    double final_eq_inf = 0.0;
+    for (size_t i = 0; i < N; ++i) {
+      final_eq_inf = std::max({final_eq_inf, std::abs(e1[i]), std::abs(e2[i])});
+    }
+    double final_ineq_inf = 0.0;
+    for_each_ineq<false, false>(
+      pc, V_s, A_s, tau_s, v, a, dt,
+      [&](size_t, double val, int, const int *, const double *, int, const int *, const int *, const double *) {
+        final_ineq_inf = std::max(final_ineq_inf, std::max(0.0, val));
+      });
+    res.eq_inf = final_eq_inf;
+    res.ineq_inf = final_ineq_inf;
+    res.mu = mu;
+    if (res.eq_inf < 1e-4 && res.ineq_inf < 5e-3) {
+      res.converged = true;
+      res.kkt_optimal = false;
+      res.fallback_reason = "max-iterations primal-feasible fallback";
+    }
   }
   return res;
 }
@@ -1757,6 +1879,44 @@ void build_grid_data(
   }
 }
 
+double compute_interval_time_midpoint(
+  double u0, double u1, double v0, double a0, double a1, double dt_i)
+{
+  const double h = u1 - u0;
+  const double eps = 1e-3 * h;
+  const double u_raw = u0 + 0.5 * v0 * dt_i + ((5.0 * a0 + a1) / 48.0) * dt_i * dt_i;
+  if (!std::isfinite(u_raw)) {
+    return 0.5 * (u0 + u1);
+  }
+  return std::clamp(u_raw, u0 + eps, u1 - eps);
+}
+
+// Re-evaluates all collocation midpoints at the exact cubic time midpoints of (v, a, dt)
+// and returns max_i |u_{m,i}^{new} - u_{m,i}^{old}| / h_i.
+double refresh_time_midpoints(
+  const std::vector<double> & grid,
+  const std::vector<double> & v,
+  const std::vector<double> & a,
+  const std::vector<double> & dt,
+  const PathSampler & sampler,
+  const std::array<lite6_planner::JointLimit, 6> & jl,
+  const lite6_planner::CartesianLimit & cl,
+  std::vector<MidData> & mids)
+{
+  const size_t N = grid.size() - 1;
+  double max_rel_shift = 0.0;
+  for (size_t i = 0; i < N; ++i) {
+    const double h = std::max(grid[i + 1] - grid[i], 1e-12);
+    const double u_new = compute_interval_time_midpoint(
+      grid[i], grid[i + 1], v[i], a[i], a[i + 1], dt[i]);
+    max_rel_shift = std::max(max_rel_shift, std::abs(u_new - mids[i].u) / h);
+    mids[i].u = u_new;
+    mids[i].p_mid = sampler.eval(u_new);
+    mids[i].v_max = compute_v_max(mids[i].p_mid, jl, cl, kLimitMargin);
+  }
+  return max_rel_shift;
+}
+
 struct TickViolation
 {
   double u = 0.0;
@@ -1797,6 +1957,80 @@ Verify1kHzResult evaluate_1khz(
     }
   }
 
+  auto eval_continuous_ratios = [&](
+    const PathPoint & pp, double v_s, double a_s, double j_s,
+    Vec6 & dq, Vec6 & ddq, double & rv, double & ra, double & rj)
+  {
+    dq = pp.q1 * v_s;
+    ddq = pp.q2 * (v_s * v_s) + pp.q1 * a_s;
+    const Vec6 jrk = pp.q3 * (v_s * v_s * v_s) + 3.0 * pp.q2 * (v_s * a_s) + pp.q1 * j_s;
+    rv = 0.0;
+    ra = 0.0;
+    rj = 0.0;
+    for (int k = 0; k < 6; ++k) {
+      const auto & lim = jl[static_cast<size_t>(k)];
+      rv = std::max(rv, std::abs(dq[k]) / (pp.vs * lim.max_vel * kCheckMargin));
+      ra = std::max(ra, std::abs(ddq[k]) / (pp.as * lim.max_acc * kCheckMargin));
+      rj = std::max(rj, std::abs(jrk[k]) / (pp.js * lim.max_jerk * kCheckMargin));
+    }
+    if (pp.cart) {
+      rv = std::max(rv, (pp.p1 * v_s).norm() / (pp.vs * cl.max_trans_vel * kCheckMargin));
+      rv = std::max(rv, (pp.w1 * v_s).norm() / (pp.vs * cl.max_rot_vel * kCheckMargin));
+      ra = std::max(
+        ra, (pp.p2 * (v_s * v_s) + pp.p1 * a_s).norm() / (pp.as * cl.max_trans_acc * kCheckMargin));
+      ra = std::max(
+        ra, (pp.w2 * (v_s * v_s) + pp.w1 * a_s).norm() / (pp.as * cl.max_rot_acc * kCheckMargin));
+    }
+  };
+
+  // Continuous Stage-4 check at every collocation node (left/right one-sided limits) and
+  // intra-interval sub-samples tau in {0, 0.25, 0.5, 0.75, 1} to catch sub-millisecond peaks.
+  if (out == nullptr) {
+    constexpr double kSubTaus[5] = {0.0, 0.25, 0.5, 0.75, 1.0};
+    for (size_t i = 0; i < timing.dt.size(); ++i) {
+      const double u0 = timing.u[i];
+      const double u1 = timing.u[i + 1];
+      const double h_i = u1 - u0;
+      const double dt_i = timing.dt[i];
+      const double j_i = timing.j[i];
+      const double eps_i = std::min(1e-9, 1e-3 * h_i);
+      const double u_lo = u0 + eps_i;
+      const double u_hi = u1 - eps_i;
+      for (int s_idx = 0; s_idx < 5; ++s_idx) {
+        double u_eval = u_lo;
+        double v_s = 0.0;
+        double a_s = 0.0;
+        if (s_idx == 0) {
+          u_eval = u_lo;
+          v_s = timing.v[i];
+          a_s = timing.a[i];
+        } else if (s_idx == 4) {
+          u_eval = u_hi;
+          v_s = timing.v[i + 1];
+          a_s = timing.a[i + 1];
+        } else {
+          const double d = kSubTaus[s_idx] * dt_i;
+          const double u_raw = u0 + timing.v[i] * d + 0.5 * timing.a[i] * d * d +
+            (1.0 / 6.0) * j_i * d * d * d;
+          u_eval = std::clamp(u_raw, u_lo, u_hi);
+          v_s = std::max(0.0, timing.v[i] + timing.a[i] * d + 0.5 * j_i * d * d);
+          a_s = timing.a[i] + j_i * d;
+        }
+        const PathPoint pp = sampler.eval(u_eval);
+        Vec6 dq, ddq;
+        double rv = 0.0, ra = 0.0, rj = 0.0;
+        eval_continuous_ratios(pp, v_s, a_s, j_i, dq, ddq, rv, ra, rj);
+        res.max_rv = std::max(res.max_rv, rv);
+        res.max_ra = std::max(res.max_ra, ra);
+        res.max_rj = std::max(res.max_rj, rj);
+        const double worst = std::max({rv, ra, rj});
+        if (worst > 1.0) {
+          res.violations.push_back({u_eval, worst});
+        }
+      }
+    }
+  }
+
   Vec6 prev_ddq = Vec6::Zero();
   double prev_js = 1.0;
 
@@ -1813,29 +2047,16 @@ Verify1kHzResult evaluate_1khz(
     }
 
     const PathPoint pp = sampler.eval(u_s);
-    const Vec6 dq = pp.q1 * v_s;
-    const Vec6 ddq = pp.q2 * (v_s * v_s) + pp.q1 * a_s;
-    const Vec6 jrk = pp.q3 * (v_s * v_s * v_s) + 3.0 * pp.q2 * (v_s * a_s) + pp.q1 * j_s;
-
+    Vec6 dq, ddq;
     double rv = 0.0, ra = 0.0, rj = 0.0;
-    const double disc_js = (tick > 0) ? std::max(prev_js, pp.js) : pp.js;
-    for (int k = 0; k < 6; ++k) {
-      const auto & lim = jl[static_cast<size_t>(k)];
-      rv = std::max(rv, std::abs(dq[k]) / (pp.vs * lim.max_vel * kCheckMargin));
-      ra = std::max(ra, std::abs(ddq[k]) / (pp.as * lim.max_acc * kCheckMargin));
-      rj = std::max(rj, std::abs(jrk[k]) / (pp.js * lim.max_jerk * kCheckMargin));
-      if (tick > 0) {
+    eval_continuous_ratios(pp, v_s, a_s, j_s, dq, ddq, rv, ra, rj);
+    if (tick > 0) {
+      const double disc_js = std::max(prev_js, pp.js);
+      for (int k = 0; k < 6; ++k) {
+        const auto & lim = jl[static_cast<size_t>(k)];
         const double disc_jrk = std::abs(ddq[k] - prev_ddq[k]) / 0.001;
         rj = std::max(rj, disc_jrk / (disc_js * lim.max_jerk * kCheckMargin));
       }
-    }
-    if (pp.cart) {
-      rv = std::max(rv, (pp.p1 * v_s).norm() / (pp.vs * cl.max_trans_vel * kCheckMargin));
-      rv = std::max(rv, (pp.w1 * v_s).norm() / (pp.vs * cl.max_rot_vel * kCheckMargin));
-      ra = std::max(
-        ra, (pp.p2 * (v_s * v_s) + pp.p1 * a_s).norm() / (pp.as * cl.max_trans_acc * kCheckMargin));
-      ra = std::max(
-        ra, (pp.w2 * (v_s * v_s) + pp.w1 * a_s).norm() / (pp.as * cl.max_rot_acc * kCheckMargin));
     }
     prev_ddq = ddq;
     prev_js = pp.js;
@@ -1876,7 +2097,9 @@ bool TOPPJerkSolver::solve(
   double default_jerk_scale,
   const SourceLocation & default_loc,
   SampledTrajectory1kHz & out_traj,
-  std::string & err_msg)
+  std::string & err_msg,
+  std::vector<std::string> * out_warnings,
+  const TOPPSolveOptions & solve_options)
 {
   out_traj.samples.clear();
   out_traj.duration_sec = 0.0;
@@ -2011,6 +2234,7 @@ bool TOPPJerkSolver::solve(
 
   std::vector<double> v, a, dt, y1, y2;
   build_initial_guess(grid, x_ra, nodes, joint_limits, v, a, dt);
+  refresh_time_midpoints(grid, v, a, dt, sampler, joint_limits, cart_limits, mids);
 
   // 3. Exact 3rd-order direct-transcription interior-point solve + adaptive collocation refinement.
   CubicTiming timing;
@@ -2020,7 +2244,8 @@ bool TOPPJerkSolver::solve(
 
   for (int refine = 0; refine < kMaxCollocationRefines; ++refine) {
     last_ipm = solve_3rd_order_ipm(
-      nodes, mids, joint_limits, cart_limits, v, a, dt, y1, y2, T_ra, refine > 0);
+      nodes, mids, joint_limits, cart_limits, v, a, dt, y1, y2, T_ra, refine > 0,
+      solve_options.max_ipm_iters_override);
     if (!last_ipm.converged) {
       std::ostringstream oss;
       oss << "3rd-order TOPP interior-point solver failed to converge (eq_inf="
@@ -2028,6 +2253,38 @@ bool TOPPJerkSolver::solve(
           << ", dual_inf=" << last_ipm.dual_inf << ")";
       err_msg = oss.str();
       return false;
+    }
+
+    // Fixed-point exact cubic time-midpoint polish (up to 4 passes).
+    constexpr int kMaxMidpointPolishes = 4;
+    constexpr double kMidpointRelTol = 1e-3;
+    for (int mp = 0; mp < kMaxMidpointPolishes; ++mp) {
+      std::vector<MidData> mids_next = mids;
+      const double max_rel_shift = refresh_time_midpoints(
+        grid, v, a, dt, sampler, joint_limits, cart_limits, mids_next);
+      if (max_rel_shift <= kMidpointRelTol) {
+        mids.swap(mids_next);
+        break;
+      }
+      std::vector<double> v_bak = v;
+      std::vector<double> a_bak = a;
+      std::vector<double> dt_bak = dt;
+      std::vector<double> y1_bak = y1;
+      std::vector<double> y2_bak = y2;
+      mids.swap(mids_next);
+      const IPMResult polish_ipm = solve_3rd_order_ipm(
+        nodes, mids, joint_limits, cart_limits, v, a, dt, y1, y2, T_ra, true,
+        solve_options.max_ipm_iters_override);
+      if (!polish_ipm.converged) {
+        v.swap(v_bak);
+        a.swap(a_bak);
+        dt.swap(dt_bak);
+        y1.swap(y1_bak);
+        y2.swap(y2_bak);
+        mids.swap(mids_next);
+        break;
+      }
+      last_ipm = polish_ipm;
     }
 
     timing.rebuild_from_state(grid, v, a, dt);
@@ -2132,6 +2389,7 @@ bool TOPPJerkSolver::solve(
     y1.swap(y1_next);
     y2.swap(y2_next);
     build_grid_data(grid, sampler, joint_limits, cart_limits, nodes, mids);
+    refresh_time_midpoints(grid, v, a, dt, sampler, joint_limits, cart_limits, mids);
   }
 
   if (!accepted) {
@@ -2147,6 +2405,19 @@ bool TOPPJerkSolver::solve(
     err_msg = "Computed trajectory duration=" + std::to_string(final_1khz_T) +
       " s exceeds 300 s limit";
     return false;
+  }
+
+  if (!last_ipm.kkt_optimal && out_warnings != nullptr) {
+    std::ostringstream oss;
+    oss << std::scientific << std::setprecision(3)
+        << "3rd-order TOPP accepted "
+        << (last_ipm.fallback_reason.empty() ? "primal-feasible fallback" : last_ipm.fallback_reason)
+        << " without full KKT optimality (dual_inf=" << last_ipm.dual_inf
+        << ", compl_inf=" << last_ipm.compl_inf
+        << ", mu=" << last_ipm.mu
+        << ", eq_inf=" << last_ipm.eq_inf
+        << ", ineq_inf=" << last_ipm.ineq_inf << ")";
+    out_warnings->push_back(oss.str());
   }
 
   evaluate_1khz(timing, sampler, joint_limits, cart_limits, &out_traj);

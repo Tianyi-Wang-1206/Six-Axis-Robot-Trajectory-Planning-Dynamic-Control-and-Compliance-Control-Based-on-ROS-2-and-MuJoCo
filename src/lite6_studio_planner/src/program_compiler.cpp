@@ -597,9 +597,13 @@ bool ProgramCompiler::compile_cartesian_group(
   CompositeCartesianPath cart_path;
   SourceLocation err_loc = group.front().loc;
   std::string err_code, err_msg;
-  if (!cart_path.build(start_pose, group, err_loc, err_code, err_msg)) {
+  std::vector<BlendWarning> blend_warnings;
+  if (!cart_path.build(start_pose, group, err_loc, err_code, err_msg, &blend_warnings)) {
     add_diag(out_diagnostics, D::STAGE_PLANNING, err_loc, err_code, err_msg);
     return false;
+  }
+  for (const auto & w : blend_warnings) {
+    add_warning(out_diagnostics, D::STAGE_PLANNING, w.loc, w.code, w.message);
   }
 
   // Warn when a 3-point MoveC passes a custom intermediate 'via' orientation that differs
@@ -920,13 +924,17 @@ bool ProgramCompiler::plan_cartesian_path(
     return false;
   }
   std::string topp_err;
+  std::vector<std::string> topp_warnings;
   if (!TOPPJerkSolver::solve(
         joint_path, &cart_path, motion_limits(is_impedance), engine_.get_cartesian_limits(),
         default_options.vel_scale, default_options.acc_scale, default_options.jerk_scale,
-        default_loc, out_sampled, topp_err))
+        default_loc, out_sampled, topp_err, &topp_warnings))
   {
     add_diag(out_diagnostics, D::STAGE_PLANNING, default_loc, "ERR_TOPP_SOLVER", topp_err);
     return false;
+  }
+  for (const auto & w : topp_warnings) {
+    add_warning(out_diagnostics, D::STAGE_PLANNING, default_loc, "WARN_TOPP_SUBOPTIMAL", w);
   }
   return verify_sampled_trajectory_1khz(
     out_sampled, /*check_singularity=*/true, out_diagnostics, is_impedance);
@@ -953,7 +961,7 @@ double ProgramCompiler::tcp_blend_trim(
   // Measure strictly monotonic cumulative TCP pseudo-arc-length (combining translation [m]
   // and kCharLength * rotation [m]) along the joint line from corner_q toward neighbor_q.
   // This handles pure-orientation joint moves and >180 deg rotations without non-monotonicity.
-  const int steps = std::max(16, static_cast<int>(std::ceil(d_max / 0.04)));
+  const int steps = std::max(16, static_cast<int>(std::ceil(d_max / 0.02)));
   Eigen::Matrix4d prev_fk = engine_.forward_pose(corner_q, workspace.data);
   double prev_s = 0.0;
   double acc_len = 0.0;
@@ -983,6 +991,37 @@ double ProgramCompiler::tcp_blend_trim(
     prev_s = s;
   }
   return d_max;
+}
+
+double ProgramCompiler::tcp_arc_length_at_joint_trim(
+  const std::array<double, 6> & corner_q,
+  const std::array<double, 6> & neighbor_q,
+  double joint_trim) const
+{
+  if (!(joint_trim > 1e-12)) {
+    return 0.0;
+  }
+  auto workspace = engine_.collision_workspace();
+  const Vec6 c = to_vec6(corner_q);
+  const Vec6 d = to_vec6(neighbor_q) - c;
+  const double len = d.norm();
+  if (len < 1e-12) {
+    return 0.0;
+  }
+  const double s_end = std::min(joint_trim, len);
+  const Vec6 e = d / len;
+  const int steps = std::max(16, static_cast<int>(std::ceil(s_end / 0.02)));
+  Eigen::Matrix4d prev_fk = engine_.forward_pose(corner_q, workspace.data);
+  double acc_len = 0.0;
+  for (int k = 1; k <= steps; ++k) {
+    const double s = s_end * static_cast<double>(k) / steps;
+    const Eigen::Matrix4d curr_fk = engine_.forward_pose(to_array(c + s * e), workspace.data);
+    const double dp = (curr_fk.topRightCorner<3, 1>() - prev_fk.topRightCorner<3, 1>()).norm();
+    const double dr = rot_diff(prev_fk.topLeftCorner<3, 3>(), curr_fk.topLeftCorner<3, 3>());
+    acc_len += std::max(dp, kCharLength * dr);
+    prev_fk = curr_fk;
+  }
+  return acc_len;
 }
 
 bool ProgramCompiler::build_joint_group_path(
@@ -1054,10 +1093,36 @@ bool ProgramCompiler::build_joint_group_path(
   for (size_t i = 0; i < group.size(); ++i) {
     const Vec6 d = to_vec6(raw_waypoints[i + 1]) - to_vec6(out_waypoints.back());
     if (group.size() > 1 && d.norm() < 1e-9) {
+      const double st_blend = (i + 1 < group.size()) ? group[i].options.blend_radius : 0.0;
       if (!opts.empty()) {
-        opts.back().blend_radius = (i + 1 < group.size()) ?
-          std::min(opts.back().blend_radius, group[i].options.blend_radius) :
+        const double prev_req = opts.back().blend_radius;
+        const double eff = (i + 1 < group.size()) ?
+          std::min(prev_req, st_blend) :
           0.0;
+        if (prev_req > 1e-5 && eff < prev_req - 1e-5) {
+          std::ostringstream oss;
+          oss << std::fixed << std::setprecision(4)
+              << "Joint blend radius " << (eff <= 1e-5 ? "ignored" : "clamped")
+              << " because following joint move is zero-length (requested=" << prev_req
+              << " m, effective=" << eff << " m)";
+          add_warning(
+            out_diagnostics, D::STAGE_PLANNING, locs.back(),
+            eff <= 1e-5 ? "WARN_BLEND_IGNORED" : "WARN_BLEND_CLAMPED", oss.str());
+        }
+        opts.back().blend_radius = eff;
+      }
+      if (st_blend > 1e-5) {
+        const double eff_st = opts.empty() ? 0.0 : opts.back().blend_radius;
+        if (eff_st < st_blend - 1e-5) {
+          std::ostringstream oss;
+          oss << std::fixed << std::setprecision(4)
+              << "Joint blend radius " << (eff_st <= 1e-5 ? "ignored" : "clamped")
+              << " on skipped zero-length joint move (requested=" << st_blend
+              << " m, effective=" << eff_st << " m)";
+          add_warning(
+            out_diagnostics, D::STAGE_PLANNING, group[i].loc,
+            eff_st <= 1e-5 ? "WARN_BLEND_IGNORED" : "WARN_BLEND_CLAMPED", oss.str());
+        }
       }
       continue;
     }
@@ -1085,9 +1150,46 @@ bool ProgramCompiler::build_joint_group_path(
     corners.push_back(c);
   }
   std::string err;
-  if (!out_path.build(out_waypoints, opts, locs, corners, err)) {
+  std::vector<double> corner_trims;
+  if (!out_path.build(out_waypoints, opts, locs, corners, err, &corner_trims)) {
     add_diag(out_diagnostics, D::STAGE_PLANNING, group.front().loc, "ERR_JOINT_PATH", err);
     return false;
+  }
+
+  // Warn whenever the 45% segment cap or symmetric min(trim_in, trim_out) clamp reduces
+  // the achieved TCP blend distance below the requested blend_radius.
+  for (size_t k = 1; k + 1 < out_waypoints.size(); ++k) {
+    const double r = opts[k - 1].blend_radius;
+    if (r <= 1e-5) {
+      continue;
+    }
+    const double d_eff = (k - 1 < corner_trims.size()) ? corner_trims[k - 1] : 0.0;
+    const double tcp_in = tcp_arc_length_at_joint_trim(out_waypoints[k], out_waypoints[k - 1], d_eff);
+    const double tcp_out = tcp_arc_length_at_joint_trim(out_waypoints[k], out_waypoints[k + 1], d_eff);
+    const double eff_tcp = std::min(tcp_in, tcp_out);
+    if (d_eff <= 1e-12 || eff_tcp < r - 2e-4) {
+      const double len_in = (to_vec6(out_waypoints[k]) - to_vec6(out_waypoints[k - 1])).norm();
+      const double len_out = (to_vec6(out_waypoints[k + 1]) - to_vec6(out_waypoints[k])).norm();
+      const bool hit_cap = (d_eff >= 0.45 * std::min(len_in, len_out) - 1e-6);
+      const bool hit_sym = (std::abs(corners[k - 1].trim_in - corners[k - 1].trim_out) > 1e-5);
+      std::string cause;
+      if (hit_cap && hit_sym) {
+        cause = "45% segment cap and symmetric joint trim clamp";
+      } else if (hit_cap) {
+        cause = "45% adjacent segment length cap";
+      } else {
+        cause = "symmetric min(trim_in, trim_out) joint blend clamp";
+      }
+      const bool ignored = (eff_tcp <= 1e-5);
+      std::ostringstream oss;
+      oss << std::fixed << std::setprecision(4)
+          << "Joint blend radius " << (ignored ? "ignored" : "clamped") << " by " << cause
+          << " (requested=" << r << " m, effective TCP=" << eff_tcp
+          << " m; in=" << tcp_in << " m, out=" << tcp_out << " m)";
+      add_warning(
+        out_diagnostics, D::STAGE_PLANNING, locs[k - 1],
+        ignored ? "WARN_BLEND_IGNORED" : "WARN_BLEND_CLAMPED", oss.str());
+    }
   }
   return true;
 }
@@ -1115,14 +1217,20 @@ bool ProgramCompiler::compile_joint_group(
     sampled = scurve_samples(scurve, st.loc, 0.0, 1.0);
   } else {
     std::string topp_err;
+    std::vector<std::string> topp_warnings;
     if (!TOPPJerkSolver::solve(
           path, nullptr, engine_.get_joint_limits(), engine_.get_cartesian_limits(),
           group.front().options.vel_scale, group.front().options.acc_scale,
-          group.front().options.jerk_scale, group.front().loc, sampled, topp_err))
+          group.front().options.jerk_scale, group.front().loc, sampled, topp_err,
+          &topp_warnings))
     {
       add_diag(
         out_diagnostics, D::STAGE_PLANNING, group.front().loc, "ERR_TOPP_SOLVER", topp_err);
       return false;
+    }
+    for (const auto & w : topp_warnings) {
+      add_warning(
+        out_diagnostics, D::STAGE_PLANNING, group.front().loc, "WARN_TOPP_SUBOPTIMAL", w);
     }
   }
 
@@ -1183,11 +1291,34 @@ bool ProgramCompiler::compile_pva_statement(
     }
   }
 
+  auto is_all_zero = [](const std::array<double, 6> & arr) {
+    for (double x : arr) {
+      if (std::abs(x) > 1e-9) {
+        return false;
+      }
+    }
+    return true;
+  };
+
   bool any_vel_or_acc_or_dt = false;
   for (size_t k = 0; k < M; ++k) {
     const auto & wp = pva.waypoints[k];
-    if (wp.velocity.has_value() || wp.acceleration.has_value() || wp.dt.has_value()) {
+    if (wp.dt.has_value()) {
       any_vel_or_acc_or_dt = true;
+      break;
+    }
+    if (k + 1 == M) {
+      // Ignore an explicit all-zero v=[0..0], a=[0..0] on the final waypoint alone so
+      // restating the mandatory terminal rest condition preserves pure-(P) TOPP.
+      if ((wp.velocity.has_value() && !is_all_zero(*wp.velocity)) ||
+          (wp.acceleration.has_value() && !is_all_zero(*wp.acceleration)))
+      {
+        any_vel_or_acc_or_dt = true;
+        break;
+      }
+    } else if (wp.velocity.has_value() || wp.acceleration.has_value()) {
+      any_vel_or_acc_or_dt = true;
+      break;
     }
   }
 
@@ -1270,7 +1401,12 @@ bool ProgramCompiler::compile_pva_statement(
       } else {
         q_nodes[k + 1] = sols.front();
       }
-      if (k + 1 < M && wp.velocity.has_value()) {
+      if (k + 1 < M && !wp.velocity.has_value()) {
+        add_warning(
+          out_diagnostics, D::STAGE_SEMANTIC, wp.loc, "WARN_PVA_INTERMEDIATE_STOP",
+          "Intermediate Cartesian MovePVA waypoint " + std::to_string(k + 1) +
+            " omits velocity 'v'; robot will stop at V=0, A=0 at this waypoint");
+      } else if (k + 1 < M && wp.velocity.has_value()) {
         V_nodes[k + 1] = to_vec6(*wp.velocity);
         if (wp.acceleration.has_value()) {
           A_nodes[k + 1] = to_vec6(*wp.acceleration);
@@ -1799,18 +1935,26 @@ bool ProgramCompiler::compile_pva_statement(
       sampled = scurve_samples(scurve, pva.waypoints.front().loc, 0.0, 1.0);
     } else {
       // Pure (P) sequence: C^3 joint spline + 3rd-order direct-transcription TOPP timing.
+      const std::vector<double> knot_u = C3JointSpline::chord_length_parameters(q_nodes);
       C3JointSpline spline;
-      spline.build(q_nodes);
+      spline.build(q_nodes, knot_u);
+      if (knot_u.size() > 2) {
+        spline.set_pinned_boundaries(
+          std::vector<double>(knot_u.begin() + 1, knot_u.end() - 1));
+      }
       std::string topp_err;
+      std::vector<std::string> topp_warnings;
       if (!TOPPJerkSolver::solve(
             spline, nullptr, limits, cart_limits,
             pva.options.vel_scale, pva.options.acc_scale, pva.options.jerk_scale,
-            pva.loc, sampled, topp_err))
+            pva.loc, sampled, topp_err, &topp_warnings))
       {
         add_diag(out_diagnostics, D::STAGE_PLANNING, pva.loc, "ERR_TOPP_SOLVER", topp_err);
         return false;
       }
-      const std::vector<double> knot_u = C3JointSpline::chord_length_parameters(q_nodes);
+      for (const auto & w : topp_warnings) {
+        add_warning(out_diagnostics, D::STAGE_PLANNING, pva.loc, "WARN_TOPP_SUBOPTIMAL", w);
+      }
       for (auto & s : sampled.samples) {
         const auto it = std::upper_bound(knot_u.begin() + 1, knot_u.end() - 1, s.path_u);
         const size_t wp_idx = std::min(
@@ -1819,107 +1963,27 @@ bool ProgramCompiler::compile_pva_statement(
       }
     }
   } else {
-    // Explicit (P, V), (P, V, A), or dt joint sequence: chained C^3 Septic Hermite segments.
-    std::vector<std::array<double, 6>> v_nodes(M + 1, std::array<double, 6>{});
-    std::vector<std::array<double, 6>> a_nodes(M + 1, std::array<double, 6>{});
-    for (size_t k = 0; k + 1 < M; ++k) {
-      if (pva.waypoints[k].velocity.has_value()) {
-        v_nodes[k + 1] = *pva.waypoints[k].velocity;
-        if (pva.waypoints[k].acceleration.has_value()) {
-          a_nodes[k + 1] = *pva.waypoints[k].acceleration;
-        }
-      }
+    // Explicit / mixed Joint MovePVA: full 3rd-order time-optimal multi-waypoint solver
+    // ("Full Ruckig": hard [min_pos, max_pos] clamping, exact dt, free-(v_k, a_k) optimization).
+    JointPVASolver::MultiWaypointResult pva_res;
+    SourceLocation pva_err_loc = pva.loc;
+    std::string pva_err_code, pva_err_msg;
+    if (!JointPVASolver::solve_multi_waypoint(
+          start_q, pva.waypoints, limits,
+          pva.options.vel_scale, pva.options.acc_scale, pva.options.jerk_scale,
+          pva_res, pva_err_loc, pva_err_code, pva_err_msg))
+    {
+      const uint8_t stage =
+        (pva_err_code == "ERR_JOINT_POS_LIMIT" ||
+         pva_err_code == "ERR_PVA_VEL_LIMIT" ||
+         pva_err_code == "ERR_PVA_ACC_LIMIT" ||
+         pva_err_code == "ERR_PVA_JERK_LIMIT")
+        ? D::STAGE_KINEMATIC_LIMIT
+        : D::STAGE_PLANNING;
+      add_diag(out_diagnostics, stage, pva_err_loc, pva_err_code, pva_err_msg);
+      return false;
     }
-    // Endpoint terminates at rest for safe controller settling (warning already emitted if nonzero).
-    v_nodes[M].fill(0.0);
-    a_nodes[M].fill(0.0);
-
-    double t_accum = 0.0;
-    for (size_t seg_idx = 0; seg_idx < M; ++seg_idx) {
-      const auto & wp = pva.waypoints[seg_idx];
-      SepticHermiteSegment seg;
-      if (wp.dt.has_value()) {
-        seg.build_with_duration(
-          q_nodes[seg_idx], v_nodes[seg_idx], a_nodes[seg_idx],
-          q_nodes[seg_idx + 1], v_nodes[seg_idx + 1], a_nodes[seg_idx + 1], *wp.dt);
-      } else {
-        if (!seg.build_time_optimal(
-              q_nodes[seg_idx], v_nodes[seg_idx], a_nodes[seg_idx],
-              q_nodes[seg_idx + 1], v_nodes[seg_idx + 1], a_nodes[seg_idx + 1],
-              limits, pva.options.vel_scale, pva.options.acc_scale, pva.options.jerk_scale))
-        {
-          add_diag(
-            out_diagnostics, D::STAGE_PLANNING, wp.loc, "ERR_PVA_INFEASIBLE",
-            "MovePVA segment " + std::to_string(seg_idx + 1) +
-              " has no feasible duration within 60 s satisfying scaled joint (pos/vel/acc/jerk) limits");
-          return false;
-        }
-      }
-
-      const int seg_ticks = std::max(1, static_cast<int>(std::llround(seg.duration() * 1000.0)));
-      const int start_tick = (seg_idx == 0) ? 0 : 1;
-      std::array<double, 6> prev_ddq = a_nodes[seg_idx];
-      for (int tick = 0; tick <= seg_ticks; ++tick) {
-        const double t_local = static_cast<double>(tick) * 0.001;
-        SampledTrajectory1kHz::Sample smp;
-        smp.time_sec = t_accum + t_local;
-        smp.path_u = (static_cast<double>(seg_idx) +
-                      static_cast<double>(tick) / seg_ticks) / static_cast<double>(M);
-        std::array<double, 6> jrk{};
-        seg.eval(t_local, smp.q, smp.dq, smp.ddq, jrk);
-        if (seg_idx + 1 == M && tick == seg_ticks) {
-          smp.dq.fill(0.0);
-          smp.ddq.fill(0.0);
-        }
-        // Enforce MovePVA scaled vel/acc/jerk options when explicit wp.dt is specified.
-        if (wp.dt.has_value()) {
-          for (size_t i = 0; i < 6; ++i) {
-            const double v_scaled = limits[i].max_vel * pva.options.vel_scale;
-            const double a_scaled = limits[i].max_acc * pva.options.acc_scale;
-            const double j_scaled = limits[i].max_jerk * pva.options.jerk_scale;
-            if (std::abs(smp.dq[i]) > v_scaled + lite6_planner::tolerance::kTrajectoryVelocity) {
-              std::ostringstream oss;
-              oss << std::fixed << std::setprecision(5)
-                  << "MovePVA explicit dt=" << *wp.dt << " s violates scaled joint" << (i + 1)
-                  << " velocity limit at t=" << smp.time_sec << " s: |dq|=" << std::abs(smp.dq[i])
-                  << " rad/s > " << v_scaled << " rad/s (vel=" << pva.options.vel_scale << ")";
-              add_diag(out_diagnostics, D::STAGE_KINEMATIC_LIMIT, wp.loc, "ERR_PVA_VEL_LIMIT", oss.str());
-              return false;
-            }
-            if (std::abs(smp.ddq[i]) > a_scaled + lite6_planner::tolerance::kTrajectoryAcceleration) {
-              std::ostringstream oss;
-              oss << std::fixed << std::setprecision(5)
-                  << "MovePVA explicit dt=" << *wp.dt << " s violates scaled joint" << (i + 1)
-                  << " acceleration limit at t=" << smp.time_sec << " s: |ddq|="
-                  << std::abs(smp.ddq[i]) << " rad/s^2 > " << a_scaled
-                  << " rad/s^2 (acc=" << pva.options.acc_scale << ")";
-              add_diag(out_diagnostics, D::STAGE_KINEMATIC_LIMIT, wp.loc, "ERR_PVA_ACC_LIMIT", oss.str());
-              return false;
-            }
-            if (tick > 0) {
-              const double disc_jrk = std::abs(smp.ddq[i] - prev_ddq[i]) / 0.001;
-              if (disc_jrk > j_scaled * 1.001 + 1e-3 || std::abs(jrk[i]) > j_scaled * 1.001 + 1e-3) {
-                std::ostringstream oss;
-                oss << std::fixed << std::setprecision(3)
-                    << "MovePVA explicit dt=" << *wp.dt << " s violates scaled joint" << (i + 1)
-                    << " jerk limit at t=" << smp.time_sec << " s: |jerk|="
-                    << std::max(disc_jrk, std::abs(jrk[i])) << " rad/s^3 > " << j_scaled
-                    << " rad/s^3 (jerk=" << pva.options.jerk_scale << ")";
-                add_diag(out_diagnostics, D::STAGE_KINEMATIC_LIMIT, wp.loc, "ERR_PVA_JERK_LIMIT", oss.str());
-                return false;
-              }
-            }
-          }
-        }
-        prev_ddq = smp.ddq;
-        if (tick >= start_tick) {
-          smp.loc = wp.loc;
-          sampled.samples.push_back(smp);
-        }
-      }
-      t_accum += static_cast<double>(seg_ticks) * 0.001;
-    }
-    sampled.duration_sec = t_accum;
+    sampled = std::move(pva_res.trajectory);
   }
 
   if (!verify_sampled_trajectory_1khz(
@@ -1992,6 +2056,43 @@ bool ProgramCompiler::compile(
           }
           ++i;
           group.push_back(*stmts[i].motion);
+        }
+
+        if (group.back().options.blend_radius > 1e-5) {
+          std::string reason;
+          if (i + 1 >= stmts.size()) {
+            reason = is_impedance ? "end of ImpedanceCartesian block" : "end of program";
+          } else {
+            switch (stmts[i + 1].kind) {
+              case StatementKind::MOTION:
+                reason = is_cart
+                  ? "next motion is in joint space (MoveJ/MoveP)"
+                  : "next motion is in Cartesian space (MoveL/MoveC)";
+                break;
+              case StatementKind::MOVE_PVA:
+                reason = "followed by MovePVA";
+                break;
+              case StatementKind::IMPEDANCE_BLOCK:
+                reason = "followed by ImpedanceCartesian block";
+                break;
+              case StatementKind::GRIPPER:
+                reason = "followed by Gripper command";
+                break;
+              case StatementKind::WAIT:
+                reason = "followed by Wait command";
+                break;
+              case StatementKind::SET_PAYLOAD:
+                reason = "followed by SetPayload command";
+                break;
+            }
+          }
+          std::ostringstream oss;
+          oss << std::fixed << std::setprecision(4)
+              << "Blend radius ignored at end of motion group (" << reason
+              << "): requested=" << group.back().options.blend_radius
+              << " m, effective=0.0000 m";
+          add_warning(
+            out_diagnostics, D::STAGE_PLANNING, group.back().loc, "WARN_BLEND_IGNORED", oss.str());
         }
 
         ExecutionBlock blk;

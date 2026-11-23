@@ -40,22 +40,30 @@ struct SampledTrajectory1kHz
 // 3. Solves the exact piecewise-constant-jerk 3rd-order direct-transcription nonlinear
 //    program minimizing T = sum_i dt_i over (v_i, a_i, dt_i) subject to exact cubic-jerk
 //    transition equalities, rest-to-rest boundary conditions (v = 0, a = 0 at u = 0, 1),
-//    endpoint and Hermite-Simpson midpoint velocity/acceleration bounds, exact smooth
-//    Euclidean Cartesian acceleration norm bounds, and endpoint joint jerk bounds.
+//    endpoint and Hermite-Simpson exact-time-midpoint velocity/acceleration/jerk bounds,
+//    and exact smooth Euclidean Cartesian acceleration norm bounds.
 //    Solved via a banded primal-dual interior-point Newton method (half-bandwidth 6 SQD
 //    LDL^T with inertia regularization, exact Lagrangian Hessian, filter line search,
-//    and second-order corrections) — with no post-hoc boxcar smoothing, heuristic limit
-//    tightening, or uniform time dilation.
-// 4. Evaluates the exact piecewise-cubic timing law at 1 kHz (verifying joint vel/acc,
-//    continuous and 1 ms finite-difference joint jerk, and analytic Cartesian path
-//    vel/acc). If any inter-node sample violates a bound, inserts collocation knots at
-//    the offending intervals and re-solves the warm-started interior-point problem.
+//    and second-order corrections) with fixed-point time-midpoint refinement — no post-hoc
+//    boxcar smoothing, heuristic limit tightening, or uniform time dilation.
+// 4. Evaluates the exact piecewise-cubic timing law at 1 kHz plus every collocation node
+//    (left/right one-sided limits) and intra-interval sub-samples (verifying joint
+//    vel/acc, continuous and 1 ms finite-difference joint jerk, and analytic Cartesian
+//    path vel/acc). If any sample violates a bound, inserts collocation knots at the
+//    offending intervals and re-solves the warm-started interior-point problem.
 //
 // Mathematical scope:
 // - The 3rd-order jerk-constrained path parameterization NLP is non-convex; the solver
 //   converges to KKT (locally time-optimal) solutions of the discretized collocation
-//   problem with 1 kHz sampled verification, rather than proving global continuous-time
-//   optimality. Cartesian bounds are evaluated on the analytic CartesianPath derivatives.
+//   problem with continuous and 1 kHz verification, rather than proving global
+//   continuous-time optimality. If the IPM falls back to a primal-feasible non-KKT
+//   solution, a structured warning is emitted via out_warnings.
+struct TOPPSolveOptions
+{
+  // When > 0, overrides the IPM iteration cap (useful for testing suboptimal fallback).
+  int max_ipm_iters_override = 0;
+};
+
 class TOPPJerkSolver
 {
 public:
@@ -73,7 +81,9 @@ public:
     double default_jerk_scale,
     const SourceLocation & default_loc,
     SampledTrajectory1kHz & out_traj,
-    std::string & err_msg);
+    std::string & err_msg,
+    std::vector<std::string> * out_warnings = nullptr,
+    const TOPPSolveOptions & solve_options = TOPPSolveOptions{});
 };
 
 }  // namespace lite6_studio_planner

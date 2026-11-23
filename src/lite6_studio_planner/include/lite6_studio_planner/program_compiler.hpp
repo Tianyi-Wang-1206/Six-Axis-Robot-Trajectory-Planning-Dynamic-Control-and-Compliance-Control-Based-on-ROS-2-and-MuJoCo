@@ -4,6 +4,7 @@
 #include "lite6_studio_planner/curve_geometry.hpp"
 #include "lite6_studio_planner/dsl_ast.hpp"
 #include "lite6_studio_planner/dsl_parser.hpp"
+#include "lite6_studio_planner/joint_pva_solver.hpp"
 #include "lite6_studio_planner/s_curve_solver.hpp"
 #include "lite6_studio_planner/topp_jerk_solver.hpp"
 #include "lite6_planner/kinematics_engine.hpp"
@@ -218,6 +219,13 @@ private:
     const std::array<double, 6> & corner_q,
     const std::array<double, 6> & neighbor_q,
     double blend_radius) const;
+
+  // Cumulative TCP pseudo-arc-length [m] along the straight joint line from corner_q toward
+  // neighbor_q at a given joint-space trim distance [rad].
+  double tcp_arc_length_at_joint_trim(
+    const std::array<double, 6> & corner_q,
+    const std::array<double, 6> & neighbor_q,
+    double joint_trim) const;
 
   bool compile_pva_statement(
     const MovePVAStatement & pva,

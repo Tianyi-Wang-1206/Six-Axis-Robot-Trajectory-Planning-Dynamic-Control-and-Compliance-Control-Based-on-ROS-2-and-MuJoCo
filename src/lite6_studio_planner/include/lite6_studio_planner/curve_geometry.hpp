@@ -73,6 +73,14 @@ private:
   double span_;
 };
 
+// Structured non-fatal warning produced during geometric blend construction.
+struct BlendWarning
+{
+  SourceLocation loc;
+  std::string code;
+  std::string message;
+};
+
 // Composite C^3 continuous Cartesian path built from one or more blended motion statements.
 class CompositeCartesianPath : public CartesianPath
 {
@@ -87,7 +95,8 @@ public:
     const std::vector<MotionStatement> & statements,
     SourceLocation & err_loc,
     std::string & err_code,
-    std::string & err_msg);
+    std::string & err_msg,
+    std::vector<BlendWarning> * out_warnings = nullptr);
 
   double total_length() const override { return total_length_; }
 
@@ -239,7 +248,16 @@ public:
   static std::vector<double> chord_length_parameters(
     const std::vector<std::array<double, 6>> & knots);
 
+  // Opt-in pinned TOPP collocation boundaries in (0, 1). Empty by default so dense Cartesian
+  // IK splines and resume splines do not force excessive TOPP knots; populated only for
+  // sparse user-waypoint splines such as pure-(P) joint MovePVA.
+  void set_pinned_boundaries(std::vector<double> boundaries)
+  {
+    pinned_boundaries_ = std::move(boundaries);
+  }
+
   void eval(double u, Vec6 & q, Vec6 & q_u, Vec6 & q_uu, Vec6 & q_uuu) const override;
+  std::vector<double> piece_boundaries() const override { return pinned_boundaries_; }
 
 private:
   struct Segment
@@ -249,6 +267,7 @@ private:
     std::array<Vec6, 8> c{};
   };
   std::vector<Segment> segments_;
+  std::vector<double> pinned_boundaries_;
 };
 
 // Joint-space polyline through waypoints with explicit C^3 degree-7 Bernstein/Bezier
@@ -270,7 +289,8 @@ public:
     const std::vector<MotionOptions> & segment_opts,
     const std::vector<SourceLocation> & segment_locs,
     const std::vector<Corner> & corners,
-    std::string & err_msg);
+    std::string & err_msg,
+    std::vector<double> * out_corner_trims = nullptr);
 
   double total_length() const { return total_length_; }
 
