@@ -1,6 +1,7 @@
 #ifndef LITE6_STUDIO_PLANNER__PROGRAM_COMPILER_HPP_
 #define LITE6_STUDIO_PLANNER__PROGRAM_COMPILER_HPP_
 
+#include "lite6_studio_planner/cartesian_collocation_solver.hpp"
 #include "lite6_studio_planner/curve_geometry.hpp"
 #include "lite6_studio_planner/dsl_ast.hpp"
 #include "lite6_studio_planner/dsl_parser.hpp"

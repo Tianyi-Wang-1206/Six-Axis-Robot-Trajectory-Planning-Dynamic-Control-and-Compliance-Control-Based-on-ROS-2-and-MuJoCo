@@ -45,6 +45,7 @@ add_library(studio_planner_core SHARED
   src/third_order_otg.cpp
   src/joint_pva_solver.cpp
   src/topp_jerk_solver.cpp
+  src/cartesian_collocation_solver.cpp
   src/program_compiler.cpp
 )
 target_include_directories(studio_planner_core PUBLIC
