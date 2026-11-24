@@ -62,7 +62,68 @@ MovePVA(space=CARTESIAN, vel=1.0, acc=1.0) {
   )
 }
 """,
-    "2. Horizontal Cartesian Path Blending (Stop-and-Go vs Smooth)": """# Large horizontal-plane (z = 0.250 m) Cartesian trajectory splicing comparison
+    "2. Chaotic 10-Point Joint PVA (Full Workspace)": """# 10-point full-workspace high-speed Joint-space (P, V, A) 3rd-order time-optimal demo.
+# Waypoints 1-9 whip rapidly across all 6 joints with varied chaotic positions, velocities,
+# and accelerations (Full Ruckig with position limits); waypoint 10 brings the robot smoothly to rest.
+joint READY = [0.0, 0.35, 1.0, 0.0, 0.65, 0.0]
+
+SetPayload(mass=0.0)
+MoveJ(READY, vel=1.0, acc=1.0)
+
+MovePVA(space=JOINT, vel=1.0, acc=1.0) {
+  point(
+    p=[-2.870,  0.199,  1.355,  2.451, -0.726, -2.723],
+    v=[ 1.554, -0.595,  1.575, -1.983, -1.093,  1.815],
+    a=[ 1.225, -0.875, -0.883,  3.362,  4.328, -1.762]
+  )
+  point(
+    p=[ 1.671, -0.096,  1.968, -1.569,  0.139,  2.828],
+    v=[ 1.507, -0.712, -0.948,  1.264,  1.321,  1.379],
+    a=[ 1.842, -0.922,  1.261, -4.436, -2.800, -3.500]
+  )
+  point(
+    p=[-2.111, -0.575,  0.811,  1.892,  0.666,  2.968],
+    v=[-1.638,  1.125, -0.704,  1.745, -1.592, -1.716],
+    a=[ 1.581,  0.408,  2.165, -3.090,  2.800,  2.213]
+  )
+  point(
+    p=[ 0.070,  0.051,  1.609, -1.359, -0.356,  1.919],
+    v=[-1.550,  0.773,  1.271,  1.254, -2.051, -1.508],
+    a=[-1.317, -0.920,  1.472, -2.800,  3.111, -2.872]
+  )
+  point(
+    p=[ 2.650, -0.139,  1.761,  2.642,  0.376, -0.017],
+    v=[ 1.302,  0.731, -1.093,  2.132,  1.563,  2.208],
+    a=[-1.225,  0.875,  1.618,  2.026,  2.668, -1.643]
+  )
+  point(
+    p=[-0.528,  0.554,  1.303,  0.925, -0.222,  1.997],
+    v=[-2.046,  0.895,  1.159, -2.046, -1.662, -2.277],
+    a=[-1.225,  1.051,  1.400,  2.514, -1.613,  2.074]
+  )
+  point(
+    p=[-2.846, -0.135,  1.892, -0.877, -0.182, -1.973],
+    v=[ 1.499, -0.733, -0.782, -2.315,  1.659, -1.510],
+    a=[ 1.225,  0.875, -2.134, -4.358, -3.516, -3.500]
+  )
+  point(
+    p=[ 0.233, -0.456,  1.089, -2.339,  0.696, -0.285],
+    v=[-2.135,  0.901, -0.526, -2.133,  1.573,  1.557],
+    a=[-0.901,  1.022,  1.400, -4.596, -1.851,  4.425]
+  )
+  point(
+    p=[-2.769,  0.017,  0.950,  2.441,  0.033, -0.617],
+    v=[ 1.707,  0.929, -0.444,  1.629, -1.777,  1.913],
+    a=[ 1.524,  0.552, -1.589, -2.749,  1.885, -3.500]
+  )
+  point(
+    p=[ 0.000,  0.350,  1.000,  0.000,  0.650,  0.000],
+    v=[ 0.000,  0.000,  0.000,  0.000,  0.000,  0.000],
+    a=[ 0.000,  0.000,  0.000,  0.000,  0.000,  0.000]
+  )
+}
+""",
+    "3. Horizontal Cartesian Path Blending (Stop-and-Go vs Smooth)": """# Large horizontal-plane (z = 0.250 m) Cartesian trajectory splicing comparison
 # in robot base frame (+Y is left, -Y is right):
 # 1. Leave ZERO and move to READY on the z = 0.250 m plane ([0.260, 0.000, 0.250]).
 # 2. Loop 1 (no blending): wide horizontal zigzag MoveL left (+Y), wide MoveC arc
@@ -105,7 +166,7 @@ MoveL(Pose(xyz=[0.335, -0.135, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.
 MoveL(Pose(xyz=[0.165, -0.070, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0, blend=0.025)
 MoveL(Pose(xyz=[0.260,  0.000, 0.250], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0)
 """,
-    "3. Compliant Stack & Side-Grasp Arc (300 g Objects)": """# Full physical manipulation demo matching scene.xml object positions:
+    "4. Compliant Stack & Side-Grasp Arc (300 g Objects)": """# Full physical manipulation demo matching scene.xml object positions:
 # - Cylinder at [0.24, -0.15, 0.05] (height 100 mm, dia 30 mm, mass 0.30 kg)
 # - Box at [0.24, 0.12, 0.04] (30 x 40 x 80 mm, mass 0.30 kg)
 joint ZERO = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
