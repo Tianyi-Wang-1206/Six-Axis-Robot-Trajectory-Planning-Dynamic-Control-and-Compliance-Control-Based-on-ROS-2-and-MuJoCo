@@ -174,14 +174,14 @@ joint ZERO = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 joint READY = [0.0, 0.35, 1.0, 0.0, 0.65, 0.0]
 
 SetPayload(mass=0.0)
-MoveJ(READY, vel=0.55, acc=0.55)
+MoveJ(READY, vel=1.0, acc=1.0)
 Gripper(action=OPEN, wait=true)
 
 # 1. MoveL directly above cylinder and stop
 MoveL(Pose(xyz=[0.240, -0.150, 0.160], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0, blend=0.025)
 
 # 2. Descend to z=85 mm and close gripper to pick 0.30 kg cylinder
-MoveL(Pose(xyz=[0.240, -0.150, 0.085], rpy=[3.14159, 0.0, 0.0]), vel=0.8, acc=0.7)
+MoveL(Pose(xyz=[0.240, -0.150, 0.085], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0)
 Gripper(action=CLOSE, wait=true)
 SetPayload(mass=0.30, com=[0.0, 0.0, 0.0])
 Wait(duration=0.05)
@@ -191,13 +191,13 @@ MoveL(Pose(xyz=[0.240, -0.150, 0.200], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.
 MoveC(
   via=Pose(xyz=[0.365, -0.015, 0.220], rpy=[3.14159, 0.0, 0.0]),
   target=Pose(xyz=[0.240, 0.120, 0.200], rpy=[3.14159, 0.0, 0.0]),
-  vel=0.9, acc=0.9
+  vel=1.0, acc=1.0
 )
 
 # 4. Cartesian impedance descent: cylinder contacts box top (~z=0.165),
 #    while equilibrium descends to z=0.135 to clearly demonstrate compliant yielding
 ImpedanceCartesian(kt=[450, 450, 100], dt=[0.85, 0.85, 0.80], kr=[25, 25, 18], dr=[0.85, 0.85, 0.80]) {
-  MoveL(Pose(xyz=[0.240, 0.120, 0.135], rpy=[3.14159, 0.0, 0.0]), vel=0.18, acc=0.20)
+  MoveL(Pose(xyz=[0.240, 0.120, 0.135], rpy=[3.14159, 0.0, 0.0]), vel=0.5, acc=0.5)
 }
 
 # 5. Stop, open gripper, reset payload, lift to z=200 mm, and blend MoveC to approach box from -Y side
@@ -209,13 +209,13 @@ MoveL(Pose(xyz=[0.240, 0.120, 0.200], rpy=[3.14159, 0.0, 0.0]), vel=1.0, acc=1.0
 MoveC(
   via=Pose(xyz=[0.240, 0.055, 0.140], rpy=[3.14159, 1.309, -1.5708]),
   target=Pose(xyz=[0.240, 0.045, 0.055], rpy=[3.14159, 1.309, -1.5708]),
-  vel=0.6, acc=0.6,
+  vel=1.0, acc=1.0,
   blend=0.025
 )
 
 # Approach from the side at z=55 mm without touching the stacked cylinder,
 # then close gripper across the 30 mm X-width (0.30 kg box + 0.30 kg stacked cylinder = 0.60 kg)
-MoveL(Pose(xyz=[0.240, 0.112, 0.055], rpy=[3.14159, 1.309, -1.5708]), vel=0.5, acc=0.5)
+MoveL(Pose(xyz=[0.240, 0.112, 0.055], rpy=[3.14159, 1.309, -1.5708]), vel=1.0, acc=1.0)
 Gripper(action=CLOSE, wait=true)
 SetPayload(mass=0.60, com=[0.0, 0.0, 0.0])
 Wait(duration=0.1)
@@ -229,7 +229,7 @@ MoveC(
 
 # 7. Compliant Cartesian impedance placement onto table, open gripper, reset payload, retract clear, MoveJ ZERO
 ImpedanceCartesian(kt=[450, 450, 120], dt=[0.85, 0.85, 0.80], kr=[25, 25, 18], dr=[0.85, 0.85, 0.80]) {
-  MoveL(Pose(xyz=[0.240, -0.070, 0.038], rpy=[3.14159, 1.309, -1.5708]), vel=0.18, acc=0.20)
+  MoveL(Pose(xyz=[0.240, -0.070, 0.038], rpy=[3.14159, 1.309, -1.5708]), vel=0.5, acc=0.5)
 }
 Gripper(action=OPEN, wait=true)
 SetPayload(mass=0.0)
