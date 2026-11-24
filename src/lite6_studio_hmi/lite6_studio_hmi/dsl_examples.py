@@ -64,7 +64,7 @@ MovePVA(space=CARTESIAN, vel=1.0, acc=1.0) {
 """,
     "2. Chaotic 10-Point Joint PVA (Full Workspace)": """# 10-point full-workspace high-speed Joint-space (P, V, A) 3rd-order time-optimal demo.
 # Waypoints 1-9 whip rapidly across all 6 joints with varied chaotic positions, velocities,
-# and accelerations (Full Ruckig with position limits); waypoint 10 brings the robot smoothly to rest.
+# and accelerations; waypoint 10 brings the robot smoothly to rest.
 joint READY = [0.0, 0.35, 1.0, 0.0, 0.65, 0.0]
 
 SetPayload(mass=0.0)

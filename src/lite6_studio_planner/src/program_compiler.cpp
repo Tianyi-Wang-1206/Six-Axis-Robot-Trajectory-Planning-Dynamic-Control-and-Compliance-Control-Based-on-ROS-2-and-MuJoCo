@@ -1963,8 +1963,8 @@ bool ProgramCompiler::compile_pva_statement(
       }
     }
   } else {
-    // Explicit / mixed Joint MovePVA: full 3rd-order time-optimal multi-waypoint solver
-    // ("Full Ruckig": hard [min_pos, max_pos] clamping, exact dt, free-(v_k, a_k) optimization).
+    // Explicit / mixed Joint MovePVA: 6-DOF 3rd-order multi-waypoint PVA solver
+    // (hard [min_pos, max_pos] clamping, exact dt, free-(v_k, a_k) optimization).
     JointPVASolver::MultiWaypointResult pva_res;
     SourceLocation pva_err_loc = pva.loc;
     std::string pva_err_code, pva_err_msg;

@@ -13,28 +13,26 @@
 namespace lite6_studio_planner
 {
 
-// Full 3rd-order time-optimal joint-space multi-waypoint generator ("Full Ruckig" /
-// Ruckig-Pro-equivalent) built on top of Ruckig Community's analytic 7-segment solver:
+// Native 6-DOF 3rd-order time-optimal joint-space multi-waypoint PVA solver built on
+// the standalone analytic 3rd-order OTG engine (third_order_otg.hpp, no external Ruckig):
 //
-// Layer A — Exact hard position-limit enforcement ([min_pos, max_pos]) and exact dt
-//   support per segment:
+// Layer A — Exact analytic 3rd-order state-to-state segment solver with hard position
+//   limits [min_pos, max_pos], exact blocked-interval synchronization, and exact dt:
 //   - Verifies forward-time and reverse-time minimum braking feasibility from both
-//     endpoints against [min_pos, max_pos].
-//   - Enforces Pontryagin state-constrained minimum-time boundary clamping whenever an
-//     unconstrained 3rd-order profile overshoots a position limit, splitting the DoF
-//     through (q_lim, 0, 0) (or minimal bounce acceleration when zero-acc braking exceeds
-//     q_lim) with recursive double-sided bounce handling and dwell / extended-subsegment
-//     slack absorption during 6-axis synchronization.
-//   - Supports exact integer-millisecond segment duration (round_1ms(dt)) via
-//     minimum_duration, resolving Ruckig blocked time intervals cleanly via a 2-section
-//     split or verified SepticHermiteSegment fallback.
+//     endpoints against [min_pos, max_pos] and scaled (v, a, j) limits.
+//   - Enforces hard position limits via continuous 1D Pontryagin optimization over inward
+//     boundary contact acceleration a_b (capturing both touch-and-go bounces and
+//     zero-acceleration boundary arcs with recursive double-sided bounce handling).
+//   - Synchronizes all 6 joints using exact blocked-interval union skipping and supports
+//     exact integer-millisecond segment durations (round_1ms(dt)) with piecewise-constant
+//     jerk throughout.
 //
-// Layer B — Multi-waypoint (v_k, a_k) optimization for unspecified intermediate states:
-//   - Pins every user-supplied intermediate velocity/acceleration (and rest at start/end),
-//     initializes omitted interior velocities via braking-safe Catmull-Rom tangents and
-//     omitted accelerations to 0, and optimizes free interior (v_k, a_k) coordinates over
-//     the Layer-A segment duration oracle to minimize total trajectory duration while
-//     strictly obeying position, velocity, acceleration, jerk, and explicit dt bounds.
+// Layer B — Deterministic coupled multi-waypoint (v_k, a_k) optimization:
+//   - Pins user-supplied intermediate velocities/accelerations (and rest at start/end).
+//   - Evaluates natural C^2 cubic-spline, direction-preserving Catmull-Rom, and zero seeds.
+//   - Runs per-DoF chain pre-optimization, coupled 6-DOF smooth-max (LogSumExp) projected
+//     L-BFGS continuation over all free (v_k, a_k) simultaneously, and a deterministic
+//     exact 6-DOF synchronized polish (blocked-interval aware, no wall-clock timers).
 class JointPVASolver
 {
 public:
@@ -70,9 +68,9 @@ public:
     std::string & err_code,
     std::string & err_msg);
 
-  // Solves a full multi-waypoint joint-space MovePVA starting from rest at start_q and
+  // Solves a multi-waypoint joint-space MovePVA starting from rest at start_q and
   // ending at rest at waypoints.back().joint_pos. Unspecified intermediate velocities
-  // and accelerations are optimized to minimize total duration.
+  // and accelerations are optimized deterministically to minimize synchronized duration.
   static bool solve_multi_waypoint(
     const std::array<double, 6> & start_q,
     const std::vector<PVAWaypoint> & waypoints,

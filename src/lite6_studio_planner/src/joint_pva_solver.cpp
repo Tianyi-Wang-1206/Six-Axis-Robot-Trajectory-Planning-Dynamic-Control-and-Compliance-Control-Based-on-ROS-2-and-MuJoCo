@@ -1,16 +1,14 @@
 #include "lite6_studio_planner/joint_pva_solver.hpp"
-#include "lite6_studio_planner/s_curve_solver.hpp"
+#include "lite6_studio_planner/third_order_otg.hpp"
 #include "lite6_planner/motion_tolerances.hpp"
 
-#include <ruckig/ruckig.hpp>
-
 #include <algorithm>
-#include <chrono>
+#include <array>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <sstream>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -22,10 +20,8 @@ namespace
 constexpr double kDt = 0.001;
 constexpr double kHeadroom = 0.996;
 constexpr double kPosTol = 1e-6;
-constexpr double kTimeMatchTol = 1e-6;
 constexpr double kMaxSegmentDurationSec = 120.0;
 constexpr double kMaxTotalDurationSec = 300.0;
-constexpr int kMaxSplitDepth = 3;
 
 struct DoFLimit
 {
@@ -36,1264 +32,9 @@ struct DoFLimit
   double j_lim = 0.0;
 };
 
-struct ProfileExtrema
-{
-  double min = std::numeric_limits<double>::infinity();
-  double max = -std::numeric_limits<double>::infinity();
-  double t_min = 0.0;
-  double t_max = 0.0;
-};
-
-// Exact analytical position extrema of a 1-DOF Ruckig Profile, including constant-acceleration
-// segments (j == 0, a != 0) where velocity can cross zero.
-void check_step_extrema(
-  double t_offset, double t_dur, double p0, double v0, double a0, double j0,
-  ProfileExtrema & ext)
-{
-  auto record = [&](double tau, double val) {
-    if (val < ext.min) {
-      ext.min = val;
-      ext.t_min = t_offset + tau;
-    }
-    if (val > ext.max) {
-      ext.max = val;
-      ext.t_max = t_offset + tau;
-    }
-  };
-  auto eval_p = [&](double tau) {
-    return p0 + tau * (v0 + tau * (0.5 * a0 + tau * (j0 / 6.0)));
-  };
-
-  record(0.0, p0);
-  if (t_dur <= 0.0) {
-    return;
-  }
-  record(t_dur, eval_p(t_dur));
-
-  if (std::abs(j0) > 1e-14) {
-    const double D = a0 * a0 - 2.0 * j0 * v0;
-    if (std::abs(D) <= 1e-16) {
-      const double tau = -a0 / j0;
-      if (tau > 0.0 && tau < t_dur) {
-        record(tau, eval_p(tau));
-      }
-    } else if (D > 0.0) {
-      const double sD = std::sqrt(D);
-      const double r1 = (-a0 - sD) / j0;
-      const double r2 = (-a0 + sD) / j0;
-      if (r1 > 0.0 && r1 < t_dur) {
-        record(r1, eval_p(r1));
-      }
-      if (r2 > 0.0 && r2 < t_dur) {
-        record(r2, eval_p(r2));
-      }
-    }
-  } else if (std::abs(a0) > 1e-14) {
-    const double tau = -v0 / a0;
-    if (tau > 0.0 && tau < t_dur) {
-      record(tau, eval_p(tau));
-    }
-  }
-}
-
-ProfileExtrema compute_profile_extrema(const ruckig::Profile & prof)
-{
-  ProfileExtrema ext;
-  double t_off = 0.0;
-  if (prof.brake.duration > 0.0) {
-    if (prof.brake.t[0] > 0.0) {
-      check_step_extrema(
-        t_off, prof.brake.t[0], prof.brake.p[0], prof.brake.v[0],
-        prof.brake.a[0], prof.brake.j[0], ext);
-      t_off += prof.brake.t[0];
-      if (prof.brake.t[1] > 0.0) {
-        check_step_extrema(
-          t_off, prof.brake.t[1], prof.brake.p[1], prof.brake.v[1],
-          prof.brake.a[1], prof.brake.j[1], ext);
-        t_off += prof.brake.t[1];
-      }
-    }
-  }
-  for (size_t i = 0; i < 7; ++i) {
-    const double t_step_off = prof.brake.duration + (i > 0 ? prof.t_sum[i - 1] : 0.0);
-    check_step_extrema(
-      t_step_off, prof.t[i], prof.p[i], prof.v[i], prof.a[i], prof.j[i], ext);
-  }
-  const double t_end = prof.brake.duration + prof.t_sum.back();
-  if (prof.pf < ext.min) {
-    ext.min = prof.pf;
-    ext.t_min = t_end;
-  }
-  if (prof.pf > ext.max) {
-    ext.max = prof.pf;
-    ext.t_max = t_end;
-  }
-  return ext;
-}
-
-void eval_ruckig_profile(
-  const ruckig::Profile & prof, double t,
-  double & q, double & v, double & a, double & j)
-{
-  const double dur = prof.brake.duration + prof.t_sum.back();
-  if (t <= 0.0) {
-    if (prof.brake.duration > 0.0 && prof.brake.t[0] > 0.0) {
-      q = prof.brake.p[0];
-      v = prof.brake.v[0];
-      a = prof.brake.a[0];
-      j = prof.brake.j[0];
-    } else {
-      q = prof.p[0];
-      v = prof.v[0];
-      a = prof.a[0];
-      j = prof.j[0];
-    }
-    return;
-  }
-  if (t >= dur) {
-    q = prof.pf;
-    v = prof.vf;
-    a = prof.af;
-    j = 0.0;
-    return;
-  }
-  double tau = t;
-  if (prof.brake.duration > 0.0) {
-    if (tau < prof.brake.duration) {
-      const size_t idx = (tau < prof.brake.t[0]) ? 0 : 1;
-      if (idx > 0) {
-        tau -= prof.brake.t[0];
-      }
-      j = prof.brake.j[idx];
-      std::tie(q, v, a) = ruckig::integrate(
-        tau, prof.brake.p[idx], prof.brake.v[idx], prof.brake.a[idx], j);
-      return;
-    }
-    tau -= prof.brake.duration;
-  }
-  if (tau >= prof.t_sum.back()) {
-    q = prof.pf;
-    v = prof.vf;
-    a = prof.af;
-    j = 0.0;
-    return;
-  }
-  const auto it = std::upper_bound(prof.t_sum.begin(), prof.t_sum.end(), tau);
-  const size_t idx = std::min<size_t>(
-    6, static_cast<size_t>(std::distance(prof.t_sum.begin(), it)));
-  if (idx > 0) {
-    tau -= prof.t_sum[idx - 1];
-  }
-  j = prof.j[idx];
-  std::tie(q, v, a) = ruckig::integrate(tau, prof.p[idx], prof.v[idx], prof.a[idx], j);
-}
-
-// Minimum upper position peak reachable from (q0, v0, a0) under maximum downward braking
-// (j = -j_max down to a = -a_max). Any (a, j)-limited trajectory from (q0, v0, a0) must
-// attain at least this upper position.
-double min_upper_excursion(double q0, double v0, double a0, double a_max, double j_max)
-{
-  if (v0 <= 0.0 && a0 <= 0.0) {
-    return q0;
-  }
-  double q = q0;
-  double v = v0;
-  double a = a0;
-
-  if (a > 0.0) {
-    const double t0 = a / j_max;
-    const double v_apex = v + 0.5 * a * t0;
-    if (v_apex <= 0.0) {
-      return q0;
-    }
-    q += v * t0 + (a * a * a) / (3.0 * j_max * j_max);
-    v = v_apex;
-    a = 0.0;
-  }
-
-  // Now a <= 0 and v > 0. Ramp a down toward -a_max at j = -j_max.
-  const double t1 = std::max(0.0, (a + a_max) / j_max);
-  const double v1 = v + a * t1 - 0.5 * j_max * t1 * t1;
-  if (v1 <= 0.0) {
-    const double disc = std::max(0.0, a * a + 2.0 * j_max * v);
-    const double t_star = std::clamp((a + std::sqrt(disc)) / j_max, 0.0, t1);
-    return q + v * t_star + 0.5 * a * t_star * t_star -
-      (1.0 / 6.0) * j_max * t_star * t_star * t_star;
-  }
-  const double q1 = q + v * t1 + 0.5 * a * t1 * t1 - (1.0 / 6.0) * j_max * t1 * t1 * t1;
-  return q1 + (v1 * v1) / (2.0 * a_max);
-}
-
-double max_lower_excursion(double q0, double v0, double a0, double a_max, double j_max)
-{
-  return -min_upper_excursion(-q0, -v0, -a0, a_max, j_max);
-}
-
-// Maximum |v| with a = 0 whose stopping excursion to (0, 0) under (a_max, j_max)
-// stays within distance d >= 0.
-double max_speed_for_distance(double d, double a_max, double j_max)
-{
-  if (d <= 0.0) {
-    return 0.0;
-  }
-  const double d_crit = (a_max * a_max * a_max) / (j_max * j_max);
-  if (d <= d_crit) {
-    return std::cbrt(d * d * j_max);
-  }
-  const double half_b = 0.5 * (a_max * a_max) / j_max;
-  return std::max(0.0, -half_b + std::sqrt(half_b * half_b + 2.0 * a_max * d));
-}
-
-// Checks whether a 1-DOF state (q, v, a) is valid and velocity-reachable/braking-feasible
-// in both forward and reverse time inside [q_min, q_max] and scaled (v_lim, a_lim, j_lim).
-bool validate_dof_state(
-  double q, double v, double a, const DoFLimit & lim,
-  bool check_forward, bool check_reverse,
-  std::string & out_code, std::string & out_reason)
-{
-  if (!std::isfinite(q) || !std::isfinite(v) || !std::isfinite(a)) {
-    out_code = "ERR_NONFINITE_SAMPLE";
-    out_reason = "non-finite waypoint state";
-    return false;
-  }
-  if (q < lim.q_min - kPosTol || q > lim.q_max + kPosTol) {
-    out_code = "ERR_JOINT_POS_LIMIT";
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(5)
-        << "position=" << q << " rad outside [" << lim.q_min << ", " << lim.q_max << "] rad";
-    out_reason = oss.str();
-    return false;
-  }
-  if (std::abs(v) > lim.v_lim * (1.0 + 1e-6)) {
-    out_code = "ERR_PVA_VEL_LIMIT";
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(5)
-        << "|v|=" << std::abs(v) << " rad/s exceeds scaled limit=" << lim.v_lim << " rad/s";
-    out_reason = oss.str();
-    return false;
-  }
-  if (std::abs(a) > lim.a_lim * (1.0 + 1e-6)) {
-    out_code = "ERR_PVA_ACC_LIMIT";
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(5)
-        << "|a|=" << std::abs(a) << " rad/s^2 exceeds scaled limit=" << lim.a_lim << " rad/s^2";
-    out_reason = oss.str();
-    return false;
-  }
-  // Velocity-limit reachability under jerk bound:
-  // Forward: a > 0 => v + a^2/(2*j) <= v_lim; a < 0 => v - a^2/(2*j) >= -v_lim.
-  if (check_forward) {
-    if ((a > 0.0 && v + (a * a) / (2.0 * lim.j_lim) > lim.v_lim * (1.0 + 1e-5)) ||
-        (a < 0.0 && v - (a * a) / (2.0 * lim.j_lim) < -lim.v_lim * (1.0 + 1e-5)))
-    {
-      out_code = "ERR_PVA_VEL_LIMIT";
-      out_reason = "waypoint (v, a) unavoidably overshoots scaled velocity limit under jerk bound";
-      return false;
-    }
-    const double q_hi = min_upper_excursion(q, v, a, lim.a_lim, lim.j_lim);
-    const double q_lo = max_lower_excursion(q, v, a, lim.a_lim, lim.j_lim);
-    if (q_hi > lim.q_max + kPosTol || q_lo < lim.q_min - kPosTol) {
-      out_code = "ERR_JOINT_POS_LIMIT";
-      std::ostringstream oss;
-      oss << std::fixed << std::setprecision(5)
-          << "forward braking excursion [" << q_lo << ", " << q_hi
-          << "] rad exceeds joint limits [" << lim.q_min << ", " << lim.q_max << "] rad";
-      out_reason = oss.str();
-      return false;
-    }
-  }
-  // Reverse-time: (q, -v, a).
-  if (check_reverse) {
-    if ((a < 0.0 && v + (a * a) / (2.0 * lim.j_lim) > lim.v_lim * (1.0 + 1e-5)) ||
-        (a > 0.0 && v - (a * a) / (2.0 * lim.j_lim) < -lim.v_lim * (1.0 + 1e-5)))
-    {
-      out_code = "ERR_PVA_VEL_LIMIT";
-      out_reason = "waypoint (v, a) cannot be approached without exceeding scaled velocity limit";
-      return false;
-    }
-    const double q_hi_rev = min_upper_excursion(q, -v, a, lim.a_lim, lim.j_lim);
-    const double q_lo_rev = max_lower_excursion(q, -v, a, lim.a_lim, lim.j_lim);
-    if (q_hi_rev > lim.q_max + kPosTol || q_lo_rev < lim.q_min - kPosTol) {
-      out_code = "ERR_JOINT_POS_LIMIT";
-      std::ostringstream oss;
-      oss << std::fixed << std::setprecision(5)
-          << "reverse-time braking excursion [" << q_lo_rev << ", " << q_hi_rev
-          << "] rad exceeds joint limits [" << lim.q_min << ", " << lim.q_max << "] rad";
-      out_reason = oss.str();
-      return false;
-    }
-  }
-  return true;
-}
-
-// Compute working Ruckig limits (v_cap, a_cap, j_cap) for a 1-DOF segment so interior motion
-// retains kHeadroom (0.996) margin while allowing valid boundary states up to 100% of limits.
-void compute_working_caps(
-  double v0, double a0, double v1, double a1, const DoFLimit & lim,
-  double & v_cap, double & a_cap, double & j_cap)
-{
-  j_cap = lim.j_lim * kHeadroom;
-  a_cap = std::min(
-    lim.a_lim,
-    std::max({lim.a_lim * kHeadroom, std::abs(a0) + 1e-9, std::abs(a1) + 1e-9}));
-
-  // Ensure Ruckig's v_at_a_zero check passes for both initial and target states.
-  auto peak_v = [](double v, double a, double j) {
-    return std::abs(v) + (a * a) / (2.0 * j);
-  };
-  double v_req = std::max({lim.v_lim * kHeadroom, std::abs(v0) + 1e-9, std::abs(v1) + 1e-9});
-  if (a0 > 0.0) {
-    v_req = std::max(v_req, std::abs(v0 + (a0 * a0) / (2.0 * j_cap)) + 1e-9);
-  } else if (a0 < 0.0) {
-    v_req = std::max(v_req, std::abs(v0 - (a0 * a0) / (2.0 * j_cap)) + 1e-9);
-  }
-  if (a1 < 0.0) {
-    v_req = std::max(v_req, std::abs(v1 + (a1 * a1) / (2.0 * j_cap)) + 1e-9);
-  } else if (a1 > 0.0) {
-    v_req = std::max(v_req, std::abs(v1 - (a1 * a1) / (2.0 * j_cap)) + 1e-9);
-  }
-  if (v_req > lim.v_lim) {
-    // Relax jerk headroom up to hard j_lim if needed for boundary reachability.
-    j_cap = lim.j_lim;
-    v_req = std::max({lim.v_lim * kHeadroom, std::abs(v0) + 1e-9, std::abs(v1) + 1e-9});
-    if (a0 > 0.0) {
-      v_req = std::max(v_req, std::abs(v0 + (a0 * a0) / (2.0 * j_cap)) + 1e-9);
-    } else if (a0 < 0.0) {
-      v_req = std::max(v_req, std::abs(v0 - (a0 * a0) / (2.0 * j_cap)) + 1e-9);
-    }
-    if (a1 < 0.0) {
-      v_req = std::max(v_req, std::abs(v1 + (a1 * a1) / (2.0 * j_cap)) + 1e-9);
-    } else if (a1 > 0.0) {
-      v_req = std::max(v_req, std::abs(v1 - (a1 * a1) / (2.0 * j_cap)) + 1e-9);
-    }
-    (void)peak_v;
-  }
-  v_cap = std::min(lim.v_lim * (1.0 + 1e-7), v_req);
-}
-
-enum class SubPartKind
-{
-  RUCKIG_PROFILE,
-  DWELL,
-  SEPTIC_POLY
-};
-
-struct DoFSubPart
-{
-  SubPartKind kind = SubPartKind::RUCKIG_PROFILE;
-  double duration = 0.0;
-  double dwell_q = 0.0;
-  ruckig::Profile profile;
-  std::array<double, 8> septic_c{};
-};
-
-struct DoFTrajectory
-{
-  std::vector<DoFSubPart> parts;
-  double total_duration = 0.0;
-  double min_pos = std::numeric_limits<double>::infinity();
-  double max_pos = -std::numeric_limits<double>::infinity();
-
-  void clear()
-  {
-    parts.clear();
-    total_duration = 0.0;
-    min_pos = std::numeric_limits<double>::infinity();
-    max_pos = -std::numeric_limits<double>::infinity();
-  }
-
-  void append(const DoFSubPart & part, double part_min, double part_max)
-  {
-    parts.push_back(part);
-    total_duration += part.duration;
-    min_pos = std::min(min_pos, part_min);
-    max_pos = std::max(max_pos, part_max);
-  }
-
-  void append_traj(const DoFTrajectory & other)
-  {
-    for (const auto & p : other.parts) {
-      parts.push_back(p);
-    }
-    total_duration += other.total_duration;
-    min_pos = std::min(min_pos, other.min_pos);
-    max_pos = std::max(max_pos, other.max_pos);
-  }
-
-  void eval(double t, double & q, double & v, double & a, double & j) const
-  {
-    if (parts.empty()) {
-      q = v = a = j = 0.0;
-      return;
-    }
-    double tau = std::clamp(t, 0.0, total_duration);
-    for (size_t i = 0; i < parts.size(); ++i) {
-      const auto & part = parts[i];
-      if (tau <= part.duration || i + 1 == parts.size()) {
-        const double tl = std::clamp(tau, 0.0, part.duration);
-        if (part.kind == SubPartKind::DWELL) {
-          q = part.dwell_q;
-          v = 0.0;
-          a = 0.0;
-          j = 0.0;
-        } else if (part.kind == SubPartKind::RUCKIG_PROFILE) {
-          eval_ruckig_profile(part.profile, tl, q, v, a, j);
-        } else {
-          const double T = std::max(1e-9, part.duration);
-          const double s = std::clamp(tl / T, 0.0, 1.0);
-          const double s2 = s * s, s3 = s2 * s, s4 = s3 * s, s5 = s4 * s, s6 = s5 * s, s7 = s6 * s;
-          const double invT = 1.0 / T, invT2 = invT * invT, invT3 = invT2 * invT;
-          const auto & c = part.septic_c;
-          q = c[0] + c[1] * s + c[2] * s2 + c[3] * s3 + c[4] * s4 + c[5] * s5 + c[6] * s6 + c[7] * s7;
-          v = (c[1] + 2.0 * c[2] * s + 3.0 * c[3] * s2 + 4.0 * c[4] * s3 +
-               5.0 * c[5] * s4 + 6.0 * c[6] * s5 + 7.0 * c[7] * s6) * invT;
-          a = (2.0 * c[2] + 6.0 * c[3] * s + 12.0 * c[4] * s2 +
-               20.0 * c[5] * s3 + 30.0 * c[6] * s4 + 42.0 * c[7] * s5) * invT2;
-          j = (6.0 * c[3] + 24.0 * c[4] * s + 60.0 * c[5] * s2 +
-               120.0 * c[6] * s3 + 210.0 * c[7] * s4) * invT3;
-        }
-        return;
-      }
-      tau -= part.duration;
-    }
-  }
-};
-
-// Raw 1-DOF unconstrained Ruckig solve (continuous duration, optional minimum_duration).
-bool solve_ruckig_1dof_raw(
-  double q0, double v0, double a0,
-  double q1, double v1, double a1,
-  const DoFLimit & lim,
-  std::optional<double> min_dur,
-  ruckig::Profile & out_profile,
-  double & out_duration,
-  ProfileExtrema & out_ext)
-{
-  double v_cap = 0.0, a_cap = 0.0, j_cap = 0.0;
-  compute_working_caps(v0, a0, v1, a1, lim, v_cap, a_cap, j_cap);
-
-  ruckig::InputParameter<1> inp;
-  inp.control_interface = ruckig::ControlInterface::Position;
-  inp.synchronization = ruckig::Synchronization::Time;
-  inp.duration_discretization = ruckig::DurationDiscretization::Continuous;
-  inp.current_position[0] = q0;
-  inp.current_velocity[0] = v0;
-  inp.current_acceleration[0] = a0;
-  inp.target_position[0] = q1;
-  inp.target_velocity[0] = v1;
-  inp.target_acceleration[0] = a1;
-  inp.max_velocity[0] = v_cap;
-  inp.max_acceleration[0] = a_cap;
-  inp.max_jerk[0] = j_cap;
-  if (min_dur.has_value() && *min_dur > 0.0) {
-    inp.minimum_duration = *min_dur;
-  }
-
-  ruckig::Ruckig<1> otg;
-  ruckig::Trajectory<1> traj;
-  const auto res = otg.calculate(inp, traj);
-  if (static_cast<int>(res) < 0) {
-    return false;
-  }
-  const double dur = traj.get_duration();
-  if (!std::isfinite(dur) || dur < 0.0 || dur > kMaxSegmentDurationSec) {
-    return false;
-  }
-  out_profile = traj.get_profiles()[0][0];
-  out_duration = dur;
-  out_ext = compute_profile_extrema(out_profile);
-  return true;
-}
-
-bool extrema_within(const ProfileExtrema & ext, const DoFLimit & lim)
-{
-  return ext.min >= lim.q_min - kPosTol && ext.max <= lim.q_max + kPosTol;
-}
-
-// Builds a single-DoF septic Hermite polynomial part at exact duration T and verifies
-// all scaled position/velocity/acceleration/continuous+discrete jerk bounds at 1 kHz.
-bool build_verified_septic_1dof(
-  double q0, double v0, double a0,
-  double q1, double v1, double a1,
-  const DoFLimit & lim, double T,
-  DoFSubPart & out_part, double & out_min, double & out_max)
-{
-  if (!(T > 1e-4) || T > kMaxSegmentDurationSec) {
-    return false;
-  }
-  const double T2 = T * T;
-  const double c0 = q0;
-  const double c1 = v0 * T;
-  const double c2 = 0.5 * a0 * T2;
-  const double d0 = q1 - (c0 + c1 + c2);
-  const double d1 = v1 * T - (c1 + 2.0 * c2);
-  const double d2 = a1 * T2 - 2.0 * c2;
-
-  std::array<double, 8> c{{
-    c0, c1, c2, 0.0,
-    35.0 * d0 - 15.0 * d1 + 2.5 * d2,
-    -84.0 * d0 + 39.0 * d1 - 7.0 * d2,
-    70.0 * d0 - 34.0 * d1 + 6.5 * d2,
-    -20.0 * d0 + 10.0 * d1 - 2.0 * d2}};
-
-  const int ticks = std::max(2, static_cast<int>(std::llround(T * 1000.0)));
-  const double invT = 1.0 / T, invT2 = invT * invT, invT3 = invT2 * invT;
-  double prev_a = a0;
-  out_min = std::min(q0, q1);
-  out_max = std::max(q0, q1);
-
-  for (int k = 0; k <= ticks; ++k) {
-    const double s = std::clamp(static_cast<double>(k) * kDt / T, 0.0, 1.0);
-    const double s2 = s * s, s3 = s2 * s, s4 = s3 * s, s5 = s4 * s, s6 = s5 * s, s7 = s6 * s;
-    const double q = c[0] + c[1] * s + c[2] * s2 + c[4] * s4 + c[5] * s5 + c[6] * s6 + c[7] * s7;
-    const double v = (c[1] + 2.0 * c[2] * s + 4.0 * c[4] * s3 +
-                      5.0 * c[5] * s4 + 6.0 * c[6] * s5 + 7.0 * c[7] * s6) * invT;
-    const double a = (2.0 * c[2] + 12.0 * c[4] * s2 +
-                      20.0 * c[5] * s3 + 30.0 * c[6] * s4 + 42.0 * c[7] * s5) * invT2;
-    const double j = (24.0 * c[4] * s + 60.0 * c[5] * s2 +
-                      120.0 * c[6] * s3 + 210.0 * c[7] * s4) * invT3;
-    if (!std::isfinite(q) || !std::isfinite(v) || !std::isfinite(a) || !std::isfinite(j)) {
-      return false;
-    }
-    if (q < lim.q_min - kPosTol || q > lim.q_max + kPosTol ||
-        std::abs(v) > lim.v_lim * 0.999 + 1e-6 ||
-        std::abs(a) > lim.a_lim * 0.999 + 1e-5 ||
-        std::abs(j) > lim.j_lim * 0.999 + 1e-3)
-    {
-      return false;
-    }
-    if (k > 0 && std::abs(a - prev_a) / kDt > lim.j_lim * 0.999 + 1e-3) {
-      return false;
-    }
-    prev_a = a;
-    out_min = std::min(out_min, q);
-    out_max = std::max(out_max, q);
-  }
-  out_part.kind = SubPartKind::SEPTIC_POLY;
-  out_part.duration = T;
-  out_part.septic_c = c;
-  return true;
-}
-
-// Layer A (1-DOF): Minimum-time state-constrained trajectory keeping q(t) in [q_min, q_max].
-bool solve_dof_min_time(
-  double q0, double v0, double a0,
-  double q1, double v1, double a1,
-  const DoFLimit & lim,
-  DoFTrajectory & out_traj,
-  bool & out_clamped,
-  int depth = 0)
-{
-  out_traj.clear();
-  out_clamped = false;
-
-  if (std::abs(q1 - q0) < 1e-11 && std::abs(v0) < 1e-10 && std::abs(v1) < 1e-10 &&
-      std::abs(a0) < 1e-10 && std::abs(a1) < 1e-10)
-  {
-    DoFSubPart dwell;
-    dwell.kind = SubPartKind::DWELL;
-    dwell.duration = 0.0;
-    dwell.dwell_q = std::clamp(q0, lim.q_min, lim.q_max);
-    out_traj.append(dwell, dwell.dwell_q, dwell.dwell_q);
-    return true;
-  }
-
-  ruckig::Profile prof;
-  double dur = 0.0;
-  ProfileExtrema ext;
-  if (!solve_ruckig_1dof_raw(q0, v0, a0, q1, v1, a1, lim, std::nullopt, prof, dur, ext)) {
-    return false;
-  }
-
-  if (extrema_within(ext, lim)) {
-    DoFSubPart part;
-    part.kind = SubPartKind::RUCKIG_PROFILE;
-    part.duration = dur;
-    part.profile = prof;
-    out_traj.append(part, ext.min, ext.max);
-    return true;
-  }
-
-  if (depth >= kMaxSplitDepth) {
-    return false;
-  }
-
-  // Pontryagin state-constrained minimum-time condition: meet violated boundary tangentially
-  // at (q_lim, 0, 0). Choose whichever bound is violated first in time if both overshoot.
-  const bool hi_vio = (ext.max > lim.q_max + kPosTol);
-  const bool lo_vio = (ext.min < lim.q_min - kPosTol);
-  double q_lim = lim.q_max;
-  if (hi_vio && lo_vio) {
-    q_lim = (ext.t_max <= ext.t_min) ? lim.q_max : lim.q_min;
-  } else if (lo_vio) {
-    q_lim = lim.q_min;
-  }
-
-  auto try_boundary_split = [&](double q_b, double a_b, DoFTrajectory & res_traj) -> bool {
-    DoFTrajectory sub1, sub2;
-    bool c1 = false, c2 = false;
-    if (!solve_dof_min_time(q0, v0, a0, q_b, 0.0, a_b, lim, sub1, c1, depth + 1)) {
-      return false;
-    }
-    if (!solve_dof_min_time(q_b, 0.0, a_b, q1, v1, a1, lim, sub2, c2, depth + 1)) {
-      return false;
-    }
-    if (sub1.min_pos < lim.q_min - kPosTol || sub1.max_pos > lim.q_max + kPosTol ||
-        sub2.min_pos < lim.q_min - kPosTol || sub2.max_pos > lim.q_max + kPosTol)
-    {
-      return false;
-    }
-    res_traj.clear();
-    res_traj.append_traj(sub1);
-    res_traj.append_traj(sub2);
-    return true;
-  };
-
-  // Primary Pontryagin tangential contact: (q_lim, 0, 0).
-  if (try_boundary_split(q_lim, 0.0, out_traj)) {
-    out_clamped = true;
-    return true;
-  }
-
-  // Rare edge case: braking to a = 0 overshoots q_lim even though a nonzero bounce
-  // acceleration a_b (pointing back into the feasible interior) stays strictly inside q_lim.
-  const double dir = (q_lim >= lim.q_max - 1e-9) ? -1.0 : 1.0;
-  const double a_work = lim.a_lim * kHeadroom;
-  for (double frac : {0.25, 0.5, 0.75, 0.95, 1.0}) {
-    if (try_boundary_split(q_lim, dir * frac * a_work, out_traj)) {
-      out_clamped = true;
-      return true;
-    }
-  }
-  return false;
-}
-
-// Forward declaration for recursive call.
-bool solve_dof_at_duration(
-  double q0, double v0, double a0,
-  double q1, double v1, double a1,
-  const DoFLimit & lim,
-  double T_target,
-  bool allow_blocked_split,
-  DoFTrajectory & out_traj,
-  double & out_next_unblocked_T,
-  int depth = 0);
-
-// Resolve a blocked time interval at exact T_target via a 2-section split through an
-// intermediate state (q_m, v_m, 0) or verified septic polynomial fallback.
-bool resolve_blocked_at_exact_duration(
-  double q0, double v0, double a0,
-  double q1, double v1, double a1,
-  const DoFLimit & lim,
-  double T_target,
-  DoFTrajectory & out_traj,
-  int depth)
-{
-  if (depth >= 2) {
-    DoFSubPart sp;
-    double pmin = 0.0, pmax = 0.0;
-    if (build_verified_septic_1dof(q0, v0, a0, q1, v1, a1, lim, T_target, sp, pmin, pmax)) {
-      out_traj.clear();
-      out_traj.append(sp, pmin, pmax);
-      return true;
-    }
-    return false;
-  }
-
-  // Strategy 1: 2-section split through an intermediate rest state (q_m, 0, 0).
-  // Any (q_m, 0, 0) with T1_min + T2_min <= T_target admits an exact duration T_target
-  // via either extended sub-segments or a dwell at (q_m, 0, 0) with zero blocked intervals.
-  const double q_mid_raw = 0.5 * (q0 + q1);
-  const double q_ext_hi = std::min(lim.q_max, std::max(q0, q1) + 0.15 * (lim.q_max - std::max(q0, q1)));
-  const double q_ext_lo = std::max(lim.q_min, std::min(q0, q1) - 0.15 * (std::min(q0, q1) - lim.q_min));
-  const std::array<double, 7> q_cands{{
-    std::clamp(q_mid_raw, lim.q_min, lim.q_max),
-    std::clamp(q0 + 0.25 * (q1 - q0), lim.q_min, lim.q_max),
-    std::clamp(q0 + 0.75 * (q1 - q0), lim.q_min, lim.q_max),
-    q_ext_hi, q_ext_lo,
-    std::clamp(q0, lim.q_min, lim.q_max),
-    std::clamp(q1, lim.q_min, lim.q_max)
-  }};
-
-  for (double qm : q_cands) {
-    DoFTrajectory s1_min, s2_min;
-    bool c1 = false, c2 = false;
-    if (!solve_dof_min_time(q0, v0, a0, qm, 0.0, 0.0, lim, s1_min, c1, depth + 1) ||
-        !solve_dof_min_time(qm, 0.0, 0.0, q1, v1, a1, lim, s2_min, c2, depth + 1))
-    {
-      continue;
-    }
-    const double t_sum = s1_min.total_duration + s2_min.total_duration;
-    if (t_sum <= T_target + kTimeMatchTol) {
-      const double slack = std::max(0.0, T_target - t_sum);
-      // Prefer smooth extended sub-segments when both are unblocked and within position limits.
-      if (slack > 1e-6) {
-        const double frac = (t_sum > 1e-9) ? (s1_min.total_duration / t_sum) : 0.5;
-        const double T1 = s1_min.total_duration + frac * slack;
-        const double T2 = T_target - T1;
-        DoFTrajectory e1, e2;
-        double n1 = 0.0, n2 = 0.0;
-        if (solve_dof_at_duration(q0, v0, a0, qm, 0.0, 0.0, lim, T1, false, e1, n1, depth + 1) &&
-            solve_dof_at_duration(qm, 0.0, 0.0, q1, v1, a1, lim, T2, false, e2, n2, depth + 1))
-        {
-          out_traj.clear();
-          out_traj.append_traj(e1);
-          out_traj.append_traj(e2);
-          return true;
-        }
-      }
-      out_traj.clear();
-      out_traj.append_traj(s1_min);
-      if (slack > 1e-9) {
-        DoFSubPart dwell;
-        dwell.kind = SubPartKind::DWELL;
-        dwell.duration = slack;
-        dwell.dwell_q = qm;
-        out_traj.append(dwell, qm, qm);
-      }
-      out_traj.append_traj(s2_min);
-      return true;
-    }
-  }
-
-  // Strategy 2: 2-section split with non-zero midpoint velocity (q_m, v_m, a_m) at t_m = 0.5 * T_target
-  // trying both cubic-Hermite and symmetric-trapezoid midpoint estimates.
-  const double v_herm = 1.5 * (q1 - q0) / T_target - 0.25 * (v0 + v1);
-  const double v_sym = 2.0 * (q1 - q0) / T_target - 0.5 * (v0 + v1);
-  const double q_herm = std::clamp(
-    0.5 * (q0 + q1) + 0.125 * T_target * (v0 - v1), lim.q_min, lim.q_max);
-  const double v_lim_safe = std::min(
-    lim.v_lim * kHeadroom,
-    max_speed_for_distance(
-      0.98 * std::min(lim.q_max - q_herm, q_herm - lim.q_min),
-      lim.a_lim * kHeadroom, lim.j_lim * kHeadroom));
-
-  const double T_half = 0.5 * T_target;
-  const std::array<double, 7> vm_cands{{
-    v_sym,
-    v_herm,
-    0.75 * v_herm,
-    0.5 * v_herm,
-    0.25 * v_herm,
-    -0.25 * v_herm,
-    0.5 * (v0 + v1)
-  }};
-  for (double vm_raw : vm_cands) {
-    const double vm = std::clamp(vm_raw, -v_lim_safe, v_lim_safe);
-    DoFTrajectory e1, e2;
-    double n1 = 0.0, n2 = 0.0;
-    if (solve_dof_at_duration(q0, v0, a0, q_herm, vm, 0.0, lim, T_half, false, e1, n1, depth + 1) &&
-        solve_dof_at_duration(q_herm, vm, 0.0, q1, v1, a1, lim, T_target - T_half, false, e2, n2, depth + 1))
-    {
-      out_traj.clear();
-      out_traj.append_traj(e1);
-      out_traj.append_traj(e2);
-      return true;
-    }
-  }
-
-  // Strategy 3: Verified single-DoF septic Hermite polynomial fallback at exact T_target.
-  DoFSubPart sp;
-  double pmin = 0.0, pmax = 0.0;
-  if (build_verified_septic_1dof(q0, v0, a0, q1, v1, a1, lim, T_target, sp, pmin, pmax)) {
-    out_traj.clear();
-    out_traj.append(sp, pmin, pmax);
-    return true;
-  }
-  return false;
-}
-
-// Layer A (1-DOF): Solve for exact duration T_target keeping q(t) in [q_min, q_max].
-// If T_target is blocked (and !allow_blocked_split) or below the state-constrained minimum,
-// returns false and writes a strictly larger candidate duration to out_next_unblocked_T.
-bool solve_dof_at_duration(
-  double q0, double v0, double a0,
-  double q1, double v1, double a1,
-  const DoFLimit & lim,
-  double T_target,
-  bool allow_blocked_split,
-  DoFTrajectory & out_traj,
-  double & out_next_unblocked_T,
-  int depth)
-{
-  out_traj.clear();
-  out_next_unblocked_T = std::numeric_limits<double>::infinity();
-
-  if (std::abs(q1 - q0) < 1e-11 && std::abs(v0) < 1e-10 && std::abs(v1) < 1e-10 &&
-      std::abs(a0) < 1e-10 && std::abs(a1) < 1e-10)
-  {
-    DoFSubPart dwell;
-    dwell.kind = SubPartKind::DWELL;
-    dwell.duration = std::max(0.0, T_target);
-    dwell.dwell_q = std::clamp(q0, lim.q_min, lim.q_max);
-    out_traj.append(dwell, dwell.dwell_q, dwell.dwell_q);
-    return true;
-  }
-
-  ruckig::Profile prof;
-  double dur = 0.0;
-  ProfileExtrema ext;
-  if (!solve_ruckig_1dof_raw(q0, v0, a0, q1, v1, a1, lim, T_target, prof, dur, ext)) {
-    return false;
-  }
-
-  const bool exact_dur = (std::abs(dur - T_target) <= kTimeMatchTol);
-  if (exact_dur && extrema_within(ext, lim)) {
-    DoFSubPart part;
-    part.kind = SubPartKind::RUCKIG_PROFILE;
-    part.duration = dur;
-    part.profile = prof;
-    out_traj.append(part, ext.min, ext.max);
-    return true;
-  }
-
-  if (exact_dur && !extrema_within(ext, lim)) {
-    // Unconstrained profile at T_target overshot a position limit: apply Pontryagin
-    // boundary split at q_lim and absorb remaining slack in extended T1/T2 or T_dwell.
-    if (depth >= kMaxSplitDepth) {
-      return false;
-    }
-    const bool hi_vio = (ext.max > lim.q_max + kPosTol);
-    const bool lo_vio = (ext.min < lim.q_min - kPosTol);
-    double q_lim = lim.q_max;
-    if (hi_vio && lo_vio) {
-      q_lim = (ext.t_max <= ext.t_min) ? lim.q_max : lim.q_min;
-    } else if (lo_vio) {
-      q_lim = lim.q_min;
-    }
-
-    DoFTrajectory s1_min, s2_min;
-    bool c1 = false, c2 = false;
-    if (solve_dof_min_time(q0, v0, a0, q_lim, 0.0, 0.0, lim, s1_min, c1, depth + 1) &&
-        solve_dof_min_time(q_lim, 0.0, 0.0, q1, v1, a1, lim, s2_min, c2, depth + 1))
-    {
-      const double t_sum = s1_min.total_duration + s2_min.total_duration;
-      if (t_sum <= T_target + kTimeMatchTol) {
-        const double slack = std::max(0.0, T_target - t_sum);
-        // Try smooth proportional extension of T1, T2 first while staying inside [q_min, q_max].
-        if (slack > 1e-6) {
-          const double frac = (t_sum > 1e-9) ? (s1_min.total_duration / t_sum) : 0.5;
-          const double T1 = s1_min.total_duration + frac * slack;
-          const double T2 = T_target - T1;
-          DoFTrajectory e1, e2;
-          double n1 = 0.0, n2 = 0.0;
-          if (solve_dof_at_duration(q0, v0, a0, q_lim, 0.0, 0.0, lim, T1, false, e1, n1, depth + 1) &&
-              solve_dof_at_duration(q_lim, 0.0, 0.0, q1, v1, a1, lim, T2, false, e2, n2, depth + 1))
-          {
-            out_traj.clear();
-            out_traj.append_traj(e1);
-            out_traj.append_traj(e2);
-            return true;
-          }
-        }
-        // Fallback: exact dwell on the boundary rail (q_lim, 0, 0).
-        out_traj.clear();
-        out_traj.append_traj(s1_min);
-        if (slack > 1e-9) {
-          DoFSubPart dwell;
-          dwell.kind = SubPartKind::DWELL;
-          dwell.duration = slack;
-          dwell.dwell_q = q_lim;
-          out_traj.append(dwell, q_lim, q_lim);
-        }
-        out_traj.append_traj(s2_min);
-        return true;
-      }
-      // If zero-acceleration clamping at (q_lim, 0, 0) exceeds T_target, try a tangential
-      // touch-and-go bounce (q_lim, 0, a_bounce) pointing strictly into the interior.
-      const double inward_sgn = (q_lim == lim.q_max) ? -1.0 : 1.0;
-      for (double frac : {0.25, 0.5, 0.75, 0.95}) {
-        const double a_b = inward_sgn * frac * lim.a_lim * kHeadroom;
-        DoFTrajectory b1, b2;
-        bool bc1 = false, bc2 = false;
-        if (solve_dof_min_time(q0, v0, a0, q_lim, 0.0, a_b, lim, b1, bc1, depth + 1) &&
-            solve_dof_min_time(q_lim, 0.0, a_b, q1, v1, a1, lim, b2, bc2, depth + 1))
-        {
-          const double tb_sum = b1.total_duration + b2.total_duration;
-          if (tb_sum <= T_target + kTimeMatchTol) {
-            const double slack_b = std::max(0.0, T_target - tb_sum);
-            const double ratio_b = (tb_sum > 1e-9) ? (b1.total_duration / tb_sum) : 0.5;
-            const double T1_b = b1.total_duration + ratio_b * slack_b;
-            const double T2_b = T_target - T1_b;
-            DoFTrajectory e1, e2;
-            double n1 = 0.0, n2 = 0.0;
-            if (solve_dof_at_duration(q0, v0, a0, q_lim, 0.0, a_b, lim, T1_b, false, e1, n1, depth + 1) &&
-                solve_dof_at_duration(q_lim, 0.0, a_b, q1, v1, a1, lim, T2_b, false, e2, n2, depth + 1))
-            {
-              out_traj.clear();
-              out_traj.append_traj(e1);
-              out_traj.append_traj(e2);
-              return true;
-            }
-          }
-        }
-      }
-      out_next_unblocked_T = t_sum;
-      return false;
-    }
-
-    // Bounce-without-zero-acceleration edge case when (q_lim, 0, 0) was unreachable.
-    DoFTrajectory min_constrained;
-    bool clamped = false;
-    if (solve_dof_min_time(q0, v0, a0, q1, v1, a1, lim, min_constrained, clamped, depth + 1)) {
-      if (min_constrained.total_duration > T_target + kTimeMatchTol) {
-        out_next_unblocked_T = min_constrained.total_duration;
-        return false;
-      }
-      if (std::abs(min_constrained.total_duration - T_target) <= kTimeMatchTol) {
-        out_traj = std::move(min_constrained);
-        return true;
-      }
-      if (allow_blocked_split) {
-        return resolve_blocked_at_exact_duration(
-          q0, v0, a0, q1, v1, a1, lim, T_target, out_traj, depth + 1);
-      }
-    }
-    return false;
-  }
-
-  // Here dur > T_target + kTimeMatchTol: either T_target < T_min or T_target is in a blocked interval.
-  // Check true minimum constrained duration first.
-  DoFTrajectory min_traj;
-  bool clamped = false;
-  if (!solve_dof_min_time(q0, v0, a0, q1, v1, a1, lim, min_traj, clamped, depth + 1)) {
-    return false;
-  }
-  if (T_target + kTimeMatchTol < min_traj.total_duration) {
-    out_next_unblocked_T = min_traj.total_duration;
-    return false;
-  }
-
-  // T_target >= min_traj.total_duration, so T_target landed inside a Ruckig blocked interval.
-  if (allow_blocked_split) {
-    if (resolve_blocked_at_exact_duration(
-          q0, v0, a0, q1, v1, a1, lim, T_target, out_traj, depth))
-    {
-      return true;
-    }
-  }
-  out_next_unblocked_T = dur;
-  return false;
-}
-
-double ceil_1ms(double t)
-{
-  return std::max(kDt, std::ceil(t * 1000.0 - 1e-9) * kDt);
-}
-
 double round_1ms(double t)
 {
   return std::max(kDt, std::round(t * 1000.0) * kDt);
-}
-
-struct SegmentSolution6DoF
-{
-  std::array<DoFTrajectory, 6> dofs{};
-  std::array<double, 6> ind_min_durations{};
-  double duration = 0.0;
-};
-
-// Diagnoses which scaled limit prevented reaching an explicit target duration T_target on joint j.
-void diagnose_dt_failure(
-  size_t j, double q0, double v0, double a0, double q1, double v1, double a1,
-  const DoFLimit & lim, double T_target, double T_min_j,
-  std::string & err_code, std::string & err_msg)
-{
-  const double dq = std::abs(q1 - q0);
-  const double dv = std::abs(v1 - v0);
-  const double da = std::abs(a1 - a0);
-
-  if (dq / T_target > lim.v_lim + 1e-6) {
-    err_code = "ERR_PVA_VEL_LIMIT";
-  } else if (dv / T_target > lim.a_lim + 1e-6) {
-    err_code = "ERR_PVA_ACC_LIMIT";
-  } else if (da / T_target > lim.j_lim + 1e-3) {
-    err_code = "ERR_PVA_JERK_LIMIT";
-  } else {
-    // Probe which bound is active by relaxing v, a, j individually.
-    auto test_relaxed = [&](double vm, double am, double jm) -> bool {
-      DoFLimit rlim = lim;
-      rlim.v_lim *= vm;
-      rlim.a_lim *= am;
-      rlim.j_lim *= jm;
-      DoFTrajectory tmp;
-      bool cl = false;
-      return solve_dof_min_time(q0, v0, a0, q1, v1, a1, rlim, tmp, cl) &&
-             tmp.total_duration <= T_target + 1e-5;
-    };
-    const bool v_helps = test_relaxed(4.0, 1.0, 1.0);
-    const bool a_helps = test_relaxed(1.0, 4.0, 1.0);
-    const bool j_helps = test_relaxed(1.0, 1.0, 4.0);
-    if (v_helps && !a_helps && !j_helps) {
-      err_code = "ERR_PVA_VEL_LIMIT";
-    } else if (a_helps && !j_helps) {
-      err_code = "ERR_PVA_ACC_LIMIT";
-    } else if (j_helps) {
-      err_code = "ERR_PVA_JERK_LIMIT";
-    } else {
-      // Check if relaxing position limits makes T_target reachable.
-      DoFLimit wide = lim;
-      wide.q_min = -1e6;
-      wide.q_max = 1e6;
-      ruckig::Profile p;
-      double d = 0.0;
-      ProfileExtrema ex;
-      if (solve_ruckig_1dof_raw(q0, v0, a0, q1, v1, a1, wide, std::nullopt, p, d, ex) &&
-          d <= T_target + 1e-5)
-      {
-        err_code = "ERR_JOINT_POS_LIMIT";
-      } else {
-        err_code = "ERR_PVA_ACC_LIMIT";
-      }
-    }
-  }
-
-  std::ostringstream oss;
-  oss << std::fixed << std::setprecision(4)
-      << "MovePVA explicit dt=" << T_target << " s is infeasible on joint" << (j + 1)
-      << " (minimum feasible duration under scaled limits is " << T_min_j << " s)";
-  err_msg = oss.str();
-}
-
-// Layer A (6-DOF): Synchronized state-to-state solver with hard [min_pos, max_pos] and exact dt.
-bool solve_segment_6dof(
-  const JointPVASolver::SegmentInput & seg,
-  const std::array<DoFLimit, 6> & lims,
-  bool discretize_1ms,
-  SegmentSolution6DoF & out_sol,
-  std::string & err_code,
-  std::string & err_msg)
-{
-  // 1. Validate both endpoint states and braking feasibility on every DoF.
-  for (size_t j = 0; j < 6; ++j) {
-    std::string code, reason;
-    if (!validate_dof_state(
-          seg.q0[j], seg.v0[j], seg.a0[j], lims[j],
-          /*check_forward=*/true, /*check_reverse=*/false, code, reason))
-    {
-      err_code = code;
-      err_msg = "Joint" + std::to_string(j + 1) + " start state invalid: " + reason;
-      return false;
-    }
-    if (!validate_dof_state(
-          seg.q1[j], seg.v1[j], seg.a1[j], lims[j],
-          /*check_forward=*/false, /*check_reverse=*/true, code, reason))
-    {
-      err_code = code;
-      err_msg = "Joint" + std::to_string(j + 1) + " target state invalid: " + reason;
-      return false;
-    }
-  }
-
-  // 2. Explicit dt mode: enforce exact T_sync = round_1ms(dt).
-  if (seg.explicit_dt.has_value()) {
-    const double T_target = round_1ms(*seg.explicit_dt);
-    if (T_target > kMaxSegmentDurationSec) {
-      err_code = "ERR_PVA_DT";
-      err_msg = "MovePVA explicit dt exceeds maximum segment duration";
-      return false;
-    }
-
-    // Check individual minimum durations first for accurate diagnostics.
-    for (size_t j = 0; j < 6; ++j) {
-      DoFTrajectory min_j;
-      bool cl = false;
-      if (!solve_dof_min_time(
-            seg.q0[j], seg.v0[j], seg.a0[j], seg.q1[j], seg.v1[j], seg.a1[j],
-            lims[j], min_j, cl))
-      {
-        err_code = "ERR_PVA_INFEASIBLE";
-        err_msg = "MovePVA segment has no feasible trajectory on joint" + std::to_string(j + 1);
-        return false;
-      }
-      out_sol.ind_min_durations[j] = min_j.total_duration;
-      if (min_j.total_duration > T_target + kTimeMatchTol) {
-        diagnose_dt_failure(
-          j, seg.q0[j], seg.v0[j], seg.a0[j], seg.q1[j], seg.v1[j], seg.a1[j],
-          lims[j], T_target, min_j.total_duration, err_code, err_msg);
-        return false;
-      }
-    }
-
-    for (size_t j = 0; j < 6; ++j) {
-      double next_T = 0.0;
-      if (!solve_dof_at_duration(
-            seg.q0[j], seg.v0[j], seg.a0[j], seg.q1[j], seg.v1[j], seg.a1[j],
-            lims[j], T_target, /*allow_blocked_split=*/true, out_sol.dofs[j], next_T))
-      {
-        diagnose_dt_failure(
-          j, seg.q0[j], seg.v0[j], seg.a0[j], seg.q1[j], seg.v1[j], seg.a1[j],
-          lims[j], T_target, std::isfinite(next_T) ? next_T : out_sol.ind_min_durations[j],
-          err_code, err_msg);
-        return false;
-      }
-    }
-    out_sol.duration = T_target;
-    return true;
-  }
-
-  // 3. Free-duration mode: fast unconstrained 6-DOF Ruckig path first.
-  bool all_zero = true;
-  for (size_t j = 0; j < 6; ++j) {
-    if (std::abs(seg.q1[j] - seg.q0[j]) > 1e-11 ||
-        std::abs(seg.v0[j]) > 1e-10 || std::abs(seg.v1[j]) > 1e-10 ||
-        std::abs(seg.a0[j]) > 1e-10 || std::abs(seg.a1[j]) > 1e-10)
-    {
-      all_zero = false;
-      break;
-    }
-  }
-  if (all_zero) {
-    const double T0 = discretize_1ms ? kDt : 0.0;
-    for (size_t j = 0; j < 6; ++j) {
-      out_sol.dofs[j].clear();
-      DoFSubPart dwell;
-      dwell.kind = SubPartKind::DWELL;
-      dwell.duration = T0;
-      dwell.dwell_q = std::clamp(seg.q0[j], lims[j].q_min, lims[j].q_max);
-      out_sol.dofs[j].append(dwell, dwell.dwell_q, dwell.dwell_q);
-      out_sol.ind_min_durations[j] = 0.0;
-    }
-    out_sol.duration = T0;
-    return true;
-  }
-
-  {
-    ruckig::InputParameter<6> inp;
-    inp.control_interface = ruckig::ControlInterface::Position;
-    inp.synchronization = ruckig::Synchronization::Time;
-    inp.duration_discretization = discretize_1ms ?
-      ruckig::DurationDiscretization::Discrete :
-      ruckig::DurationDiscretization::Continuous;
-    for (size_t j = 0; j < 6; ++j) {
-      double vc = 0.0, ac = 0.0, jc = 0.0;
-      compute_working_caps(seg.v0[j], seg.a0[j], seg.v1[j], seg.a1[j], lims[j], vc, ac, jc);
-      inp.current_position[j] = seg.q0[j];
-      inp.current_velocity[j] = seg.v0[j];
-      inp.current_acceleration[j] = seg.a0[j];
-      inp.target_position[j] = seg.q1[j];
-      inp.target_velocity[j] = seg.v1[j];
-      inp.target_acceleration[j] = seg.a1[j];
-      inp.max_velocity[j] = vc;
-      inp.max_acceleration[j] = ac;
-      inp.max_jerk[j] = jc;
-    }
-    ruckig::Ruckig<6> otg(kDt);
-    ruckig::Trajectory<6> traj;
-    const auto res = otg.calculate(inp, traj);
-    if (static_cast<int>(res) >= 0) {
-      const double dur = traj.get_duration();
-      if (std::isfinite(dur) && dur >= 0.0 && dur <= kMaxSegmentDurationSec) {
-        const auto profiles = traj.get_profiles()[0];
-        bool all_within = true;
-        std::array<ProfileExtrema, 6> exts{};
-        for (size_t j = 0; j < 6; ++j) {
-          exts[j] = compute_profile_extrema(profiles[j]);
-          if (!extrema_within(exts[j], lims[j])) {
-            all_within = false;
-            break;
-          }
-        }
-        if (all_within) {
-          const auto ind = traj.get_independent_min_durations();
-          for (size_t j = 0; j < 6; ++j) {
-            out_sol.dofs[j].clear();
-            DoFSubPart part;
-            part.kind = SubPartKind::RUCKIG_PROFILE;
-            part.duration = dur;
-            part.profile = profiles[j];
-            out_sol.dofs[j].append(part, exts[j].min, exts[j].max);
-            out_sol.ind_min_durations[j] = ind[j];
-          }
-          out_sol.duration = dur;
-          return true;
-        }
-      }
-    }
-  }
-
-  // 4. Position-constrained 6-DOF synchronization.
-  double T_cand = 0.0;
-  for (size_t j = 0; j < 6; ++j) {
-    DoFTrajectory min_j;
-    bool cl = false;
-    if (!solve_dof_min_time(
-          seg.q0[j], seg.v0[j], seg.a0[j], seg.q1[j], seg.v1[j], seg.a1[j],
-          lims[j], min_j, cl))
-    {
-      err_code = "ERR_JOINT_POS_LIMIT";
-      err_msg = "Joint" + std::to_string(j + 1) +
-        " cannot satisfy position limits under scaled (v, a, j) bounds";
-      return false;
-    }
-    out_sol.ind_min_durations[j] = min_j.total_duration;
-    T_cand = std::max(T_cand, min_j.total_duration);
-  }
-  if (discretize_1ms) {
-    T_cand = ceil_1ms(T_cand);
-  }
-
-  for (int iter = 0; iter < 16; ++iter) {
-    if (T_cand > kMaxSegmentDurationSec) {
-      break;
-    }
-    bool all_ok = true;
-    double max_next = T_cand;
-    for (size_t j = 0; j < 6; ++j) {
-      double next_T = 0.0;
-      if (!solve_dof_at_duration(
-            seg.q0[j], seg.v0[j], seg.a0[j], seg.q1[j], seg.v1[j], seg.a1[j],
-            lims[j], T_cand, /*allow_blocked_split=*/false, out_sol.dofs[j], next_T))
-      {
-        all_ok = false;
-        if (std::isfinite(next_T) && next_T > max_next) {
-          max_next = next_T;
-        }
-      }
-    }
-    if (all_ok) {
-      out_sol.duration = T_cand;
-      return true;
-    }
-    if (max_next <= T_cand + 1e-7) {
-      break;
-    }
-    T_cand = discretize_1ms ? ceil_1ms(max_next) : max_next;
-  }
-
-  // Final attempt at tightest T_cand allowing 2-section blocked-interval resolution.
-  T_cand = 0.0;
-  for (size_t j = 0; j < 6; ++j) {
-    T_cand = std::max(T_cand, out_sol.ind_min_durations[j]);
-  }
-  if (discretize_1ms) {
-    T_cand = ceil_1ms(T_cand);
-  }
-  for (int bump = 0; bump < 6; ++bump) {
-    bool all_ok = true;
-    for (size_t j = 0; j < 6; ++j) {
-      double next_T = 0.0;
-      if (!solve_dof_at_duration(
-            seg.q0[j], seg.v0[j], seg.a0[j], seg.q1[j], seg.v1[j], seg.a1[j],
-            lims[j], T_cand, /*allow_blocked_split=*/true, out_sol.dofs[j], next_T))
-      {
-        all_ok = false;
-        break;
-      }
-    }
-    if (all_ok) {
-      out_sol.duration = T_cand;
-      return true;
-    }
-    T_cand = discretize_1ms ? ceil_1ms(T_cand * 1.05 + kDt) : (T_cand * 1.05 + kDt);
-    if (T_cand > kMaxSegmentDurationSec) {
-      break;
-    }
-  }
-
-  err_code = "ERR_PVA_INFEASIBLE";
-  err_msg = "MovePVA segment could not synchronize all 6 joints within limits";
-  return false;
 }
 
 std::array<DoFLimit, 6> build_dof_limits(
@@ -1311,39 +52,457 @@ std::array<DoFLimit, 6> build_dof_limits(
   return out;
 }
 
-// Fast 1-DOF Layer-A cost oracle for Layer-B coordinate optimization:
-// returns the minimum feasible continuous duration for joint j on a single segment
-// (or +inf if infeasible or violating explicit_dt).
-double eval_dof_segment_cost(
+otg::AxisLimits to_hard_axis_limits(const DoFLimit & lim)
+{
+  otg::AxisLimits al;
+  al.q_min = lim.q_min;
+  al.q_max = lim.q_max;
+  al.v_min = -lim.v_lim;
+  al.v_max = lim.v_lim;
+  al.a_min = -lim.a_lim;
+  al.a_max = lim.a_lim;
+  al.j_max = lim.j_lim;
+  return al;
+}
+
+// Compute working 1-DOF OTG limits preserving kHeadroom (0.996) interior margin while
+// permitting valid user-pinned boundary states up to 100% of scaled limits.
+otg::AxisLimits build_working_axis_limits(
+  double v0, double a0, double v1, double a1, const DoFLimit & lim)
+{
+  double j_cap = lim.j_lim * kHeadroom;
+  const double a_cap = std::min(
+    lim.a_lim,
+    std::max({lim.a_lim * kHeadroom, std::abs(a0) + 1e-9, std::abs(a1) + 1e-9}));
+
+  auto compute_v_req = [&](double j_use) {
+    double vr = std::max({lim.v_lim * kHeadroom, std::abs(v0) + 1e-9, std::abs(v1) + 1e-9});
+    if (a0 > 0.0) {
+      vr = std::max(vr, std::abs(v0 + (a0 * a0) / (2.0 * j_use)) + 1e-9);
+    } else if (a0 < 0.0) {
+      vr = std::max(vr, std::abs(v0 - (a0 * a0) / (2.0 * j_use)) + 1e-9);
+    }
+    if (a1 < 0.0) {
+      vr = std::max(vr, std::abs(v1 + (a1 * a1) / (2.0 * j_use)) + 1e-9);
+    } else if (a1 > 0.0) {
+      vr = std::max(vr, std::abs(v1 - (a1 * a1) / (2.0 * j_use)) + 1e-9);
+    }
+    return vr;
+  };
+
+  double v_req = compute_v_req(j_cap);
+  if (v_req > lim.v_lim) {
+    j_cap = lim.j_lim;
+    v_req = compute_v_req(j_cap);
+  }
+  const double v_cap = std::min(lim.v_lim * (1.0 + 1e-7), v_req);
+
+  otg::AxisLimits al;
+  al.q_min = lim.q_min;
+  al.q_max = lim.q_max;
+  al.v_min = -v_cap;
+  al.v_max = v_cap;
+  al.a_min = -a_cap;
+  al.a_max = a_cap;
+  al.j_max = j_cap;
+  return al;
+}
+
+bool validate_dof_state_diag(
+  double q, double v, double a, const DoFLimit & lim,
+  bool check_forward, bool check_reverse,
+  std::string & out_code, std::string & out_reason)
+{
+  const otg::AxisLimits al = to_hard_axis_limits(lim);
+  const char * tag = nullptr;
+  if (otg::validate_axis_state({q, v, a}, al, check_forward, check_reverse, &tag)) {
+    return true;
+  }
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(5);
+  if (tag != nullptr && std::strcmp(tag, "NONFINITE") == 0) {
+    out_code = "ERR_NONFINITE_SAMPLE";
+    out_reason = "non-finite waypoint state";
+  } else if (tag != nullptr && std::strcmp(tag, "POS_LIMIT") == 0) {
+    out_code = "ERR_JOINT_POS_LIMIT";
+    oss << "position=" << q << " rad outside [" << lim.q_min << ", " << lim.q_max << "] rad";
+    out_reason = oss.str();
+  } else if (tag != nullptr && std::strcmp(tag, "VEL_LIMIT") == 0) {
+    out_code = "ERR_PVA_VEL_LIMIT";
+    oss << "|v|=" << std::abs(v) << " rad/s exceeds scaled limit=" << lim.v_lim << " rad/s";
+    out_reason = oss.str();
+  } else if (tag != nullptr && std::strcmp(tag, "ACC_LIMIT") == 0) {
+    out_code = "ERR_PVA_ACC_LIMIT";
+    oss << "|a|=" << std::abs(a) << " rad/s^2 exceeds scaled limit=" << lim.a_lim << " rad/s^2";
+    out_reason = oss.str();
+  } else if (tag != nullptr && std::strcmp(tag, "VEL_REACH_FWD") == 0) {
+    out_code = "ERR_PVA_VEL_LIMIT";
+    out_reason = "waypoint (v, a) unavoidably overshoots scaled velocity limit under jerk bound";
+  } else if (tag != nullptr && std::strcmp(tag, "VEL_REACH_REV") == 0) {
+    out_code = "ERR_PVA_VEL_LIMIT";
+    out_reason = "waypoint (v, a) cannot be approached without exceeding scaled velocity limit";
+  } else if (tag != nullptr && std::strcmp(tag, "POS_BRAKE_FWD") == 0) {
+    out_code = "ERR_JOINT_POS_LIMIT";
+    const double q_hi = otg::min_upper_excursion(q, v, a, -lim.a_lim, lim.j_lim);
+    const double q_lo = otg::max_lower_excursion(q, v, a, lim.a_lim, lim.j_lim);
+    oss << "forward braking excursion [" << q_lo << ", " << q_hi
+        << "] rad exceeds joint limits [" << lim.q_min << ", " << lim.q_max << "] rad";
+    out_reason = oss.str();
+  } else {
+    out_code = "ERR_JOINT_POS_LIMIT";
+    const double q_hi = otg::min_upper_excursion(q, -v, a, -lim.a_lim, lim.j_lim);
+    const double q_lo = otg::max_lower_excursion(q, -v, a, lim.a_lim, lim.j_lim);
+    oss << "reverse-time braking excursion [" << q_lo << ", " << q_hi
+        << "] rad exceeds joint limits [" << lim.q_min << ", " << lim.q_max << "] rad";
+    out_reason = oss.str();
+  }
+  return false;
+}
+
+void diagnose_dt_failure(
+  size_t j, double q0, double v0, double a0, double q1, double v1, double a1,
+  const DoFLimit & lim, double T_target, double T_min_j,
+  std::string & err_code, std::string & err_msg)
+{
+  const double dq = std::abs(q1 - q0);
+  const double dv = std::abs(v1 - v0);
+  const double da = std::abs(a1 - a0);
+
+  if (dq / T_target > lim.v_lim + 1e-6) {
+    err_code = "ERR_PVA_VEL_LIMIT";
+  } else if (dv / T_target > lim.a_lim + 1e-6) {
+    err_code = "ERR_PVA_ACC_LIMIT";
+  } else if (da / T_target > lim.j_lim + 1e-3) {
+    err_code = "ERR_PVA_JERK_LIMIT";
+  } else {
+    auto test_relaxed = [&](double vm, double am, double jm) -> bool {
+      DoFLimit rlim = lim;
+      rlim.v_lim *= vm;
+      rlim.a_lim *= am;
+      rlim.j_lim *= jm;
+      const otg::AxisLimits al = build_working_axis_limits(v0, a0, v1, a1, rlim);
+      otg::AxisProfile p;
+      double next_t = 0.0;
+      return otg::solve_axis_bounded_at_duration({q0, v0, a0}, {q1, v1, a1}, al, T_target, p, next_t);
+    };
+    const bool v_helps = test_relaxed(4.0, 1.0, 1.0);
+    const bool a_helps = test_relaxed(1.0, 4.0, 1.0);
+    const bool j_helps = test_relaxed(1.0, 1.0, 4.0);
+    if (v_helps && !a_helps && !j_helps) {
+      err_code = "ERR_PVA_VEL_LIMIT";
+    } else if (a_helps && !j_helps) {
+      err_code = "ERR_PVA_ACC_LIMIT";
+    } else if (j_helps) {
+      err_code = "ERR_PVA_JERK_LIMIT";
+    } else {
+      otg::AxisLimits wide = build_working_axis_limits(v0, a0, v1, a1, lim);
+      wide.q_min = -std::numeric_limits<double>::infinity();
+      wide.q_max = std::numeric_limits<double>::infinity();
+      otg::AxisProfile unc;
+      if (otg::solve_axis_unconstrained_step2({q0, v0, a0}, {q1, v1, a1}, wide, T_target, unc)) {
+        err_code = "ERR_JOINT_POS_LIMIT";
+      } else {
+        err_code = "ERR_PVA_ACC_LIMIT";
+      }
+    }
+  }
+
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(4)
+      << "MovePVA explicit dt=" << T_target << " s is infeasible on joint" << (j + 1)
+      << " (minimum feasible duration under scaled limits is " << T_min_j << " s)";
+  err_msg = oss.str();
+}
+
+struct SegmentSolution6DoF
+{
+  std::array<otg::AxisProfile, 6> dofs{};
+  std::array<double, 6> ind_min_durations{};
+  double duration = 0.0;
+};
+
+// Layer A (6-DOF): Native synchronized state-to-state solver with hard [min_pos, max_pos]
+// and exact blocked-interval handling.
+bool solve_segment_6dof(
+  const JointPVASolver::SegmentInput & seg,
+  const std::array<DoFLimit, 6> & lims,
+  bool discretize_1ms,
+  SegmentSolution6DoF & out_sol,
+  std::string & err_code,
+  std::string & err_msg)
+{
+  for (size_t j = 0; j < 6; ++j) {
+    std::string code, reason;
+    if (!validate_dof_state_diag(
+          seg.q0[j], seg.v0[j], seg.a0[j], lims[j],
+          /*check_forward=*/true, /*check_reverse=*/false, code, reason))
+    {
+      err_code = code;
+      err_msg = "Joint" + std::to_string(j + 1) + " start state invalid: " + reason;
+      return false;
+    }
+    if (!validate_dof_state_diag(
+          seg.q1[j], seg.v1[j], seg.a1[j], lims[j],
+          /*check_forward=*/false, /*check_reverse=*/true, code, reason))
+    {
+      err_code = code;
+      err_msg = "Joint" + std::to_string(j + 1) + " target state invalid: " + reason;
+      return false;
+    }
+  }
+
+  otg::MultiDoFInput inp;
+  inp.current.resize(6);
+  inp.target.resize(6);
+  inp.limits.resize(6);
+  inp.control_interface = otg::ControlInterface::POSITION;
+  inp.synchronization = otg::Synchronization::TIME;
+  inp.discretization = discretize_1ms ?
+    otg::DurationDiscretization::DISCRETE :
+    otg::DurationDiscretization::CONTINUOUS;
+  inp.dt_step = kDt;
+  inp.max_duration = kMaxSegmentDurationSec;
+
+  if (seg.explicit_dt.has_value()) {
+    const double T_target = round_1ms(*seg.explicit_dt);
+    if (T_target > kMaxSegmentDurationSec) {
+      err_code = "ERR_PVA_DT";
+      err_msg = "MovePVA explicit dt exceeds maximum segment duration";
+      return false;
+    }
+    inp.exact_duration = T_target;
+  }
+
+  for (size_t j = 0; j < 6; ++j) {
+    inp.current[j] = {seg.q0[j], seg.v0[j], seg.a0[j]};
+    inp.target[j] = {seg.q1[j], seg.v1[j], seg.a1[j]};
+    inp.limits[j] = build_working_axis_limits(seg.v0[j], seg.a0[j], seg.v1[j], seg.a1[j], lims[j]);
+  }
+
+  const otg::MultiDoFResult res = otg::solve_multidof(inp);
+  if (!res.ok) {
+    const size_t bad_j = (res.failed_dof >= 0 && res.failed_dof < 6)
+      ? static_cast<size_t>(res.failed_dof) : 0;
+    if (seg.explicit_dt.has_value()) {
+      const double T_target = round_1ms(*seg.explicit_dt);
+      const double t_ref = std::isfinite(res.next_feasible_duration)
+        ? res.next_feasible_duration
+        : (bad_j < res.independent_min_durations.size() ? res.independent_min_durations[bad_j] : T_target);
+      diagnose_dt_failure(
+        bad_j, seg.q0[bad_j], seg.v0[bad_j], seg.a0[bad_j],
+        seg.q1[bad_j], seg.v1[bad_j], seg.a1[bad_j],
+        lims[bad_j], T_target, t_ref, err_code, err_msg);
+    } else {
+      err_code = "ERR_PVA_INFEASIBLE";
+      err_msg = "MovePVA segment could not synchronize all 6 joints within limits (joint" +
+        std::to_string(bad_j + 1) + ")";
+    }
+    return false;
+  }
+
+  for (size_t j = 0; j < 6; ++j) {
+    out_sol.dofs[j] = res.profiles[j];
+    out_sol.ind_min_durations[j] = res.independent_min_durations[j];
+  }
+  out_sol.duration = res.duration;
+  return true;
+}
+
+// Fast 1-DOF native bounded minimum-time oracle (returns +inf if infeasible).
+double eval_1dof_min_dur(
+  double q0, double v0, double a0,
+  double q1, double v1, double a1,
+  const DoFLimit & lim)
+{
+  const otg::AxisLimits hard = to_hard_axis_limits(lim);
+  if (!otg::validate_axis_state({q0, v0, a0}, hard, true, false) ||
+      !otg::validate_axis_state({q1, v1, a1}, hard, false, true))
+  {
+    return std::numeric_limits<double>::infinity();
+  }
+  const otg::AxisLimits work = build_working_axis_limits(v0, a0, v1, a1, lim);
+  otg::AxisProfile prof;
+  if (!otg::solve_axis_bounded_min_time({q0, v0, a0}, {q1, v1, a1}, work, prof)) {
+    return std::numeric_limits<double>::infinity();
+  }
+  return prof.duration;
+}
+
+// Fast 1-DOF oracle respecting optional explicit dt (for feasibility & Stage B2/B3).
+double eval_1dof_seg_cost(
   double q0, double v0, double a0,
   double q1, double v1, double a1,
   const DoFLimit & lim,
   std::optional<double> explicit_dt)
 {
-  std::string dummy_c, dummy_r;
-  if (!validate_dof_state(q0, v0, a0, lim, true, false, dummy_c, dummy_r) ||
-      !validate_dof_state(q1, v1, a1, lim, false, true, dummy_c, dummy_r))
+  const otg::AxisLimits hard = to_hard_axis_limits(lim);
+  if (!otg::validate_axis_state({q0, v0, a0}, hard, true, false) ||
+      !otg::validate_axis_state({q1, v1, a1}, hard, false, true))
   {
     return std::numeric_limits<double>::infinity();
   }
+  const otg::AxisLimits work = build_working_axis_limits(v0, a0, v1, a1, lim);
   if (explicit_dt.has_value()) {
     const double T_target = round_1ms(*explicit_dt);
-    DoFTrajectory tr;
-    double next_T = 0.0;
-    if (!solve_dof_at_duration(q0, v0, a0, q1, v1, a1, lim, T_target, true, tr, next_T)) {
+    otg::AxisProfile prof;
+    double next_t = 0.0;
+    if (!otg::solve_axis_bounded_at_duration({q0, v0, a0}, {q1, v1, a1}, work, T_target, prof, next_t)) {
       return std::numeric_limits<double>::infinity();
     }
     return T_target;
   }
-  DoFTrajectory tr;
-  bool clamped = false;
-  if (!solve_dof_min_time(q0, v0, a0, q1, v1, a1, lim, tr, clamped)) {
+  otg::AxisProfile prof;
+  if (!otg::solve_axis_bounded_min_time({q0, v0, a0}, {q1, v1, a1}, work, prof)) {
     return std::numeric_limits<double>::infinity();
   }
-  return tr.total_duration;
+  return prof.duration;
 }
 
-// Samples a verified SegmentSolution6DoF onto the 1 kHz grid.
+// Exact 6-DOF continuous synchronized duration for segment m (blocked-interval aware).
+double eval_6dof_sync_dur(
+  const std::array<double, 6> & q0, const std::array<double, 6> & v0, const std::array<double, 6> & a0,
+  const std::array<double, 6> & q1, const std::array<double, 6> & v1, const std::array<double, 6> & a1,
+  const std::array<DoFLimit, 6> & lims,
+  std::optional<double> explicit_dt,
+  double * out_sum_ind = nullptr)
+{
+  otg::MultiDoFInput inp;
+  inp.current.resize(6);
+  inp.target.resize(6);
+  inp.limits.resize(6);
+  inp.control_interface = otg::ControlInterface::POSITION;
+  inp.synchronization = otg::Synchronization::TIME;
+  inp.discretization = otg::DurationDiscretization::CONTINUOUS;
+  inp.dt_step = kDt;
+  inp.max_duration = kMaxSegmentDurationSec;
+  if (explicit_dt.has_value()) {
+    inp.exact_duration = round_1ms(*explicit_dt);
+  }
+  for (size_t j = 0; j < 6; ++j) {
+    const otg::AxisLimits hard = to_hard_axis_limits(lims[j]);
+    if (!otg::validate_axis_state({q0[j], v0[j], a0[j]}, hard, true, false) ||
+        !otg::validate_axis_state({q1[j], v1[j], a1[j]}, hard, false, true))
+    {
+      return std::numeric_limits<double>::infinity();
+    }
+    inp.current[j] = {q0[j], v0[j], a0[j]};
+    inp.target[j] = {q1[j], v1[j], a1[j]};
+    inp.limits[j] = build_working_axis_limits(v0[j], a0[j], v1[j], a1[j], lims[j]);
+  }
+  const otg::MultiDoFResult r = otg::solve_multidof(inp);
+  if (!r.ok) {
+    return std::numeric_limits<double>::infinity();
+  }
+  if (out_sum_ind != nullptr) {
+    double s = 0.0;
+    for (double d : r.independent_min_durations) {
+      s += d;
+    }
+    *out_sum_ind = s;
+  }
+  return r.duration;
+}
+
+// Fits a natural C^2 cubic spline with clamped zero endpoint velocities (v0 = vM = 0)
+// over knot durations h[0..M-1] for one DoF to produce physically consistent initial (v_k, a_k).
+void fit_clamped_cubic_seed_1dof(
+  const std::vector<double> & q,
+  const std::vector<double> & h,
+  std::vector<double> & out_v,
+  std::vector<double> & out_a)
+{
+  const size_t M = h.size();
+  out_v.assign(M + 1, 0.0);
+  out_a.assign(M + 1, 0.0);
+  if (M < 2) {
+    return;
+  }
+  // Solve tridiagonal system for nodal second derivatives c[0..M] with clamped v[0] = v[M] = 0:
+  //   (h[0]/3) c[0] + (h[0]/6) c[1] = (q[1] - q[0])/h[0]
+  //   (h[k-1]/6) c[k-1] + ((h[k-1]+h[k])/3) c[k] + (h[k]/6) c[k+1] = (q[k+1]-q[k])/h[k] - (q[k]-q[k-1])/h[k-1]
+  //   (h[M-1]/6) c[M-1] + (h[M-1]/3) c[M] = -(q[M] - q[M-1])/h[M-1]
+  const size_t n = M + 1;
+  std::vector<double> dl(n, 0.0), dm(n, 0.0), du(n, 0.0), rhs(n, 0.0);
+  dm[0] = h[0] / 3.0;
+  du[0] = h[0] / 6.0;
+  rhs[0] = (q[1] - q[0]) / h[0];
+  for (size_t k = 1; k < M; ++k) {
+    dl[k] = h[k - 1] / 6.0;
+    dm[k] = (h[k - 1] + h[k]) / 3.0;
+    du[k] = h[k] / 6.0;
+    rhs[k] = (q[k + 1] - q[k]) / h[k] - (q[k] - q[k - 1]) / h[k - 1];
+  }
+  dl[M] = h[M - 1] / 6.0;
+  dm[M] = h[M - 1] / 3.0;
+  rhs[M] = -(q[M] - q[M - 1]) / h[M - 1];
+
+  // Thomas algorithm.
+  for (size_t k = 1; k < n; ++k) {
+    const double w = dl[k] / std::max(1e-12, dm[k - 1]);
+    dm[k] -= w * du[k - 1];
+    rhs[k] -= w * rhs[k - 1];
+  }
+  out_a[M] = rhs[M] / std::max(1e-12, dm[M]);
+  for (size_t k = M; k-- > 0;) {
+    out_a[k] = (rhs[k] - du[k] * out_a[k + 1]) / std::max(1e-12, dm[k]);
+  }
+  out_v[0] = 0.0;
+  out_v[M] = 0.0;
+  for (size_t k = 1; k < M; ++k) {
+    out_v[k] = (q[k + 1] - q[k]) / h[k] - h[k] * (2.0 * out_a[k] + out_a[k + 1]) / 6.0;
+  }
+}
+
+void project_node_respecting_masks(
+  double q, bool v_fixed, bool a_fixed,
+  double & v, double & a, const DoFLimit & lim)
+{
+  const otg::AxisLimits al = to_hard_axis_limits(lim);
+  if (!v_fixed && !a_fixed) {
+    otg::project_state_feasible(q, v, a, al, kHeadroom);
+    return;
+  }
+  if (!v_fixed && a_fixed) {
+    // Keep pinned a fixed; project v into valid velocity + braking interval.
+    const double a_use = a;
+    const double dv_a = (a_use * a_use) / (2.0 * lim.j_lim);
+    const double v_hi = std::max(0.0, lim.v_lim * kHeadroom - dv_a);
+    v = std::clamp(v, -v_hi, v_hi);
+    if (!otg::validate_axis_state({q, v, a_use}, al, true, true)) {
+      double lo = 0.0, hi = 1.0;
+      for (int it = 0; it < 20; ++it) {
+        const double m = 0.5 * (lo + hi);
+        if (otg::validate_axis_state({q, m * v, a_use}, al, true, true)) {
+          lo = m;
+        } else {
+          hi = m;
+        }
+      }
+      v *= lo;
+    }
+    return;
+  }
+  if (v_fixed && !a_fixed) {
+    // Keep pinned v fixed; project a into valid acceleration + braking interval.
+    const double v_use = v;
+    const double a_vel_max = std::sqrt(std::max(0.0, 2.0 * lim.j_lim * (lim.v_lim - std::abs(v_use))));
+    const double a_cap = std::min(lim.a_lim * kHeadroom, a_vel_max);
+    a = std::clamp(a, -a_cap, a_cap);
+    if (!otg::validate_axis_state({q, v_use, a}, al, true, true)) {
+      double lo = 0.0, hi = 1.0;
+      for (int it = 0; it < 20; ++it) {
+        const double m = 0.5 * (lo + hi);
+        if (otg::validate_axis_state({q, v_use, m * a}, al, true, true)) {
+          lo = m;
+        } else {
+          hi = m;
+        }
+      }
+      a *= lo;
+    }
+  }
+}
+
 void sample_segment_1khz(
   const SegmentSolution6DoF & sol,
   const SourceLocation & loc,
@@ -1478,7 +637,6 @@ bool JointPVASolver::solve_multi_waypoint(
     q_nodes[k + 1] = wp.joint_pos;
     seg_dt[k] = wp.dt;
 
-    // Validate waypoint positions against mechanical limits.
     for (size_t j = 0; j < 6; ++j) {
       if (!std::isfinite(wp.joint_pos[j]) ||
           wp.joint_pos[j] < lims[j].q_min - lite6_planner::tolerance::kJointPosition ||
@@ -1506,13 +664,13 @@ bool JointPVASolver::solve_multi_waypoint(
         a_nodes[k + 1] = *wp.acceleration;
         a_fixed[k + 1] = true;
       }
-      // Validate user-pinned intermediate velocity/acceleration immediately.
       for (size_t j = 0; j < 6; ++j) {
-        if (v_fixed[k + 1]) {
+        if (v_fixed[k + 1] || a_fixed[k + 1]) {
           std::string code, reason;
+          const double v_chk = v_fixed[k + 1] ? v_nodes[k + 1][j] : 0.0;
           const double a_chk = a_fixed[k + 1] ? a_nodes[k + 1][j] : 0.0;
-          if (!validate_dof_state(
-                q_nodes[k + 1][j], v_nodes[k + 1][j], a_chk, lims[j],
+          if (!validate_dof_state_diag(
+                q_nodes[k + 1][j], v_chk, a_chk, lims[j],
                 /*check_forward=*/true, /*check_reverse=*/true, code, reason))
           {
             err_loc = wp.loc;
@@ -1526,112 +684,131 @@ bool JointPVASolver::solve_multi_waypoint(
     }
   }
 
-  // 2. Initialize free interior velocities with braking-safe Catmull-Rom tangents
-  //    and free interior accelerations to 0.
-  std::vector<double> est_dt(M, 0.2);
-  for (size_t m = 0; m < M; ++m) {
-    if (seg_dt[m].has_value()) {
-      est_dt[m] = std::max(0.01, *seg_dt[m]);
-    } else {
-      double t_est = 0.05;
-      for (size_t j = 0; j < 6; ++j) {
-        const double dq = std::abs(q_nodes[m + 1][j] - q_nodes[m][j]);
-        t_est = std::max(t_est, dq / std::max(1e-4, 0.65 * lims[j].v_lim));
-      }
-      est_dt[m] = t_est;
-    }
-  }
-
-  auto braking_safe_vel_bound = [&](size_t node_k, size_t j) -> double {
-    const double margin_pos = 0.96 * std::min(
-      lims[j].q_max - q_nodes[node_k][j],
-      q_nodes[node_k][j] - lims[j].q_min);
-    const double v_pos = max_speed_for_distance(
-      std::max(0.0, margin_pos), lims[j].a_lim * kHeadroom, lims[j].j_lim * kHeadroom);
-    return std::min(lims[j].v_lim * kHeadroom, v_pos);
-  };
-
-  std::vector<std::array<double, 6>> v_catmull = v_nodes;
-  std::vector<std::array<double, 6>> a_init = a_nodes;
   bool has_any_free = false;
-
   for (size_t k = 1; k < M; ++k) {
     if (!v_fixed[k] || !a_fixed[k]) {
       has_any_free = true;
-    }
-    if (!v_fixed[k]) {
-      const double tm = est_dt[k - 1];
-      const double tp = est_dt[k];
-      for (size_t j = 0; j < 6; ++j) {
-        const double sm = (q_nodes[k][j] - q_nodes[k - 1][j]) / tm;
-        const double sp = (q_nodes[k + 1][j] - q_nodes[k][j]) / tp;
-        double v_cr = 0.0;
-        if (sm * sp > 0.0) {
-          // Time-weighted Catmull-Rom tangent (zero at local direction reversals).
-          v_cr = (tp * sm + tm * sp) / (tm + tp);
-        }
-        const double v_bnd = braking_safe_vel_bound(k, j);
-        v_catmull[k][j] = std::clamp(v_cr, -v_bnd, v_bnd);
-      }
-    }
-    if (!a_fixed[k]) {
-      a_init[k].fill(0.0);
+      break;
     }
   }
 
-  // 3. Layer B: Bounded derivative-free multi-waypoint (v_k, a_k) optimization over
-  //    the fast Layer-A per-DoF duration oracle.
+  // 2. Layer B: Deterministic 4-stage multi-waypoint (v_k, a_k) optimization.
   if (has_any_free) {
-    // Table of per-segment, per-DoF continuous durations: T_mat[m][j].
-    auto build_t_mat = [&](
+    // Exact 6-DOF synchronized total objective (with tiny individual-duration tie-breaker).
+    auto eval_total_sync = [&](
       const std::vector<std::array<double, 6>> & vn,
       const std::vector<std::array<double, 6>> & an,
-      std::vector<std::array<double, 6>> & t_mat) -> double
+      std::vector<double> * out_seg_t = nullptr) -> double
     {
-      t_mat.assign(M, std::array<double, 6>{});
+      if (out_seg_t != nullptr) {
+        out_seg_t->assign(M, 0.0);
+      }
       double total = 0.0;
       double sum_ind = 0.0;
       for (size_t m = 0; m < M; ++m) {
-        double seg_max = seg_dt[m].has_value() ? round_1ms(*seg_dt[m]) : 0.0;
-        for (size_t j = 0; j < 6; ++j) {
-          const double tj = eval_dof_segment_cost(
-            q_nodes[m][j], vn[m][j], an[m][j],
-            q_nodes[m + 1][j], vn[m + 1][j], an[m + 1][j],
-            lims[j], seg_dt[m]);
-          if (!std::isfinite(tj)) {
-            return std::numeric_limits<double>::infinity();
-          }
-          t_mat[m][j] = tj;
-          seg_max = std::max(seg_max, tj);
-          sum_ind += tj;
+        double si = 0.0;
+        const double tm = eval_6dof_sync_dur(
+          q_nodes[m], vn[m], an[m], q_nodes[m + 1], vn[m + 1], an[m + 1],
+          lims, seg_dt[m], &si);
+        if (!std::isfinite(tm)) {
+          return std::numeric_limits<double>::infinity();
         }
-        total += seg_max;
+        if (out_seg_t != nullptr) {
+          (*out_seg_t)[m] = tm;
+        }
+        total += tm;
+        sum_ind += si;
       }
       return total + 1e-4 * sum_ind;
     };
 
-    std::vector<std::array<double, 6>> t_mat;
-    double best_obj = build_t_mat(v_catmull, a_init, t_mat);
-    v_nodes = v_catmull;
-    a_nodes = a_init;
+    // Estimate segment durations from rest-to-rest 6-DOF solves (or explicit dt).
+    std::vector<double> est_dt(M, 0.2);
+    for (size_t m = 0; m < M; ++m) {
+      if (seg_dt[m].has_value()) {
+        est_dt[m] = std::max(0.01, round_1ms(*seg_dt[m]));
+      } else {
+        double t_est = 0.02;
+        for (size_t j = 0; j < 6; ++j) {
+          const double tj = eval_1dof_min_dur(
+            q_nodes[m][j], 0.0, 0.0, q_nodes[m + 1][j], 0.0, 0.0, lims[j]);
+          if (std::isfinite(tj)) {
+            t_est = std::max(t_est, tj);
+          }
+        }
+        est_dt[m] = t_est;
+      }
+    }
 
-    // Also evaluate the zero-free-state seed in case tight explicit dt prefers it.
-    std::vector<std::array<double, 6>> v_zero = v_nodes;
+    // ---- Stage B1: Multi-seed deterministic initialization ----
+    // Seed 1: Natural C^2 cubic spline (v_k, a_k).
+    auto v_spline = v_nodes;
+    auto a_spline = a_nodes;
+    for (size_t j = 0; j < 6; ++j) {
+      std::vector<double> qj(M + 1), vj, aj;
+      for (size_t k = 0; k <= M; ++k) {
+        qj[k] = q_nodes[k][j];
+      }
+      fit_clamped_cubic_seed_1dof(qj, est_dt, vj, aj);
+      for (size_t k = 1; k < M; ++k) {
+        if (!v_fixed[k]) {
+          v_spline[k][j] = vj[k];
+        }
+        if (!a_fixed[k]) {
+          a_spline[k][j] = aj[k];
+        }
+        project_node_respecting_masks(
+          q_nodes[k][j], v_fixed[k], a_fixed[k], v_spline[k][j], a_spline[k][j], lims[j]);
+      }
+    }
+
+    // Seed 2: Direction-preserving time-weighted Catmull-Rom velocity + zero acceleration.
+    auto v_catmull = v_nodes;
+    auto a_zero = a_nodes;
+    for (size_t k = 1; k < M; ++k) {
+      if (!a_fixed[k]) {
+        a_zero[k].fill(0.0);
+      }
+      if (!v_fixed[k]) {
+        const double tm = est_dt[k - 1];
+        const double tp = est_dt[k];
+        for (size_t j = 0; j < 6; ++j) {
+          const double sm = (q_nodes[k][j] - q_nodes[k - 1][j]) / tm;
+          const double sp = (q_nodes[k + 1][j] - q_nodes[k][j]) / tp;
+          v_catmull[k][j] = (sm * sp > 0.0) ? ((tp * sm + tm * sp) / (tm + tp)) : 0.0;
+          project_node_respecting_masks(
+            q_nodes[k][j], v_fixed[k], a_fixed[k], v_catmull[k][j], a_zero[k][j], lims[j]);
+        }
+      }
+    }
+
+    // Seed 3: Zero free states.
+    auto v_zero = v_nodes;
     for (size_t k = 1; k < M; ++k) {
       if (!v_fixed[k]) {
         v_zero[k].fill(0.0);
       }
     }
-    std::vector<std::array<double, 6>> t_mat_zero;
-    const double zero_obj = build_t_mat(v_zero, a_init, t_mat_zero);
-    if (zero_obj < best_obj) {
-      best_obj = zero_obj;
+
+    double best_sync_obj = eval_total_sync(v_spline, a_spline);
+    v_nodes = v_spline;
+    a_nodes = a_spline;
+
+    const double cat_obj = eval_total_sync(v_catmull, a_zero);
+    if (cat_obj < best_sync_obj) {
+      best_sync_obj = cat_obj;
+      v_nodes = v_catmull;
+      a_nodes = a_zero;
+    }
+    const double zero_obj = eval_total_sync(v_zero, a_zero);
+    if (zero_obj < best_sync_obj) {
+      best_sync_obj = zero_obj;
       v_nodes = v_zero;
-      t_mat = t_mat_zero;
+      a_nodes = a_zero;
     }
 
-    // Phase-I feasibility restoration if explicit dt makes both seeds infeasible on some segment.
-    if (!std::isfinite(best_obj)) {
+    // Phase-I deterministic feasibility restoration when tight explicit dt makes all seeds infeasible.
+    if (!std::isfinite(best_sync_obj)) {
       auto violation_cost = [&](
         const std::vector<std::array<double, 6>> & vn,
         const std::vector<std::array<double, 6>> & an) -> double
@@ -1640,10 +817,9 @@ bool JointPVASolver::solve_multi_waypoint(
         for (size_t m = 0; m < M; ++m) {
           const double target = seg_dt[m].has_value() ? round_1ms(*seg_dt[m]) : kMaxSegmentDurationSec;
           for (size_t j = 0; j < 6; ++j) {
-            const double tj = eval_dof_segment_cost(
+            const double tj = eval_1dof_min_dur(
               q_nodes[m][j], vn[m][j], an[m][j],
-              q_nodes[m + 1][j], vn[m + 1][j], an[m + 1][j],
-              lims[j], std::nullopt);
+              q_nodes[m + 1][j], vn[m + 1][j], an[m + 1][j], lims[j]);
             if (!std::isfinite(tj)) {
               return std::numeric_limits<double>::infinity();
             }
@@ -1656,235 +832,766 @@ bool JointPVASolver::solve_multi_waypoint(
       };
 
       v_nodes = v_catmull;
-      a_nodes = a_init;
+      a_nodes = a_zero;
       double cur_vio = violation_cost(v_nodes, a_nodes);
-      if (!std::isfinite(cur_vio)) {
-        v_nodes = v_zero;
-        cur_vio = violation_cost(v_nodes, a_nodes);
+      const double spl_vio = violation_cost(v_spline, a_spline);
+      if (spl_vio < cur_vio) {
+        cur_vio = spl_vio;
+        v_nodes = v_spline;
+        a_nodes = a_spline;
       }
+      const double zr_vio = violation_cost(v_zero, a_zero);
+      if (zr_vio < cur_vio) {
+        cur_vio = zr_vio;
+        v_nodes = v_zero;
+        a_nodes = a_zero;
+      }
+
       if (std::isfinite(cur_vio) && cur_vio > 0.0) {
-        for (int sweep = 0; sweep < 6 && cur_vio > 1e-6; ++sweep) {
-          const double scale = std::pow(0.5, sweep);
+        for (int sweep = 0; sweep < 10 && cur_vio > 1e-6; ++sweep) {
+          const double scale = std::pow(0.55, sweep);
           for (size_t k = 1; k < M; ++k) {
             for (size_t j = 0; j < 6; ++j) {
               if (!v_fixed[k]) {
-                const double vb = braking_safe_vel_bound(k, j);
-                const double dv = 0.35 * scale * vb;
+                const double dv = 0.4 * scale * lims[j].v_lim * kHeadroom;
                 for (double sgn : {1.0, -1.0}) {
-                  const double orig = v_nodes[k][j];
-                  v_nodes[k][j] = std::clamp(orig + sgn * dv, -vb, vb);
+                  const double ov = v_nodes[k][j];
+                  const double oa = a_nodes[k][j];
+                  v_nodes[k][j] = ov + sgn * dv;
+                  project_node_respecting_masks(
+                    q_nodes[k][j], v_fixed[k], a_fixed[k], v_nodes[k][j], a_nodes[k][j], lims[j]);
                   const double nv = violation_cost(v_nodes, a_nodes);
                   if (nv < cur_vio - 1e-9) {
                     cur_vio = nv;
                     break;
                   }
-                  v_nodes[k][j] = orig;
+                  v_nodes[k][j] = ov;
+                  a_nodes[k][j] = oa;
                 }
               }
               if (!a_fixed[k]) {
-                const double ab = lims[j].a_lim * kHeadroom;
-                const double da = 0.35 * scale * ab;
+                const double da = 0.4 * scale * lims[j].a_lim * kHeadroom;
                 for (double sgn : {1.0, -1.0}) {
-                  const double orig = a_nodes[k][j];
-                  a_nodes[k][j] = std::clamp(orig + sgn * da, -ab, ab);
+                  const double ov = v_nodes[k][j];
+                  const double oa = a_nodes[k][j];
+                  a_nodes[k][j] = oa + sgn * da;
+                  project_node_respecting_masks(
+                    q_nodes[k][j], v_fixed[k], a_fixed[k], v_nodes[k][j], a_nodes[k][j], lims[j]);
                   const double nv = violation_cost(v_nodes, a_nodes);
                   if (nv < cur_vio - 1e-9) {
                     cur_vio = nv;
                     break;
                   }
-                  a_nodes[k][j] = orig;
+                  v_nodes[k][j] = ov;
+                  a_nodes[k][j] = oa;
                 }
               }
             }
           }
         }
-        best_obj = build_t_mat(v_nodes, a_nodes, t_mat);
+        best_sync_obj = eval_total_sync(v_nodes, a_nodes);
       }
     }
 
-    // Phase-II: Fast local coordinate-pattern + coupled (v, a) + Powell extrapolation search.
-    if (std::isfinite(best_obj)) {
-      const auto opt_start = std::chrono::steady_clock::now();
-      constexpr auto kOptBudget = std::chrono::milliseconds(150);
-
-      // Local delta objective when changing (v[k][j], a[k][j]): affects ONLY segments k-1 and k
-      // and ONLY DoF j within those two segments!
-      auto local_pair_cost = [&](
-        size_t k, size_t j, double vk_try, double ak_try,
-        double & out_tm1, double & out_tp) -> double
+    // ---- Stage B2 & B3: Coupled 6-DOF Smooth-Max Projected L-BFGS Continuation ----
+    if (std::isfinite(best_sync_obj)) {
+      // Index mapping of all free scalar coordinates (normalized by v_lim / a_lim).
+      struct FreeVar
       {
-        const double tm1 = eval_dof_segment_cost(
-          q_nodes[k - 1][j], v_nodes[k - 1][j], a_nodes[k - 1][j],
-          q_nodes[k][j], vk_try, ak_try, lims[j], seg_dt[k - 1]);
-        if (!std::isfinite(tm1)) {
-          return std::numeric_limits<double>::infinity();
+        size_t node_k = 0;
+        size_t dof_j = 0;
+        bool is_acc = false;
+        double scale = 1.0;
+      };
+      std::vector<FreeVar> vars;
+      vars.reserve(12 * (M - 1));
+      for (size_t k = 1; k < M; ++k) {
+        for (size_t j = 0; j < 6; ++j) {
+          if (!v_fixed[k]) {
+            vars.push_back({k, j, false, lims[j].v_lim * kHeadroom});
+          }
+          if (!a_fixed[k]) {
+            vars.push_back({k, j, true, lims[j].a_lim * kHeadroom});
+          }
         }
-        const double tp = eval_dof_segment_cost(
-          q_nodes[k][j], vk_try, ak_try,
-          q_nodes[k + 1][j], v_nodes[k + 1][j], a_nodes[k + 1][j],
-          lims[j], seg_dt[k]);
-        if (!std::isfinite(tp)) {
-          return std::numeric_limits<double>::infinity();
-        }
-        out_tm1 = tm1;
-        out_tp = tp;
+      }
+      const size_t D = vars.size();
 
-        double max_m1 = seg_dt[k - 1].has_value() ? round_1ms(*seg_dt[k - 1]) : tm1;
-        double max_p = seg_dt[k].has_value() ? round_1ms(*seg_dt[k]) : tp;
-        for (size_t d = 0; d < 6; ++d) {
-          if (d == j) {
+      auto pack_x = [&](
+        const std::vector<std::array<double, 6>> & vn,
+        const std::vector<std::array<double, 6>> & an) -> std::vector<double>
+      {
+        std::vector<double> x(D, 0.0);
+        for (size_t idx = 0; idx < D; ++idx) {
+          const auto & fv = vars[idx];
+          x[idx] = (fv.is_acc ? an[fv.node_k][fv.dof_j] : vn[fv.node_k][fv.dof_j]) / fv.scale;
+        }
+        return x;
+      };
+
+      auto unpack_and_project = [&](
+        const std::vector<double> & x,
+        std::vector<std::array<double, 6>> & vn,
+        std::vector<std::array<double, 6>> & an)
+      {
+        vn = v_nodes;
+        an = a_nodes;
+        for (size_t idx = 0; idx < D; ++idx) {
+          const auto & fv = vars[idx];
+          const double val = std::clamp(x[idx], -1.0, 1.0) * fv.scale;
+          if (fv.is_acc) {
+            an[fv.node_k][fv.dof_j] = val;
+          } else {
+            vn[fv.node_k][fv.dof_j] = val;
+          }
+        }
+        for (size_t k = 1; k < M; ++k) {
+          if (v_fixed[k] && a_fixed[k]) {
             continue;
           }
-          max_m1 = std::max(max_m1, t_mat[k - 1][d]);
-          max_p = std::max(max_p, t_mat[k][d]);
+          for (size_t j = 0; j < 6; ++j) {
+            project_node_respecting_masks(
+              q_nodes[k][j], v_fixed[k], a_fixed[k], vn[k][j], an[k][j], lims[j]);
+          }
         }
-        return (max_m1 + max_p) + 1e-4 * (tm1 + tp);
       };
+
+      // Smooth-max LogSumExp objective on 1-DOF exact bounded durations T_mat[m][j].
+      // For explicit dt segments, checks feasibility and adds exact target duration + small tie-breaker.
+      auto eval_smooth_obj = [&](
+        const std::vector<std::array<double, 6>> & vn,
+        const std::vector<std::array<double, 6>> & an,
+        double beta,
+        std::vector<std::array<double, 6>> & out_tmat) -> double
+      {
+        out_tmat.assign(M, std::array<double, 6>{});
+        double total = 0.0;
+        for (size_t m = 0; m < M; ++m) {
+          double seg_max = 0.0;
+          double sum_j = 0.0;
+          for (size_t j = 0; j < 6; ++j) {
+            const double tj = eval_1dof_seg_cost(
+              q_nodes[m][j], vn[m][j], an[m][j],
+              q_nodes[m + 1][j], vn[m + 1][j], an[m + 1][j],
+              lims[j], seg_dt[m]);
+            if (!std::isfinite(tj)) {
+              return std::numeric_limits<double>::infinity();
+            }
+            const double t_ind = seg_dt[m].has_value()
+              ? eval_1dof_min_dur(
+                  q_nodes[m][j], vn[m][j], an[m][j],
+                  q_nodes[m + 1][j], vn[m + 1][j], an[m + 1][j], lims[j])
+              : tj;
+            out_tmat[m][j] = t_ind;
+            seg_max = std::max(seg_max, t_ind);
+            sum_j += t_ind;
+          }
+          if (seg_dt[m].has_value()) {
+            total += round_1ms(*seg_dt[m]) + 1e-4 * sum_j;
+          } else {
+            double exp_sum = 0.0;
+            for (size_t j = 0; j < 6; ++j) {
+              exp_sum += std::exp(beta * (out_tmat[m][j] - seg_max));
+            }
+            const double smax = seg_max + std::log(exp_sum) / beta;
+            total += smax + 1e-4 * sum_j;
+          }
+        }
+        return total;
+      };
+
+      // Stage B2: Per-DoF independent chain pre-optimization (fast 1-DOF L-BFGS warm start).
+      // Only attempted if no explicit dt constraints exist (so per-DoF solves stay unconstrained in time).
+      bool any_explicit_dt = false;
+      for (const auto & d : seg_dt) {
+        if (d.has_value()) {
+          any_explicit_dt = true;
+          break;
+        }
+      }
+      if (!any_explicit_dt && M >= 2) {
+        auto v_chain = v_nodes;
+        auto a_chain = a_nodes;
+        for (size_t j = 0; j < 6; ++j) {
+          std::vector<size_t> j_vars;
+          for (size_t idx = 0; idx < D; ++idx) {
+            if (vars[idx].dof_j == j) {
+              j_vars.push_back(idx);
+            }
+          }
+          if (j_vars.empty()) {
+            continue;
+          }
+          const size_t dj = j_vars.size();
+          std::vector<double> xj(dj, 0.0);
+          for (size_t p = 0; p < dj; ++p) {
+            const auto & fv = vars[j_vars[p]];
+            xj[p] = (fv.is_acc ? a_chain[fv.node_k][j] : v_chain[fv.node_k][j]) / fv.scale;
+          }
+          auto eval_chain_j = [&](const std::vector<double> & xv,
+                                  std::vector<double> & vj_out, std::vector<double> & aj_out,
+                                  std::vector<double> & seg_out) -> double
+          {
+            vj_out.resize(M + 1);
+            aj_out.resize(M + 1);
+            for (size_t k = 0; k <= M; ++k) {
+              vj_out[k] = v_chain[k][j];
+              aj_out[k] = a_chain[k][j];
+            }
+            for (size_t p = 0; p < dj; ++p) {
+              const auto & fv = vars[j_vars[p]];
+              const double val = std::clamp(xv[p], -1.0, 1.0) * fv.scale;
+              if (fv.is_acc) {
+                aj_out[fv.node_k] = val;
+              } else {
+                vj_out[fv.node_k] = val;
+              }
+            }
+            for (size_t k = 1; k < M; ++k) {
+              project_node_respecting_masks(
+                q_nodes[k][j], v_fixed[k], a_fixed[k], vj_out[k], aj_out[k], lims[j]);
+            }
+            seg_out.assign(M, 0.0);
+            double tot = 0.0;
+            for (size_t m = 0; m < M; ++m) {
+              const double tm = eval_1dof_min_dur(
+                q_nodes[m][j], vj_out[m], aj_out[m],
+                q_nodes[m + 1][j], vj_out[m + 1], aj_out[m + 1], lims[j]);
+              if (!std::isfinite(tm)) {
+                return std::numeric_limits<double>::infinity();
+              }
+              seg_out[m] = tm;
+              tot += tm;
+            }
+            return tot;
+          };
+
+          std::vector<double> vj_c, aj_c, seg_c;
+          double fj = eval_chain_j(xj, vj_c, aj_c, seg_c);
+          if (!std::isfinite(fj)) {
+            continue;
+          }
+          std::vector<std::vector<double>> s_hist, y_hist;
+          std::vector<double> rho_hist;
+          std::vector<double> g_prev;
+          for (int it = 0; it < 10; ++it) {
+            std::vector<double> g(dj, 0.0);
+            constexpr double kFD = 1e-4;
+            for (size_t p = 0; p < dj; ++p) {
+              const auto & fv = vars[j_vars[p]];
+              const size_t k = fv.node_k;
+              const double base = fv.is_acc ? aj_c[k] : vj_c[k];
+              const double h = kFD * fv.scale;
+              auto eval_pair = [&](double val) -> double {
+                const double vt = fv.is_acc ? vj_c[k] : val;
+                const double at = fv.is_acc ? val : aj_c[k];
+                const double t1 = eval_1dof_min_dur(
+                  q_nodes[k - 1][j], vj_c[k - 1], aj_c[k - 1], q_nodes[k][j], vt, at, lims[j]);
+                if (!std::isfinite(t1)) {
+                  return std::numeric_limits<double>::infinity();
+                }
+                const double t2 = eval_1dof_min_dur(
+                  q_nodes[k][j], vt, at, q_nodes[k + 1][j], vj_c[k + 1], aj_c[k + 1], lims[j]);
+                return std::isfinite(t2) ? (t1 + t2) : std::numeric_limits<double>::infinity();
+              };
+              const double fp = eval_pair(base + h);
+              const double fm = eval_pair(base - h);
+              const double f0 = seg_c[k - 1] + seg_c[k];
+              if (std::isfinite(fp) && std::isfinite(fm)) {
+                g[p] = ((fp - fm) / (2.0 * h)) * fv.scale;
+              } else if (std::isfinite(fp)) {
+                g[p] = ((fp - f0) / h) * fv.scale;
+              } else if (std::isfinite(fm)) {
+                g[p] = ((f0 - fm) / h) * fv.scale;
+              }
+            }
+            double gnorm = 0.0;
+            for (double gv : g) {
+              gnorm = std::max(gnorm, std::abs(gv));
+            }
+            if (gnorm < 1e-5) {
+              break;
+            }
+
+            // Two-loop L-BFGS direction.
+            std::vector<double> dir = g;
+            const size_t nh = s_hist.size();
+            std::vector<double> alphas(nh, 0.0);
+            for (size_t r = nh; r-- > 0;) {
+              double dot = 0.0;
+              for (size_t p = 0; p < dj; ++p) {
+                dot += s_hist[r][p] * dir[p];
+              }
+              alphas[r] = rho_hist[r] * dot;
+              for (size_t p = 0; p < dj; ++p) {
+                dir[p] -= alphas[r] * y_hist[r][p];
+              }
+            }
+            double gamma = 1.0 / std::max(1.0, gnorm);
+            if (nh > 0) {
+              double sy = 0.0, yy = 0.0;
+              for (size_t p = 0; p < dj; ++p) {
+                sy += s_hist.back()[p] * y_hist.back()[p];
+                yy += y_hist.back()[p] * y_hist.back()[p];
+              }
+              if (yy > 1e-16 && sy > 1e-16) {
+                gamma = sy / yy;
+              }
+            }
+            for (size_t p = 0; p < dj; ++p) {
+              dir[p] *= -gamma;
+            }
+            for (size_t r = 0; r < nh; ++r) {
+              double dot = 0.0;
+              for (size_t p = 0; p < dj; ++p) {
+                dot += y_hist[r][p] * dir[p];
+              }
+              const double beta_r = rho_hist[r] * dot;
+              for (size_t p = 0; p < dj; ++p) {
+                dir[p] += s_hist[r][p] * (alphas[r] - beta_r);
+              }
+            }
+
+            double ddotg = 0.0;
+            for (size_t p = 0; p < dj; ++p) {
+              ddotg += dir[p] * g[p];
+            }
+            if (!(ddotg < 0.0)) {
+              for (size_t p = 0; p < dj; ++p) {
+                dir[p] = -g[p] / std::max(1.0, gnorm);
+              }
+            }
+
+            double step = 1.0;
+            bool acc = false;
+            std::vector<double> x_new(dj), vj_n, aj_n, seg_n;
+            double f_new = fj;
+            for (int ls = 0; ls < 8; ++ls) {
+              for (size_t p = 0; p < dj; ++p) {
+                x_new[p] = std::clamp(xj[p] + step * dir[p], -1.0, 1.0);
+              }
+              f_new = eval_chain_j(x_new, vj_n, aj_n, seg_n);
+              if (f_new < fj - 1e-7) {
+                acc = true;
+                break;
+              }
+              step *= 0.4;
+            }
+            if (!acc) {
+              break;
+            }
+            // Re-pack projected coordinates into x_new.
+            for (size_t p = 0; p < dj; ++p) {
+              const auto & fv = vars[j_vars[p]];
+              x_new[p] = (fv.is_acc ? aj_n[fv.node_k] : vj_n[fv.node_k]) / fv.scale;
+            }
+            if (!g_prev.empty()) {
+              std::vector<double> sv(dj), yv(dj);
+              double sy = 0.0;
+              for (size_t p = 0; p < dj; ++p) {
+                sv[p] = x_new[p] - xj[p];
+                yv[p] = g[p] - g_prev[p];
+                sy += sv[p] * yv[p];
+              }
+              if (sy > 1e-12) {
+                if (s_hist.size() >= 5) {
+                  s_hist.erase(s_hist.begin());
+                  y_hist.erase(y_hist.begin());
+                  rho_hist.erase(rho_hist.begin());
+                }
+                s_hist.push_back(std::move(sv));
+                y_hist.push_back(std::move(yv));
+                rho_hist.push_back(1.0 / sy);
+              }
+            }
+            g_prev = g;
+            xj.swap(x_new);
+            vj_c.swap(vj_n);
+            aj_c.swap(aj_n);
+            seg_c.swap(seg_n);
+            const double rel = (fj - f_new) / std::max(fj, 1e-6);
+            fj = f_new;
+            if (rel < 1e-4) {
+              break;
+            }
+          }
+          for (size_t k = 1; k < M; ++k) {
+            v_chain[k][j] = vj_c[k];
+            a_chain[k][j] = aj_c[k];
+          }
+        }
+        const double chain_sync = eval_total_sync(v_chain, a_chain);
+        if (chain_sync < best_sync_obj) {
+          best_sync_obj = chain_sync;
+          v_nodes = std::move(v_chain);
+          a_nodes = std::move(a_chain);
+        }
+      }
+
+      // Stage B3: Coupled 6-DOF Smooth-Max Continuation via Projected L-BFGS.
+      // Sparse gradient: perturbing (k, j) evaluates only 2 scalar 1-DOF calls!
+      auto v_lbfgs = v_nodes;
+      auto a_lbfgs = a_nodes;
+      std::vector<double> x = pack_x(v_lbfgs, a_lbfgs);
+      constexpr std::array<double, 2> kBetas{{25.0, 150.0}};
+
+      for (double beta : kBetas) {
+        std::vector<std::array<double, 6>> tmat;
+        double f_cur = eval_smooth_obj(v_lbfgs, a_lbfgs, beta, tmat);
+        if (!std::isfinite(f_cur)) {
+          break;
+        }
+        std::vector<std::vector<double>> s_hist, y_hist;
+        std::vector<double> rho_hist;
+        std::vector<double> g_prev;
+
+        auto compute_sparse_grad = [&](
+          const std::vector<std::array<double, 6>> & vn,
+          const std::vector<std::array<double, 6>> & an,
+          const std::vector<std::array<double, 6>> & tm,
+          std::vector<double> & g_out)
+        {
+          g_out.assign(D, 0.0);
+          constexpr double kFD = 1e-4;
+          auto seg_contrib = [&](size_t m, size_t j_mod, double t_mod) -> double {
+            if (seg_dt[m].has_value()) {
+              return 1e-4 * t_mod;
+            }
+            double mx = t_mod;
+            for (size_t d = 0; d < 6; ++d) {
+              if (d != j_mod) {
+                mx = std::max(mx, tm[m][d]);
+              }
+            }
+            double es = std::exp(beta * (t_mod - mx));
+            double sum_j = t_mod;
+            for (size_t d = 0; d < 6; ++d) {
+              if (d != j_mod) {
+                es += std::exp(beta * (tm[m][d] - mx));
+                sum_j += tm[m][d];
+              }
+            }
+            return mx + std::log(es) / beta + 1e-4 * sum_j;
+          };
+
+          for (size_t idx = 0; idx < D; ++idx) {
+            const auto & fv = vars[idx];
+            const size_t k = fv.node_k;
+            const size_t j = fv.dof_j;
+            const double base = fv.is_acc ? an[k][j] : vn[k][j];
+            const double h = kFD * fv.scale;
+
+            auto eval_local = [&](double val) -> double {
+              const double vt = fv.is_acc ? vn[k][j] : val;
+              const double at = fv.is_acc ? val : an[k][j];
+              const double c1 = eval_1dof_seg_cost(
+                q_nodes[k - 1][j], vn[k - 1][j], an[k - 1][j],
+                q_nodes[k][j], vt, at, lims[j], seg_dt[k - 1]);
+              if (!std::isfinite(c1)) {
+                return std::numeric_limits<double>::infinity();
+              }
+              const double c2 = eval_1dof_seg_cost(
+                q_nodes[k][j], vt, at,
+                q_nodes[k + 1][j], vn[k + 1][j], an[k + 1][j], lims[j], seg_dt[k]);
+              if (!std::isfinite(c2)) {
+                return std::numeric_limits<double>::infinity();
+              }
+              const double t1 = seg_dt[k - 1].has_value()
+                ? eval_1dof_min_dur(q_nodes[k - 1][j], vn[k - 1][j], an[k - 1][j], q_nodes[k][j], vt, at, lims[j])
+                : c1;
+              const double t2 = seg_dt[k].has_value()
+                ? eval_1dof_min_dur(q_nodes[k][j], vt, at, q_nodes[k + 1][j], vn[k + 1][j], an[k + 1][j], lims[j])
+                : c2;
+              return seg_contrib(k - 1, j, t1) + seg_contrib(k, j, t2);
+            };
+
+            const double fp = eval_local(base + h);
+            const double fm = eval_local(base - h);
+            const double f0 = seg_contrib(k - 1, j, tm[k - 1][j]) + seg_contrib(k, j, tm[k][j]);
+            if (std::isfinite(fp) && std::isfinite(fm)) {
+              g_out[idx] = ((fp - fm) / (2.0 * h)) * fv.scale;
+            } else if (std::isfinite(fp)) {
+              g_out[idx] = ((fp - f0) / h) * fv.scale;
+            } else if (std::isfinite(fm)) {
+              g_out[idx] = ((f0 - fm) / h) * fv.scale;
+            }
+          }
+        };
+
+        std::vector<double> g(D, 0.0);
+        compute_sparse_grad(v_lbfgs, a_lbfgs, tmat, g);
+
+        for (int it = 0; it < 16; ++it) {
+          double gnorm = 0.0;
+          for (double gv : g) {
+            gnorm = std::max(gnorm, std::abs(gv));
+          }
+          if (gnorm < 1e-5) {
+            break;
+          }
+
+          // Two-loop L-BFGS recursion (memory m = 7).
+          std::vector<double> dir = g;
+          const size_t nh = s_hist.size();
+          std::vector<double> alphas(nh, 0.0);
+          for (size_t r = nh; r-- > 0;) {
+            double dot = 0.0;
+            for (size_t idx = 0; idx < D; ++idx) {
+              dot += s_hist[r][idx] * dir[idx];
+            }
+            alphas[r] = rho_hist[r] * dot;
+            for (size_t idx = 0; idx < D; ++idx) {
+              dir[idx] -= alphas[r] * y_hist[r][idx];
+            }
+          }
+          double gamma = 0.5 / std::max(0.5, gnorm);
+          if (nh > 0) {
+            double sy = 0.0, yy = 0.0;
+            for (size_t idx = 0; idx < D; ++idx) {
+              sy += s_hist.back()[idx] * y_hist.back()[idx];
+              yy += y_hist.back()[idx] * y_hist.back()[idx];
+            }
+            if (yy > 1e-16 && sy > 1e-16) {
+              gamma = std::clamp(sy / yy, 1e-4, 10.0);
+            }
+          }
+          for (size_t idx = 0; idx < D; ++idx) {
+            dir[idx] *= -gamma;
+          }
+          for (size_t r = 0; r < nh; ++r) {
+            double dot = 0.0;
+            for (size_t idx = 0; idx < D; ++idx) {
+              dot += y_hist[r][idx] * dir[idx];
+            }
+            const double beta_r = rho_hist[r] * dot;
+            for (size_t idx = 0; idx < D; ++idx) {
+              dir[idx] += s_hist[r][idx] * (alphas[r] - beta_r);
+            }
+          }
+
+          double ddotg = 0.0;
+          double max_dir = 0.0;
+          for (size_t idx = 0; idx < D; ++idx) {
+            ddotg += dir[idx] * g[idx];
+            max_dir = std::max(max_dir, std::abs(dir[idx]));
+          }
+          if (!(ddotg < 0.0)) {
+            s_hist.clear();
+            y_hist.clear();
+            rho_hist.clear();
+            max_dir = 0.0;
+            for (size_t idx = 0; idx < D; ++idx) {
+              dir[idx] = -g[idx] / std::max(1.0, gnorm);
+              max_dir = std::max(max_dir, std::abs(dir[idx]));
+            }
+          }
+          if (max_dir > 0.6) {
+            const double cap = 0.6 / max_dir;
+            for (double & dv : dir) {
+              dv *= cap;
+            }
+          }
+
+          double step = 1.0;
+          bool accepted = false;
+          std::vector<double> x_try(D);
+          std::vector<std::array<double, 6>> v_try, a_try;
+          std::vector<std::array<double, 6>> tm_try;
+          double f_try = f_cur;
+
+          for (int ls = 0; ls < 9; ++ls) {
+            for (size_t idx = 0; idx < D; ++idx) {
+              x_try[idx] = std::clamp(x[idx] + step * dir[idx], -1.0, 1.0);
+            }
+            unpack_and_project(x_try, v_try, a_try);
+            f_try = eval_smooth_obj(v_try, a_try, beta, tm_try);
+            if (f_try < f_cur - 1e-7) {
+              accepted = true;
+              break;
+            }
+            step *= 0.4;
+          }
+          if (!accepted) {
+            break;
+          }
+
+          const std::vector<double> x_new = pack_x(v_try, a_try);
+          std::vector<double> g_new(D, 0.0);
+          compute_sparse_grad(v_try, a_try, tm_try, g_new);
+
+          std::vector<double> sv(D), yv(D);
+          double sy = 0.0;
+          for (size_t idx = 0; idx < D; ++idx) {
+            sv[idx] = x_new[idx] - x[idx];
+            yv[idx] = g_new[idx] - g[idx];
+            sy += sv[idx] * yv[idx];
+          }
+          if (sy > 1e-12) {
+            if (s_hist.size() >= 7) {
+              s_hist.erase(s_hist.begin());
+              y_hist.erase(y_hist.begin());
+              rho_hist.erase(rho_hist.begin());
+            }
+            s_hist.push_back(std::move(sv));
+            y_hist.push_back(std::move(yv));
+            rho_hist.push_back(1.0 / sy);
+          }
+
+          const double rel = (f_cur - f_try) / std::max(f_cur, 1e-6);
+          x = x_new;
+          v_lbfgs.swap(v_try);
+          a_lbfgs.swap(a_try);
+          tmat.swap(tm_try);
+          g.swap(g_new);
+          f_cur = f_try;
+          if (rel < 1e-5) {
+            break;
+          }
+        }
+      }
+
+      const double lbfgs_sync = eval_total_sync(v_lbfgs, a_lbfgs);
+      if (lbfgs_sync < best_sync_obj) {
+        best_sync_obj = lbfgs_sync;
+        v_nodes = std::move(v_lbfgs);
+        a_nodes = std::move(a_lbfgs);
+      }
+
+      // ---- Stage B4: Deterministic Exact 6-DOF Synchronized Polish (Blocked-Interval Aware) ----
+      std::vector<double> seg_sync(M, 0.0);
+      best_sync_obj = eval_total_sync(v_nodes, a_nodes, &seg_sync);
 
       std::vector<std::array<double, 6>> step_v(M + 1), step_a(M + 1);
       for (size_t k = 1; k < M; ++k) {
         for (size_t j = 0; j < 6; ++j) {
-          step_v[k][j] = 0.45 * lims[j].v_lim * kHeadroom;
-          step_a[k][j] = 0.45 * lims[j].a_lim * kHeadroom;
+          step_v[k][j] = 0.15 * lims[j].v_lim * kHeadroom;
+          step_a[k][j] = 0.15 * lims[j].a_lim * kHeadroom;
         }
       }
 
-      for (int sweep = 0; sweep < 10; ++sweep) {
-        if (std::chrono::steady_clock::now() - opt_start > kOptBudget) {
-          break;
-        }
+      for (int sweep = 0; sweep < 5; ++sweep) {
         const auto v_prev = v_nodes;
         const auto a_prev = a_nodes;
-        const double obj_before = best_obj;
+        const double obj_before = best_sync_obj;
         bool any_improved = false;
 
         for (size_t k = 1; k < M; ++k) {
-          for (size_t j = 0; j < 6; ++j) {
-            if (v_fixed[k] && a_fixed[k]) {
-              continue;
+          if (v_fixed[k] && a_fixed[k]) {
+            continue;
+          }
+          // Evaluate exact synchronized pair cost for segments (k-1, k).
+          auto pair_sync_cost = [&](
+            const std::array<double, 6> & vk, const std::array<double, 6> & ak,
+            double & out_t1, double & out_t2) -> double
+          {
+            double s1 = 0.0, s2 = 0.0;
+            const double t1 = eval_6dof_sync_dur(
+              q_nodes[k - 1], v_nodes[k - 1], a_nodes[k - 1],
+              q_nodes[k], vk, ak, lims, seg_dt[k - 1], &s1);
+            if (!std::isfinite(t1)) {
+              return std::numeric_limits<double>::infinity();
             }
-            const double v_max_k = lims[j].v_lim * kHeadroom;
-            const double a_max_k = lims[j].a_lim * kHeadroom;
+            const double t2 = eval_6dof_sync_dur(
+              q_nodes[k], vk, ak,
+              q_nodes[k + 1], v_nodes[k + 1], a_nodes[k + 1], lims, seg_dt[k], &s2);
+            if (!std::isfinite(t2)) {
+              return std::numeric_limits<double>::infinity();
+            }
+            out_t1 = t1;
+            out_t2 = t2;
+            return (t1 + t2) + 1e-4 * (s1 + s2);
+          };
 
-            double cur_tm1 = t_mat[k - 1][j];
-            double cur_tp = t_mat[k][j];
-            double cur_local = local_pair_cost(k, j, v_nodes[k][j], a_nodes[k][j], cur_tm1, cur_tp);
+          double cur_t1 = 0.0, cur_t2 = 0.0;
+          double cur_pair = pair_sync_cost(v_nodes[k], a_nodes[k], cur_t1, cur_t2);
 
-            auto try_state = [&](double vt, double at) -> bool {
-              vt = std::clamp(vt, -v_max_k, v_max_k);
-              at = std::clamp(at, -a_max_k, a_max_k);
-              double tm1 = 0.0, tp = 0.0;
-              const double c = local_pair_cost(k, j, vt, at, tm1, tp);
-              if (c < cur_local - 1e-7) {
+          for (size_t j = 0; j < 6; ++j) {
+            auto try_kj = [&](double vt, double at) -> bool {
+              project_node_respecting_masks(
+                q_nodes[k][j], v_fixed[k], a_fixed[k], vt, at, lims[j]);
+              auto vk = v_nodes[k];
+              auto ak = a_nodes[k];
+              vk[j] = vt;
+              ak[j] = at;
+              double t1 = 0.0, t2 = 0.0;
+              const double c = pair_sync_cost(vk, ak, t1, t2);
+              if (c < cur_pair - 1e-7) {
                 v_nodes[k][j] = vt;
                 a_nodes[k][j] = at;
-                t_mat[k - 1][j] = tm1;
-                t_mat[k][j] = tp;
-                cur_local = c;
+                seg_sync[k - 1] = t1;
+                seg_sync[k] = t2;
+                cur_pair = c;
                 any_improved = true;
                 return true;
               }
               return false;
             };
 
-            // 1D velocity coordinate step (with adaptive expansion/contraction).
             if (!v_fixed[k]) {
               const double sv = step_v[k][j];
-              if (try_state(v_nodes[k][j] + sv, a_nodes[k][j])) {
-                try_state(v_nodes[k][j] + 0.5 * sv, a_nodes[k][j]);
-              } else if (try_state(v_nodes[k][j] - sv, a_nodes[k][j])) {
-                try_state(v_nodes[k][j] - 0.5 * sv, a_nodes[k][j]);
+              if (try_kj(v_nodes[k][j] + sv, a_nodes[k][j])) {
+                try_kj(v_nodes[k][j] + 0.5 * sv, a_nodes[k][j]);
+              } else if (try_kj(v_nodes[k][j] - sv, a_nodes[k][j])) {
+                try_kj(v_nodes[k][j] - 0.5 * sv, a_nodes[k][j]);
               } else {
                 step_v[k][j] *= 0.5;
               }
             }
-
-            // 1D acceleration coordinate step.
             if (!a_fixed[k]) {
               const double sa = step_a[k][j];
-              if (try_state(v_nodes[k][j], a_nodes[k][j] + sa)) {
-                try_state(v_nodes[k][j], a_nodes[k][j] + 0.5 * sa);
-              } else if (try_state(v_nodes[k][j], a_nodes[k][j] - sa)) {
-                try_state(v_nodes[k][j], a_nodes[k][j] - 0.5 * sa);
+              if (try_kj(v_nodes[k][j], a_nodes[k][j] + sa)) {
+                try_kj(v_nodes[k][j], a_nodes[k][j] + 0.5 * sa);
+              } else if (try_kj(v_nodes[k][j], a_nodes[k][j] - sa)) {
+                try_kj(v_nodes[k][j], a_nodes[k][j] - 0.5 * sa);
               } else {
                 step_a[k][j] *= 0.5;
-              }
-            }
-
-            // Coupled 2D (v, a) diagonal probes when both are free.
-            if (!v_fixed[k] && !a_fixed[k]) {
-              const double sv = step_v[k][j];
-              const double sa = step_a[k][j];
-              const double v0_c = v_nodes[k][j];
-              const double a0_c = a_nodes[k][j];
-              if (!try_state(v0_c + sv, a0_c + sa)) {
-                if (!try_state(v0_c - sv, a0_c - sa)) {
-                  if (!try_state(v0_c + sv, a0_c - sa)) {
-                    try_state(v0_c - sv, a0_c + sa);
-                  }
-                }
               }
             }
           }
         }
 
-        // Powell-style extrapolated multi-waypoint direction step across all free variables.
         if (any_improved) {
+          // Powell-style extrapolated multi-waypoint step on exact synchronized objective.
           for (double alpha : {1.0, 0.5}) {
             auto v_try = v_nodes;
             auto a_try = a_nodes;
             for (size_t k = 1; k < M; ++k) {
               for (size_t j = 0; j < 6; ++j) {
                 if (!v_fixed[k]) {
-                  v_try[k][j] = std::clamp(
-                    v_nodes[k][j] + alpha * (v_nodes[k][j] - v_prev[k][j]),
-                    -lims[j].v_lim * kHeadroom, lims[j].v_lim * kHeadroom);
+                  v_try[k][j] = v_nodes[k][j] + alpha * (v_nodes[k][j] - v_prev[k][j]);
                 }
                 if (!a_fixed[k]) {
-                  a_try[k][j] = std::clamp(
-                    a_nodes[k][j] + alpha * (a_nodes[k][j] - a_prev[k][j]),
-                    -lims[j].a_lim * kHeadroom, lims[j].a_lim * kHeadroom);
+                  a_try[k][j] = a_nodes[k][j] + alpha * (a_nodes[k][j] - a_prev[k][j]);
                 }
+                project_node_respecting_masks(
+                  q_nodes[k][j], v_fixed[k], a_fixed[k], v_try[k][j], a_try[k][j], lims[j]);
               }
             }
-            std::vector<std::array<double, 6>> t_try;
-            const double o_try = build_t_mat(v_try, a_try, t_try);
-            if (o_try < best_obj - 1e-6) {
+            std::vector<double> seg_try;
+            const double o_try = eval_total_sync(v_try, a_try, &seg_try);
+            if (o_try < best_sync_obj - 1e-6) {
               v_nodes.swap(v_try);
               a_nodes.swap(a_try);
-              t_mat.swap(t_try);
-              best_obj = o_try;
+              seg_sync.swap(seg_try);
+              best_sync_obj = o_try;
               break;
             }
           }
-          best_obj = build_t_mat(v_nodes, a_nodes, t_mat);
+          best_sync_obj = eval_total_sync(v_nodes, a_nodes, &seg_sync);
         }
 
-        const double rel_imp = (obj_before - best_obj) / std::max(obj_before, 1e-6);
-        if (!any_improved && sweep >= 2) {
-          // Shrink remaining step sizes and check if converged.
-          double max_step = 0.0;
-          for (size_t k = 1; k < M; ++k) {
-            for (size_t j = 0; j < 6; ++j) {
-              if (!v_fixed[k]) {
-                max_step = std::max(max_step, step_v[k][j] / lims[j].v_lim);
-              }
-              if (!a_fixed[k]) {
-                max_step = std::max(max_step, step_a[k][j] / lims[j].a_lim);
-              }
-            }
-          }
-          if (max_step < 1e-3) {
-            break;
-          }
-        } else if (rel_imp < 1e-4 && sweep >= 3) {
+        const double rel_imp = (obj_before - best_sync_obj) / std::max(obj_before, 1e-6);
+        if (!any_improved && sweep >= 1) {
+          break;
+        }
+        if (rel_imp < 1e-5 && sweep >= 2) {
           break;
         }
       }
     }
   }
 
-  // 4. Final 1 ms synchronized Layer-A solve for all M segments and 1 kHz sampling.
+  // 3. Final 1 ms synchronized Layer-A solve for all M segments and 1 kHz sampling.
   std::vector<SegmentSolution6DoF> seg_sols(M);
   double total_dur = 0.0;
   for (size_t m = 0; m < M; ++m) {

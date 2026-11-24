@@ -37,12 +37,12 @@ find_package(lite6_planner REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(pinocchio REQUIRED)
 find_package(coal REQUIRED)
-find_package(ruckig REQUIRED)
 
 add_library(studio_planner_core SHARED
   src/dsl_parser.cpp
   src/s_curve_solver.cpp
   src/curve_geometry.cpp
+  src/third_order_otg.cpp
   src/joint_pva_solver.cpp
   src/topp_jerk_solver.cpp
   src/program_compiler.cpp
@@ -62,7 +62,6 @@ target_link_libraries(studio_planner_core
   pinocchio::pinocchio
   coal::coal
   yaml-cpp
-  ruckig::ruckig
 )
 
 install(TARGETS studio_planner_core
@@ -86,7 +85,6 @@ ament_export_dependencies(
   pinocchio
   coal
   yaml-cpp
-  ruckig
 )
 
 add_executable(lite6_studio_planner_node
