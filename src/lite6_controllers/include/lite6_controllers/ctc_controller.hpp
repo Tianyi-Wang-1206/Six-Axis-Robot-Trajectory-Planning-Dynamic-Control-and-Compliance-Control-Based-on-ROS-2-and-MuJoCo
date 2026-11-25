@@ -57,7 +57,7 @@ private:
   enum class TrajectoryResult {
     RUNNING, SUCCEEDED, CANCELED, DEACTIVATED, PATH_POSITION, PATH_VELOCITY,
     GOAL_TIMEOUT, SATURATION, INVALID_STATE, INVALID_COMMAND, COMMAND_WRITE, MODE_CHANGED,
-    CONTROL_EXCEPTION
+    CONTROL_EXCEPTION, ENTRY_DEVIATION
   };
   enum class SpliceState : uint8_t {
     PENDING = 0,
@@ -88,16 +88,18 @@ private:
     bool uniform_1khz = true;
     double t0_sec = 0.0;
     // Path-preserving splice submitted via /ctc_controller/splice_joint_trajectory.
-    // splice_owner is set once under trajectory_mutex_ before splice is published;
-    // the RT thread accesses splice lock-free and never frees it.
+    // splice_owner holds the active pending or adopted splice under trajectory_mutex_;
+    // rejected/withdrawn splices are moved to retired_splices so RT accesses splice
+    // lock-free without use-after-free or ABA pointer reuse while this execution exists.
     std::shared_ptr<SpliceExecution> splice_owner;
+    std::vector<std::shared_ptr<SpliceExecution>> retired_splices;
     std::atomic<SpliceExecution *> splice{nullptr};
     bool splice_reserved = false;  // Non-RT, under trajectory_mutex_.
     std::atomic<bool> on_tail{false};
-    // Control thread only: adopted splice tail and its resolution state.
+    // Control thread only: adopted splice tail and per-candidate resolution tracking.
     SpliceExecution * tail = nullptr;
-    bool splice_seen = false;
-    bool splice_resolved = false;
+    const SpliceExecution * last_splice_seen = nullptr;
+    const SpliceExecution * last_splice_resolved = nullptr;
     std::array<std::atomic<double>, 6> actual_pos{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
     std::array<std::atomic<double>, 6> actual_vel{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
     std::array<std::atomic<double>, 6> actual_eff{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
@@ -128,6 +130,13 @@ private:
   void configure_trajectory_action();
   bool valid_trajectory_goal(
     const FollowTrajectory::Goal & goal, bool * out_uniform_1khz = nullptr) const;
+  bool check_trajectory_entry_continuity(
+    const FollowTrajectory::Goal & goal,
+    const std::array<double, 6> & q_meas,
+    const std::array<double, 6> & dq_meas,
+    int * out_joint = nullptr,
+    double * out_value = nullptr,
+    double * out_limit = nullptr) const;
   // Non-RT, under trajectory_mutex_: validates a SpliceJointTrajectory request.
   uint8_t valid_splice_request(
     const SpliceTrajectory::Request & req,
@@ -135,6 +144,9 @@ private:
     std::string * out_message = nullptr) const;
   void populate_goal_tolerances(
     const FollowTrajectory::Goal & goal, TrajectoryExecution & exec) const;
+  void publish_measured_state_atomic(bool valid);
+  bool read_measured_state_atomic(
+    std::array<double, 6> & q_out, std::array<double, 6> & dq_out) const;
   void monitor_trajectory();
   void check_trajectory_path();
   void finish_trajectory_cycle(double dt);
@@ -151,9 +163,16 @@ private:
   std::vector<double> path_position_tolerance_, path_velocity_tolerance_;
   std::vector<double> goal_position_tolerance_, goal_velocity_tolerance_;
   std::vector<double> sysid_goal_position_tolerance_, sysid_goal_velocity_tolerance_;
+  double entry_position_tolerance_ = 0.05;
+  double entry_velocity_tolerance_ = 0.05;
   double goal_settle_duration_ = 1.0;
   double goal_time_tolerance_ = 5.0;
   double saturation_timeout_ = 1.0;
+  // Lock-free seqlock snapshot of measured joint state for non-RT goal admission.
+  std::atomic<uint64_t> measured_state_seq_{0};
+  std::atomic<bool> measured_state_valid_{false};
+  std::array<std::atomic<double>, 6> measured_q_atomic_{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+  std::array<std::atomic<double>, 6> measured_dq_atomic_{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
   std::array<bool, 6> effort_saturated_{};
   std::vector<double> reference_interfaces_;
   Vec6d tau_point_ff_ = Vec6d::Zero();

@@ -183,6 +183,103 @@ bool Lite6CTCController::valid_trajectory_goal(
   return true;
 }
 
+void Lite6CTCController::publish_measured_state_atomic(bool valid)
+{
+  if (!valid) {
+    measured_state_valid_.store(false, std::memory_order_release);
+    return;
+  }
+  const uint64_t seq = measured_state_seq_.load(std::memory_order_relaxed);
+  measured_state_seq_.store(seq + 1ULL, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
+  for (size_t i = 0; i < 6; ++i) {
+    measured_q_atomic_[i].store(q_[static_cast<Eigen::Index>(i)], std::memory_order_relaxed);
+    measured_dq_atomic_[i].store(dq_[static_cast<Eigen::Index>(i)], std::memory_order_relaxed);
+  }
+  measured_state_seq_.store(seq + 2ULL, std::memory_order_release);
+  measured_state_valid_.store(true, std::memory_order_release);
+}
+
+bool Lite6CTCController::read_measured_state_atomic(
+  std::array<double, 6> & q_out, std::array<double, 6> & dq_out) const
+{
+  if (!measured_state_valid_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    const uint64_t s1 = measured_state_seq_.load(std::memory_order_acquire);
+    if ((s1 & 1ULL) != 0ULL) {
+      continue;
+    }
+    for (size_t i = 0; i < 6; ++i) {
+      q_out[i] = measured_q_atomic_[i].load(std::memory_order_relaxed);
+      dq_out[i] = measured_dq_atomic_[i].load(std::memory_order_relaxed);
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const uint64_t s2 = measured_state_seq_.load(std::memory_order_relaxed);
+    if (s1 == s2 && measured_state_valid_.load(std::memory_order_acquire)) {
+      for (size_t i = 0; i < 6; ++i) {
+        if (!std::isfinite(q_out[i]) || !std::isfinite(dq_out[i])) {
+          return false;
+        }
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+bool Lite6CTCController::check_trajectory_entry_continuity(
+  const FollowTrajectory::Goal & goal,
+  const std::array<double, 6> & q_meas,
+  const std::array<double, 6> & dq_meas,
+  int * out_joint,
+  double * out_value,
+  double * out_limit) const
+{
+  if (goal.trajectory.points.empty()) {
+    return false;
+  }
+  std::array<double, 6> eff_pos_tol{};
+  std::array<double, 6> eff_vel_tol{};
+  for (size_t i = 0; i < joint_names_.size(); ++i) {
+    eff_pos_tol[i] = path_position_tolerance_[i];
+    eff_vel_tol[i] = path_velocity_tolerance_[i];
+  }
+  for (const auto & tol : goal.path_tolerance) {
+    const auto it = std::find(joint_names_.begin(), joint_names_.end(), tol.name);
+    if (it != joint_names_.end()) {
+      const size_t idx = static_cast<size_t>(std::distance(joint_names_.begin(), it));
+      if (tol.position > 0.0) {
+        eff_pos_tol[idx] = tol.position;
+      }
+      if (tol.velocity > 0.0) {
+        eff_vel_tol[idx] = tol.velocity;
+      }
+    }
+  }
+  const auto & first = goal.trajectory.points.front();
+  for (size_t i = 0; i < joint_names_.size(); ++i) {
+    const double pos_lim = std::min(entry_position_tolerance_, eff_pos_tol[i]);
+    const double vel_lim = std::min(entry_velocity_tolerance_, eff_vel_tol[i]);
+    const double pos_err = std::abs(first.positions[i] - q_meas[i]);
+    if (pos_err > pos_lim) {
+      if (out_joint) *out_joint = static_cast<int>(i);
+      if (out_value) *out_value = pos_err;
+      if (out_limit) *out_limit = pos_lim;
+      return false;
+    }
+    const double vel_err = std::abs(first.velocities[i] - dq_meas[i]);
+    if (vel_err > vel_lim) {
+      if (out_joint) *out_joint = static_cast<int>(i);
+      if (out_value) *out_value = vel_err;
+      if (out_limit) *out_limit = vel_lim;
+      return false;
+    }
+  }
+  return true;
+}
+
 uint8_t Lite6CTCController::valid_splice_request(
   const SpliceTrajectory::Request & req,
   bool * out_uniform_1khz,
@@ -310,6 +407,11 @@ uint8_t Lite6CTCController::valid_splice_request(
       return Resp::RESULT_REJECTED_INVALID_ARG;
     }
   }
+  const double est_elapsed = parent->elapsed_pub.load(std::memory_order_acquire);
+  if (t_switch <= est_elapsed) {
+    if (out_message) *out_message = "Splice switch_time already passed";
+    return Resp::RESULT_REJECTED_TIMING;
+  }
   if (out_uniform_1khz != nullptr) {
     *out_uniform_1khz = (max_grid_err <= 2e-4);
   }
@@ -361,11 +463,14 @@ void Lite6CTCController::configure_trajectory_action()
       using CS = lite6_interfaces::msg::ControllerStatus;
       std::lock_guard<std::mutex> lock(trajectory_mutex_);
       const uint8_t mode = current_mode_atomic_.load(std::memory_order_acquire);
+      std::array<double, 6> q_meas{}, dq_meas{};
       if (!trajectory_enabled_.load(std::memory_order_acquire) ||
           compliance_blocks_trajectory_.load() ||
           (mode != CS::MODE_NORMAL && mode != CS::MODE_SYSID) ||
           trajectory_reserved_ || impedance_trajectory_reserved_ ||
-          !valid_trajectory_goal(*goal))
+          !valid_trajectory_goal(*goal) ||
+          !read_measured_state_atomic(q_meas, dq_meas) ||
+          !check_trajectory_entry_continuity(*goal, q_meas, dq_meas))
         return rclcpp_action::GoalResponse::REJECT;
       trajectory_reserved_ = true;
       return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
@@ -428,7 +533,7 @@ void Lite6CTCController::configure_trajectory_action()
         splice->uniform_1khz = uniform_1khz;
         splice->controller_epoch = active_epoch;
 
-        const double est_elapsed = parent->elapsed_pub.load(std::memory_order_relaxed);
+        const double est_elapsed = parent->elapsed_pub.load(std::memory_order_acquire);
         wait_sec = std::clamp(
           std::max(0.0, splice->switch_time - est_elapsed) + 0.25, 0.20, 2.0);
 
@@ -441,6 +546,14 @@ void Lite6CTCController::configure_trajectory_action()
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
           std::chrono::duration<double>(wait_sec));
       auto finalize = [&](SpliceState st) {
+        if (st != SpliceState::ADOPTED) {
+          std::lock_guard<std::mutex> lock(trajectory_mutex_);
+          if (parent->splice_owner == splice) {
+            parent->splice.store(nullptr, std::memory_order_release);
+            parent->retired_splices.push_back(std::move(parent->splice_owner));
+            parent->splice_reserved = false;
+          }
+        }
         resp->controller_epoch = controller_epoch_atomic_.load(std::memory_order_acquire);
         switch (st) {
           case SpliceState::ADOPTED:
@@ -538,14 +651,16 @@ void Lite6CTCController::update_trajectory_reference(
     return;
   }
   auto reject_pending_splice = [&](SpliceState reason) {
-    if (!execution->splice_resolved) {
+    if (execution->tail == nullptr) {
       if (auto * splice = execution->splice.load(std::memory_order_acquire)) {
-        uint8_t expected = static_cast<uint8_t>(SpliceState::PENDING);
-        splice->state.compare_exchange_strong(
-          expected, static_cast<uint8_t>(reason),
-          std::memory_order_acq_rel, std::memory_order_acquire);
+        if (splice != execution->last_splice_resolved) {
+          uint8_t expected = static_cast<uint8_t>(SpliceState::PENDING);
+          splice->state.compare_exchange_strong(
+            expected, static_cast<uint8_t>(reason),
+            std::memory_order_acq_rel, std::memory_order_acquire);
+          execution->last_splice_resolved = splice;
+        }
       }
-      execution->splice_resolved = true;
     }
   };
 
@@ -574,7 +689,7 @@ void Lite6CTCController::update_trajectory_reference(
   }
   if (execution->started) {
     execution->elapsed += period.seconds();
-    execution->elapsed_pub.store(execution->elapsed, std::memory_order_relaxed);
+    execution->elapsed_pub.store(execution->elapsed, std::memory_order_release);
   } else {
     if (system_state_ != SystemState::NORMAL && system_state_ != SystemState::SYS_ID) {
       reject_pending_splice(SpliceState::REJECTED_STATE);
@@ -584,37 +699,59 @@ void Lite6CTCController::update_trajectory_reference(
     }
     // Start the trajectory clock only after the configured payload model has settled.
     if (payload_smoothing_active_) return;
+    std::array<double, 6> q_rt{}, dq_rt{};
+    for (size_t i = 0; i < n; ++i) {
+      q_rt[i] = q_[static_cast<Eigen::Index>(i)];
+      dq_rt[i] = dq_[static_cast<Eigen::Index>(i)];
+    }
+    int entry_joint = -1;
+    double entry_val = 0.0;
+    double entry_lim = 0.0;
+    if (!check_trajectory_entry_continuity(
+          *execution->goal->get_goal(), q_rt, dq_rt, &entry_joint, &entry_val, &entry_lim))
+    {
+      // Abort pre-start cleanly without latching E-STOP if physical state drifted
+      // beyond entry continuity tolerance between admission and first RT tick.
+      reject_pending_splice(SpliceState::REJECTED_PARENT);
+      execution->failure_joint = entry_joint;
+      execution->failure_value = entry_val;
+      execution->failure_limit = entry_lim;
+      execution->result.store(TrajectoryResult::ENTRY_DEVIATION);
+      tau_point_ff_.setZero();
+      return;
+    }
     execution->started = true;
     execution->start_time_ns = time.nanoseconds();
     execution->start_time_pub_ns.store(execution->start_time_ns, std::memory_order_release);
-    execution->elapsed_pub.store(0.0, std::memory_order_relaxed);
+    execution->elapsed_pub.store(0.0, std::memory_order_release);
     execution->start_mode = static_cast<int>(system_state_);
   }
 
-  // Path-preserving splice: decided once on first sight (rejected if epoch/mode changed,
-  // switch_time already passed, or endpoint already held), then adopted atomically at
-  // switch_time via CAS on splice->state (racing cleanly against service withdrawal).
-  if (!execution->splice_resolved) {
+  // Path-preserving splice: each candidate is validated once on first sight (rejected if
+  // epoch/mode changed, switch_time already passed, or endpoint already held), then adopted
+  // atomically at switch_time via CAS on splice->state (racing cleanly against withdrawal).
+  // Rejected/withdrawn candidates do not prevent a subsequent valid retry on this parent.
+  if (execution->tail == nullptr) {
     auto * splice = execution->splice.load(std::memory_order_acquire);
-    if (splice != nullptr) {
+    if (splice != nullptr && splice != execution->last_splice_resolved) {
       uint8_t expected = static_cast<uint8_t>(SpliceState::PENDING);
-      if (!execution->splice_seen) {
-        execution->splice_seen = true;
+      if (splice != execution->last_splice_seen) {
+        execution->last_splice_seen = splice;
         if (system_state_ != SystemState::NORMAL || splice->controller_epoch != controller_epoch_) {
-          execution->splice_resolved = true;
+          execution->last_splice_resolved = splice;
           splice->state.compare_exchange_strong(
             expected, static_cast<uint8_t>(SpliceState::REJECTED_STATE),
             std::memory_order_acq_rel, std::memory_order_acquire);
         } else if (execution->endpoint_applied || execution->elapsed > splice->switch_time) {
-          execution->splice_resolved = true;
+          execution->last_splice_resolved = splice;
           splice->state.compare_exchange_strong(
             expected, static_cast<uint8_t>(SpliceState::REJECTED_TIMING),
             std::memory_order_acq_rel, std::memory_order_acquire);
         }
       }
-      if (!execution->splice_resolved && execution->elapsed >= splice->switch_time) {
+      if (splice != execution->last_splice_resolved && execution->elapsed >= splice->switch_time) {
         if (system_state_ != SystemState::NORMAL || splice->controller_epoch != controller_epoch_) {
-          execution->splice_resolved = true;
+          execution->last_splice_resolved = splice;
           splice->state.compare_exchange_strong(
             expected, static_cast<uint8_t>(SpliceState::REJECTED_STATE),
             std::memory_order_acq_rel, std::memory_order_acquire);
@@ -622,14 +759,14 @@ void Lite6CTCController::update_trajectory_reference(
                      expected, static_cast<uint8_t>(SpliceState::ADOPTED),
                      std::memory_order_acq_rel, std::memory_order_acquire))
         {
-          execution->splice_resolved = true;
+          execution->last_splice_resolved = splice;
           execution->tail = splice;
           execution->last_sample_index = 0;
           execution->endpoint_applied = false;
           execution->on_tail.store(true, std::memory_order_release);
         } else {
-          // Service already withdrew the splice before adoption.
-          execution->splice_resolved = true;
+          // Service already withdrew or rejected the splice before adoption.
+          execution->last_splice_resolved = splice;
         }
       }
     }
@@ -706,14 +843,16 @@ void Lite6CTCController::fail_trajectory(
   request_execution_stop();
   auto * execution = current_execution_;
   if (!execution || execution->result.load() != TrajectoryResult::RUNNING) return;
-  if (!execution->splice_resolved) {
+  if (execution->tail == nullptr) {
     if (auto * splice = execution->splice.load(std::memory_order_acquire)) {
-      uint8_t expected = static_cast<uint8_t>(SpliceState::PENDING);
-      splice->state.compare_exchange_strong(
-        expected, static_cast<uint8_t>(SpliceState::REJECTED_PARENT),
-        std::memory_order_acq_rel, std::memory_order_acquire);
+      if (splice != execution->last_splice_resolved) {
+        uint8_t expected = static_cast<uint8_t>(SpliceState::PENDING);
+        splice->state.compare_exchange_strong(
+          expected, static_cast<uint8_t>(SpliceState::REJECTED_PARENT),
+          std::memory_order_acq_rel, std::memory_order_acquire);
+        execution->last_splice_resolved = splice;
+      }
     }
-    execution->splice_resolved = true;
   }
   execution->failure_joint = joint;
   execution->failure_value = value;
@@ -725,6 +864,7 @@ controller_interface::return_type Lite6CTCController::fail_controller(
   TrajectoryResult reason, int joint)
 {
   trajectory_enabled_.store(false);
+  publish_measured_state_atomic(false);
   fail_trajectory(reason, joint);
   ImpedanceTrajectoryResult imp_reason = ImpedanceTrajectoryResult::CONTROL_EXCEPTION;
   if (reason == TrajectoryResult::INVALID_STATE) {
@@ -876,14 +1016,16 @@ void Lite6CTCController::finish_trajectory_cycle(double dt)
   if (execution->elapsed > end_time + time_tol) {
     fail_trajectory(TrajectoryResult::GOAL_TIMEOUT, worst_joint, worst_ratio, 1.0);
   } else if (execution->settled_duration >= goal_settle_duration_) {
-    if (!execution->splice_resolved) {
+    if (execution->tail == nullptr) {
       if (auto * splice = execution->splice.load(std::memory_order_acquire)) {
-        uint8_t expected = static_cast<uint8_t>(SpliceState::PENDING);
-        splice->state.compare_exchange_strong(
-          expected, static_cast<uint8_t>(SpliceState::REJECTED_PARENT),
-          std::memory_order_acq_rel, std::memory_order_acquire);
+        if (splice != execution->last_splice_resolved) {
+          uint8_t expected = static_cast<uint8_t>(SpliceState::PENDING);
+          splice->state.compare_exchange_strong(
+            expected, static_cast<uint8_t>(SpliceState::REJECTED_PARENT),
+            std::memory_order_acq_rel, std::memory_order_acquire);
+          execution->last_splice_resolved = splice;
+        }
       }
-      execution->splice_resolved = true;
     }
     execution->result.store(TrajectoryResult::SUCCEEDED);
   }
@@ -966,10 +1108,14 @@ void Lite6CTCController::monitor_trajectory()
     result->error_code = FollowTrajectory::Result::SUCCESSFUL;
     goal->succeed(result);
   } else {
-    result->error_code = outcome == TrajectoryResult::GOAL_TIMEOUT ?
-      FollowTrajectory::Result::GOAL_TOLERANCE_VIOLATED :
+    result->error_code =
+      outcome == TrajectoryResult::GOAL_TIMEOUT ? FollowTrajectory::Result::GOAL_TOLERANCE_VIOLATED :
+      outcome == TrajectoryResult::ENTRY_DEVIATION ? FollowTrajectory::Result::INVALID_GOAL :
       FollowTrajectory::Result::PATH_TOLERANCE_VIOLATED;
     switch (outcome) {
+      case TrajectoryResult::ENTRY_DEVIATION:
+        result->error_string =
+          "Initial trajectory state deviates from measured joint state [rad or rad/s]"; break;
       case TrajectoryResult::PATH_POSITION:
         result->error_string = "Path position tolerance violated [rad]"; break;
       case TrajectoryResult::PATH_VELOCITY:

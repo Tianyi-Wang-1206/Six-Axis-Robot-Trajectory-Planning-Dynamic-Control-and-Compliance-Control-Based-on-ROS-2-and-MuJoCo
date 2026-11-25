@@ -29,7 +29,7 @@ constexpr int kMinGridPerPiece = 5;
 constexpr int kMinGrid = 64;
 constexpr int kMaxInitGrid = 300;
 constexpr int kMaxRefinedGrid = 1400;
-constexpr int kMaxCollocationRefines = 8;
+constexpr int kMaxCollocationRefines = 12;
 constexpr double kMaxDurationSec = 300.0;
 
 // Initial adaptive-grid resolution targets per stage.
@@ -824,35 +824,73 @@ void for_each_ineq(
       }
     }
 
-    // 3a. Midpoint velocity bounds
+    // 3a. Interval velocity bounds:
+    // Lower bound: on interior intervals (1 <= i <= N - 2), enforce non-negativity of the
+    // quadratic Bernstein middle control point
+    //   b1 = 0.5 * (v_i + v_{i+1}) + 0.25 * (a_i - a_{i+1}) * dt_i >= 0.
+    // Together with v_i >= 0 and v_{i+1} >= 0, this strictly certifies v(tau) >= 0 on the
+    // entire interval [0, dt_i] (preventing interior speed reversals and Zeno bisection at
+    // near-stop corners) and algebraically implies vm = 0.25 * (v_i + v_{i+1}) + 0.5 * b1 >= 0
+    // even off the equality manifold. On endpoint intervals (i == 0 or i == N - 1), rest
+    // boundary conditions fix b1 == 0 on e1 == 0 while v_1 >= 0 / v_{N-1} >= 0 already
+    // guarantees non-negative v(tau), so keep the strictly interior bound vm >= 0 there.
     {
-      int nh = 0;
+      const bool use_b1 = (i > 0 && i + 1 < N);
+      const double v_lo = use_b1 ?
+        (0.5 * (v[i] + v[i + 1]) + 0.25 * (a[i] - a[i + 1]) * dt[i]) : vm;
+      int nh_lo = 0;
+      if constexpr (NeedGrad) {
+        if (use_b1) {
+          for (int q = 0; q < nl; ++q) {
+            double db1 = dvm[q];
+            if (q == pos_ai) {
+              db1 = 0.25 * dt[i] * A_s;
+            } else if (q == pos_ai1) {
+              db1 = -0.25 * dt[i] * A_s;
+            } else if (q == pos_t) {
+              db1 = 0.25 * (a[i] - a[i + 1]) * tau_s;
+            }
+            grad[q] = -db1 * inv_Vs;
+          }
+          if constexpr (NeedHess) {
+            if (pos_ai >= 0) {
+              hr[nh_lo] = idx[pos_ai]; hc[nh_lo] = idx[pos_t]; hv[nh_lo] = -2.0 * h_vm_at * inv_Vs; ++nh_lo;
+            }
+            if (pos_ai1 >= 0) {
+              hr[nh_lo] = idx[pos_ai1]; hc[nh_lo] = idx[pos_t]; hv[nh_lo] = 2.0 * h_vm_at * inv_Vs; ++nh_lo;
+            }
+          }
+        } else {
+          for (int q = 0; q < nl; ++q) {
+            grad[q] = -dvm[q] * inv_Vs;
+          }
+          if constexpr (NeedHess) {
+            if (pos_ai >= 0) {
+              hr[nh_lo] = idx[pos_ai]; hc[nh_lo] = idx[pos_t]; hv[nh_lo] = -h_vm_at * inv_Vs; ++nh_lo;
+            }
+            if (pos_ai1 >= 0) {
+              hr[nh_lo] = idx[pos_ai1]; hc[nh_lo] = idx[pos_t]; hv[nh_lo] = h_vm_at * inv_Vs; ++nh_lo;
+            }
+          }
+        }
+      }
+      fn(m++, -v_lo * inv_Vs, nl, idx, grad, nh_lo, hr, hc, hv);
+
+      int nh_hi = 0;
       if constexpr (NeedGrad) {
         for (int q = 0; q < nl; ++q) {
-          grad[q] = -dvm[q] * inv_Vs;
+          grad[q] = dvm[q] * inv_Vs;
         }
         if constexpr (NeedHess) {
           if (pos_ai >= 0) {
-            hr[nh] = idx[pos_ai]; hc[nh] = idx[pos_t]; hv[nh] = -h_vm_at * inv_Vs; ++nh;
+            hr[nh_hi] = idx[pos_ai]; hc[nh_hi] = idx[pos_t]; hv[nh_hi] = h_vm_at * inv_Vs; ++nh_hi;
           }
           if (pos_ai1 >= 0) {
-            hr[nh] = idx[pos_ai1]; hc[nh] = idx[pos_t]; hv[nh] = h_vm_at * inv_Vs; ++nh;
+            hr[nh_hi] = idx[pos_ai1]; hc[nh_hi] = idx[pos_t]; hv[nh_hi] = -h_vm_at * inv_Vs; ++nh_hi;
           }
         }
       }
-      fn(m++, -vm * inv_Vs, nl, idx, grad, nh, hr, hc, hv);
-
-      if constexpr (NeedGrad) {
-        for (int q = 0; q < nl; ++q) {
-          grad[q] = -grad[q];
-        }
-        if constexpr (NeedHess) {
-          for (int q = 0; q < nh; ++q) {
-            hv[q] = -hv[q];
-          }
-        }
-      }
-      fn(m++, (vm - pc.v_mid_max[i]) * inv_Vs, nl, idx, grad, nh, hr, hc, hv);
+      fn(m++, (vm - pc.v_mid_max[i]) * inv_Vs, nl, idx, grad, nh_hi, hr, hc, hv);
     }
 
     // 3b. Midpoint joint acceleration
@@ -2194,7 +2232,12 @@ Verify1kHzResult evaluate_1khz(
       const double dj = timing.a[i + 1] - timing.a[i];
       const double v_min = timing.v[i] - 0.5 * timing.a[i] * timing.a[i] * timing.dt[i] / dj;
       if (v_min < -1e-6) {
-        res.violations.push_back({0.5 * (timing.u[i] + timing.u[i + 1]), 2.0});
+        const double d_min = std::clamp(-timing.a[i] * timing.dt[i] / dj, 0.0, timing.dt[i]);
+        const double u_min = std::clamp(
+          timing.u[i] + timing.v[i] * d_min + 0.5 * timing.a[i] * d_min * d_min +
+            (1.0 / 6.0) * timing.j[i] * d_min * d_min * d_min,
+          timing.u[i], timing.u[i + 1]);
+        res.violations.push_back({u_min, 2.0});
       }
     }
   }
@@ -2460,8 +2503,10 @@ bool TOPPJerkSolver::solve(
   for (size_t b = 0; b + 1 < boundaries.size(); ++b) {
     const double u0 = boundaries[b];
     const double span = boundaries[b + 1] - u0;
-    for (int m = 0; m <= kMinGridPerPiece; ++m) {
-      grid.push_back(u0 + span * static_cast<double>(m) / kMinGridPerPiece);
+    const int n_piece = std::clamp(
+      static_cast<int>(std::ceil(span / 1e-4)), 1, kMinGridPerPiece);
+    for (int m = 0; m <= n_piece; ++m) {
+      grid.push_back(u0 + span * static_cast<double>(m) / n_piece);
     }
   }
   grid.push_back(1.0);
@@ -2475,10 +2520,32 @@ bool TOPPJerkSolver::solve(
     grid.push_back(1.0 - d);
   }
 
+  // Merge free knots while preserving exact pinned piece boundaries and preventing
+  // accidental micro-slivers when density or ramp knots land near a boundary or each other.
   std::sort(grid.begin(), grid.end());
-  grid.erase(
-    std::unique(grid.begin(), grid.end(), [](double x, double y) { return std::abs(x - y) < 1e-8; }),
-    grid.end());
+  std::vector<double> filtered;
+  filtered.reserve(grid.size());
+  auto near_boundary = [&](double u) {
+    const auto it = std::lower_bound(boundaries.begin(), boundaries.end(), u);
+    const double d_hi = (it != boundaries.end()) ? std::abs(*it - u) : 1.0;
+    const double d_lo = (it != boundaries.begin()) ? std::abs(u - *std::prev(it)) : 1.0;
+    return std::min(d_lo, d_hi);
+  };
+  for (double u : grid) {
+    const bool is_pinned = (near_boundary(u) < 1e-11);
+    const double min_gap = std::clamp(0.1 * std::min(u, 1.0 - u), 1e-7, 2e-5);
+    if (!is_pinned && near_boundary(u) < min_gap) {
+      continue;
+    }
+    if (!filtered.empty() && (u - filtered.back()) < min_gap) {
+      if (is_pinned && near_boundary(filtered.back()) >= 1e-11) {
+        filtered.back() = u;
+      }
+      continue;
+    }
+    filtered.push_back(u);
+  }
+  grid.swap(filtered);
   grid.front() = 0.0;
   grid.back() = 1.0;
 
@@ -2620,11 +2687,17 @@ bool TOPPJerkSolver::solve(
     for (size_t idx = 0; idx < N_old; ++idx) {
       if (best_in_seg[idx].second > 0.0) {
         const double ua = grid[idx], ub = grid[idx + 1];
-        double um = best_in_seg[idx].first;
-        if (um - ua < 0.15 * (ub - ua) || ub - um < 0.15 * (ub - ua)) {
-          um = 0.5 * (ua + ub);
+        const double span_seg = ub - ua;
+        const double u_raw = best_in_seg[idx].first;
+        if (u_raw - ua < 0.20 * span_seg || ub - u_raw < 0.20 * span_seg) {
+          new_u.push_back(0.5 * (ua + ub));
+          const double u_clamped = std::clamp(u_raw, ua + 0.05 * span_seg, ub - 0.05 * span_seg);
+          if (std::abs(u_clamped - 0.5 * (ua + ub)) > 0.05 * span_seg) {
+            new_u.push_back(u_clamped);
+          }
+        } else {
+          new_u.push_back(u_raw);
         }
-        new_u.push_back(um);
       }
     }
     if (new_u.empty()) {

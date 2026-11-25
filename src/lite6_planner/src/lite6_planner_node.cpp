@@ -668,6 +668,7 @@ private:
       }
     } catch(const std::exception& e) {
       supervisor_.end_excitation_validation(req.session_id);
+      publish_state();
       resp.accepted=false;resp.message=std::string("Friction identification trajectory rejected: ")+e.what();
       resp.revision=supervisor_.snapshot().revision;return;
     }
@@ -680,6 +681,7 @@ private:
         resp.accepted=false;
         resp.message="Fresh joint state feedback unavailable for friction identification validation";
         supervisor_.end_excitation_validation(req.session_id);
+        publish_state();
         resp.revision=supervisor_.snapshot().revision;
         return;
       }
@@ -689,6 +691,7 @@ private:
           resp.accepted=false;
           resp.message="Friction identification reference start differs from stationary physical state";
           supervisor_.end_excitation_validation(req.session_id);
+          publish_state();
           resp.revision=supervisor_.snapshot().revision;
           return;
         }
@@ -696,6 +699,7 @@ private:
     }
     if(!supervisor_.reserve_excitation(req.session_id,key,why)) {
       supervisor_.end_excitation_validation(req.session_id);
+      publish_state();
       resp.accepted=false;resp.message=why;
       resp.revision=supervisor_.snapshot().revision;return;
     }

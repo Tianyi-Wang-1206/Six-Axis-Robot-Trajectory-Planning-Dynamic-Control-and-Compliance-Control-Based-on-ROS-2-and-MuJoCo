@@ -1602,9 +1602,13 @@ CartesianSample RestrictedCartesianPath::eval_normalized(double u) const
 std::vector<double> RestrictedCartesianPath::piece_boundaries() const
 {
   std::vector<double> result;
+  if (!(span_ > 1e-12)) {
+    return result;
+  }
   for (double u : path_->piece_boundaries()) {
-    if (u > begin_ && u < 1.0) {
-      result.push_back((u - begin_) / span_);
+    const double ur = (u - begin_) / span_;
+    if (ur > 1e-9 && ur < 1.0 - 1e-9) {
+      result.push_back(ur);
     }
   }
   return result;

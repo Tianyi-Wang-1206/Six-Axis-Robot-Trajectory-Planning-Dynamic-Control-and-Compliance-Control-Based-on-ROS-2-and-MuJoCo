@@ -39,6 +39,8 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
   auto_declare<std::vector<double>>("execution.sysid_goal_position_tolerance", std::vector<double>(6, 0.04));
   auto_declare<std::vector<double>>("execution.sysid_goal_velocity_tolerance", std::vector<double>(6, 0.005));
   auto_declare<std::vector<double>>("execution.goal_velocity_tolerance", std::vector<double>(6, 0.02));
+  auto_declare<double>("execution.entry_position_tolerance", 0.05);
+  auto_declare<double>("execution.entry_velocity_tolerance", 0.05);
   auto_declare<double>("execution.goal_settle_duration", 1.0);
   auto_declare<double>("execution.goal_time_tolerance", 5.0);
   auto_declare<double>("execution.saturation_timeout", 1.0);
@@ -161,6 +163,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   current_impedance_execution_ = nullptr;
   rt_seen_execution_.store(nullptr, std::memory_order_release);
   rt_seen_impedance_execution_.store(nullptr, std::memory_order_release);
+  publish_measured_state_atomic(false);
 
   path_position_tolerance_ = get_node()->get_parameter("execution.path_position_tolerance").as_double_array();
   path_velocity_tolerance_ = get_node()->get_parameter("execution.path_velocity_tolerance").as_double_array();
@@ -168,6 +171,8 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   sysid_goal_position_tolerance_ = get_node()->get_parameter("execution.sysid_goal_position_tolerance").as_double_array();
   sysid_goal_velocity_tolerance_ = get_node()->get_parameter("execution.sysid_goal_velocity_tolerance").as_double_array();
   goal_velocity_tolerance_ = get_node()->get_parameter("execution.goal_velocity_tolerance").as_double_array();
+  entry_position_tolerance_ = get_node()->get_parameter("execution.entry_position_tolerance").as_double();
+  entry_velocity_tolerance_ = get_node()->get_parameter("execution.entry_velocity_tolerance").as_double();
   goal_settle_duration_ = get_node()->get_parameter("execution.goal_settle_duration").as_double();
   goal_time_tolerance_ = get_node()->get_parameter("execution.goal_time_tolerance").as_double();
   saturation_timeout_ = get_node()->get_parameter("execution.saturation_timeout").as_double();
@@ -177,6 +182,24 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
     if (values->size() != n || !std::all_of(values->begin(), values->end(),
         [](double value) {return std::isfinite(value) && value > 0.0;})) {
       RCLCPP_ERROR(get_node()->get_logger(), "Execution tolerances require six finite positive values");
+      return controller_interface::CallbackReturn::ERROR;
+    }
+  }
+  if (!std::isfinite(entry_position_tolerance_) || entry_position_tolerance_ <= 0.0 ||
+      !std::isfinite(entry_velocity_tolerance_) || entry_velocity_tolerance_ <= 0.0)
+  {
+    RCLCPP_ERROR(
+      get_node()->get_logger(),
+      "execution.entry_position_tolerance and execution.entry_velocity_tolerance must be finite and positive");
+    return controller_interface::CallbackReturn::ERROR;
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if (entry_position_tolerance_ > path_position_tolerance_[i] ||
+        entry_velocity_tolerance_ > path_velocity_tolerance_[i])
+    {
+      RCLCPP_ERROR(
+        get_node()->get_logger(),
+        "Entry tolerances must not exceed execution path tolerances");
       return controller_interface::CallbackReturn::ERROR;
     }
   }
@@ -399,6 +422,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
     dq_imp_ref_[i] = 0.0;
     ddq_imp_ref_[i] = 0.0;
   }
+  publish_measured_state_atomic(true);
 
   payload_mass_filtered_ = payload_mass_;
   const Eigen::Vector3d c_tcp(payload_com_tcp_[0], payload_com_tcp_[1], payload_com_tcp_[2]);
@@ -477,6 +501,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_deactivate(const rcl
     current_mode_atomic_.store(
       lite6_interfaces::msg::ControllerStatus::MODE_UNKNOWN, std::memory_order_release);
   }
+  publish_measured_state_atomic(false);
   has_applied_tau_ = false;
   recovery_bias_active_ = false;
   recovery_bias_elapsed_ = 0.0;
@@ -778,6 +803,7 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
     if (!std::isfinite(q_[i]) || !std::isfinite(dq_[i]))
       return fail_controller(TrajectoryResult::INVALID_STATE, static_cast<int>(i));
   }
+  publish_measured_state_atomic(true);
 
   dynamics_q_.head(6) = q_;
   dynamics_dq_.head(6) = dq_;
