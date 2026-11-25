@@ -245,6 +245,7 @@ bool Lite6CTCController::valid_impedance_trajectory_goal(
   const FollowImpedance::Goal & goal, bool * out_uniform_1khz) const
 {
   if (goal.joint_names != joint_names_ || goal.points.empty() ||
+      goal.points.size() > kMaxTrajectoryPoints ||
       !lite6_interfaces::valid_transition_time(goal.transition_time) ||
       (goal.end_behavior != FollowImpedance::Goal::END_TRANSITION_NORMAL &&
        goal.end_behavior != FollowImpedance::Goal::END_HOLD_CARTESIAN_IMPEDANCE)) {
@@ -264,8 +265,9 @@ bool Lite6CTCController::valid_impedance_trajectory_goal(
         point.nullspace_stiffness != 0.0) {
       return false;
     }
+    double dt = 0.0;
     if (idx > 0) {
-      const double dt = t - previous;
+      dt = t - previous;
       if (std::abs(dt - lite6_interfaces::contract::kControlDtSec) >
           lite6_interfaces::contract::kTrajectorySampleSpacingTolSec)
       {
@@ -275,15 +277,20 @@ bool Lite6CTCController::valid_impedance_trajectory_goal(
         static_cast<double>(idx) * lite6_interfaces::contract::kControlDtSec;
       max_grid_err = std::max(max_grid_err, std::abs(t - expected_t));
     }
+    const auto * prev_pt = (idx > 0) ? &goal.points[idx - 1] : nullptr;
     for (size_t i = 0; i < joint_names_.size(); ++i) {
-      const double q = point.positions[i];
-      const double dq = point.velocities[i];
-      const double ddq = point.accelerations[i];
-      if (!std::isfinite(q) || !std::isfinite(dq) || !std::isfinite(ddq)) {
-        return false;
-      }
-      if (q < pin_model_.lowerPositionLimit[static_cast<int>(i)] - imp_hard_limit_tolerance_ ||
-          q > pin_model_.upperPositionLimit[static_cast<int>(i)] + imp_hard_limit_tolerance_) {
+      const double max_vel = std::min(imp_max_joint_velocity_, execution_max_joint_velocity_[i]);
+      if (!valid_pva_sample_and_step(
+            i, point.positions[i], point.velocities[i], point.accelerations[i],
+            imp_hard_limit_tolerance_,
+            max_vel,
+            execution_max_joint_acceleration_[i],
+            prev_pt != nullptr,
+            prev_pt ? prev_pt->positions[i] : 0.0,
+            prev_pt ? prev_pt->velocities[i] : 0.0,
+            prev_pt ? prev_pt->accelerations[i] : 0.0,
+            dt))
+      {
         return false;
       }
     }

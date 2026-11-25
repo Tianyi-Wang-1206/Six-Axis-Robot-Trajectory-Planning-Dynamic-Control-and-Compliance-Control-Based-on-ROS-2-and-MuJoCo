@@ -4,9 +4,12 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <map>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
+#include <utility>
 
 namespace lite6_studio_planner
 {
@@ -14,6 +17,208 @@ namespace
 {
 
 constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+constexpr size_t kMaxCodeChars = 64;
+constexpr size_t kDiagFixedOverheadBytes = 64;
+constexpr size_t kReservedTruncationBytes = 512;
+
+struct LineSpan
+{
+  size_t start = 0;
+  size_t length = 0;
+};
+
+size_t utf8_sequence_length(const std::string_view sv, size_t pos)
+{
+  if (pos >= sv.size()) {
+    return 0;
+  }
+  const unsigned char b0 = static_cast<unsigned char>(sv[pos]);
+  if (b0 < 0x80) {
+    return 1;
+  }
+  if ((b0 & 0xE0) == 0xC0 && pos + 1 < sv.size()) {
+    const unsigned char b1 = static_cast<unsigned char>(sv[pos + 1]);
+    if ((b1 & 0xC0) != 0x80) {
+      return 0;
+    }
+    const uint32_t cp = ((b0 & 0x1Fu) << 6) | (b1 & 0x3Fu);
+    return (cp >= 0x80u) ? 2 : 0;
+  }
+  if ((b0 & 0xF0) == 0xE0 && pos + 2 < sv.size()) {
+    const unsigned char b1 = static_cast<unsigned char>(sv[pos + 1]);
+    const unsigned char b2 = static_cast<unsigned char>(sv[pos + 2]);
+    if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80) {
+      return 0;
+    }
+    const uint32_t cp = ((b0 & 0x0Fu) << 12) | ((b1 & 0x3Fu) << 6) | (b2 & 0x3Fu);
+    return (cp >= 0x800u && (cp < 0xD800u || cp > 0xDFFFu)) ? 3 : 0;
+  }
+  if ((b0 & 0xF8) == 0xF0 && pos + 3 < sv.size()) {
+    const unsigned char b1 = static_cast<unsigned char>(sv[pos + 1]);
+    const unsigned char b2 = static_cast<unsigned char>(sv[pos + 2]);
+    const unsigned char b3 = static_cast<unsigned char>(sv[pos + 3]);
+    if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80) {
+      return 0;
+    }
+    const uint32_t cp =
+      ((b0 & 0x07u) << 18) | ((b1 & 0x3Fu) << 12) | ((b2 & 0x3Fu) << 6) | (b3 & 0x3Fu);
+    return (cp >= 0x10000u && cp <= 0x10FFFFu) ? 4 : 0;
+  }
+  return 0;
+}
+
+std::string sanitize_bounded_view(std::string_view text, size_t max_chars)
+{
+  if (max_chars == 0 || text.empty()) {
+    return "";
+  }
+  std::string out;
+  out.reserve(std::min(text.size(), max_chars));
+  const size_t ellipsis_len = (max_chars >= 3) ? 3 : 0;
+  const size_t soft_limit = max_chars - ellipsis_len;
+  bool truncated = false;
+  size_t i = 0;
+  while (i < text.size()) {
+    const unsigned char b = static_cast<unsigned char>(text[i]);
+    char esc_buf[8];
+    std::string_view piece;
+    size_t advance_by = 1;
+    if (b >= 0x20 && b <= 0x7E) {
+      piece = text.substr(i, 1);
+    } else if (b == '\t' || b == '\r' || b == '\n') {
+      piece = " ";
+    } else if (b >= 0x80) {
+      const size_t ulen = utf8_sequence_length(text, i);
+      if (ulen > 0) {
+        piece = text.substr(i, ulen);
+        advance_by = ulen;
+      } else {
+        std::snprintf(esc_buf, sizeof(esc_buf), "\\x%02x", static_cast<unsigned>(b));
+        piece = std::string_view(esc_buf, 4);
+      }
+    } else {
+      std::snprintf(esc_buf, sizeof(esc_buf), "\\x%02x", static_cast<unsigned>(b));
+      piece = std::string_view(esc_buf, 4);
+    }
+
+    const bool has_more = (i + advance_by < text.size());
+    const size_t limit = has_more ? soft_limit : max_chars;
+    if (out.size() + piece.size() > limit) {
+      if (has_more || out.size() + piece.size() > max_chars) {
+        truncated = true;
+        break;
+      }
+    }
+    out.append(piece.data(), piece.size());
+    i += advance_by;
+  }
+  if (truncated && ellipsis_len > 0) {
+    while (out.size() + ellipsis_len > max_chars && !out.empty()) {
+      // Back off cleanly to a UTF-8 codepoint boundary.
+      while (!out.empty() && (static_cast<unsigned char>(out.back()) & 0xC0) == 0x80) {
+        out.pop_back();
+      }
+      if (!out.empty()) {
+        out.pop_back();
+      }
+    }
+    out.append("...");
+  }
+  return out;
+}
+
+std::string format_unexpected_char(char c)
+{
+  const unsigned char u = static_cast<unsigned char>(c);
+  if (u >= 0x20 && u <= 0x7E) {
+    return std::string("'") + c + "'";
+  }
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "0x%02x", static_cast<unsigned>(u));
+  return std::string(buf);
+}
+
+size_t diagnostic_byte_cost(const DSLParser::Diagnostic & d)
+{
+  return d.code.size() + d.command_text.size() + d.message.size() + kDiagFixedOverheadBytes;
+}
+
+void sanitize_diagnostic_fields(DSLParser::Diagnostic & d)
+{
+  d.code = sanitize_bounded_view(d.code, kMaxCodeChars);
+  d.command_text = sanitize_bounded_view(d.command_text, DSLParser::kMaxSnippetChars);
+  d.message = sanitize_bounded_view(d.message, DSLParser::kMaxDiagnosticMessageChars);
+}
+
+class DiagnosticSink
+{
+public:
+  using D = DSLParser::Diagnostic;
+  static constexpr size_t kMaxRegularDiags = DSLParser::kMaxDiagnostics - 1;
+
+  explicit DiagnosticSink(std::vector<D> & diags) : diags_(diags) {}
+
+  bool can_accept_more() const
+  {
+    return diags_.size() < kMaxRegularDiags &&
+           total_bytes_ + kReservedTruncationBytes < DSLParser::kMaxTotalDiagnosticBytes;
+  }
+
+  bool add(D d)
+  {
+    sanitize_diagnostic_fields(d);
+    const size_t cost = diagnostic_byte_cost(d);
+    if (diags_.size() >= kMaxRegularDiags ||
+        total_bytes_ + cost + kReservedTruncationBytes > DSLParser::kMaxTotalDiagnosticBytes)
+    {
+      ++suppressed_;
+      return false;
+    }
+    total_bytes_ += cost;
+    if (d.severity == D::SEVERITY_ERROR) {
+      ++error_count_;
+    }
+    diags_.push_back(std::move(d));
+    return true;
+  }
+
+  void add_suppressed(size_t n) { suppressed_ += n; }
+  void mark_stopped_early() { stopped_early_ = true; }
+  size_t suppressed() const { return suppressed_; }
+  bool stopped_early() const { return stopped_early_; }
+  size_t error_count() const { return error_count_; }
+
+  void finalize()
+  {
+    if (suppressed_ == 0 && !stopped_early_) {
+      return;
+    }
+    D notice;
+    notice.severity = D::SEVERITY_WARNING;
+    notice.stage = diags_.empty() ? D::STAGE_LEX_SYNTAX : diags_.back().stage;
+    notice.line_number = diags_.empty() ? 1 : diags_.back().line_number;
+    notice.column_number = diags_.empty() ? 1 : diags_.back().column_number;
+    notice.statement_index = -1;
+    notice.code = "WARN_DIAGNOSTICS_TRUNCATED";
+    std::ostringstream oss;
+    oss << "Diagnostic output capped at " << diags_.size() << " entries";
+    if (suppressed_ > 0) {
+      oss << " (" << suppressed_ << " additional diagnostic(s) suppressed)";
+    }
+    if (stopped_early_) {
+      oss << "; remaining source analysis skipped";
+    }
+    notice.message = sanitize_bounded_view(oss.str(), DSLParser::kMaxDiagnosticMessageChars);
+    diags_.push_back(std::move(notice));
+  }
+
+private:
+  std::vector<D> & diags_;
+  size_t total_bytes_ = 0;
+  size_t suppressed_ = 0;
+  size_t error_count_ = 0;
+  bool stopped_early_ = false;
+};
 
 enum class TokenKind
 {
@@ -53,40 +258,99 @@ struct ParseError : public std::runtime_error
   }
 };
 
-std::vector<std::string> split_lines(const std::string & source)
+// Builds a zero-copy O(N) index of line byte ranges in source.
+// Returns false if line count exceeds DSLParser::kMaxSourceLines.
+bool index_lines(const std::string & source, std::vector<LineSpan> & out_lines)
 {
-  std::vector<std::string> lines;
-  std::stringstream ss(source);
-  std::string line;
-  while (std::getline(ss, line)) {
-    if (!line.empty() && line.back() == '\r') {
-      line.pop_back();
+  out_lines.clear();
+  size_t line_start = 0;
+  const size_t n = source.size();
+  for (size_t i = 0; i < n; ++i) {
+    if (source[i] == '\n') {
+      size_t len = i - line_start;
+      if (len > 0 && source[line_start + len - 1] == '\r') {
+        --len;
+      }
+      if (out_lines.size() >= DSLParser::kMaxSourceLines) {
+        return false;
+      }
+      out_lines.push_back({line_start, len});
+      line_start = i + 1;
     }
-    lines.push_back(line);
   }
-  if (lines.empty()) {
-    lines.emplace_back("");
+  if (line_start < n || out_lines.empty()) {
+    size_t len = n - line_start;
+    if (len > 0 && source[line_start + len - 1] == '\r') {
+      --len;
+    }
+    if (out_lines.size() >= DSLParser::kMaxSourceLines) {
+      return false;
+    }
+    out_lines.push_back({line_start, len});
   }
-  return lines;
+  return true;
 }
 
-std::string trim_copy(const std::string & s)
+// Extracts an O(1)-bounded, UTF-8-safe snippet for a 1-based line and optional column.
+std::string extract_line_snippet(
+  const std::string & source,
+  const std::vector<LineSpan> & lines,
+  int ln,
+  int col_1based = 1)
 {
-  size_t a = 0;
-  while (a < s.size() && std::isspace(static_cast<unsigned char>(s[a]))) {
+  if (ln < 1 || static_cast<size_t>(ln) > lines.size()) {
+    return "";
+  }
+  const LineSpan span = lines[static_cast<size_t>(ln - 1)];
+  size_t a = span.start;
+  size_t b = span.start + span.length;
+  while (a < b && std::isspace(static_cast<unsigned char>(source[a]))) {
     ++a;
   }
-  size_t b = s.size();
-  while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) {
+  while (b > a && std::isspace(static_cast<unsigned char>(source[b - 1]))) {
     --b;
   }
-  return s.substr(a, b - a);
+  if (a >= b) {
+    return "";
+  }
+  const size_t trimmed_len = b - a;
+  if (trimmed_len <= DSLParser::kMaxSnippetChars) {
+    return sanitize_bounded_view(
+      std::string_view(source.data() + a, trimmed_len), DSLParser::kMaxSnippetChars);
+  }
+
+  // Center a bounded window around the offending column so huge single-line inputs
+  // never copy the full line.
+  const size_t raw_col_offset =
+    (col_1based > 1) ? static_cast<size_t>(col_1based - 1) : 0;
+  const size_t focus = std::clamp(span.start + raw_col_offset, a, b);
+  constexpr size_t kLeadContext = 32;
+  size_t win_start = (focus > a + kLeadContext) ? (focus - kLeadContext) : a;
+  if (win_start + DSLParser::kMaxSnippetChars > b) {
+    win_start = b - DSLParser::kMaxSnippetChars;
+  }
+  // Advance past any UTF-8 continuation bytes at the window start.
+  while (win_start < b &&
+         (static_cast<unsigned char>(source[win_start]) & 0xC0) == 0x80)
+  {
+    ++win_start;
+  }
+  const bool prefix_ellipsis = (win_start > a);
+  const size_t avail =
+    DSLParser::kMaxSnippetChars - (prefix_ellipsis ? 3 : 0);
+  const size_t win_len = std::min(b - win_start, avail + 1);
+  std::string body = sanitize_bounded_view(
+    std::string_view(source.data() + win_start, win_len), avail);
+  if (prefix_ellipsis) {
+    return "..." + body;
+  }
+  return body;
 }
 
 std::vector<Token> tokenize(
   const std::string & source,
-  const std::vector<std::string> & lines,
-  std::vector<DSLParser::Diagnostic> & diags)
+  const std::vector<LineSpan> & lines,
+  DiagnosticSink & sink)
 {
   using D = DSLParser::Diagnostic;
   std::vector<Token> tokens;
@@ -95,11 +359,28 @@ std::vector<Token> tokenize(
   size_t i = 0;
   const size_t n = source.size();
 
-  auto line_snippet = [&](int ln) -> std::string {
-    if (ln >= 1 && static_cast<size_t>(ln) <= lines.size()) {
-      return trim_copy(lines[static_cast<size_t>(ln - 1)]);
+  auto line_snippet = [&](int ln, int c_col) -> std::string {
+    return extract_line_snippet(source, lines, ln, c_col);
+  };
+
+  auto push_token = [&](Token tok) -> bool {
+    if (tokens.size() >= DSLParser::kMaxTokens) {
+      D d;
+      d.severity = D::SEVERITY_ERROR;
+      d.stage = D::STAGE_LEX_SYNTAX;
+      d.line_number = tok.line;
+      d.column_number = tok.column;
+      d.statement_index = -1;
+      d.command_text = line_snippet(tok.line, tok.column);
+      d.code = "ERR_TOKEN_LIMIT";
+      d.message = "Program exceeds maximum token budget (" +
+        std::to_string(DSLParser::kMaxTokens) + " tokens)";
+      sink.add(std::move(d));
+      sink.mark_stopped_early();
+      return false;
     }
-    return "";
+    tokens.push_back(std::move(tok));
+    return true;
   };
 
   while (i < n) {
@@ -127,49 +408,49 @@ std::vector<Token> tokenize(
     }
     const int start_col = col;
     if (c == '[') {
-      tokens.push_back({TokenKind::LBRACKET, "[", 0.0, line, start_col});
+      if (!push_token({TokenKind::LBRACKET, "[", 0.0, line, start_col})) break;
       ++i;
       ++col;
       continue;
     }
     if (c == ']') {
-      tokens.push_back({TokenKind::RBRACKET, "]", 0.0, line, start_col});
+      if (!push_token({TokenKind::RBRACKET, "]", 0.0, line, start_col})) break;
       ++i;
       ++col;
       continue;
     }
     if (c == '(') {
-      tokens.push_back({TokenKind::LPAREN, "(", 0.0, line, start_col});
+      if (!push_token({TokenKind::LPAREN, "(", 0.0, line, start_col})) break;
       ++i;
       ++col;
       continue;
     }
     if (c == ')') {
-      tokens.push_back({TokenKind::RPAREN, ")", 0.0, line, start_col});
+      if (!push_token({TokenKind::RPAREN, ")", 0.0, line, start_col})) break;
       ++i;
       ++col;
       continue;
     }
     if (c == '{') {
-      tokens.push_back({TokenKind::LBRACE, "{", 0.0, line, start_col});
+      if (!push_token({TokenKind::LBRACE, "{", 0.0, line, start_col})) break;
       ++i;
       ++col;
       continue;
     }
     if (c == '}') {
-      tokens.push_back({TokenKind::RBRACE, "}", 0.0, line, start_col});
+      if (!push_token({TokenKind::RBRACE, "}", 0.0, line, start_col})) break;
       ++i;
       ++col;
       continue;
     }
     if (c == ',') {
-      tokens.push_back({TokenKind::COMMA, ",", 0.0, line, start_col});
+      if (!push_token({TokenKind::COMMA, ",", 0.0, line, start_col})) break;
       ++i;
       ++col;
       continue;
     }
     if (c == '=') {
-      tokens.push_back({TokenKind::EQUALS, "=", 0.0, line, start_col});
+      if (!push_token({TokenKind::EQUALS, "=", 0.0, line, start_col})) break;
       ++i;
       ++col;
       continue;
@@ -179,7 +460,7 @@ std::vector<Token> tokenize(
         ((c == '+' || c == '-') && i + 1 < n &&
          (std::isdigit(static_cast<unsigned char>(source[i + 1])) || source[i + 1] == '.')) ||
         (c == '.' && i + 1 < n && std::isdigit(static_cast<unsigned char>(source[i + 1])))) {
-      size_t start = i;
+      const size_t start = i;
       if (source[i] == '+' || source[i] == '-') {
         ++i;
         ++col;
@@ -207,14 +488,33 @@ std::vector<Token> tokenize(
           break;
         }
       }
-      const std::string lex = source.substr(start, i - start);
+      const size_t lex_len = i - start;
+      if (lex_len > DSLParser::kMaxTokenLength) {
+        D d;
+        d.severity = D::SEVERITY_ERROR;
+        d.stage = D::STAGE_LEX_SYNTAX;
+        d.line_number = line;
+        d.column_number = start_col;
+        d.statement_index = -1;
+        d.command_text = line_snippet(line, start_col);
+        d.code = "ERR_INVALID_NUMBER";
+        d.message = "Numeric literal exceeds maximum token length (" +
+          std::to_string(DSLParser::kMaxTokenLength) + " chars)";
+        sink.add(std::move(d));
+        if (!sink.can_accept_more()) {
+          sink.mark_stopped_early();
+          break;
+        }
+        continue;
+      }
+      const std::string lex = source.substr(start, lex_len);
       try {
         size_t idx = 0;
         const double val = std::stod(lex, &idx);
         if (idx != lex.size() || !std::isfinite(val)) {
           throw std::runtime_error("Non-finite numeric literal");
         }
-        tokens.push_back({TokenKind::NUMBER, lex, val, line, start_col});
+        if (!push_token({TokenKind::NUMBER, lex, val, line, start_col})) break;
       } catch (const std::exception &) {
         D d;
         d.severity = D::SEVERITY_ERROR;
@@ -222,23 +522,47 @@ std::vector<Token> tokenize(
         d.line_number = line;
         d.column_number = start_col;
         d.statement_index = -1;
-        d.command_text = line_snippet(line);
+        d.command_text = line_snippet(line, start_col);
         d.code = "ERR_INVALID_NUMBER";
         d.message = "Malformed numeric literal '" + lex + "'";
-        diags.push_back(d);
+        sink.add(std::move(d));
+        if (!sink.can_accept_more()) {
+          sink.mark_stopped_early();
+          break;
+        }
       }
       continue;
     }
 
     if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
-      size_t start = i;
+      const size_t start = i;
       while (i < n &&
              (std::isalnum(static_cast<unsigned char>(source[i])) || source[i] == '_')) {
         ++i;
         ++col;
       }
-      tokens.push_back(
-        {TokenKind::IDENT, source.substr(start, i - start), 0.0, line, start_col});
+      const size_t lex_len = i - start;
+      if (lex_len > DSLParser::kMaxTokenLength) {
+        D d;
+        d.severity = D::SEVERITY_ERROR;
+        d.stage = D::STAGE_LEX_SYNTAX;
+        d.line_number = line;
+        d.column_number = start_col;
+        d.statement_index = -1;
+        d.command_text = line_snippet(line, start_col);
+        d.code = "ERR_TOKEN_TOO_LONG";
+        d.message = "Identifier exceeds maximum token length (" +
+          std::to_string(DSLParser::kMaxTokenLength) + " chars)";
+        sink.add(std::move(d));
+        if (!sink.can_accept_more()) {
+          sink.mark_stopped_early();
+          break;
+        }
+        continue;
+      }
+      if (!push_token({TokenKind::IDENT, source.substr(start, lex_len), 0.0, line, start_col})) {
+        break;
+      }
       continue;
     }
 
@@ -248,12 +572,16 @@ std::vector<Token> tokenize(
     d.line_number = line;
     d.column_number = start_col;
     d.statement_index = -1;
-    d.command_text = line_snippet(line);
+    d.command_text = line_snippet(line, start_col);
     d.code = "ERR_UNEXPECTED_CHAR";
-    d.message = std::string("Unexpected character '") + c + "' in source";
-    diags.push_back(d);
+    d.message = "Unexpected character " + format_unexpected_char(c) + " in source";
+    sink.add(std::move(d));
     ++i;
     ++col;
+    if (!sink.can_accept_more()) {
+      sink.mark_stopped_early();
+      break;
+    }
   }
 
   tokens.push_back({TokenKind::END_OF_FILE, "<EOF>", 0.0, line, col});
@@ -272,18 +600,29 @@ class ParserImpl
 {
 public:
   using D = DSLParser::Diagnostic;
-  ParserImpl(const std::vector<Token> & tokens, const std::vector<std::string> & lines)
-  : tokens_(tokens), lines_(lines)
+  ParserImpl(
+    const std::string & source,
+    const std::vector<Token> & tokens,
+    const std::vector<LineSpan> & lines)
+  : source_(source), tokens_(tokens), lines_(lines)
   {
   }
 
-  void parse_program(ASTProgram & prog, std::vector<D> & diags)
+  void parse_program(ASTProgram & prog, DiagnosticSink & sink)
   {
     while (!at_eof()) {
+      if (!sink.can_accept_more()) {
+        sink.mark_stopped_early();
+        break;
+      }
       try {
         parse_top_level(prog);
       } catch (const ParseError & err) {
-        record_error(err, diags);
+        record_error(err, sink);
+        if (!sink.can_accept_more()) {
+          sink.mark_stopped_early();
+          break;
+        }
         synchronize();
       }
     }
@@ -291,12 +630,25 @@ public:
   }
 
 private:
+  const std::string & source_;
   const std::vector<Token> & tokens_;
-  const std::vector<std::string> & lines_;
+  const std::vector<LineSpan> & lines_;
   size_t pos_ = 0;
   int next_stmt_index_ = 0;
+  size_t total_parsed_statements_ = 0;
   std::map<std::string, std::array<double, 6>> joint_consts_;
   std::map<std::string, Eigen::Matrix4d> pose_consts_;
+
+  void consume_statement_budget(const Token & kw, int stmt_idx)
+  {
+    if (total_parsed_statements_ >= DSLParser::kMaxStatements) {
+      throw ParseError(
+        D::STAGE_SEMANTIC, kw.line, kw.column, stmt_idx, "ERR_STATEMENT_LIMIT",
+        "Program exceeds maximum statement budget (" +
+          std::to_string(DSLParser::kMaxStatements) + " statements)");
+    }
+    ++total_parsed_statements_;
+  }
 
   const Token & peek(size_t offset = 0) const
   {
@@ -337,15 +689,12 @@ private:
     return advance();
   }
 
-  std::string line_snippet(int ln) const
+  std::string line_snippet(int ln, int col = 1) const
   {
-    if (ln >= 1 && static_cast<size_t>(ln) <= lines_.size()) {
-      return trim_copy(lines_[static_cast<size_t>(ln - 1)]);
-    }
-    return "";
+    return extract_line_snippet(source_, lines_, ln, col);
   }
 
-  void record_error(const ParseError & err, std::vector<D> & diags) const
+  void record_error(const ParseError & err, DiagnosticSink & sink) const
   {
     D d;
     d.severity = D::SEVERITY_ERROR;
@@ -353,10 +702,10 @@ private:
     d.line_number = err.line;
     d.column_number = err.column;
     d.statement_index = err.stmt_idx;
-    d.command_text = line_snippet(err.line);
+    d.command_text = line_snippet(err.line, err.column);
     d.code = err.code;
     d.message = err.what();
-    diags.push_back(d);
+    sink.add(std::move(d));
   }
 
   void synchronize()
@@ -759,6 +1108,12 @@ private:
           D::STAGE_LEX_SYNTAX, pt_kw.line, pt_kw.column, stmt_idx, "ERR_SYNTAX",
           "Expected 'point(...)' inside MovePVA block, found '" + pt_kw.lexeme + "'");
       }
+      if (pva.waypoints.size() >= DSLParser::kMaxPvaWaypointsPerStatement) {
+        throw ParseError(
+          D::STAGE_SEMANTIC, pt_kw.line, pt_kw.column, stmt_idx, "ERR_PVA_WAYPOINT_LIMIT",
+          "MovePVA block exceeds maximum waypoint budget (" +
+            std::to_string(DSLParser::kMaxPvaWaypointsPerStatement) + " waypoints)");
+      }
       expect(TokenKind::LPAREN, "'(' after point", stmt_idx);
       PVAWaypoint wp;
       wp.loc = {pt_kw.line, pt_kw.column, stmt_idx, line_snippet(pt_kw.line)};
@@ -939,6 +1294,7 @@ private:
     while (peek().kind != TokenKind::RBRACE && !at_eof()) {
       const Token & inner_kw = expect(
         TokenKind::IDENT, "statement inside ImpedanceCartesian block", next_stmt_index_);
+      consume_statement_budget(inner_kw, next_stmt_index_);
       if (inner_kw.lexeme == "MoveL" || inner_kw.lexeme == "MoveC" ||
           inner_kw.lexeme == "MoveJ" || inner_kw.lexeme == "MoveP") {
         block_stmt.body.push_back(parse_motion_stmt(inner_kw, true));
@@ -1157,6 +1513,7 @@ private:
   void parse_top_level(ASTProgram & prog)
   {
     const Token & kw = expect(TokenKind::IDENT, "statement or declaration keyword", -1);
+    consume_statement_budget(kw, -1);
     if (kw.lexeme == "joint") {
       const Token & name = expect(TokenKind::IDENT, "joint constant identifier", -1);
       if (joint_consts_.count(name.lexeme) || pose_consts_.count(name.lexeme)) {
@@ -1199,6 +1556,39 @@ private:
 
 }  // namespace
 
+std::string DSLParser::sanitize_bounded_text(const std::string & text, size_t max_chars)
+{
+  return sanitize_bounded_view(text, max_chars);
+}
+
+void DSLParser::enforce_diagnostic_budget(
+  std::vector<Diagnostic> & diags,
+  size_t additional_suppressed,
+  bool stopped_early)
+{
+  if (diags.empty() && additional_suppressed == 0 && !stopped_early) {
+    return;
+  }
+  std::vector<Diagnostic> bounded;
+  bounded.reserve(std::min(diags.size() + 1, kMaxDiagnostics));
+  DiagnosticSink sink(bounded);
+  for (auto & d : diags) {
+    if (d.code == "WARN_DIAGNOSTICS_TRUNCATED") {
+      stopped_early = true;
+      continue;
+    }
+    sink.add(std::move(d));
+  }
+  if (additional_suppressed > 0) {
+    sink.add_suppressed(additional_suppressed);
+  }
+  if (stopped_early) {
+    sink.mark_stopped_early();
+  }
+  sink.finalize();
+  diags.swap(bounded);
+}
+
 bool DSLParser::parse(
   const std::string & source,
   ASTProgram & out_program,
@@ -1207,21 +1597,46 @@ bool DSLParser::parse(
   out_program = ASTProgram{};
   out_diagnostics.clear();
 
-  auto has_error = [](const std::vector<Diagnostic> & diags) {
-    return std::any_of(diags.begin(), diags.end(), [](const Diagnostic & d) {
-      return d.severity == Diagnostic::SEVERITY_ERROR;
-    });
-  };
-
-  const auto lines = split_lines(source);
-  const auto tokens = tokenize(source, lines, out_diagnostics);
-  if (has_error(out_diagnostics)) {
+  if (source.size() > kMaxSourceBytes) {
+    Diagnostic d;
+    d.severity = Diagnostic::SEVERITY_ERROR;
+    d.stage = Diagnostic::STAGE_LEX_SYNTAX;
+    d.line_number = 1;
+    d.column_number = 1;
+    d.statement_index = -1;
+    d.code = "ERR_SOURCE_TOO_LARGE";
+    d.message = "Source program size (" + std::to_string(source.size()) +
+      " bytes) exceeds maximum limit (" + std::to_string(kMaxSourceBytes) + " bytes)";
+    out_diagnostics.push_back(std::move(d));
     return false;
   }
 
-  ParserImpl parser(tokens, lines);
-  parser.parse_program(out_program, out_diagnostics);
-  if (has_error(out_diagnostics)) {
+  std::vector<LineSpan> lines;
+  if (!index_lines(source, lines)) {
+    Diagnostic d;
+    d.severity = Diagnostic::SEVERITY_ERROR;
+    d.stage = Diagnostic::STAGE_LEX_SYNTAX;
+    d.line_number = 1;
+    d.column_number = 1;
+    d.statement_index = -1;
+    d.code = "ERR_SOURCE_TOO_LARGE";
+    d.message = "Source program exceeds maximum line count (" +
+      std::to_string(kMaxSourceLines) + " lines)";
+    out_diagnostics.push_back(std::move(d));
+    return false;
+  }
+
+  DiagnosticSink sink(out_diagnostics);
+  const auto tokens = tokenize(source, lines, sink);
+  if (sink.error_count() > 0) {
+    sink.finalize();
+    return false;
+  }
+
+  ParserImpl parser(source, tokens, lines);
+  parser.parse_program(out_program, sink);
+  if (sink.error_count() > 0) {
+    sink.finalize();
     return false;
   }
 
@@ -1232,13 +1647,15 @@ bool DSLParser::parse(
     d.line_number = 1;
     d.column_number = 1;
     d.statement_index = -1;
-    d.command_text = trim_copy(lines.front());
+    d.command_text = extract_line_snippet(source, lines, 1, 1);
     d.code = "ERR_EMPTY_PROGRAM";
     d.message = "Program contains no executable motion, gripper, or wait statements";
-    out_diagnostics.push_back(d);
+    sink.add(std::move(d));
+    sink.finalize();
     return false;
   }
 
+  sink.finalize();
   return true;
 }
 

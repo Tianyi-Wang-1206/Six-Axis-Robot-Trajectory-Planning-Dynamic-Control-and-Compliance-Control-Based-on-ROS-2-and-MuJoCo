@@ -128,6 +128,15 @@ private:
     double failure_limit = 0.0;
   };
   void configure_trajectory_action();
+  bool valid_pva_sample_and_step(
+    size_t joint_idx,
+    double q, double dq, double ddq,
+    double pos_limit_tol,
+    double max_vel,
+    double max_acc,
+    bool has_prev,
+    double prev_q, double prev_dq, double prev_ddq,
+    double dt) const;
   bool valid_trajectory_goal(
     const FollowTrajectory::Goal & goal, bool * out_uniform_1khz = nullptr) const;
   bool check_trajectory_entry_continuity(
@@ -160,6 +169,9 @@ private:
   // Borrowed from the RT buffer once per update; valid until the next RT read.
   TrajectoryExecution * current_execution_ = nullptr;
   std::atomic<const TrajectoryExecution *> rt_seen_execution_{nullptr};
+  static constexpr size_t kMaxTrajectoryPoints = 300001;
+  std::vector<double> execution_max_joint_velocity_, execution_max_joint_acceleration_;
+  double execution_position_limit_tolerance_ = 1e-4;
   std::vector<double> path_position_tolerance_, path_velocity_tolerance_;
   std::vector<double> goal_position_tolerance_, goal_velocity_tolerance_;
   std::vector<double> sysid_goal_position_tolerance_, sysid_goal_velocity_tolerance_;
@@ -512,6 +524,10 @@ private:
   // Leaf mutex (never held across waits) synchronizing non-RT enqueue with
   // on_activate/on_deactivate epoch and queue resets.
   std::mutex cmd_queue_mutex_;
+  // Bounds concurrent non-E-STOP executor waiters so executor threads remain free for
+  // lock-free CMD_ESTOP preemption and action/timer callbacks under command bursts.
+  std::atomic<uint32_t> ordinary_cmd_waiters_{0};
+  uint32_t max_ordinary_cmd_waiters_ = 4;
   // Reentrant so CMD_ESTOP never waits behind a pending command's RT handshake.
   rclcpp::CallbackGroup::SharedPtr command_callback_group_;
   rclcpp::Service<lite6_interfaces::srv::ControllerCommand>::SharedPtr command_service_;

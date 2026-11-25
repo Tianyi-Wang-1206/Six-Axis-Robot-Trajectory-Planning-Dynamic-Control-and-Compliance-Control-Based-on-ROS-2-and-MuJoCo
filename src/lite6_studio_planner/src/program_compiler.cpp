@@ -50,16 +50,33 @@ void add_diag_with_severity(
   const std::string & code,
   const std::string & msg)
 {
+  // Keep space for at least one fatal error even after many warnings, while strictly
+  // capping growth so enforce_diagnostic_budget() can emit a truncation notice.
+  if (severity == D::SEVERITY_ERROR) {
+    if (diags.size() >= DSLParser::kMaxDiagnostics - 1) {
+      for (auto it = diags.rbegin(); it != diags.rend(); ++it) {
+        if (it->severity != D::SEVERITY_ERROR) {
+          diags.erase(std::next(it).base());
+          break;
+        }
+      }
+      if (diags.size() >= DSLParser::kMaxDiagnostics) {
+        return;
+      }
+    }
+  } else if (diags.size() >= DSLParser::kMaxDiagnostics) {
+    return;
+  }
   D d;
   d.severity = severity;
   d.stage = stage;
   d.line_number = loc.line;
   d.column_number = loc.column;
   d.statement_index = loc.statement_index;
-  d.command_text = loc.text;
-  d.code = code;
-  d.message = msg;
-  diags.push_back(d);
+  d.command_text = DSLParser::sanitize_bounded_text(loc.text, DSLParser::kMaxSnippetChars);
+  d.code = DSLParser::sanitize_bounded_text(code, 64);
+  d.message = DSLParser::sanitize_bounded_text(msg, DSLParser::kMaxDiagnosticMessageChars);
+  diags.push_back(std::move(d));
 }
 
 void add_diag(
@@ -257,6 +274,9 @@ SampledTrajectory1kHz scurve_samples(
     *out_cancelled = false;
   }
   SampledTrajectory1kHz sampled;
+  if (!std::isfinite(scurve.duration()) || scurve.duration() < 0.0 || scurve.duration() > 300.0) {
+    return sampled;
+  }
   const int total_ticks = std::max(1, static_cast<int>(std::llround(scurve.duration() * 1000.0)));
   sampled.duration_sec = static_cast<double>(total_ticks) * 0.001;
   sampled.samples.reserve(static_cast<size_t>(total_ticks + 1));
@@ -350,7 +370,8 @@ bool ProgramCompiler::verify_sampled_trajectory_1khz(
   std::vector<Diagnostic> & diags,
   bool is_impedance,
   bool enforce_jerk,
-  const Cancellation & is_cancelled) const
+  const Cancellation & is_cancelled,
+  size_t max_samples) const
 {
   if (sampled.samples.size() < 2) {
     SourceLocation loc;
@@ -360,6 +381,13 @@ bool ProgramCompiler::verify_sampled_trajectory_1khz(
     add_diag(
       diags, D::STAGE_PLANNING, loc, "ERR_TOO_FEW_SAMPLES",
       "Generated trajectory has fewer than 2 samples");
+    return false;
+  }
+  if (sampled.samples.size() > max_samples) {
+    add_diag(
+      diags, D::STAGE_PLANNING, sampled.samples.front().loc, "ERR_PROGRAM_RESOURCE_LIMIT",
+      "Compiled program exceeds maximum 1 kHz sample budget (" +
+        std::to_string(kMaxProgramSamples1kHz) + " samples)");
     return false;
   }
 
@@ -529,7 +557,8 @@ bool ProgramCompiler::compile_cartesian_group(
   const ImpedanceParams & imp_params,
   ExecutionBlock & out_block,
   std::vector<Diagnostic> & out_diagnostics,
-  const Cancellation & is_cancelled) const
+  const Cancellation & is_cancelled,
+  size_t max_samples) const
 {
   if (is_cancelled && is_cancelled()) {
     add_diag(out_diagnostics, D::STAGE_PLANNING, group.front().loc, "ERR_CANCELLED",
@@ -596,7 +625,7 @@ bool ProgramCompiler::compile_cartesian_group(
   SampledTrajectory1kHz sampled;
   if (!plan_cartesian_path(
         cart_path, start_q, group.front().options, group.front().loc, is_impedance, sampled,
-        out_diagnostics, is_cancelled))
+        out_diagnostics, is_cancelled, max_samples))
   {
     return false;
   }
@@ -890,7 +919,8 @@ bool ProgramCompiler::plan_cartesian_path(
   bool is_impedance,
   SampledTrajectory1kHz & out_sampled,
   std::vector<Diagnostic> & out_diagnostics,
-  const Cancellation & is_cancelled) const
+  const Cancellation & is_cancelled,
+  size_t max_samples) const
 {
   C3JointSpline joint_path;
   if (!build_cartesian_joint_path(cart_path, start_q, joint_path, out_diagnostics, is_cancelled)) {
@@ -916,7 +946,7 @@ bool ProgramCompiler::plan_cartesian_path(
   }
   return verify_sampled_trajectory_1khz(
     out_sampled, /*check_singularity=*/true, out_diagnostics, is_impedance,
-    /*enforce_jerk=*/true, is_cancelled);
+    /*enforce_jerk=*/true, is_cancelled, max_samples);
 }
 
 double ProgramCompiler::tcp_blend_trim(
@@ -1197,7 +1227,8 @@ bool ProgramCompiler::compile_joint_group(
   const std::array<double, 6> & start_q,
   ExecutionBlock & out_block,
   std::vector<Diagnostic> & out_diagnostics,
-  const Cancellation & is_cancelled) const
+  const Cancellation & is_cancelled,
+  size_t max_samples) const
 {
   std::vector<std::array<double, 6>> waypoints;
   JointCompositePath path;
@@ -1221,6 +1252,15 @@ bool ProgramCompiler::compile_joint_group(
         out_diagnostics, D::STAGE_PLANNING, st.loc, "ERR_DURATION_LIMIT",
         "Computed S-curve trajectory duration=" + std::to_string(scurve.duration()) +
           " s exceeds 300 s limit");
+      return false;
+    }
+    const size_t est_samples =
+      static_cast<size_t>(std::max(1LL, std::llround(scurve.duration() * 1000.0))) + 1;
+    if (est_samples > max_samples) {
+      add_diag(
+        out_diagnostics, D::STAGE_PLANNING, st.loc, "ERR_PROGRAM_RESOURCE_LIMIT",
+        "Compiled program exceeds maximum 1 kHz sample budget (" +
+          std::to_string(kMaxProgramSamples1kHz) + " samples)");
       return false;
     }
     bool cancelled = false;
@@ -1255,7 +1295,7 @@ bool ProgramCompiler::compile_joint_group(
 
   if (!verify_sampled_trajectory_1khz(
         sampled, /*check_singularity=*/false, out_diagnostics,
-        /*is_impedance=*/false, /*enforce_jerk=*/true, is_cancelled))
+        /*is_impedance=*/false, /*enforce_jerk=*/true, is_cancelled, max_samples))
   {
     return false;
   }
@@ -1275,7 +1315,8 @@ bool ProgramCompiler::compile_pva_statement(
   const ImpedanceParams & imp_params,
   ExecutionBlock & out_block,
   std::vector<Diagnostic> & out_diagnostics,
-  const Cancellation & is_cancelled) const
+  const Cancellation & is_cancelled,
+  size_t max_samples) const
 {
   if (is_cancelled && is_cancelled()) {
     add_diag(
@@ -1356,7 +1397,7 @@ bool ProgramCompiler::compile_pva_statement(
       }
       if (!plan_cartesian_path(
             cart_spline, start_q, pva.options, pva.loc, is_impedance, sampled, out_diagnostics,
-            is_cancelled))
+            is_cancelled, max_samples))
       {
         return false;
       }
@@ -1398,7 +1439,8 @@ bool ProgramCompiler::compile_pva_statement(
 
     sampled = std::move(coll_res.trajectory);
     if (!verify_sampled_trajectory_1khz(
-          sampled, /*check_singularity=*/true, out_diagnostics, is_impedance, true, is_cancelled))
+          sampled, /*check_singularity=*/true, out_diagnostics, is_impedance, true, is_cancelled,
+          max_samples))
     {
       return false;
     }
@@ -1439,6 +1481,25 @@ bool ProgramCompiler::compile_pva_statement(
       scurve.build(
         start_q, q_nodes[1], limits,
         pva.options.vel_scale, pva.options.acc_scale, pva.options.jerk_scale);
+      constexpr double kMaxSCurveDurationSec = 300.0;
+      if (!std::isfinite(scurve.duration()) || scurve.duration() <= 0.0 ||
+          scurve.duration() > kMaxSCurveDurationSec)
+      {
+        add_diag(
+          out_diagnostics, D::STAGE_PLANNING, pva.waypoints.front().loc, "ERR_DURATION_LIMIT",
+          "Computed S-curve trajectory duration=" + std::to_string(scurve.duration()) +
+            " s exceeds 300 s limit");
+        return false;
+      }
+      const size_t est_samples =
+        static_cast<size_t>(std::max(1LL, std::llround(scurve.duration() * 1000.0))) + 1;
+      if (est_samples > max_samples) {
+        add_diag(
+          out_diagnostics, D::STAGE_PLANNING, pva.waypoints.front().loc, "ERR_PROGRAM_RESOURCE_LIMIT",
+          "Compiled program exceeds maximum 1 kHz sample budget (" +
+            std::to_string(kMaxProgramSamples1kHz) + " samples)");
+        return false;
+      }
       bool cancelled = false;
       sampled = scurve_samples(
         scurve, pva.waypoints.front().loc, 0.0, 1.0, is_cancelled, &cancelled);
@@ -1506,7 +1567,8 @@ bool ProgramCompiler::compile_pva_statement(
   }
 
   if (!verify_sampled_trajectory_1khz(
-        sampled, /*check_singularity=*/false, out_diagnostics, is_impedance, true, is_cancelled))
+        sampled, /*check_singularity=*/false, out_diagnostics, is_impedance, true, is_cancelled,
+        max_samples))
   {
     return false;
   }
@@ -1552,6 +1614,35 @@ bool ProgramCompiler::compile(
   out_program.source_code = source_code;
   out_program.total_statements = static_cast<uint32_t>(ast.total_leaf_statements);
   out_program.initial_joints = curr_q;
+  size_t cumulative_samples = 0;
+
+  auto append_block_checked = [&](ExecutionBlock && blk) -> bool {
+    if (out_program.blocks.size() >= kMaxProgramBlocks) {
+      add_diag(
+        out_diagnostics, D::STAGE_PLANNING, blk.loc, "ERR_PROGRAM_RESOURCE_LIMIT",
+        "Compiled program exceeds maximum block budget (" +
+          std::to_string(kMaxProgramBlocks) + " blocks)");
+      return false;
+    }
+    size_t blk_samples = 0;
+    if (blk.type == ExecutionBlockType::RIGID_TRAJECTORY) {
+      blk_samples = blk.rigid_trajectory.points.size();
+    } else if (blk.type == ExecutionBlockType::IMPEDANCE_TRAJECTORY) {
+      blk_samples = blk.impedance_goal.points.size();
+    }
+    if (blk_samples > kMaxProgramSamples1kHz ||
+        cumulative_samples + blk_samples > kMaxProgramSamples1kHz)
+    {
+      add_diag(
+        out_diagnostics, D::STAGE_PLANNING, blk.loc, "ERR_PROGRAM_RESOURCE_LIMIT",
+        "Compiled program exceeds maximum 1 kHz sample budget (" +
+          std::to_string(kMaxProgramSamples1kHz) + " samples)");
+      return false;
+    }
+    cumulative_samples += blk_samples;
+    out_program.blocks.push_back(std::move(blk));
+    return true;
+  };
 
   // Recursive statement list compiler supporting corner-blended groups
   auto compile_stmt_list = [&](
@@ -1629,25 +1720,37 @@ bool ProgramCompiler::compile(
         }
 
         ExecutionBlock blk;
+        const size_t rem_samples =
+          (cumulative_samples < kMaxProgramSamples1kHz) ?
+          (kMaxProgramSamples1kHz - cumulative_samples) : 0;
         const bool ok = is_cart ?
           compile_cartesian_group(
-            group, curr_q, is_impedance, imp_params, blk, out_diagnostics, is_cancelled) :
-          compile_joint_group(group, curr_q, blk, out_diagnostics, is_cancelled);
+            group, curr_q, is_impedance, imp_params, blk, out_diagnostics, is_cancelled,
+            rem_samples) :
+          compile_joint_group(group, curr_q, blk, out_diagnostics, is_cancelled, rem_samples);
         if (!ok) {
           return false;
         }
         curr_q = blk.end_joints;
-        out_program.blocks.push_back(std::move(blk));
+        if (!append_block_checked(std::move(blk))) {
+          return false;
+        }
         ++i;
       } else if (st.kind == StatementKind::MOVE_PVA) {
         ExecutionBlock blk;
+        const size_t rem_samples =
+          (cumulative_samples < kMaxProgramSamples1kHz) ?
+          (kMaxProgramSamples1kHz - cumulative_samples) : 0;
         if (!compile_pva_statement(
-              *st.move_pva, curr_q, is_impedance, imp_params, blk, out_diagnostics, is_cancelled))
+              *st.move_pva, curr_q, is_impedance, imp_params, blk, out_diagnostics, is_cancelled,
+              rem_samples))
         {
           return false;
         }
         curr_q = blk.end_joints;
-        out_program.blocks.push_back(std::move(blk));
+        if (!append_block_checked(std::move(blk))) {
+          return false;
+        }
         ++i;
       } else if (st.kind == StatementKind::IMPEDANCE_BLOCK) {
         if (!self_ref(st.body, true, *st.impedance_params, self_ref)) {
@@ -1662,7 +1765,9 @@ bool ProgramCompiler::compile(
         blk.end_joints = curr_q;
         blk.gripper_cmd = *st.gripper;
         blk.duration_sec = st.gripper->wait_for_completion ? 0.6 : 0.01;
-        out_program.blocks.push_back(std::move(blk));
+        if (!append_block_checked(std::move(blk))) {
+          return false;
+        }
         ++i;
       } else if (st.kind == StatementKind::WAIT) {
         ExecutionBlock blk;
@@ -1672,7 +1777,9 @@ bool ProgramCompiler::compile(
         blk.end_joints = curr_q;
         blk.wait_cmd = *st.wait_stmt;
         blk.duration_sec = st.wait_stmt->duration_sec;
-        out_program.blocks.push_back(std::move(blk));
+        if (!append_block_checked(std::move(blk))) {
+          return false;
+        }
         ++i;
       } else if (st.kind == StatementKind::SET_PAYLOAD) {
         if (!st.payload_stmt || !lite6_interfaces::valid_payload_params(
@@ -1688,7 +1795,9 @@ bool ProgramCompiler::compile(
         blk.end_joints = curr_q;
         blk.payload_cmd = *st.payload_stmt;
         blk.duration_sec = 0.05;
-        out_program.blocks.push_back(std::move(blk));
+        if (!append_block_checked(std::move(blk))) {
+          return false;
+        }
         ++i;
       }
     }
@@ -1696,6 +1805,7 @@ bool ProgramCompiler::compile(
   };
 
   if (!compile_stmt_list(ast.statements, false, ImpedanceParams{}, compile_stmt_list)) {
+    DSLParser::enforce_diagnostic_budget(out_diagnostics);
     return false;
   }
 
@@ -1716,6 +1826,7 @@ bool ProgramCompiler::compile(
   const auto stamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
     std::chrono::system_clock::now().time_since_epoch()).count();
   out_program.program_id = "prog_" + std::to_string(stamp_ms);
+  DSLParser::enforce_diagnostic_budget(out_diagnostics);
   return true;
 }
 

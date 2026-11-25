@@ -2636,6 +2636,16 @@ Verify1kHzReport sample_and_verify_1khz(
     out_knot_times[i + 1] = out_knot_times[i] + mesh.gamma[i] * mesh.T[mesh.interval_seg[i]];
   }
   const double T_total = out_knot_times.back();
+  constexpr double kMaxCollocationDurationSec = 300.0;
+  if (!std::isfinite(T_total) || T_total <= 0.0 || T_total > kMaxCollocationDurationSec) {
+    rep.all_ok = false;
+    rep.first_error_code = "ERR_DURATION_LIMIT";
+    rep.first_error_msg = "Cartesian collocation trajectory duration is non-finite or exceeds 300 s limit";
+    if (!waypoints.empty()) {
+      rep.first_error_loc = waypoints.front().loc;
+    }
+    return rep;
+  }
   const int total_ticks = std::max(2, static_cast<int>(std::llround(T_total * 1000.0)));
   const double T_grid = static_cast<double>(total_ticks) * 0.001;
 

@@ -96,6 +96,9 @@ public:
   // Joint speed cap [rad/s] for impedance trajectory blocks: 90 % of the CTC
   // impedance_execution.max_joint_velocity (3.0 rad/s), whose violation latches E-STOP.
   static constexpr double kImpedanceJointVelocityCap = 2.7;
+  // Program-wide compilation resource caps preventing unbounded trajectory allocation.
+  static constexpr size_t kMaxProgramBlocks = 512;
+  static constexpr size_t kMaxProgramSamples1kHz = 180000;
 
   using Diagnostic = lite6_interfaces::msg::CompileDiagnostic;
   using Cancellation = std::function<bool()>;
@@ -201,14 +204,16 @@ private:
     const ImpedanceParams & imp_params,
     ExecutionBlock & out_block,
     std::vector<Diagnostic> & out_diagnostics,
-    const Cancellation & is_cancelled = {}) const;
+    const Cancellation & is_cancelled = {},
+    size_t max_samples = kMaxProgramSamples1kHz) const;
 
   bool compile_joint_group(
     const std::vector<MotionStatement> & group,
     const std::array<double, 6> & start_q,
     ExecutionBlock & out_block,
     std::vector<Diagnostic> & out_diagnostics,
-    const Cancellation & is_cancelled = {}) const;
+    const Cancellation & is_cancelled = {},
+    size_t max_samples = kMaxProgramSamples1kHz) const;
 
   // Joint-space Hermite path through IK knots of a Cartesian path; nodal derivatives
   // dq/du, d2q/du2 come from differential kinematics on the analytic Cartesian path
@@ -229,7 +234,8 @@ private:
     bool is_impedance,
     SampledTrajectory1kHz & out_sampled,
     std::vector<Diagnostic> & out_diagnostics,
-    const Cancellation & is_cancelled = {}) const;
+    const Cancellation & is_cancelled = {},
+    size_t max_samples = kMaxProgramSamples1kHz) const;
 
   // Joint limits used to plan and verify a block. Impedance blocks additionally cap
   // max_vel at kImpedanceJointVelocityCap so the measured joint speed (reference plus
@@ -266,7 +272,8 @@ private:
     const ImpedanceParams & imp_params,
     ExecutionBlock & out_block,
     std::vector<Diagnostic> & out_diagnostics,
-    const Cancellation & is_cancelled = {}) const;
+    const Cancellation & is_cancelled = {},
+    size_t max_samples = kMaxProgramSamples1kHz) const;
 
   bool verify_sampled_trajectory_1khz(
     const SampledTrajectory1kHz & sampled,
@@ -274,7 +281,8 @@ private:
     std::vector<Diagnostic> & diags,
     bool is_impedance = false,
     bool enforce_jerk = true,
-    const Cancellation & is_cancelled = {}) const;
+    const Cancellation & is_cancelled = {},
+    size_t max_samples = kMaxProgramSamples1kHz) const;
 };
 
 }  // namespace lite6_studio_planner

@@ -33,6 +33,9 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
   auto_declare<double>("tanh_slope", 300.0);
 
   auto_declare<std::vector<double>>("estop_decel", {17.5, 12.5, 20.0, 40.0, 40.0, 50.0});
+  auto_declare<std::vector<double>>("execution.max_joint_velocity", {3.14, 3.14, 3.14, 3.14, 3.14, 3.14});
+  auto_declare<std::vector<double>>("execution.max_joint_acceleration", {3.5, 2.5, 4.0, 8.0, 8.0, 10.0});
+  auto_declare<double>("execution.position_limit_tolerance", 1e-4);
   auto_declare<std::vector<double>>("execution.path_position_tolerance", std::vector<double>(6, 0.1));
   auto_declare<std::vector<double>>("execution.path_velocity_tolerance", std::vector<double>(6, 0.5));
   auto_declare<std::vector<double>>("execution.goal_position_tolerance", std::vector<double>(6, 0.00015));
@@ -165,6 +168,12 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   rt_seen_impedance_execution_.store(nullptr, std::memory_order_release);
   publish_measured_state_atomic(false);
 
+  execution_max_joint_velocity_ =
+    get_node()->get_parameter("execution.max_joint_velocity").as_double_array();
+  execution_max_joint_acceleration_ =
+    get_node()->get_parameter("execution.max_joint_acceleration").as_double_array();
+  execution_position_limit_tolerance_ =
+    get_node()->get_parameter("execution.position_limit_tolerance").as_double();
   path_position_tolerance_ = get_node()->get_parameter("execution.path_position_tolerance").as_double_array();
   path_velocity_tolerance_ = get_node()->get_parameter("execution.path_velocity_tolerance").as_double_array();
   goal_position_tolerance_ = get_node()->get_parameter("execution.goal_position_tolerance").as_double_array();
@@ -176,14 +185,24 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   goal_settle_duration_ = get_node()->get_parameter("execution.goal_settle_duration").as_double();
   goal_time_tolerance_ = get_node()->get_parameter("execution.goal_time_tolerance").as_double();
   saturation_timeout_ = get_node()->get_parameter("execution.saturation_timeout").as_double();
-  for (const auto * values : {&path_position_tolerance_, &path_velocity_tolerance_,
+  for (const auto * values : {&execution_max_joint_velocity_, &execution_max_joint_acceleration_,
+      &path_position_tolerance_, &path_velocity_tolerance_,
       &goal_position_tolerance_, &sysid_goal_position_tolerance_, &goal_velocity_tolerance_,
       &sysid_goal_velocity_tolerance_}) {
     if (values->size() != n || !std::all_of(values->begin(), values->end(),
         [](double value) {return std::isfinite(value) && value > 0.0;})) {
-      RCLCPP_ERROR(get_node()->get_logger(), "Execution tolerances require six finite positive values");
+      RCLCPP_ERROR(get_node()->get_logger(), "Execution limits and tolerances require six finite positive values");
       return controller_interface::CallbackReturn::ERROR;
     }
+  }
+  if (!std::isfinite(execution_position_limit_tolerance_) ||
+      execution_position_limit_tolerance_ < 0.0 ||
+      execution_position_limit_tolerance_ > 0.01)
+  {
+    RCLCPP_ERROR(
+      get_node()->get_logger(),
+      "execution.position_limit_tolerance must be finite and lie in [0.0, 0.01] rad");
+    return controller_interface::CallbackReturn::ERROR;
   }
   if (!std::isfinite(entry_position_tolerance_) || entry_position_tolerance_ <= 0.0 ||
       !std::isfinite(entry_velocity_tolerance_) || entry_velocity_tolerance_ <= 0.0)
@@ -347,6 +366,36 @@ controller_interface::CallbackReturn Lite6CTCController::on_configure(const rclc
   } catch (const std::exception &) {
     RCLCPP_ERROR(get_node()->get_logger(), "Failed to load URDF");
     return controller_interface::CallbackReturn::ERROR;
+  }
+
+  for (size_t i = 0; i < n; ++i) {
+    const int j = static_cast<int>(i);
+    const double lo = pin_model_.lowerPositionLimit[j];
+    const double hi = pin_model_.upperPositionLimit[j];
+    const double urdf_vel = pin_model_.velocityLimit[j];
+    if (!std::isfinite(lo) || !std::isfinite(hi) || !(lo < hi) ||
+        !std::isfinite(urdf_vel) || !(urdf_vel > 0.0))
+    {
+      RCLCPP_ERROR(
+        get_node()->get_logger(),
+        "URDF joint%zu must define finite lower < upper position limits and positive velocity limit",
+        i + 1);
+      return controller_interface::CallbackReturn::ERROR;
+    }
+    if (execution_max_joint_velocity_[i] > urdf_vel + 1e-6) {
+      RCLCPP_ERROR(
+        get_node()->get_logger(),
+        "execution.max_joint_velocity[%zu]=%.4f exceeds URDF velocity limit %.4f rad/s",
+        i, execution_max_joint_velocity_[i], urdf_vel);
+      return controller_interface::CallbackReturn::ERROR;
+    }
+    if (execution_max_joint_acceleration_[i] > estop_decel_[static_cast<Eigen::Index>(i)] + 1e-6) {
+      RCLCPP_ERROR(
+        get_node()->get_logger(),
+        "execution.max_joint_acceleration[%zu]=%.4f exceeds estop_decel %.4f rad/s^2",
+        i, execution_max_joint_acceleration_[i], estop_decel_[static_cast<Eigen::Index>(i)]);
+      return controller_interface::CallbackReturn::ERROR;
+    }
   }
 
   if (!state_shm_.valid() && !state_shm_.open(true)) {
@@ -1192,8 +1241,17 @@ bool Lite6CTCController::step_deceleration_tracker(double dt)
 
 void Lite6CTCController::configure_command_service()
 {
+  // Reserve at least half the executor threads for lock-free CMD_ESTOP preemption,
+  // action callbacks, and timers under concurrent non-E-STOP bursts.
+  const unsigned int hw_threads = std::thread::hardware_concurrency();
+  max_ordinary_cmd_waiters_ = std::clamp<uint32_t>(
+    hw_threads > 1u ? (hw_threads / 2u) : 1u, 1u, 8u);
+  ordinary_cmd_waiters_.store(0u, std::memory_order_release);
+
   command_callback_group_ = get_node()->create_callback_group(
     rclcpp::CallbackGroupType::Reentrant);
+  // Deep reliable service queue (256) prevents silent DDS KEEP_LAST(10) drops under
+  // command bursts while remaining 100% RxO-compatible with default ServicesQoS clients.
   command_service_ = get_node()->create_service<lite6_interfaces::srv::ControllerCommand>(
     "~/command",
     [this](
@@ -1247,7 +1305,7 @@ void Lite6CTCController::configure_command_service()
         std::chrono::milliseconds(lite6_interfaces::contract::kControllerCmdWaitTimeoutMs);
 
       if (req->command == Cmd::CMD_ESTOP) {
-        // E-STOP fast path: no epoch check, no command mutex, no ring slot.
+        // E-STOP fast path: no epoch check, no waiter cap, no command mutex, no ring slot.
         // Publish cmd_seq before incrementing estop_generation_ so the RT loop
         // correlates this E-STOP sequence into ControllerStatus.last_cmd_*.
         const uint64_t estop_seq =
@@ -1282,6 +1340,32 @@ void Lite6CTCController::configure_command_service()
         return;
       }
 
+      // Explicit concurrency backpressure for non-E-STOP commands: cap concurrent waiters
+      // on cmd_service_mutex_ so excess requests receive an immediate definitive rejection
+      // instead of blocking the executor pool or starving CMD_ESTOP.
+      uint32_t waiters = ordinary_cmd_waiters_.load(std::memory_order_acquire);
+      while (true) {
+        if (waiters >= max_ordinary_cmd_waiters_) {
+          resp->accepted = false;
+          resp->ack_result = Resp::ACK_REJECTED_BUSY;
+          resp->cmd_seq = 0;
+          fill_snapshot();
+          resp->message =
+            "Controller command gateway busy (concurrency limit reached); command not queued";
+          return;
+        }
+        if (ordinary_cmd_waiters_.compare_exchange_weak(
+              waiters, waiters + 1u, std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+          break;
+        }
+      }
+      struct WaiterGuard
+      {
+        std::atomic<uint32_t> & counter;
+        ~WaiterGuard() { counter.fetch_sub(1u, std::memory_order_acq_rel); }
+      } waiter_guard{ordinary_cmd_waiters_};
+
       std::lock_guard<std::mutex> lock(cmd_service_mutex_);
 
       uint64_t active_epoch = 0;
@@ -1294,6 +1378,22 @@ void Lite6CTCController::configure_command_service()
           resp->cmd_seq = 0;
           fill_snapshot();
           resp->message = "CTC controller is not active";
+          return;
+        }
+        if (estop_generation_.load(std::memory_order_acquire) != request_estop_generation) {
+          resp->accepted = false;
+          resp->ack_result = Resp::ACK_REJECTED_STATE;
+          resp->cmd_seq = 0;
+          fill_snapshot();
+          resp->message = "Superseded by E-STOP before RT handoff; command not applied";
+          return;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+          resp->accepted = false;
+          resp->ack_result = Resp::ACK_RT_TIMEOUT;
+          resp->cmd_seq = 0;
+          fill_snapshot();
+          resp->message = "Timed out waiting for controller command gateway; command not queued";
           return;
         }
         active_epoch = controller_epoch_atomic_.load(std::memory_order_acquire);
@@ -1408,7 +1508,7 @@ void Lite6CTCController::configure_command_service()
       resp->message =
         "RT loop claimed the command without timely acknowledgement; outcome unknown, reconcile via ControllerStatus";
     },
-    rclcpp::ServicesQoS(), command_callback_group_);
+    rclcpp::ServicesQoS().keep_last(256), command_callback_group_);
 }
 
 void Lite6CTCController::process_controller_commands(double /*dt*/)

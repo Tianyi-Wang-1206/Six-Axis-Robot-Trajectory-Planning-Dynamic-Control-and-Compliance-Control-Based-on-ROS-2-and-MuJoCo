@@ -79,9 +79,60 @@ uint8_t map_trajectory_estop_reason(ResultEnum reason)
 }
 }  // namespace
 
+bool Lite6CTCController::valid_pva_sample_and_step(
+  size_t joint_idx,
+  double q, double dq, double ddq,
+  double pos_limit_tol,
+  double max_vel,
+  double max_acc,
+  bool has_prev,
+  double prev_q, double prev_dq, double prev_ddq,
+  double dt) const
+{
+  if (!std::isfinite(q) || !std::isfinite(dq) || !std::isfinite(ddq)) {
+    return false;
+  }
+  const int j = static_cast<int>(joint_idx);
+  if (q < pin_model_.lowerPositionLimit[j] - pos_limit_tol ||
+      q > pin_model_.upperPositionLimit[j] + pos_limit_tol)
+  {
+    return false;
+  }
+  constexpr double kVelLimitTol = 1e-4;
+  constexpr double kAccLimitTol = 1e-3;
+  if (std::abs(dq) > max_vel + kVelLimitTol) {
+    return false;
+  }
+  if (std::abs(ddq) > max_acc + kAccLimitTol) {
+    return false;
+  }
+  if (has_prev) {
+    constexpr double kPosStepTol = 1e-4;
+    constexpr double kVelStepTol = 1e-3;
+    const double dq_step = q - prev_q;
+    if (std::abs(dq_step) > max_vel * dt + kPosStepTol) {
+      return false;
+    }
+    const double pos_trap_err = std::abs(dq_step - 0.5 * (prev_dq + dq) * dt);
+    if (pos_trap_err > 0.5 * max_acc * dt * dt + kPosStepTol) {
+      return false;
+    }
+    const double dv_step = dq - prev_dq;
+    if (std::abs(dv_step) > max_acc * dt + kVelStepTol) {
+      return false;
+    }
+    const double vel_trap_err = std::abs(dv_step - 0.5 * (prev_ddq + ddq) * dt);
+    if (vel_trap_err > max_acc * dt + kVelStepTol) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // Playback uses 1 kHz sampled PVA with zero-order hold (ZOH). Regular FollowJointTrajectory
 // goals must have a zero header.stamp, start at time_from_start == 0, maintain uniform 1 ms
-// sample spacing within kTrajectorySampleSpacingTolSec, and end at rest.
+// sample spacing within kTrajectorySampleSpacingTolSec, respect per-joint PVA bounds and
+// inter-sample kinematic consistency, and end at rest.
 bool Lite6CTCController::valid_trajectory_goal(
   const FollowTrajectory::Goal & goal, bool * out_uniform_1khz) const
 {
@@ -89,6 +140,7 @@ bool Lite6CTCController::valid_trajectory_goal(
   const bool zero_stamp =
     trajectory.header.stamp.sec == 0 && trajectory.header.stamp.nanosec == 0;
   if (trajectory.joint_names != joint_names_ || trajectory.points.empty() ||
+      trajectory.points.size() > kMaxTrajectoryPoints ||
       !zero_stamp ||
       !goal.multi_dof_trajectory.points.empty() ||
       !goal.multi_dof_trajectory.joint_names.empty() ||
@@ -99,11 +151,17 @@ bool Lite6CTCController::valid_trajectory_goal(
 
   auto valid_joint_tolerances = [this](const std::vector<control_msgs::msg::JointTolerance> & tols) {
     if (tols.size() > joint_names_.size()) return false;
+    std::array<bool, 6> seen{};
     for (const auto & tol : tols) {
       const auto it = std::find(joint_names_.begin(), joint_names_.end(), tol.name);
       if (it == joint_names_.end()) return false;
+      const size_t idx = static_cast<size_t>(std::distance(joint_names_.begin(), it));
+      if (seen[idx]) return false;
+      seen[idx] = true;
       if (!std::isfinite(tol.position) || tol.position < 0.0 ||
+          tol.position > path_position_tolerance_[idx] ||
           !std::isfinite(tol.velocity) || tol.velocity < 0.0 ||
+          tol.velocity > path_velocity_tolerance_[idx] ||
           !std::isfinite(tol.acceleration) || tol.acceleration < 0.0)
       {
         return false;
@@ -142,8 +200,9 @@ bool Lite6CTCController::valid_trajectory_goal(
     {
       return false;
     }
+    double dt = 0.0;
     if (idx > 0) {
-      const double dt = t - previous;
+      dt = t - previous;
       if (std::abs(dt - lite6_interfaces::contract::kControlDtSec) >
           lite6_interfaces::contract::kTrajectorySampleSpacingTolSec)
       {
@@ -153,9 +212,18 @@ bool Lite6CTCController::valid_trajectory_goal(
         static_cast<double>(idx) * lite6_interfaces::contract::kControlDtSec;
       max_grid_err = std::max(max_grid_err, std::abs(t - expected_t));
     }
+    const auto * prev_pt = (idx > 0) ? &trajectory.points[idx - 1] : nullptr;
     for (size_t i = 0; i < joint_names_.size(); ++i) {
-      if (!std::isfinite(point.positions[i]) || !std::isfinite(point.velocities[i]) ||
-          !std::isfinite(point.accelerations[i]))
+      if (!valid_pva_sample_and_step(
+            i, point.positions[i], point.velocities[i], point.accelerations[i],
+            execution_position_limit_tolerance_,
+            execution_max_joint_velocity_[i],
+            execution_max_joint_acceleration_[i],
+            prev_pt != nullptr,
+            prev_pt ? prev_pt->positions[i] : 0.0,
+            prev_pt ? prev_pt->velocities[i] : 0.0,
+            prev_pt ? prev_pt->accelerations[i] : 0.0,
+            dt))
       {
         return false;
       }
@@ -314,8 +382,10 @@ uint8_t Lite6CTCController::valid_splice_request(
   }
   const double t_switch = seconds(req.switch_time);
   const auto & trajectory = req.trajectory;
-  if (!(t_switch > 0.0) || trajectory.joint_names != joint_names_ || trajectory.points.empty()) {
-    if (out_message) *out_message = "Invalid splice trajectory header, joint names, or empty points";
+  if (!(t_switch > 0.0) || trajectory.joint_names != joint_names_ ||
+      trajectory.points.empty() || trajectory.points.size() > kMaxTrajectoryPoints)
+  {
+    if (out_message) *out_message = "Invalid splice trajectory header, joint names, or point count";
     return Resp::RESULT_REJECTED_INVALID_ARG;
   }
   const double first_time = seconds(trajectory.points.front().time_from_start);
@@ -338,8 +408,9 @@ uint8_t Lite6CTCController::valid_splice_request(
       if (out_message) *out_message = "Malformed splice trajectory point";
       return Resp::RESULT_REJECTED_INVALID_ARG;
     }
+    double dt = 0.0;
     if (idx > 0) {
-      const double dt = t - previous;
+      dt = t - previous;
       if (std::abs(dt - lite6_interfaces::contract::kControlDtSec) >
           lite6_interfaces::contract::kTrajectorySampleSpacingTolSec)
       {
@@ -350,11 +421,23 @@ uint8_t Lite6CTCController::valid_splice_request(
         static_cast<double>(idx) * lite6_interfaces::contract::kControlDtSec;
       max_grid_err = std::max(max_grid_err, std::abs(t - expected_t));
     }
+    const auto * prev_pt = (idx > 0) ? &trajectory.points[idx - 1] : nullptr;
     for (size_t i = 0; i < joint_names_.size(); ++i) {
-      if (!std::isfinite(point.positions[i]) || !std::isfinite(point.velocities[i]) ||
-          !std::isfinite(point.accelerations[i]))
+      if (!valid_pva_sample_and_step(
+            i, point.positions[i], point.velocities[i], point.accelerations[i],
+            execution_position_limit_tolerance_,
+            execution_max_joint_velocity_[i],
+            execution_max_joint_acceleration_[i],
+            prev_pt != nullptr,
+            prev_pt ? prev_pt->positions[i] : 0.0,
+            prev_pt ? prev_pt->velocities[i] : 0.0,
+            prev_pt ? prev_pt->accelerations[i] : 0.0,
+            dt))
       {
-        if (out_message) *out_message = "Non-finite PVA in splice trajectory";
+        if (out_message) {
+          *out_message =
+            "Splice trajectory violates joint position, velocity, acceleration, or continuity limits";
+        }
         return Resp::RESULT_REJECTED_INVALID_ARG;
       }
       if (!point.effort.empty() &&
@@ -632,7 +715,7 @@ void Lite6CTCController::configure_trajectory_action()
       }
       finalize(static_cast<SpliceState>(expected));
     },
-    rclcpp::ServicesQoS(), command_callback_group_);
+    rclcpp::ServicesQoS().keep_last(64), command_callback_group_);
 
   trajectory_monitor_ = get_node()->create_wall_timer(
     std::chrono::milliseconds(20), [this] {

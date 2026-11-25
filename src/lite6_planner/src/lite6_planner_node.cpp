@@ -73,7 +73,7 @@ public:
     rejection_pub_=create_publisher<lite6_interfaces::msg::MotionRejection>(
       "/supervisor/motion_rejections",rclcpp::QoS(32).reliable());
     ctc_cmd_client_=create_client<lite6_interfaces::srv::ControllerCommand>(
-      "/ctc_controller/command",rclcpp::ServicesQoS(),cmd_client_group_);
+      "/ctc_controller/command",rclcpp::ServicesQoS().keep_last(64),cmd_client_group_);
     rclcpp::SubscriptionOptions sensor_options;
     sensor_options.callback_group=io_group_;
     controller_sub_=create_subscription<lite6_interfaces::msg::ControllerStatus>(

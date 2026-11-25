@@ -114,7 +114,7 @@ public:
     const auto state_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     state_pub_ = create_publisher<StudioState>("/studio/state", state_qos);
     ctc_cmd_client_ = create_client<ControllerCommand>(
-      "/ctc_controller/command", rclcpp::ServicesQoS(), ctc_cmd_group_);
+      "/ctc_controller/command", rclcpp::ServicesQoS().keep_last(64), ctc_cmd_group_);
 
     supervisor_ = std::make_unique<StudioSupervisor>(
       [this](const StudioSupervisor::Snapshot & snap) { publish_snapshot(snap); });
@@ -474,6 +474,10 @@ private:
 
   void on_watchdog_timer()
   {
+    if (ctc_cmd_client_) {
+      ctc_cmd_client_->prune_requests_older_than(
+        std::chrono::system_clock::now() - std::chrono::seconds(5));
+    }
     const auto effects = supervisor_->watchdog();
     apply_effects(effects);
     publish_snapshot(supervisor_->snapshot());
@@ -576,12 +580,21 @@ private:
 
     auto compiled = std::make_shared<CompiledProgram>();
     std::vector<Diagnostic> diags;
-    auto shutdown_cancel = [this]() {
-      return !rclcpp::ok() || worker_exit_.load(std::memory_order_acquire);
+    constexpr auto kCompileWallTimeout = std::chrono::seconds(45);
+    const auto compile_deadline = std::chrono::steady_clock::now() + kCompileWallTimeout;
+    std::atomic<bool> timed_out{false};
+    auto compile_cancel = [this, compile_deadline, &timed_out]() {
+      if (!rclcpp::ok() || worker_exit_.load(std::memory_order_acquire)) {
+        return true;
+      }
+      if (std::chrono::steady_clock::now() >= compile_deadline) {
+        timed_out.store(true, std::memory_order_relaxed);
+        return true;
+      }
+      return false;
     };
-    const bool ok =
-      compiler_->compile(req->source_code, start_joints, *compiled, diags, shutdown_cancel);
-    if (!ok) {
+
+    auto handle_compile_failure = [&](std::vector<Diagnostic> & fail_diags) {
       if (req->auto_load) {
         {
           std::lock_guard<std::mutex> exec_lock(exec_mutex_);
@@ -590,8 +603,73 @@ private:
         }
         supervisor_->on_compile_failed(req->request_id);
       }
+      DSLParser::enforce_diagnostic_budget(fail_diags);
       resp->success = false;
-      resp->diagnostics = std::move(diags);
+      resp->diagnostics = std::move(fail_diags);
+    };
+
+    bool ok = false;
+    try {
+      ok = compiler_->compile(req->source_code, start_joints, *compiled, diags, compile_cancel);
+    } catch (const std::bad_alloc &) {
+      compiled.reset();
+      diags.clear();
+      RCLCPP_ERROR(get_logger(), "Compilation aborted due to memory allocation limit (std::bad_alloc)");
+      Diagnostic d;
+      d.severity = Diagnostic::SEVERITY_ERROR;
+      d.stage = Diagnostic::STAGE_PLANNING;
+      d.line_number = 1;
+      d.column_number = 1;
+      d.statement_index = -1;
+      d.code = "ERR_COMPILE_MEMORY";
+      d.message = "Compilation exceeded available memory budget";
+      diags.push_back(std::move(d));
+      handle_compile_failure(diags);
+      return;
+    } catch (const std::exception & e) {
+      compiled.reset();
+      diags.clear();
+      RCLCPP_ERROR(get_logger(), "Unexpected exception during compilation: %s", e.what());
+      Diagnostic d;
+      d.severity = Diagnostic::SEVERITY_ERROR;
+      d.stage = Diagnostic::STAGE_PLANNING;
+      d.line_number = 1;
+      d.column_number = 1;
+      d.statement_index = -1;
+      d.code = "ERR_COMPILE_INTERNAL";
+      d.message = DSLParser::sanitize_bounded_text(
+        std::string("Internal compilation error: ") + e.what(),
+        DSLParser::kMaxDiagnosticMessageChars);
+      diags.push_back(std::move(d));
+      handle_compile_failure(diags);
+      return;
+    } catch (...) {
+      compiled.reset();
+      diags.clear();
+      RCLCPP_ERROR(get_logger(), "Unknown non-standard exception during compilation");
+      Diagnostic d;
+      d.severity = Diagnostic::SEVERITY_ERROR;
+      d.stage = Diagnostic::STAGE_PLANNING;
+      d.line_number = 1;
+      d.column_number = 1;
+      d.statement_index = -1;
+      d.code = "ERR_COMPILE_INTERNAL";
+      d.message = "Unknown internal compilation error";
+      diags.push_back(std::move(d));
+      handle_compile_failure(diags);
+      return;
+    }
+
+    if (!ok) {
+      if (timed_out.load(std::memory_order_relaxed)) {
+        for (auto & d : diags) {
+          if (d.code == "ERR_CANCELLED") {
+            d.code = "ERR_COMPILE_TIMEOUT";
+            d.message = "Compilation exceeded wall-clock time budget (45 s)";
+          }
+        }
+      }
+      handle_compile_failure(diags);
       return;
     }
 
@@ -613,6 +691,7 @@ private:
       resp->program_revision = program_revision_;
     }
 
+    DSLParser::enforce_diagnostic_budget(diags);
     resp->success = true;
     resp->program_id = compiled->program_id;
     resp->total_statements = compiled->total_statements;
