@@ -160,15 +160,15 @@ double compute_v_max(
   return v_cap;
 }
 
-RAStage build_ra_stage(
+void append_ra_stage_cons(
   const PathPoint & pp,
   const std::array<lite6_planner::JointLimit, 6> & jl,
   const lite6_planner::CartesianLimit & cl,
-  double margin)
+  double margin,
+  RAStage & st)
 {
-  RAStage st;
   const double vmax = compute_v_max(pp, jl, cl, margin);
-  st.x_cap = vmax * vmax;
+  st.x_cap = std::min(st.x_cap, vmax * vmax);
   for (int j = 0; j < 6; ++j) {
     const double acc = pp.as * jl[static_cast<size_t>(j)].max_acc * margin;
     if (std::abs(pp.q1[j]) > 1e-12 || std::abs(pp.q2[j]) > 1e-12) {
@@ -180,6 +180,37 @@ RAStage build_ra_stage(
     add_norm_polygon(pp.p1, pp.p2, pp.as * cl.max_trans_acc * margin, st.cons);
     add_norm_polygon(pp.w1, pp.w2, pp.as * cl.max_rot_acc * margin, st.cons);
   }
+}
+
+bool acc_point_differs(const PathPoint & a, const PathPoint & b)
+{
+  if (std::abs(a.as - b.as) > 1e-9) {
+    return true;
+  }
+  if ((a.q1 - b.q1).cwiseAbs().maxCoeff() > 1e-5 ||
+      (a.q2 - b.q2).cwiseAbs().maxCoeff() > 1e-4)
+  {
+    return true;
+  }
+  if (a.cart || b.cart) {
+    if ((a.p1 - b.p1).norm() > 1e-5 || (a.p2 - b.p2).norm() > 1e-4 ||
+        (a.w1 - b.w1).norm() > 1e-5 || (a.w2 - b.w2).norm() > 1e-4)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+RAStage build_ra_stage(
+  const PathPoint & pp,
+  const std::array<lite6_planner::JointLimit, 6> & jl,
+  const lite6_planner::CartesianLimit & cl,
+  double margin)
+{
+  RAStage st;
+  st.x_cap = std::numeric_limits<double>::infinity();
+  append_ra_stage_cons(pp, jl, cl, margin, st);
   return st;
 }
 
@@ -521,12 +552,17 @@ struct ProblemCache
   std::vector<double> v_mid_max;
   std::vector<double> dt_min;
 
-  struct NodeAccList
+  struct NodeAccSide
   {
     int n_joint = 0;
     JointAccCon joint[6];
     CartAccCon trans;
     CartAccCon rot;
+  };
+  struct NodeAccList
+  {
+    int n_sides = 0;
+    NodeAccSide sides[3];
   };
   struct IntervalJerkList
   {
@@ -539,7 +575,7 @@ struct ProblemCache
   };
 
   std::vector<NodeAccList> node_acc;       // size N + 1 (interior 1..N-1 used)
-  std::vector<NodeAccList> mid_acc;        // size N
+  std::vector<NodeAccSide> mid_acc;        // size N
   std::vector<IntervalJerkList> int_jerk;  // size N
   size_t n_ineq = 0;
 };
@@ -574,8 +610,10 @@ ProblemCache build_problem_cache(
     pc.dt_min[i] = std::max(1e-7, 0.2 * pc.h[i] / std::max(vmax_i, 1e-6));
   }
 
-  auto fill_acc = [&](const PathPoint & pp, ProblemCache::NodeAccList & dst) {
+  auto fill_acc = [&](const PathPoint & pp, ProblemCache::NodeAccSide & dst) {
     dst.n_joint = 0;
+    dst.trans.active = false;
+    dst.rot.active = false;
     for (int k = 0; k < 6; ++k) {
       if (std::abs(pp.q1[k]) < 1e-12 && std::abs(pp.q2[k]) < 1e-12) {
         continue;
@@ -603,15 +641,32 @@ ProblemCache build_problem_cache(
     }
   };
 
+  auto count_acc_side = [](const ProblemCache::NodeAccSide & side) -> size_t {
+    size_t c = static_cast<size_t>(2 * side.n_joint);
+    if (side.trans.active) {
+      ++c;
+    }
+    if (side.rot.active) {
+      ++c;
+    }
+    return c;
+  };
+
   size_t count = 2 * (N - 1) + N;  // simple node bounds (0 <= v_i <= v_max, dt_i >= dt_min)
   for (size_t i = 1; i < N; ++i) {
-    fill_acc(nodes[i].p_node, pc.node_acc[i]);
-    count += static_cast<size_t>(2 * pc.node_acc[i].n_joint);
-    if (pc.node_acc[i].trans.active) {
-      ++count;
+    auto & na = pc.node_acc[i];
+    na.n_sides = 0;
+    fill_acc(nodes[i].p_node, na.sides[na.n_sides++]);
+    if (acc_point_differs(nodes[i].p_left, nodes[i].p_node)) {
+      fill_acc(nodes[i].p_left, na.sides[na.n_sides++]);
     }
-    if (pc.node_acc[i].rot.active) {
-      ++count;
+    if (acc_point_differs(nodes[i].p_right, nodes[i].p_node) &&
+        (na.n_sides == 1 || acc_point_differs(nodes[i].p_right, nodes[i].p_left)))
+    {
+      fill_acc(nodes[i].p_right, na.sides[na.n_sides++]);
+    }
+    for (int s_idx = 0; s_idx < na.n_sides; ++s_idx) {
+      count += count_acc_side(na.sides[s_idx]);
     }
   }
   for (size_t i = 0; i < N; ++i) {
@@ -690,55 +745,58 @@ void for_each_ineq(
     fn(m++, (pc.dt_min[i] - dt[i]) * inv_ts, 1, idx, grad, 0, hr, hc, hv);
   }
 
-  // 2. Node joint & Cartesian acceleration (interior nodes i = 1..N-1)
+  // 2. Node joint & Cartesian acceleration (interior nodes i = 1..N-1, both sides at boundaries)
   for (size_t i = 1; i < N; ++i) {
-    const auto & na = pc.node_acc[i];
+    const auto & na_list = pc.node_acc[i];
     const int iv = kv(i), ia = ka(i);
     const double vi = v[i], ai = a[i], vi2 = vi * vi;
     idx[0] = iv;
     idx[1] = ia;
-    for (int k = 0; k < na.n_joint; ++k) {
-      const auto & jc = na.joint[k];
-      const double f = jc.c1 * ai + jc.c2 * vi2;
-      const double gv = NeedGrad ? (2.0 * jc.c2 * vi * V_s) : 0.0;
-      const double ga = NeedGrad ? (jc.c1 * A_s) : 0.0;
-      const double hvv = NeedHess ? (2.0 * jc.c2 * V_s * V_s) : 0.0;
-      const int nh = (NeedHess && std::abs(hvv) > 1e-16) ? 1 : 0;
-      hr[0] = iv;
-      hc[0] = iv;
+    for (int s_idx = 0; s_idx < na_list.n_sides; ++s_idx) {
+      const auto & na = na_list.sides[s_idx];
+      for (int k = 0; k < na.n_joint; ++k) {
+        const auto & jc = na.joint[k];
+        const double f = jc.c1 * ai + jc.c2 * vi2;
+        const double gv = NeedGrad ? (2.0 * jc.c2 * vi * V_s) : 0.0;
+        const double ga = NeedGrad ? (jc.c1 * A_s) : 0.0;
+        const double hvv = NeedHess ? (2.0 * jc.c2 * V_s * V_s) : 0.0;
+        const int nh = (NeedHess && std::abs(hvv) > 1e-16) ? 1 : 0;
+        hr[0] = iv;
+        hc[0] = iv;
 
-      grad[0] = gv;
-      grad[1] = ga;
-      hv[0] = hvv;
-      fn(m++, f - 1.0, 2, idx, grad, nh, hr, hc, hv);
+        grad[0] = gv;
+        grad[1] = ga;
+        hv[0] = hvv;
+        fn(m++, f - 1.0, 2, idx, grad, nh, hr, hc, hv);
 
-      grad[0] = -gv;
-      grad[1] = -ga;
-      hv[0] = -hvv;
-      fn(m++, -f - 1.0, 2, idx, grad, nh, hr, hc, hv);
-    }
-    auto visit_cart_node = [&](const CartAccCon & cc) {
-      if (!cc.active) {
-        return;
+        grad[0] = -gv;
+        grad[1] = -ga;
+        hv[0] = -hvv;
+        fn(m++, -f - 1.0, 2, idx, grad, nh, hr, hc, hv);
       }
-      const Eigen::Vector3d w = cc.w1 * ai + cc.w2 * vi2;
-      const double val = 0.5 * (w.squaredNorm() - 1.0);
-      int nh = 0;
-      if constexpr (NeedGrad) {
-        const double w2w = cc.w2.dot(w);
-        grad[0] = 2.0 * vi * w2w * V_s;
-        grad[1] = cc.w1.dot(w) * A_s;
-        if constexpr (NeedHess) {
-          nh = 3;
-          hr[0] = iv; hc[0] = iv; hv[0] = (2.0 * w2w + 4.0 * vi2 * cc.w22) * V_s * V_s;
-          hr[1] = iv; hc[1] = ia; hv[1] = (2.0 * vi * cc.w12) * V_s * A_s;
-          hr[2] = ia; hc[2] = ia; hv[2] = cc.w11 * A_s * A_s;
+      auto visit_cart_node = [&](const CartAccCon & cc) {
+        if (!cc.active) {
+          return;
         }
-      }
-      fn(m++, val, 2, idx, grad, nh, hr, hc, hv);
-    };
-    visit_cart_node(na.trans);
-    visit_cart_node(na.rot);
+        const Eigen::Vector3d w = cc.w1 * ai + cc.w2 * vi2;
+        const double val = 0.5 * (w.squaredNorm() - 1.0);
+        int nh = 0;
+        if constexpr (NeedGrad) {
+          const double w2w = cc.w2.dot(w);
+          grad[0] = 2.0 * vi * w2w * V_s;
+          grad[1] = cc.w1.dot(w) * A_s;
+          if constexpr (NeedHess) {
+            nh = 3;
+            hr[0] = iv; hc[0] = iv; hv[0] = (2.0 * w2w + 4.0 * vi2 * cc.w22) * V_s * V_s;
+            hr[1] = iv; hc[1] = ia; hv[1] = (2.0 * vi * cc.w12) * V_s * A_s;
+            hr[2] = ia; hc[2] = ia; hv[2] = cc.w11 * A_s * A_s;
+          }
+        }
+        fn(m++, val, 2, idx, grad, nh, hr, hc, hv);
+      };
+      visit_cart_node(na.trans);
+      visit_cart_node(na.rot);
+    }
   }
 
   // 3. Hermite-Simpson interval midpoint velocity & acceleration (i = 0..N-1)
@@ -1312,6 +1370,150 @@ IPMResult solve_3rd_order_ipm(
     phi = T / tau_s - mu_b * log_s;
   };
 
+  // Minimum-norm Gauss-Newton projection onto the cubic collocation equalities e1=e2=0.
+  // Eliminates residual knot discontinuities in u(t) and v(t) before 1 kHz reconstruction.
+  auto polish_equalities = [&](
+    std::vector<double> & vp, std::vector<double> & ap, std::vector<double> & dtp,
+    double & out_eq_inf, double & out_ineq_inf, double max_ineq_allow) -> bool
+  {
+    std::vector<double> pe1(N, 0.0), pe2(N, 0.0), pe1t(N, 0.0), pe2t(N, 0.0);
+    eval_eq(vp, ap, dtp, pe1, pe2);
+    double eq_cur = 0.0;
+    for (size_t i = 0; i < N; ++i) {
+      eq_cur = std::max({eq_cur, std::abs(pe1[i]), std::abs(pe2[i])});
+    }
+    double ineq_cur = 0.0;
+    for_each_ineq<false, false>(
+      pc, V_s, A_s, tau_s, vp, ap, dtp,
+      [&](size_t, double val, int, const int *, const double *, int, const int *, const int *, const double *) {
+        ineq_cur = std::max(ineq_cur, std::max(0.0, val));
+      });
+    out_eq_inf = eq_cur;
+    out_ineq_inf = ineq_cur;
+    if (eq_cur <= 1e-10) {
+      return true;
+    }
+
+    std::vector<double> vc = vp, ac = ap, dtc = dtp;
+    std::vector<double> v_tr(N + 1, 0.0), a_tr(N + 1, 0.0), dt_tr(N, 0.0);
+    std::vector<double> rhs_p(static_cast<size_t>(n_kkt), 0.0);
+    double eq_best = eq_cur;
+
+    for (int pit = 0; pit < 10 && eq_best > 1e-11; ++pit) {
+      kkt.clear();
+      std::fill(rhs_p.begin(), rhs_p.end(), 0.0);
+      for (int k = 0; k < n_kkt; ++k) {
+        if (is_primal[static_cast<size_t>(k)]) {
+          kkt.add(k, k, 1.0);
+        }
+      }
+      for (size_t i = 0; i < N; ++i) {
+        const int iy1 = ky1(i), iy2 = ky2(i), it = kt(i);
+        rhs_p[static_cast<size_t>(iy1)] = -pe1[i];
+        rhs_p[static_cast<size_t>(iy2)] = -pe2[i];
+
+        const double de1_dt = -0.5 * (ac[i] + ac[i + 1]) * tau_s / V_s;
+        kkt.add(iy1, it, de1_dt);
+        if (i > 0) {
+          const int iv = kv(i), ia = ka(i);
+          kkt.add(iy1, iv, -1.0);
+          kkt.add(iy1, ia, -0.5 * dtc[i] * A_s / V_s);
+        }
+        if (i + 1 < N) {
+          const int iv1 = kv(i + 1), ia1 = ka(i + 1);
+          kkt.add(iy1, iv1, 1.0);
+          kkt.add(iy1, ia1, -0.5 * dtc[i] * A_s / V_s);
+        }
+
+        const double inv_h = pc.inv_h[i];
+        const double de2_dt =
+          (0.5 * (vc[i] + vc[i + 1]) + (1.0 / 6.0) * (ac[i] - ac[i + 1]) * dtc[i]) * tau_s * inv_h;
+        kkt.add(iy2, it, de2_dt);
+        if (i > 0) {
+          const int iv = kv(i), ia = ka(i);
+          kkt.add(iy2, iv, 0.5 * dtc[i] * V_s * inv_h);
+          kkt.add(iy2, ia, (1.0 / 12.0) * dtc[i] * dtc[i] * A_s * inv_h);
+        }
+        if (i + 1 < N) {
+          const int iv1 = kv(i + 1), ia1 = ka(i + 1);
+          kkt.add(iy2, iv1, 0.5 * dtc[i] * V_s * inv_h);
+          kkt.add(iy2, ia1, -(1.0 / 12.0) * dtc[i] * dtc[i] * A_s * inv_h);
+        }
+      }
+
+      bool ok_fac = kkt.factorize(is_primal, 0.0, 1e-12);
+      if (!ok_fac) {
+        ok_fac = kkt.factorize(is_primal, 1e-6, 1e-10);
+      }
+      if (!ok_fac) {
+        break;
+      }
+      kkt.solve(rhs_p);
+
+      bool step_ok = false;
+      double beta = 1.0;
+      for (int ls = 0; ls < 10; ++ls) {
+        bool bounds_ok = true;
+        v_tr[0] = 0.0;
+        a_tr[0] = 0.0;
+        v_tr[N] = 0.0;
+        a_tr[N] = 0.0;
+        for (size_t i = 1; i < N; ++i) {
+          v_tr[i] = vc[i] + beta * rhs_p[static_cast<size_t>(kv(i))] * V_s;
+          a_tr[i] = ac[i] + beta * rhs_p[static_cast<size_t>(ka(i))] * A_s;
+          if (!(v_tr[i] >= 0.0) || !std::isfinite(v_tr[i]) || !std::isfinite(a_tr[i])) {
+            bounds_ok = false;
+          }
+        }
+        for (size_t i = 0; i < N; ++i) {
+          dt_tr[i] = dtc[i] + beta * rhs_p[static_cast<size_t>(kt(i))] * tau_s;
+          if (!(dt_tr[i] > 0.5 * pc.dt_min[i]) || !std::isfinite(dt_tr[i])) {
+            bounds_ok = false;
+          }
+        }
+        if (bounds_ok) {
+          eval_eq(v_tr, a_tr, dt_tr, pe1t, pe2t);
+          double eq_t = 0.0;
+          for (size_t i = 0; i < N; ++i) {
+            eq_t = std::max({eq_t, std::abs(pe1t[i]), std::abs(pe2t[i])});
+          }
+          if (eq_t < eq_best) {
+            vc.swap(v_tr);
+            ac.swap(a_tr);
+            dtc.swap(dt_tr);
+            pe1.swap(pe1t);
+            pe2.swap(pe2t);
+            eq_best = eq_t;
+            step_ok = true;
+            break;
+          }
+        }
+        beta *= 0.5;
+      }
+      if (!step_ok) {
+        break;
+      }
+    }
+
+    if (eq_best < eq_cur) {
+      double ineq_new = 0.0;
+      for_each_ineq<false, false>(
+        pc, V_s, A_s, tau_s, vc, ac, dtc,
+        [&](size_t, double val, int, const int *, const double *, int, const int *, const int *, const double *) {
+          ineq_new = std::max(ineq_new, std::max(0.0, val));
+        });
+      if (ineq_new <= std::max(ineq_cur + 1e-3, max_ineq_allow)) {
+        vp.swap(vc);
+        ap.swap(ac);
+        dtp.swap(dtc);
+        out_eq_inf = eq_best;
+        out_ineq_inf = ineq_new;
+        return eq_best <= 1e-8;
+      }
+    }
+    return eq_cur <= 1e-8;
+  };
+
   // IPOPT-style (theta, phi) filter for robust globalization without penalty blow-up.
   std::vector<std::pair<double, double>> filter;
   filter.reserve(32);
@@ -1467,6 +1669,7 @@ IPMResult solve_3rd_order_ipm(
         (mu <= 1e-7 && eq_inf < 1e-7 && ineq_inf < 1e-5 && c0_sc < 1e-5 &&
          d_sc < 2e-4 && dT_rel < 5e-5))
     {
+      polish_equalities(v, a, dt, res.eq_inf, res.ineq_inf, 1e-4);
       res.converged = true;
       res.kkt_optimal = true;
       break;
@@ -1585,6 +1788,9 @@ IPMResult solve_3rd_order_ipm(
       for (size_t i = 1; i < N; ++i) {
         vt[i] = v[i] + alpha * step[static_cast<size_t>(kv(i))] * V_s;
         at[i] = a[i] + alpha * step[static_cast<size_t>(ka(i))] * A_s;
+        if (!(vt[i] >= 0.0)) {
+          pos_ok = false;
+        }
       }
       for (size_t i = 0; i < N; ++i) {
         dtt[i] = dt[i] + alpha * step[static_cast<size_t>(kt(i))] * tau_s;
@@ -1628,19 +1834,24 @@ IPMResult solve_3rd_order_ipm(
         }
 
         // Second-Order Correction (reuses already-factored KKT, prevents Maratos rejections).
+        // IPOPT SOC target: c_soc = alpha * c(x_k) + c(x_k + alpha * d_k).
         if (ls == 0 && theta_t > theta_cur) {
           rhs_soc = rhs_orig;
           for (size_t i = 0; i < N; ++i) {
-            rhs_soc[static_cast<size_t>(ky1(i))] -= e1t[i];
-            rhs_soc[static_cast<size_t>(ky2(i))] -= e2t[i];
+            rhs_soc[static_cast<size_t>(ky1(i))] =
+              alpha * rhs_orig[static_cast<size_t>(ky1(i))] - e1t[i];
+            rhs_soc[static_cast<size_t>(ky2(i))] =
+              alpha * rhs_orig[static_cast<size_t>(ky2(i))] - e2t[i];
           }
           for_each_ineq<true, false>(
             pc, V_s, A_s, tau_s, v, a, dt,
-            [&](size_t m, double, int nv, const int * idx, const double * grad,
+            [&](size_t m, double val, int nv, const int * idx, const double * grad,
                 int, const int *, const int *, const double *)
             {
-              const double r_soc = g_trial[m] + st[m];
-              const double coef = lam[m] * r_soc / s[m];
+              // rhs_orig already includes -(lam / s) * (val + s) * grad;
+              // shift slack residual to alpha * (val + s) + (g_trial + st).
+              const double r_soc_delta = (alpha - 1.0) * (val + s[m]) + (g_trial[m] + st[m]);
+              const double coef = lam[m] * r_soc_delta / s[m];
               for (int a_i = 0; a_i < nv; ++a_i) {
                 rhs_soc[static_cast<size_t>(idx[a_i])] -= coef * grad[a_i];
               }
@@ -1657,12 +1868,18 @@ IPMResult solve_3rd_order_ipm(
               for (int a_i = 0; a_i < nv; ++a_i) {
                 g_dz += grad[a_i] * rhs_soc[static_cast<size_t>(idx[a_i])];
               }
-              const double dsm = -(val + s[m] + (g_trial[m] + st[m])) - g_dz;
+              const double dsm = -(alpha * (val + s[m]) + (g_trial[m] + st[m])) - g_dz;
               ds_soc[m] = dsm;
               if (dsm < 0.0) {
                 a_soc = std::min(a_soc, -tau_ftb * s[m] / dsm);
               }
             });
+          for (size_t i = 1; i < N; ++i) {
+            const double dv_i = rhs_soc[static_cast<size_t>(kv(i))] * V_s;
+            if (dv_i < 0.0 && v[i] > 0.0) {
+              a_soc = std::min(a_soc, -tau_ftb * v[i] / dv_i);
+            }
+          }
           for (size_t i = 0; i < N; ++i) {
             const double ddt_i = rhs_soc[static_cast<size_t>(kt(i))] * tau_s;
             if (ddt_i < 0.0) {
@@ -1675,6 +1892,9 @@ IPMResult solve_3rd_order_ipm(
           for (size_t i = 1; i < N; ++i) {
             vt2[i] = v[i] + a_soc * rhs_soc[static_cast<size_t>(kv(i))] * V_s;
             at2[i] = a[i] + a_soc * rhs_soc[static_cast<size_t>(ka(i))] * A_s;
+            if (!(vt2[i] >= 0.0)) {
+              ok2 = false;
+            }
           }
           for (size_t i = 0; i < N; ++i) {
             dtt2[i] = dt[i] + a_soc * rhs_soc[static_cast<size_t>(kt(i))] * tau_s;
@@ -1726,17 +1946,28 @@ IPMResult solve_3rd_order_ipm(
     }
 
     if (!accepted) {
-      if (eq_inf < 1e-5 && ineq_inf < 1e-4) {
-        res.converged = true;
-        res.kkt_optimal = false;
-        res.fallback_reason = "line-search stall primal-feasible fallback";
-        break;
+      if (eq_inf < 1e-4 && ineq_inf < 1e-3) {
+        std::vector<double> vp = v, ap = a, dtp = dt;
+        double p_eq = eq_inf, p_ineq = ineq_inf;
+        if (polish_equalities(vp, ap, dtp, p_eq, p_ineq, 3e-3) &&
+            p_eq <= 1e-8 && p_ineq < 3e-3)
+        {
+          v.swap(vp);
+          a.swap(ap);
+          dt.swap(dtp);
+          res.eq_inf = p_eq;
+          res.ineq_inf = p_ineq;
+          res.converged = true;
+          res.kkt_optimal = false;
+          res.fallback_reason = "line-search stall primal-feasible fallback";
+          break;
+        }
       }
       // Feasibility restoration fallback: reset filter and take a small damped primal step.
       filter.clear();
       alpha = std::min(alpha_s_max, 0.05);
       for (size_t i = 1; i < N; ++i) {
-        vt[i] = v[i] + alpha * step[static_cast<size_t>(kv(i))] * V_s;
+        vt[i] = std::max(0.0, v[i] + alpha * step[static_cast<size_t>(kv(i))] * V_s);
         at[i] = a[i] + alpha * step[static_cast<size_t>(ka(i))] * A_s;
       }
       for (size_t i = 0; i < N; ++i) {
@@ -1765,7 +1996,7 @@ IPMResult solve_3rd_order_ipm(
   }
 
   if (!res.converged) {
-    // Re-evaluate primal residuals on the final iterate before checking primal-feasible fallback.
+    // Re-evaluate primal residuals on the final iterate and polish equalities before accepting fallback.
     eval_eq(v, a, dt, e1, e2);
     double final_eq_inf = 0.0;
     for (size_t i = 0; i < N; ++i) {
@@ -1780,10 +2011,13 @@ IPMResult solve_3rd_order_ipm(
     res.eq_inf = final_eq_inf;
     res.ineq_inf = final_ineq_inf;
     res.mu = mu;
-    if (res.eq_inf < 1e-4 && res.ineq_inf < 5e-3) {
-      res.converged = true;
-      res.kkt_optimal = false;
-      res.fallback_reason = "max-iterations primal-feasible fallback";
+    if (res.eq_inf < 1e-3 && res.ineq_inf < 5e-3) {
+      polish_equalities(v, a, dt, res.eq_inf, res.ineq_inf, 3e-3);
+      if (res.eq_inf <= 1e-8 && res.ineq_inf < 3e-3) {
+        res.converged = true;
+        res.kkt_optimal = false;
+        res.fallback_reason = "max-iterations primal-feasible fallback";
+      }
     }
   }
   return res;
@@ -2216,10 +2450,18 @@ bool TOPPJerkSolver::solve(
   std::vector<MidData> mids;
   build_grid_data(grid, sampler, joint_limits, cart_limits, nodes, mids);
 
-  // 2. Exact 2nd-order TOPP-RA warm start.
+  // 2. Exact 2nd-order TOPP-RA warm start (including both sides at piece boundaries).
   std::vector<RAStage> ra_stages(grid.size());
   for (size_t i = 0; i < grid.size(); ++i) {
     ra_stages[i] = build_ra_stage(nodes[i].p_node, joint_limits, cart_limits, kLimitMargin);
+    if (i > 0 && acc_point_differs(nodes[i].p_left, nodes[i].p_node)) {
+      append_ra_stage_cons(nodes[i].p_left, joint_limits, cart_limits, kLimitMargin, ra_stages[i]);
+    }
+    if (i + 1 < grid.size() && acc_point_differs(nodes[i].p_right, nodes[i].p_node) &&
+        (i == 0 || acc_point_differs(nodes[i].p_right, nodes[i].p_left)))
+    {
+      append_ra_stage_cons(nodes[i].p_right, joint_limits, cart_limits, kLimitMargin, ra_stages[i]);
+    }
   }
   std::vector<double> x_ra;
   double T_ra = 0.0;

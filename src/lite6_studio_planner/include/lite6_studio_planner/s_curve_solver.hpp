@@ -73,54 +73,6 @@ private:
   double sync_duration_ = 0.0;
 };
 
-// Degree-7 C^3 Hermite polynomial segment matching (q0, v0, a0, j0=0) -> (q1, v1, a1, j1=0).
-class SepticHermiteSegment
-{
-public:
-  SepticHermiteSegment() = default;
-
-  // Builds the segment with explicit duration T > 0.
-  void build_with_duration(
-    const std::array<double, 6> & q0,
-    const std::array<double, 6> & v0,
-    const std::array<double, 6> & a0,
-    const std::array<double, 6> & q1,
-    const std::array<double, 6> & v1,
-    const std::array<double, 6> & a1,
-    double duration);
-
-  // Searches for the shortest feasible duration T* in (0, max_duration_sec] within the
-  // fixed degree-7 zero-endpoint-jerk Hermite polynomial family that satisfies all 6-axis
-  // position and scaled (v_max, a_max, j_max) bounds on 1 kHz sampled verification.
-  // Handles non-monotonic feasibility under non-zero boundary (v, a). Returns false if no
-  // feasible duration is found.
-  bool build_time_optimal(
-    const std::array<double, 6> & q0,
-    const std::array<double, 6> & v0,
-    const std::array<double, 6> & a0,
-    const std::array<double, 6> & q1,
-    const std::array<double, 6> & v1,
-    const std::array<double, 6> & a1,
-    const std::array<lite6_planner::JointLimit, 6> & limits,
-    double vel_scale,
-    double acc_scale,
-    double jerk_scale = 1.0,
-    double max_duration_sec = 60.0);
-
-  double duration() const { return duration_; }
-
-  void eval(
-    double t,
-    std::array<double, 6> & q,
-    std::array<double, 6> & dq,
-    std::array<double, 6> & ddq,
-    std::array<double, 6> & jrk) const;
-
-private:
-  std::array<std::array<double, 8>, 6> coeffs_{};
-  double duration_ = 0.001;
-};
-
 }  // namespace lite6_studio_planner
 
 #endif  // LITE6_STUDIO_PLANNER__S_CURVE_SOLVER_HPP_

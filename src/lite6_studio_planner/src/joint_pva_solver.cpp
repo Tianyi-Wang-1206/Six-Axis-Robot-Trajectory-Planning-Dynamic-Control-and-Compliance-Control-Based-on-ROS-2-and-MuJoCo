@@ -1071,40 +1071,49 @@ bool JointPVASolver::solve_multi_waypoint(
           if (!std::isfinite(fj)) {
             continue;
           }
-          std::vector<std::vector<double>> s_hist, y_hist;
-          std::vector<double> rho_hist;
-          std::vector<double> g_prev;
-          for (int it = 0; it < 10; ++it) {
-            std::vector<double> g(dj, 0.0);
+          auto eval_grad_j = [&](
+            const std::vector<double> & vj_in,
+            const std::vector<double> & aj_in,
+            const std::vector<double> & seg_in,
+            std::vector<double> & g_out)
+          {
+            g_out.assign(dj, 0.0);
             constexpr double kFD = 1e-4;
             for (size_t p = 0; p < dj; ++p) {
               const auto & fv = vars[j_vars[p]];
               const size_t k = fv.node_k;
-              const double base = fv.is_acc ? aj_c[k] : vj_c[k];
+              const double base = fv.is_acc ? aj_in[k] : vj_in[k];
               const double h = kFD * fv.scale;
               auto eval_pair = [&](double val) -> double {
-                const double vt = fv.is_acc ? vj_c[k] : val;
-                const double at = fv.is_acc ? val : aj_c[k];
+                const double vt = fv.is_acc ? vj_in[k] : val;
+                const double at = fv.is_acc ? val : aj_in[k];
                 const double t1 = eval_1dof_min_dur(
-                  q_nodes[k - 1][j], vj_c[k - 1], aj_c[k - 1], q_nodes[k][j], vt, at, lims[j]);
+                  q_nodes[k - 1][j], vj_in[k - 1], aj_in[k - 1], q_nodes[k][j], vt, at, lims[j]);
                 if (!std::isfinite(t1)) {
                   return std::numeric_limits<double>::infinity();
                 }
                 const double t2 = eval_1dof_min_dur(
-                  q_nodes[k][j], vt, at, q_nodes[k + 1][j], vj_c[k + 1], aj_c[k + 1], lims[j]);
+                  q_nodes[k][j], vt, at, q_nodes[k + 1][j], vj_in[k + 1], aj_in[k + 1], lims[j]);
                 return std::isfinite(t2) ? (t1 + t2) : std::numeric_limits<double>::infinity();
               };
               const double fp = eval_pair(base + h);
               const double fm = eval_pair(base - h);
-              const double f0 = seg_c[k - 1] + seg_c[k];
+              const double f0 = seg_in[k - 1] + seg_in[k];
               if (std::isfinite(fp) && std::isfinite(fm)) {
-                g[p] = ((fp - fm) / (2.0 * h)) * fv.scale;
+                g_out[p] = ((fp - fm) / (2.0 * h)) * fv.scale;
               } else if (std::isfinite(fp)) {
-                g[p] = ((fp - f0) / h) * fv.scale;
+                g_out[p] = ((fp - f0) / h) * fv.scale;
               } else if (std::isfinite(fm)) {
-                g[p] = ((f0 - fm) / h) * fv.scale;
+                g_out[p] = ((f0 - fm) / h) * fv.scale;
               }
             }
+          };
+
+          std::vector<std::vector<double>> s_hist, y_hist;
+          std::vector<double> rho_hist;
+          std::vector<double> g;
+          eval_grad_j(vj_c, aj_c, seg_c, g);
+          for (int it = 0; it < 10; ++it) {
             double gnorm = 0.0;
             for (double gv : g) {
               gnorm = std::max(gnorm, std::abs(gv));
@@ -1180,31 +1189,31 @@ bool JointPVASolver::solve_multi_waypoint(
             if (!acc) {
               break;
             }
-            // Re-pack projected coordinates into x_new.
+            // Re-pack projected coordinates into x_new and compute matching gradient g_new.
             for (size_t p = 0; p < dj; ++p) {
               const auto & fv = vars[j_vars[p]];
               x_new[p] = (fv.is_acc ? aj_n[fv.node_k] : vj_n[fv.node_k]) / fv.scale;
             }
-            if (!g_prev.empty()) {
-              std::vector<double> sv(dj), yv(dj);
-              double sy = 0.0;
-              for (size_t p = 0; p < dj; ++p) {
-                sv[p] = x_new[p] - xj[p];
-                yv[p] = g[p] - g_prev[p];
-                sy += sv[p] * yv[p];
-              }
-              if (sy > 1e-12) {
-                if (s_hist.size() >= 5) {
-                  s_hist.erase(s_hist.begin());
-                  y_hist.erase(y_hist.begin());
-                  rho_hist.erase(rho_hist.begin());
-                }
-                s_hist.push_back(std::move(sv));
-                y_hist.push_back(std::move(yv));
-                rho_hist.push_back(1.0 / sy);
-              }
+            std::vector<double> g_new;
+            eval_grad_j(vj_n, aj_n, seg_n, g_new);
+            std::vector<double> sv(dj), yv(dj);
+            double sy = 0.0;
+            for (size_t p = 0; p < dj; ++p) {
+              sv[p] = x_new[p] - xj[p];
+              yv[p] = g_new[p] - g[p];
+              sy += sv[p] * yv[p];
             }
-            g_prev = g;
+            if (sy > 1e-12) {
+              if (s_hist.size() >= 5) {
+                s_hist.erase(s_hist.begin());
+                y_hist.erase(y_hist.begin());
+                rho_hist.erase(rho_hist.begin());
+              }
+              s_hist.push_back(std::move(sv));
+              y_hist.push_back(std::move(yv));
+              rho_hist.push_back(1.0 / sy);
+            }
+            g.swap(g_new);
             xj.swap(x_new);
             vj_c.swap(vj_n);
             aj_c.swap(aj_n);

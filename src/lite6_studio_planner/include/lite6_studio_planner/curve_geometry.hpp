@@ -150,61 +150,6 @@ private:
   double total_length_ = 1e-6;
 };
 
-// Timed C^3 Cartesian Hermite segment in SE(3) matching
-//   (T0, V0=[v0;w0], A0=[a0;alpha0], j0=0) -> (T1, V1=[v1;w1], A1=[a1;alpha1], j1=0)
-// over [0, T], with analytic position and SO(3) Lie-algebra derivatives.
-class CartesianHermiteSegment
-{
-public:
-  CartesianHermiteSegment() = default;
-
-  // Returns false if relative orientation angle is too close to pi (SO(3) cut-locus)
-  // or inputs are non-finite.
-  bool build_with_duration(
-    const Eigen::Matrix4d & T0,
-    const Vec6 & V0,
-    const Vec6 & A0,
-    const Eigen::Matrix4d & T1,
-    const Vec6 & V1,
-    const Vec6 & A1,
-    double duration);
-
-  double duration() const { return duration_; }
-
-  void eval(
-    double t,
-    Eigen::Matrix4d & pose,
-    Vec6 & vel,
-    Vec6 & acc,
-    Eigen::Vector3d & pos_jrk) const;
-
-private:
-  Eigen::Matrix3d R0_ = Eigen::Matrix3d::Identity();
-  std::array<Eigen::Vector3d, 8> p_c_{};
-  std::array<Eigen::Vector3d, 8> r_c_{};
-  double duration_ = 0.002;
-};
-
-// Retains the accepted PVA Hermite segments. The path parameter is original elapsed
-// time divided by total duration, so derivatives agree across segment boundaries.
-class HermiteCartesianPath : public CartesianPath
-{
-public:
-  HermiteCartesianPath(
-    std::vector<CartesianHermiteSegment> segments,
-    std::vector<SourceLocation> locations, const MotionOptions & options);
-  double total_length() const override { return length_; }
-  CartesianSample eval_normalized(double u) const override;
-  std::vector<double> piece_boundaries() const override;
-
-private:
-  std::vector<CartesianHermiteSegment> segments_;
-  std::vector<SourceLocation> locations_;
-  std::vector<double> times_;
-  MotionOptions options_;
-  double length_ = 0.0;
-};
-
 // Geometric joint-space path q(u), u in [0, 1], with analytic derivatives.
 class JointPath
 {
@@ -292,6 +237,7 @@ public:
     std::string & err_msg,
     std::vector<double> * out_corner_trims = nullptr);
 
+  bool empty() const { return pieces_.empty(); }
   double total_length() const { return total_length_; }
 
   void eval(double u, Vec6 & q, Vec6 & q_u, Vec6 & q_uu, Vec6 & q_uuu) const override;

@@ -968,9 +968,11 @@ bool solve_max_disp_uddu(
 
 // Exact convex combination of two feasible AxisProfiles of identical duration T:
 // q(t) = (1 - alpha) * pA(t) + alpha * pB(t).
-// By convexity of box bounds on (v, a, j), guaranteed valid and piecewise-constant-jerk.
+// By convexity of box bounds on (v, a, j), guaranteed valid when durations and endpoints match;
+// validates endpoint state and kinematic bounds explicitly to guard against duration mismatch drift.
 bool blend_profiles_convex(
   const AxisProfile & pA, const AxisProfile & pB, double alpha,
+  const AxisState & sf, const AxisLimits & lim,
   AxisProfile & out_prof)
 {
   alpha = std::clamp(alpha, 0.0, 1.0);
@@ -993,37 +995,75 @@ bool blend_profiles_convex(
     knots.end());
   if (knots.size() < 2) {
     out_prof = pA;
-    return true;
-  }
-  knots.front() = 0.0;
-  knots.back() = T;
+  } else {
+    knots.front() = 0.0;
+    knots.back() = T;
 
-  double qA0 = 0.0, vA0 = 0.0, aA0 = 0.0, jA0 = 0.0;
-  double qB0 = 0.0, vB0 = 0.0, aB0 = 0.0, jB0 = 0.0;
-  pA.eval(0.0, qA0, vA0, aA0, jA0);
-  pB.eval(0.0, qB0, vB0, aB0, jB0);
+    double qA0 = 0.0, vA0 = 0.0, aA0 = 0.0, jA0 = 0.0;
+    double qB0 = 0.0, vB0 = 0.0, aB0 = 0.0, jB0 = 0.0;
+    pA.eval(0.0, qA0, vA0, aA0, jA0);
+    pB.eval(0.0, qB0, vB0, aB0, jB0);
 
-  double q = (1.0 - alpha) * qA0 + alpha * qB0;
-  double v = (1.0 - alpha) * vA0 + alpha * vB0;
-  double a = (1.0 - alpha) * aA0 + alpha * aB0;
+    double q = (1.0 - alpha) * qA0 + alpha * qB0;
+    double v = (1.0 - alpha) * vA0 + alpha * vB0;
+    double a = (1.0 - alpha) * aA0 + alpha * aB0;
 
-  out_prof.clear();
-  out_prof.phases.reserve(knots.size());
-  for (size_t i = 0; i + 1 < knots.size(); ++i) {
-    const double dt = knots[i + 1] - knots[i];
-    if (dt <= 1e-13) {
-      continue;
+    out_prof.clear();
+    out_prof.phases.reserve(knots.size());
+    for (size_t i = 0; i + 1 < knots.size(); ++i) {
+      const double dt = knots[i + 1] - knots[i];
+      if (dt <= 1e-13) {
+        continue;
+      }
+      const double t_mid = 0.5 * (knots[i] + knots[i + 1]);
+      double qa = 0.0, va = 0.0, aa = 0.0, ja = 0.0;
+      double qb = 0.0, vb = 0.0, ab = 0.0, jb = 0.0;
+      pA.eval(t_mid, qa, va, aa, ja);
+      pB.eval(t_mid, qb, vb, ab, jb);
+      const double j_mix = (1.0 - alpha) * ja + alpha * jb;
+      out_prof.append_phase(dt, q, v, a, j_mix);
+      integrate_step(dt, q, v, a, j_mix, q, v, a);
     }
-    const double t_mid = 0.5 * (knots[i] + knots[i + 1]);
-    double qa = 0.0, va = 0.0, aa = 0.0, ja = 0.0;
-    double qb = 0.0, vb = 0.0, ab = 0.0, jb = 0.0;
-    pA.eval(t_mid, qa, va, aa, ja);
-    pB.eval(t_mid, qb, vb, ab, jb);
-    const double j_mix = (1.0 - alpha) * ja + alpha * jb;
-    out_prof.append_phase(dt, q, v, a, j_mix);
-    integrate_step(dt, q, v, a, j_mix, q, v, a);
+    out_prof.finalize();
   }
-  out_prof.finalize();
+
+  // Re-validate terminal (q, v, a) against sf and kinematic bounds across every phase.
+  const double q_scale = 1.0 + std::abs(sf.q) + (out_prof.phases.empty() ? 0.0 : std::abs(out_prof.phases.front().q0));
+  const double v_scale = 1.0 + std::max(std::abs(lim.v_min), std::abs(lim.v_max));
+  const double a_scale = 1.0 + std::max(std::abs(lim.a_min), std::abs(lim.a_max));
+  if (!std::isfinite(out_prof.qf) || !std::isfinite(out_prof.vf) || !std::isfinite(out_prof.af) ||
+      std::abs(out_prof.qf - sf.q) > 1e-5 * q_scale ||
+      std::abs(out_prof.vf - sf.v) > 1e-5 * v_scale ||
+      std::abs(out_prof.af - sf.a) > 1e-5 * a_scale)
+  {
+    return false;
+  }
+  const double v_tol = 1e-5 * v_scale;
+  const double a_tol = 1e-5 * a_scale;
+  const double j_tol = 1e-5 * (1.0 + lim.j_max);
+  for (const auto & ph : out_prof.phases) {
+    if (std::abs(ph.j) > lim.j_max + j_tol) {
+      return false;
+    }
+    double q1 = 0.0, v1 = 0.0, a1 = 0.0;
+    integrate_step(ph.dt, ph.q0, ph.v0, ph.a0, ph.j, q1, v1, a1);
+    if (ph.v0 < lim.v_min - v_tol || ph.v0 > lim.v_max + v_tol ||
+        v1 < lim.v_min - v_tol || v1 > lim.v_max + v_tol ||
+        ph.a0 < lim.a_min - a_tol || ph.a0 > lim.a_max + a_tol ||
+        a1 < lim.a_min - a_tol || a1 > lim.a_max + a_tol)
+    {
+      return false;
+    }
+    if (std::abs(ph.j) > 1e-12) {
+      const double tau_ext = -ph.a0 / ph.j;
+      if (tau_ext > 0.0 && tau_ext < ph.dt) {
+        const double v_ext = ph.v0 + ph.a0 * tau_ext + 0.5 * ph.j * tau_ext * tau_ext;
+        if (v_ext < lim.v_min - v_tol || v_ext > lim.v_max + v_tol) {
+          return false;
+        }
+      }
+    }
+  }
   return true;
 }
 
@@ -1801,16 +1841,19 @@ double min_upper_excursion(double q0, double v0, double a0, double a_min, double
   }
 
   // Now a <= 0 and v > 0; brake downward with j = -j_max down to a = -a_brake.
+  // When v0 < 0 and a0 > 0 with v_apex > 0, q first dips below q0 before rising to q_stop,
+  // so the maximum excursion over [0, t_stop] is max(q0, q_stop).
   const double t1 = std::max(0.0, (a + a_brake) / j_max);
   const double v1 = v + a * t1 - 0.5 * j_max * t1 * t1;
   if (v1 <= 0.0) {
     const double disc = std::max(0.0, a * a + 2.0 * j_max * v);
     const double t_star = std::clamp((a + std::sqrt(disc)) / j_max, 0.0, t1);
-    return q + v * t_star + 0.5 * a * t_star * t_star -
+    const double q_stop = q + v * t_star + 0.5 * a * t_star * t_star -
       (1.0 / 6.0) * j_max * t_star * t_star * t_star;
+    return std::max(q0, q_stop);
   }
   const double q1 = q + v * t1 + 0.5 * a * t1 * t1 - (1.0 / 6.0) * j_max * t1 * t1 * t1;
-  return q1 + (v1 * v1) / (2.0 * a_brake);
+  return std::max(q0, q1 + (v1 * v1) / (2.0 * a_brake));
 }
 
 double max_lower_excursion(double q0, double v0, double a0, double a_max, double j_max)
@@ -2017,12 +2060,23 @@ bool solve_axis_velocity_at_duration(
         double q = s0.q, v = s0.v, a = s0.a;
         const std::array<double, 3> dts{{std::max(0.0, t0), std::max(0.0, t1), std::max(0.0, t2)}};
         const std::array<double, 3> jks{{jv, 0.0, -jv}};
-        bool ok = true;
-        for (size_t k = 0; k < 3; ++k) {
+        const double v_tol = 1e-6 * (1.0 + std::max(std::abs(lim.v_min), std::abs(lim.v_max)));
+        bool ok = (v >= lim.v_min - v_tol && v <= lim.v_max + v_tol);
+        for (size_t k = 0; k < 3 && ok; ++k) {
           if (dts[k] > 1e-13) {
+            if (std::abs(jks[k]) > 1e-12) {
+              const double tau_ext = -a / jks[k];
+              if (tau_ext > 0.0 && tau_ext < dts[k]) {
+                const double v_ext = v + a * tau_ext + 0.5 * jks[k] * tau_ext * tau_ext;
+                if (v_ext < lim.v_min - v_tol || v_ext > lim.v_max + v_tol) {
+                  ok = false;
+                  break;
+                }
+              }
+            }
             cand.append_phase(dts[k], q, v, a, jks[k]);
             integrate_step(dts[k], q, v, a, jks[k], q, v, a);
-            if (v < lim.v_min - 1e-5 || v > lim.v_max + 1e-5) {
+            if (v < lim.v_min - v_tol || v > lim.v_max + v_tol) {
               ok = false;
             }
           }
@@ -2371,7 +2425,7 @@ bool solve_axis_unconstrained_step2(
     const double span = dp_max - dp_min;
     const double alpha = (span > 1e-14) ? std::clamp((pd - dp_min) / span, 0.0, 1.0) : 0.5;
     AxisProfile blended;
-    if (blend_profiles_convex(p_min, p_max, alpha, blended)) {
+    if (blend_profiles_convex(p_min, p_max, alpha, sf, ulim, blended)) {
       cands.push_back(std::move(blended));
     }
   }
@@ -2441,14 +2495,15 @@ bool eval_boundary_split_min_time(
   return true;
 }
 
-}  // namespace
-
-bool solve_axis_bounded_min_time(
+bool solve_axis_bounded_min_time_impl(
   const AxisState & s0, const AxisState & sf, const AxisLimits & lim,
-  AxisProfile & out_profile, bool * out_clamped, int depth)
+  AxisProfile & out_profile, bool * out_clamped, double * out_best_ab, int depth)
 {
   if (out_clamped != nullptr) {
     *out_clamped = false;
+  }
+  if (out_best_ab != nullptr) {
+    *out_best_ab = 0.0;
   }
   const Step1Result s1 = solve_axis_unconstrained_step1(s0, sf, lim);
   if (!s1.ok) {
@@ -2483,29 +2538,52 @@ bool solve_axis_bounded_min_time(
   const double a_lo = std::min(0.0, a_edge);
   const double a_hi = std::max(0.0, a_edge);
 
-  constexpr int kGrid = 10;
-  std::array<double, kGrid + 1> a_pts{};
-  std::array<double, kGrid + 1> t_pts{};
+  constexpr int kGrid = 24;
+  std::vector<double> a_pts(static_cast<size_t>(kGrid + 1), 0.0);
+  std::vector<double> t_pts(static_cast<size_t>(kGrid + 1), std::numeric_limits<double>::infinity());
   bool any_feas = false;
   int best_i = -1;
   double best_t = std::numeric_limits<double>::infinity();
+  double best_ab = 0.0;
   AxisProfile best_prof;
 
   for (int i = 0; i <= kGrid; ++i) {
     const double ab = a_lo + (a_hi - a_lo) * static_cast<double>(i) / kGrid;
-    a_pts[i] = ab;
+    a_pts[static_cast<size_t>(i)] = ab;
     AxisProfile tmp;
     double dur = 0.0;
     if (eval_boundary_split_min_time(s0, sf, lim, q_lim, ab, depth, tmp, dur)) {
-      t_pts[i] = dur;
+      t_pts[static_cast<size_t>(i)] = dur;
       if (!any_feas || dur < best_t) {
         any_feas = true;
         best_i = i;
         best_t = dur;
+        best_ab = ab;
         best_prof = std::move(tmp);
       }
-    } else {
-      t_pts[i] = std::numeric_limits<double>::infinity();
+    }
+  }
+
+  // Adaptive dense fallback if the coarse grid missed a narrow feasible bounce window.
+  if (!any_feas) {
+    constexpr int kDenseGrid = 64;
+    a_pts.resize(static_cast<size_t>(kDenseGrid + 1));
+    t_pts.assign(static_cast<size_t>(kDenseGrid + 1), std::numeric_limits<double>::infinity());
+    for (int i = 0; i <= kDenseGrid; ++i) {
+      const double ab = a_lo + (a_hi - a_lo) * static_cast<double>(i) / kDenseGrid;
+      a_pts[static_cast<size_t>(i)] = ab;
+      AxisProfile tmp;
+      double dur = 0.0;
+      if (eval_boundary_split_min_time(s0, sf, lim, q_lim, ab, depth, tmp, dur)) {
+        t_pts[static_cast<size_t>(i)] = dur;
+        if (!any_feas || dur < best_t) {
+          any_feas = true;
+          best_i = i;
+          best_t = dur;
+          best_ab = ab;
+          best_prof = std::move(tmp);
+        }
+      }
     }
   }
 
@@ -2515,9 +2593,10 @@ bool solve_axis_bounded_min_time(
 
   // Refine continuous a_b around best_i using Brent's method (and tighten infeasible
   // neighbor edges by bisection so boundary optima are captured accurately).
-  double b_lo = (best_i > 0) ? a_pts[best_i - 1] : a_lo;
-  double b_hi = (best_i < kGrid) ? a_pts[best_i + 1] : a_hi;
-  const double ab_mid = a_pts[best_i];
+  const int last_idx = static_cast<int>(a_pts.size()) - 1;
+  double b_lo = (best_i > 0) ? a_pts[static_cast<size_t>(best_i - 1)] : a_lo;
+  double b_hi = (best_i < last_idx) ? a_pts[static_cast<size_t>(best_i + 1)] : a_hi;
+  const double ab_mid = a_pts[static_cast<size_t>(best_i)];
 
   auto cost_fn = [&](double ab) -> double {
     AxisProfile tmp;
@@ -2527,12 +2606,13 @@ bool solve_axis_bounded_min_time(
     }
     if (dur < best_t) {
       best_t = dur;
+      best_ab = ab;
       best_prof = std::move(tmp);
     }
     return dur;
   };
 
-  if (best_i > 0 && !std::isfinite(t_pts[best_i - 1])) {
+  if (best_i > 0 && !std::isfinite(t_pts[static_cast<size_t>(best_i - 1)])) {
     double lo = b_lo, hi = ab_mid;
     for (int it = 0; it < 12; ++it) {
       const double m = 0.5 * (lo + hi);
@@ -2544,7 +2624,7 @@ bool solve_axis_bounded_min_time(
     }
     b_lo = hi;
   }
-  if (best_i < kGrid && !std::isfinite(t_pts[best_i + 1])) {
+  if (best_i < last_idx && !std::isfinite(t_pts[static_cast<size_t>(best_i + 1)])) {
     double lo = ab_mid, hi = b_hi;
     for (int it = 0; it < 12; ++it) {
       const double m = 0.5 * (lo + hi);
@@ -2567,7 +2647,19 @@ bool solve_axis_bounded_min_time(
   if (out_clamped != nullptr) {
     *out_clamped = true;
   }
+  if (out_best_ab != nullptr) {
+    *out_best_ab = best_ab;
+  }
   return true;
+}
+
+}  // namespace
+
+bool solve_axis_bounded_min_time(
+  const AxisState & s0, const AxisState & sf, const AxisLimits & lim,
+  AxisProfile & out_profile, bool * out_clamped, int depth)
+{
+  return solve_axis_bounded_min_time_impl(s0, sf, lim, out_profile, out_clamped, nullptr, depth);
 }
 
 bool solve_axis_bounded_at_duration(
@@ -2621,10 +2713,13 @@ bool solve_axis_bounded_at_duration(
     return false;
   }
 
-  // Compute exact state-constrained minimum-time trajectory first.
+  // Compute exact state-constrained minimum-time trajectory first (retaining its contact a_b*).
   AxisProfile min_bounded;
   bool clamped = false;
-  if (!solve_axis_bounded_min_time(s0, sf, lim, min_bounded, &clamped, depth)) {
+  double min_best_ab = 0.0;
+  if (!solve_axis_bounded_min_time_impl(
+        s0, sf, lim, min_bounded, &clamped, &min_best_ab, depth))
+  {
     return false;
   }
   if (T_target < min_bounded.duration - kTimeTol) {
@@ -2650,6 +2745,47 @@ bool solve_axis_bounded_at_duration(
     q_lim = lim.q_min;
     a_edge = lim.a_max;
   }
+
+  auto try_extend_through_ab = [&](double ab) -> bool {
+    const AxisState mid_st{q_lim, 0.0, ab};
+    if (!validate_axis_state(mid_st, lim, true, true)) {
+      return false;
+    }
+    AxisProfile b1, b2;
+    bool bc1 = false, bc2 = false;
+    if (!solve_axis_bounded_min_time(s0, mid_st, lim, b1, &bc1, depth + 1) ||
+        !solve_axis_bounded_min_time(mid_st, sf, lim, b2, &bc2, depth + 1))
+    {
+      return false;
+    }
+    const double tb = b1.duration + b2.duration;
+    if (tb > T_target + kTimeTol) {
+      return false;
+    }
+    if (std::abs(tb - T_target) <= kTimeTol) {
+      out_profile = std::move(b1);
+      out_profile.append_profile(b2);
+      out_profile.finalize();
+      return true;
+    }
+    const double sl = std::max(0.0, T_target - tb);
+    const double prop = (tb > 1e-9) ? (b1.duration / tb) : 0.5;
+    for (double f : {prop, 0.5, 0.0, 1.0, 0.25, 0.75}) {
+      AxisProfile e1, e2;
+      double n1 = 0.0, n2 = 0.0;
+      const double T1 = b1.duration + f * sl;
+      const double T2 = T_target - T1;
+      if (solve_axis_bounded_at_duration(s0, mid_st, lim, T1, e1, n1, depth + 1) &&
+          solve_axis_bounded_at_duration(mid_st, sf, lim, T2, e2, n2, depth + 1))
+      {
+        out_profile = std::move(e1);
+        out_profile.append_profile(e2);
+        out_profile.finalize();
+        return true;
+      }
+    }
+    return false;
+  };
 
   // Check zero-acceleration boundary arc (q_lim, 0, 0).
   const AxisState rail{q_lim, 0.0, 0.0};
@@ -2695,69 +2831,136 @@ bool solve_axis_bounded_at_duration(
     }
 
     // Here min_bounded.duration < T_target < t_rail:
-    // By continuity of C(a_b) from optimal touch-and-go a_b* to a_b = 0, bisect a_b to hit T_target!
-    double ab_fast = 0.0;
-    double best_fast_t = t_rail;
-    constexpr int kScan = 12;
+    // Collect feasible samples along [0, a_edge] (including min_best_ab) and locate a tight
+    // feasible bracket [lo, hi] with dur(lo) <= T_target <= dur(hi).
+    struct AbSample
+    {
+      double ab;
+      double dur;
+    };
+    constexpr int kScan = 24;
+    std::vector<double> scan_abs;
+    scan_abs.reserve(static_cast<size_t>(kScan + 2));
+    scan_abs.push_back(0.0);
     for (int i = 1; i <= kScan; ++i) {
-      const double ab = a_edge * static_cast<double>(i) / kScan;
+      scan_abs.push_back(a_edge * static_cast<double>(i) / kScan);
+    }
+    if (clamped && ((a_edge > 0.0 && min_best_ab >= 0.0 && min_best_ab <= a_edge) ||
+                    (a_edge < 0.0 && min_best_ab <= 0.0 && min_best_ab >= a_edge)))
+    {
+      scan_abs.push_back(min_best_ab);
+    }
+    std::sort(scan_abs.begin(), scan_abs.end(), [](double x, double y) {
+      return std::abs(x) < std::abs(y);
+    });
+    scan_abs.erase(
+      std::unique(scan_abs.begin(), scan_abs.end(), [](double x, double y) {
+        return std::abs(x - y) <= 1e-9;
+      }),
+      scan_abs.end());
+
+    std::vector<AbSample> feas_samples;
+    feas_samples.reserve(scan_abs.size());
+    feas_samples.push_back({0.0, t_rail});
+    for (size_t idx = 1; idx < scan_abs.size(); ++idx) {
+      const double ab = scan_abs[idx];
       AxisProfile tmp;
       double dur = 0.0;
-      if (eval_boundary_split_min_time(s0, sf, lim, q_lim, ab, depth, tmp, dur) && dur < best_fast_t) {
-        best_fast_t = dur;
-        ab_fast = ab;
+      if (eval_boundary_split_min_time(s0, sf, lim, q_lim, ab, depth, tmp, dur)) {
+        if (std::abs(dur - T_target) <= kTimeTol) {
+          out_profile = std::move(tmp);
+          return true;
+        }
+        feas_samples.push_back({ab, dur});
       }
     }
-    if (best_fast_t <= T_target + kTimeTol) {
-      double lo = ab_fast, hi = 0.0;  // dur(lo) <= T_target <= dur(hi)
+
+    bool have_bracket = false;
+    double lo = 0.0;  // dur(lo) <= T_target
+    double hi = 0.0;  // dur(hi) >= T_target
+    double best_span = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i + 1 < feas_samples.size(); ++i) {
+      const auto & a0 = feas_samples[i];
+      const auto & a1 = feas_samples[i + 1];
+      if ((a0.dur <= T_target && a1.dur >= T_target) ||
+          (a1.dur <= T_target && a0.dur >= T_target))
+      {
+        const double span = std::abs(a1.ab - a0.ab);
+        if (span < best_span) {
+          best_span = span;
+          lo = (a0.dur <= a1.dur) ? a0.ab : a1.ab;
+          hi = (a0.dur <= a1.dur) ? a1.ab : a0.ab;
+          have_bracket = true;
+        }
+      }
+    }
+
+    if (have_bracket) {
       AxisProfile best_match;
       bool matched = false;
       for (int it = 0; it < 36; ++it) {
+        if (std::abs(hi - lo) <= 1e-11 * (1.0 + std::abs(a_edge))) {
+          break;
+        }
         const double mid = 0.5 * (lo + hi);
         AxisProfile tmp;
         double dur = 0.0;
-        if (!eval_boundary_split_min_time(s0, sf, lim, q_lim, mid, depth, tmp, dur)) {
-          hi = mid;
+        if (eval_boundary_split_min_time(s0, sf, lim, q_lim, mid, depth, tmp, dur)) {
+          if (std::abs(dur - T_target) <= kTimeTol) {
+            best_match = std::move(tmp);
+            matched = true;
+            break;
+          }
+          if (dur < T_target) {
+            lo = mid;
+          } else {
+            hi = mid;
+          }
           continue;
         }
-        if (std::abs(dur - T_target) <= kTimeTol) {
-          best_match = std::move(tmp);
-          matched = true;
-          break;
+        // Infeasible point at mid: probe both sub-halves symmetrically rather than discarding [mid, hi].
+        bool progressed = false;
+        const std::array<double, 2> probes{{
+          0.75 * lo + 0.25 * hi,
+          0.25 * lo + 0.75 * hi
+        }};
+        for (double p : probes) {
+          AxisProfile ptmp;
+          double pdur = 0.0;
+          if (!eval_boundary_split_min_time(s0, sf, lim, q_lim, p, depth, ptmp, pdur)) {
+            continue;
+          }
+          if (std::abs(pdur - T_target) <= kTimeTol) {
+            best_match = std::move(ptmp);
+            matched = true;
+            break;
+          }
+          if (pdur < T_target) {
+            lo = p;
+          } else {
+            hi = p;
+          }
+          progressed = true;
         }
-        if (dur < T_target) {
-          lo = mid;
-        } else {
-          hi = mid;
+        if (matched || !progressed) {
+          break;
         }
       }
       if (matched) {
         out_profile = std::move(best_match);
         return true;
       }
-      // If a small jump crossed T_target, extend at lo with exact split T1 + T2 = T_target.
-      const AxisState mid_st{q_lim, 0.0, lo};
-      AxisProfile b1, b2;
-      bool bc1 = false, bc2 = false;
-      if (solve_axis_bounded_min_time(s0, mid_st, lim, b1, &bc1, depth + 1) &&
-          solve_axis_bounded_min_time(mid_st, sf, lim, b2, &bc2, depth + 1))
-      {
-        const double tb = b1.duration + b2.duration;
-        if (tb <= T_target + kTimeTol) {
-          const double sl = std::max(0.0, T_target - tb);
-          const double prop = (tb > 1e-9) ? (b1.duration / tb) : 0.5;
-          for (double f : {prop, 0.5, 0.0, 1.0}) {
-            AxisProfile e1, e2;
-            double n1 = 0.0, n2 = 0.0;
-            if (solve_axis_bounded_at_duration(s0, mid_st, lim, b1.duration + f * sl, e1, n1, depth + 1) &&
-                solve_axis_bounded_at_duration(mid_st, sf, lim, T_target - (b1.duration + f * sl), e2, n2, depth + 1))
-            {
-              out_profile = std::move(e1);
-              out_profile.append_profile(e2);
-              out_profile.finalize();
-              return true;
-            }
-          }
+      // If a discontinuous jump crossed T_target, extend cleanly through lo (strictly feasible).
+      if (try_extend_through_ab(lo)) {
+        return true;
+      }
+    }
+
+    // Try extending through any feasible bounce acceleration with dur <= T_target.
+    for (const auto & s : feas_samples) {
+      if (s.dur <= T_target + kTimeTol && std::abs(s.ab) > 1e-12) {
+        if (try_extend_through_ab(s.ab)) {
+          return true;
         }
       }
     }
@@ -2783,36 +2986,15 @@ bool solve_axis_bounded_at_duration(
   }
 
   // Case C: Zero-acc rail (q_lim, 0, 0) was unreachable (only inward bounce a_b != 0 is feasible).
-  // Try extending sub-segments through feasible inward a_b values, or bouncing to an interior rest point.
-  for (int i = 1; i <= 10; ++i) {
-    const double ab = a_edge * static_cast<double>(i) / 10.0;
-    const AxisState mid_st{q_lim, 0.0, ab};
-    if (!validate_axis_state(mid_st, lim, true, true)) {
-      continue;
-    }
-    AxisProfile b1, b2;
-    bool bc1 = false, bc2 = false;
-    if (!solve_axis_bounded_min_time(s0, mid_st, lim, b1, &bc1, depth + 1) ||
-        !solve_axis_bounded_min_time(mid_st, sf, lim, b2, &bc2, depth + 1))
-    {
-      continue;
-    }
-    const double tb = b1.duration + b2.duration;
-    if (tb <= T_target + kTimeTol) {
-      const double sl = std::max(0.0, T_target - tb);
-      const double prop = (tb > 1e-9) ? (b1.duration / tb) : 0.5;
-      for (double f : {prop, 0.5, 0.0, 1.0}) {
-        AxisProfile e1, e2;
-        double n1 = 0.0, n2 = 0.0;
-        if (solve_axis_bounded_at_duration(s0, mid_st, lim, b1.duration + f * sl, e1, n1, depth + 1) &&
-            solve_axis_bounded_at_duration(mid_st, sf, lim, T_target - (b1.duration + f * sl), e2, n2, depth + 1))
-        {
-          out_profile = std::move(e1);
-          out_profile.append_profile(e2);
-          out_profile.finalize();
-          return true;
-        }
-      }
+  // Try min_best_ab first, then scan inward a_b values across [0, a_edge].
+  if (clamped && std::abs(min_best_ab) > 1e-12 && try_extend_through_ab(min_best_ab)) {
+    return true;
+  }
+  constexpr int kCaseCScan = 24;
+  for (int i = 1; i <= kCaseCScan; ++i) {
+    const double ab = a_edge * static_cast<double>(i) / kCaseCScan;
+    if (try_extend_through_ab(ab)) {
+      return true;
     }
   }
 

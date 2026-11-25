@@ -1201,15 +1201,6 @@ bool ProgramCompiler::compile_pva_statement(
     }
   }
 
-  auto is_all_zero = [](const std::array<double, 6> & arr) {
-    for (double x : arr) {
-      if (std::abs(x) > 1e-9) {
-        return false;
-      }
-    }
-    return true;
-  };
-
   bool any_vel_or_acc_or_dt = false;
   for (size_t k = 0; k < M; ++k) {
     const auto & wp = pva.waypoints[k];
@@ -1217,16 +1208,10 @@ bool ProgramCompiler::compile_pva_statement(
       any_vel_or_acc_or_dt = true;
       break;
     }
-    if (k + 1 == M) {
-      // Ignore an explicit all-zero v=[0..0], a=[0..0] on the final waypoint alone so
-      // restating the mandatory terminal rest condition preserves pure-(P) TOPP.
-      if ((wp.velocity.has_value() && !is_all_zero(*wp.velocity)) ||
-          (wp.acceleration.has_value() && !is_all_zero(*wp.acceleration)))
-      {
-        any_vel_or_acc_or_dt = true;
-        break;
-      }
-    } else if (wp.velocity.has_value() || wp.acceleration.has_value()) {
+    // Terminal rest (v=0, a=0) is mandatory on the final waypoint (any non-zero terminal v/a
+    // was already warned and clamped to zero above), so only interior waypoints' v/a or any dt
+    // should route away from pure-(P) TOPP / S-curve planning.
+    if (k + 1 < M && (wp.velocity.has_value() || wp.acceleration.has_value())) {
       any_vel_or_acc_or_dt = true;
       break;
     }
@@ -1943,21 +1928,48 @@ bool ProgramCompiler::replan_remaining_block(
 
   // 1. Resume point: the reference sample closest to the actual configuration. The
   //    reported pause sample lags (50 Hz feedback) and the arm brakes past it, so search
-  //    a window around it instead of trusting the index.
-  const size_t pause_idx = std::min(pause_sample_idx, total_pts - 1);
-  const size_t lo = pause_idx > 500 ? pause_idx - 500 : 0;
-  const size_t hi = std::min(total_pts - 1, pause_idx + 2500);
-  size_t resume_idx = pause_idx;
-  double best = std::numeric_limits<double>::infinity();
-  for (size_t idx = lo; idx <= hi; ++idx) {
+  //    a local window first and extend forward adaptively if braking/lag exceeds 2.5 s
+  //    (stopping once a close valley is passed so self-intersecting loops are respected).
+  auto dist_sq_at = [&](size_t idx) -> double {
     const auto q = get_pt_q(idx);
     double d2 = 0.0;
     for (size_t i = 0; i < 6; ++i) {
-      d2 += (q[i] - q_actual[i]) * (q[i] - q_actual[i]);
+      const double diff = q[i] - q_actual[i];
+      d2 += diff * diff;
     }
+    return d2;
+  };
+
+  const size_t pause_idx = std::min(pause_sample_idx, total_pts - 1);
+  const size_t lo = pause_idx > 500 ? pause_idx - 500 : 0;
+  const size_t primary_hi = std::min(total_pts - 1, pause_idx + 2500);
+  size_t resume_idx = pause_idx;
+  double best = std::numeric_limits<double>::infinity();
+  for (size_t idx = lo; idx <= primary_hi; ++idx) {
+    const double d2 = dist_sq_at(idx);
     if (d2 < best) {
       best = d2;
       resume_idx = idx;
+    }
+  }
+  constexpr double kCloseMatchSq = 1e-4;  // (0.01 rad)^2
+  if (primary_hi + 1 < total_pts &&
+      (resume_idx + 100 >= primary_hi || best > kCloseMatchSq))
+  {
+    bool entered_close_valley = (best <= kCloseMatchSq);
+    for (size_t idx = primary_hi + 1; idx < total_pts; ++idx) {
+      const double d2 = dist_sq_at(idx);
+      if (d2 < best) {
+        best = d2;
+        resume_idx = idx;
+        if (best <= kCloseMatchSq) {
+          entered_close_valley = true;
+        }
+      } else if (entered_close_valley && d2 > std::max(4.0 * best, 4.0 * kCloseMatchSq) &&
+                 idx > resume_idx + 250)
+      {
+        break;
+      }
     }
   }
   const double u_r = path_u_at(resume_idx);
@@ -2022,6 +2034,12 @@ bool ProgramCompiler::replan_remaining_block(
                 waypoints, full, diags))
           {
             return diag_error(diags, "Cannot rebuild joint path for resume");
+          }
+          if (waypoints.size() <= 2 || full.empty()) {
+            // Zero-length motions collapsed the group to a single segment with no blends:
+            // resume directly along the straight joint line to the block target.
+            straight_to_end = true;
+            break;
           }
           const JointCompositePath sub = full.restricted(u_r);
           std::string topp_err;

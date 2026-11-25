@@ -39,6 +39,7 @@ struct CartesianCollocationResult
   int mesh_refinements = 0;
   bool used_cartesian_warm_start = false;
   bool converged = false;
+  bool kkt_optimal = false;
 };
 
 // Direct-transcription joint-space cubic collocation NLP solver for multi-waypoint

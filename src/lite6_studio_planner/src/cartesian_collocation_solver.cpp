@@ -63,6 +63,25 @@ void add_diag(
   diags.push_back(std::move(d));
 }
 
+void add_warning(
+  std::vector<D> & diags,
+  uint8_t stage,
+  const SourceLocation & loc,
+  const std::string & code,
+  const std::string & msg)
+{
+  D d;
+  d.severity = D::SEVERITY_WARNING;
+  d.stage = stage;
+  d.line_number = loc.line;
+  d.column_number = loc.column;
+  d.statement_index = loc.statement_index;
+  d.command_text = loc.text;
+  d.code = code;
+  d.message = msg;
+  diags.push_back(std::move(d));
+}
+
 std::string ik_error_code(IKResult res)
 {
   switch (res) {
@@ -614,6 +633,13 @@ bool resolve_ik_chains_dp(
   // Validate waypoint Cartesian limits up front.
   for (size_t k = 0; k < M; ++k) {
     const auto & wp = waypoints[k];
+    if (k + 1 < M && wp.acceleration.has_value() && !wp.velocity.has_value()) {
+      add_diag(
+        out_diagnostics, D::STAGE_PLANNING, wp.loc, "ERR_PVA_ACC_REQUIRES_VEL",
+        "MovePVA Cartesian waypoint " + std::to_string(k + 1) +
+        " specifies acceleration without velocity (Cartesian acceleration requires velocity)");
+      return false;
+    }
     if (k + 1 < M && wp.velocity.has_value()) {
       const Vec6 V = to_vec6(*wp.velocity);
       if (V.head<3>().norm() > v_trans_lim * (1.0 + 1e-6)) {
@@ -1109,11 +1135,13 @@ struct CollocationMesh
 struct IpmSolveStats
 {
   bool converged = false;
+  bool kkt_optimal = false;
   bool primal_feasible = false;
   int iterations = 0;
   double eq_inf = 0.0;
   double ineq_inf = 0.0;
   double dual_inf = 0.0;
+  double comp_inf = 0.0;
   double mu = 0.0;
 };
 
@@ -1863,6 +1891,7 @@ IpmSolveStats run_collocation_ipm(
     stats.eq_inf = eq_inf;
     stats.ineq_inf = ineq_inf;
     stats.dual_inf = dual_inf_scaled;
+    stats.comp_inf = comp_zero_inf;
     stats.mu = mu;
 
     const double prim_inf = std::max({eq_inf, ineq_inf, prim_slack_inf});
@@ -1871,6 +1900,7 @@ IpmSolveStats run_collocation_ipm(
         dual_inf_scaled < 2e-3 && comp_zero_inf < 2e-5 && mu <= 1e-5)
     {
       stats.converged = true;
+      stats.kkt_optimal = true;
       stats.primal_feasible = true;
       break;
     }
@@ -1880,31 +1910,43 @@ IpmSolveStats run_collocation_ipm(
       break;
     }
 
-    // Adaptive barrier parameter update (Waechter & Biegler IPOPT rule).
+    // Adaptive barrier parameter update (Waechter & Biegler IPOPT rule):
+    // update mu and shift only the barrier RHS terms directly so the already-assembled
+    // KKT matrix is factored and solved on the same iteration without wasting an iteration.
     const double e_mu = std::max({dual_inf_scaled, prim_inf, comp_mu_inf / dual_scale});
     if (mu > 1e-7 && e_mu <= 10.0 * mu) {
-      mu = std::max(1e-7, std::min(0.2 * mu, std::pow(mu, 1.45)));
-      filter.clear();
-      // Gently pull severely mismatched duals toward complementarity before the new mu subproblem.
+      const double mu_new = std::max(1e-7, std::min(0.2 * mu, std::pow(mu, 1.45)));
+      const double dmu = mu_new - mu;
       for (size_t m = 0; m < n_ineq; ++m) {
-        const double target = mu / s_ineq[m];
-        lam[m] = std::clamp(lam[m], target * 1e-4, target * 1e4);
+        const auto & gc = g_grads[m];
+        const double coef = dmu / s_ineq[m];
+        for (int a_k = 0; a_k < gc.n_node; ++a_k) {
+          rhs_z[gc.z_idx[static_cast<size_t>(a_k)]] -= coef * gc.z_val[static_cast<size_t>(a_k)];
+        }
+        if (gc.t_col >= 0) {
+          rhs_T[static_cast<size_t>(gc.t_col)] -= coef * gc.t_val;
+        }
       }
-      for (size_t idx = 0; idx < xn.size(); ++idx) {
-        if (!mesh.node_fixed[idx]) {
-          const double tL = mu / (xn[idx] - lb_n[idx]);
-          const double tU = mu / (ub_n[idx] - xn[idx]);
-          zL_n[idx] = std::clamp(zL_n[idx], tL * 1e-4, tL * 1e4);
-          zU_n[idx] = std::clamp(zU_n[idx], tU * 1e-4, tU * 1e4);
+      for (size_t i = 0; i <= N; ++i) {
+        const size_t z_off = i * kBlockStride;
+        const size_t n_off = i * kNodePrimal;
+        for (int c = 0; c < kNodePrimal; ++c) {
+          const size_t n_idx = n_off + static_cast<size_t>(c);
+          if (!mesh.node_fixed[n_idx]) {
+            const double sL = xn[n_idx] - lb_n[n_idx];
+            const double sU = ub_n[n_idx] - xn[n_idx];
+            rhs_z[z_off + static_cast<size_t>(c)] += dmu / sL - dmu / sU;
+          }
         }
       }
       for (size_t c = 0; c < n_border; ++c) {
-        const double tL = mu / (xt[c] - lb_t[c]);
-        const double tU = mu / (ub_t[c] - xt[c]);
-        zL_t[c] = std::clamp(zL_t[c], tL * 1e-4, tL * 1e4);
-        zU_t[c] = std::clamp(zU_t[c], tU * 1e-4, tU * 1e4);
+        const double sL = xt[c] - lb_t[c];
+        const double sU = ub_t[c] - xt[c];
+        rhs_T[c] += dmu / sL - dmu / sU;
       }
-      continue;
+      mu = mu_new;
+      stats.mu = mu;
+      filter.clear();
     }
 
     // 2. Factor & solve bordered banded KKT with exact IPOPT inertia correction.
@@ -2090,10 +2132,13 @@ IpmSolveStats run_collocation_ipm(
         stall_count = 0;
         continue;
       }
-      // Only stop on stall if genuinely primal-feasible AND barrier parameter is already small.
+      // On stall, check dual/complementarity KKT optimality explicitly before marking converged;
+      // otherwise terminate as a non-optimal primal-feasible fallback so callers can emit a warning.
       if (stall_count >= 3 && eq_inf < 1e-6 && ineq_inf < 1e-4 && mu <= 1e-4) {
         stats.primal_feasible = true;
-        stats.converged = true;
+        const bool kkt_ok = (dual_inf_scaled < 2e-3 && comp_zero_inf < 2e-5 && mu <= 1e-5);
+        stats.kkt_optimal = kkt_ok;
+        stats.converged = kkt_ok;
         break;
       }
       // Feasibility restoration / watchdog: clear filter and take a tiny damped primal-dual step.
@@ -3053,11 +3098,22 @@ bool CartesianCollocationSolver::solve(
     cand_res.total_ipm_iterations = total_iters;
     cand_res.mesh_refinements = refinements;
     cand_res.used_cartesian_warm_start = use_cart_warm_start;
-    cand_res.converged = true;
+    cand_res.kkt_optimal = stats.kkt_optimal;
+    cand_res.converged = stats.converged || stats.primal_feasible;
     cand_res.cartesian_path = std::make_shared<CollocationCartesianPath>(
       model, tcp, std::move(knot_times), mesh.q, mesh.v, mesh.a,
       mesh.wp_node, std::move(seg_locs), options);
     return true;
+  };
+
+  auto emit_suboptimal_warning_if_needed = [&](const CartesianCollocationResult & res) {
+    if (!res.kkt_optimal) {
+      add_warning(
+        out_diagnostics, D::STAGE_PLANNING, waypoints.front().loc, "WARN_COLLOCATION_SUBOPTIMAL",
+        "Cartesian collocation IPM terminated on a primal-feasible fallback before full KKT "
+        "optimality; trajectory passed 1 kHz kinematic and collision verification but may be "
+        "slightly slower than time-optimal");
+    }
   };
 
   Verify1kHzReport last_rep;
@@ -3084,6 +3140,7 @@ bool CartesianCollocationSolver::solve(
       }
 
       if (col_seg < 0) {
+        emit_suboptimal_warning_if_needed(cand_res);
         out_result = std::move(cand_res);
         return true;
       }
@@ -3091,29 +3148,60 @@ bool CartesianCollocationSolver::solve(
       had_collision_only = true;
       last_col_detail = col_detail;
 
-      // Collision-guided waypoint midpoint recovery: if the minimum-time arc grazed the ground
-      // or robot body on segment `col_seg` (and segment dt is not pinned), insert a collision-free
-      // intermediate pose along the lifted SE(3) chord (with free v, a) and re-solve!
-      if (!waypoints[static_cast<size_t>(col_seg)].dt.has_value()) {
+      // Collision-guided waypoint midpoint recovery: insert a collision-free intermediate pose
+      // along vertical, outward-radial, or lateral offsets from the SE(3) chord midpoint.
+      // Supports both free-dt and fixed-dt segments (splitting fixed dt into exact 1 ms halves).
+      const auto & col_wp = waypoints[static_cast<size_t>(col_seg)];
+      const bool can_split = !col_wp.dt.has_value() || (*col_wp.dt >= 0.004);
+      if (can_split) {
         auto workspace = engine.collision_workspace();
         const Eigen::Matrix4d T_a = (col_seg == 0) ?
           engine.forward_pose(to_array(start_q), workspace.data) :
           waypoints[static_cast<size_t>(col_seg - 1)].pose;
-        const Eigen::Matrix4d & T_b = waypoints[static_cast<size_t>(col_seg)].pose;
+        const Eigen::Matrix4d & T_b = col_wp.pose;
         const Eigen::Vector3d pa = T_a.topRightCorner<3, 1>();
         const Eigen::Vector3d pb = T_b.topRightCorner<3, 1>();
         const Eigen::Quaterniond ra(T_a.topLeftCorner<3, 3>());
         const Eigen::Quaterniond rb(T_b.topLeftCorner<3, 3>());
+        const Eigen::Vector3d p_chord = 0.5 * (pa + pb);
 
-        for (double z_lift : {0.0, 0.06, 0.14}) {
+        Eigen::Vector3d r_hat(p_chord.x(), p_chord.y(), 0.0);
+        if (r_hat.norm() > 1e-6) {
+          r_hat.normalize();
+        } else {
+          r_hat = Eigen::Vector3d(1.0, 0.0, 0.0);
+        }
+        const Eigen::Vector3d t_hat(-r_hat.y(), r_hat.x(), 0.0);
+        const Eigen::Vector3d z_hat(0.0, 0.0, 1.0);
+
+        const std::array<Eigen::Vector3d, 8> offsets{{
+          Eigen::Vector3d::Zero(),
+          0.06 * z_hat,
+          0.14 * z_hat,
+          0.08 * r_hat + 0.04 * z_hat,
+          0.12 * r_hat,
+          0.08 * t_hat + 0.04 * z_hat,
+          -0.08 * t_hat + 0.04 * z_hat,
+          0.22 * z_hat
+        }};
+
+        for (const auto & off : offsets) {
           Eigen::Matrix4d T_mid = Eigen::Matrix4d::Identity();
-          T_mid.topRightCorner<3, 1>() = 0.5 * (pa + pb) + Eigen::Vector3d(0.0, 0.0, z_lift);
+          T_mid.topRightCorner<3, 1>() = p_chord + off;
           T_mid.topLeftCorner<3, 3>() = ra.slerp(0.5, rb).toRotationMatrix();
 
           std::vector<CartesianCollocationWaypoint> aug_wps = waypoints;
           CartesianCollocationWaypoint mid_wp;
-          mid_wp.loc = waypoints[static_cast<size_t>(col_seg)].loc;
+          mid_wp.loc = col_wp.loc;
           mid_wp.pose = T_mid;
+          if (col_wp.dt.has_value()) {
+            const double T_seg = *col_wp.dt;
+            const double dt1 = std::clamp(
+              std::round(0.5 * T_seg * 1000.0) * 0.001, 0.002, T_seg - 0.002);
+            const double dt2 = T_seg - dt1;
+            mid_wp.dt = dt1;
+            aug_wps[static_cast<size_t>(col_seg)].dt = dt2;
+          }
           aug_wps.insert(aug_wps.begin() + col_seg, mid_wp);
 
           std::vector<ResolvedWaypointChain> aug_chains;
@@ -3132,6 +3220,13 @@ bool CartesianCollocationSolver::solve(
                 aug_wps, aug_chains.front(), false, aug_res, aug_col, aug_col_detail, aug_rep) &&
               aug_col < 0)
           {
+            // Merge the split segment durations back so segment_durations matches waypoints.size().
+            if (aug_res.segment_durations.size() == waypoints.size() + 1) {
+              const size_t cs = static_cast<size_t>(col_seg);
+              aug_res.segment_durations[cs] += aug_res.segment_durations[cs + 1];
+              aug_res.segment_durations.erase(aug_res.segment_durations.begin() + col_seg + 1);
+            }
+            emit_suboptimal_warning_if_needed(aug_res);
             out_result = std::move(aug_res);
             return true;
           }
