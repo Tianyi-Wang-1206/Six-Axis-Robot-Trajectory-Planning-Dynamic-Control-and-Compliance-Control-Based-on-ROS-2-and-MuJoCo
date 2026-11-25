@@ -8,12 +8,13 @@
 #include "lite6_studio_planner/joint_pva_solver.hpp"
 #include "lite6_studio_planner/s_curve_solver.hpp"
 #include "lite6_studio_planner/topp_jerk_solver.hpp"
-#include "lite6_planner/kinematics_engine.hpp"
+#include "lite6_kinematics/kinematics_engine.hpp"
 #include "lite6_interfaces/action/follow_impedance_trajectory.hpp"
 #include "lite6_interfaces/msg/compile_diagnostic.hpp"
 
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 #include <array>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -97,8 +98,9 @@ public:
   static constexpr double kImpedanceJointVelocityCap = 2.7;
 
   using Diagnostic = lite6_interfaces::msg::CompileDiagnostic;
+  using Cancellation = std::function<bool()>;
 
-  explicit ProgramCompiler(const lite6_planner::KinematicsEngine & engine);
+  explicit ProgramCompiler(const lite6_kinematics::KinematicsEngine & engine);
 
   // Executes the full 5-stage compilation & 1 kHz verification pipeline:
   //   Stage 1: Lexical & Syntax check
@@ -111,6 +113,26 @@ public:
     const std::array<double, 6> & start_joints,
     CompiledProgram & out_program,
     std::vector<Diagnostic> & out_diagnostics) const;
+
+  // Plans and 1 kHz-verifies a single rigid MotionStatement (MoveJ, MoveP, MoveL,
+  // MoveC 3-point, or MoveC center-angle) directly from start_joints without DSL
+  // serialization. Optional cooperative cancellation aborts with ERR_CANCELLED.
+  bool plan_single_motion(
+    const MotionStatement & motion,
+    const std::array<double, 6> & start_joints,
+    trajectory_msgs::msg::JointTrajectory & out_trajectory,
+    std::vector<Diagnostic> & out_diagnostics,
+    const Cancellation & is_cancelled = {}) const;
+
+  // Runs full Stage 4 (kinematic limits and optional singularity/jerk) and Stage 5
+  // (Coal self and ground collision with 0.04 rad subdivision) verification on an
+  // externally provided 6-axis JointTrajectory (e.g., SysID excitation trajectories).
+  bool verify_joint_trajectory(
+    const trajectory_msgs::msg::JointTrajectory & trajectory,
+    bool check_singularity_along_path,
+    bool enforce_jerk,
+    std::vector<Diagnostic> & out_diagnostics,
+    const Cancellation & is_cancelled = {}) const;
 
   // Plans and verifies a smooth 1 kHz point-to-point joint alignment bridge trajectory.
   bool plan_alignment_bridge(
@@ -160,7 +182,7 @@ public:
     std::vector<Diagnostic> & out_diagnostics) const;
 
 private:
-  const lite6_planner::KinematicsEngine & engine_;
+  const lite6_kinematics::KinematicsEngine & engine_;
 
   bool validate_and_clamp_start_joints(
     const std::array<double, 6> & q_in,
@@ -174,13 +196,15 @@ private:
     bool is_impedance,
     const ImpedanceParams & imp_params,
     ExecutionBlock & out_block,
-    std::vector<Diagnostic> & out_diagnostics) const;
+    std::vector<Diagnostic> & out_diagnostics,
+    const Cancellation & is_cancelled = {}) const;
 
   bool compile_joint_group(
     const std::vector<MotionStatement> & group,
     const std::array<double, 6> & start_q,
     ExecutionBlock & out_block,
-    std::vector<Diagnostic> & out_diagnostics) const;
+    std::vector<Diagnostic> & out_diagnostics,
+    const Cancellation & is_cancelled = {}) const;
 
   // Joint-space Hermite path through IK knots of a Cartesian path; nodal derivatives
   // dq/du, d2q/du2 come from differential kinematics on the analytic Cartesian path
@@ -189,7 +213,8 @@ private:
     const CartesianPath & cart_path,
     const std::array<double, 6> & start_q,
     C3JointSpline & out_path,
-    std::vector<Diagnostic> & out_diagnostics) const;
+    std::vector<Diagnostic> & out_diagnostics,
+    const Cancellation & is_cancelled = {}) const;
 
   // Cartesian path -> joint path -> 3rd-order TOPP -> 1 kHz verification.
   bool plan_cartesian_path(
@@ -199,12 +224,13 @@ private:
     const SourceLocation & default_loc,
     bool is_impedance,
     SampledTrajectory1kHz & out_sampled,
-    std::vector<Diagnostic> & out_diagnostics) const;
+    std::vector<Diagnostic> & out_diagnostics,
+    const Cancellation & is_cancelled = {}) const;
 
   // Joint limits used to plan and verify a block. Impedance blocks additionally cap
   // max_vel at kImpedanceJointVelocityCap so the measured joint speed (reference plus
   // compliant tracking lag) stays below the controller's impedance E-STOP threshold.
-  std::array<lite6_planner::JointLimit, 6> motion_limits(bool is_impedance) const;
+  std::array<lite6_kinematics::JointLimit, 6> motion_limits(bool is_impedance) const;
 
   // Resolves joint-group waypoints and builds the blended joint path (>= 2 statements).
   bool build_joint_group_path(
@@ -212,7 +238,8 @@ private:
     const std::array<double, 6> & start_q,
     std::vector<std::array<double, 6>> & out_waypoints,
     JointCompositePath & out_path,
-    std::vector<Diagnostic> & out_diagnostics) const;
+    std::vector<Diagnostic> & out_diagnostics,
+    const Cancellation & is_cancelled = {}) const;
 
   // Joint-space length removed on the segment from corner_q towards neighbor_q so the
   // TCP lies blend_radius away from its position at corner_q (capped at 45 % of the segment).
@@ -240,7 +267,9 @@ private:
     const SampledTrajectory1kHz & sampled,
     bool check_singularity_along_path,
     std::vector<Diagnostic> & diags,
-    bool is_impedance = false) const;
+    bool is_impedance = false,
+    bool enforce_jerk = true,
+    const Cancellation & is_cancelled = {}) const;
 };
 
 }  // namespace lite6_studio_planner

@@ -1,6 +1,6 @@
 #include "lite6_studio_planner/joint_pva_solver.hpp"
 #include "lite6_studio_planner/third_order_otg.hpp"
-#include "lite6_planner/motion_tolerances.hpp"
+#include "lite6_kinematics/motion_tolerances.hpp"
 
 #include <algorithm>
 #include <array>
@@ -38,7 +38,7 @@ double round_1ms(double t)
 }
 
 std::array<DoFLimit, 6> build_dof_limits(
-  const std::array<lite6_planner::JointLimit, 6> & limits,
+  const std::array<lite6_kinematics::JointLimit, 6> & limits,
   double vel_scale, double acc_scale, double jerk_scale)
 {
   std::array<DoFLimit, 6> out{};
@@ -542,7 +542,7 @@ void sample_segment_1khz(
 
 bool JointPVASolver::solve_segment(
   const SegmentInput & seg,
-  const std::array<lite6_planner::JointLimit, 6> & limits,
+  const std::array<lite6_kinematics::JointLimit, 6> & limits,
   double vel_scale,
   double acc_scale,
   double jerk_scale,
@@ -591,7 +591,7 @@ bool JointPVASolver::solve_segment(
 bool JointPVASolver::solve_multi_waypoint(
   const std::array<double, 6> & start_q,
   const std::vector<PVAWaypoint> & waypoints,
-  const std::array<lite6_planner::JointLimit, 6> & limits,
+  const std::array<lite6_kinematics::JointLimit, 6> & limits,
   double vel_scale,
   double acc_scale,
   double jerk_scale,
@@ -639,8 +639,8 @@ bool JointPVASolver::solve_multi_waypoint(
 
     for (size_t j = 0; j < 6; ++j) {
       if (!std::isfinite(wp.joint_pos[j]) ||
-          wp.joint_pos[j] < lims[j].q_min - lite6_planner::tolerance::kJointPosition ||
-          wp.joint_pos[j] > lims[j].q_max + lite6_planner::tolerance::kJointPosition)
+          wp.joint_pos[j] < lims[j].q_min - lite6_kinematics::tolerance::kJointPosition ||
+          wp.joint_pos[j] > lims[j].q_max + lite6_kinematics::tolerance::kJointPosition)
       {
         err_loc = wp.loc;
         err_code = "ERR_JOINT_POS_LIMIT";

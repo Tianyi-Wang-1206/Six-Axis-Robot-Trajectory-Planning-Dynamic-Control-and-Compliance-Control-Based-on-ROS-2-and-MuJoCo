@@ -1,4 +1,4 @@
-#include "lite6_planner/kinematics_engine.hpp"
+#include "lite6_kinematics/kinematics_engine.hpp"
 
 #include <yaml-cpp/yaml.h>
 #include <ament_index_cpp/get_packages_with_prefixes.hpp>
@@ -21,7 +21,7 @@
 #include <sstream>
 #include <stdexcept>
 
-namespace lite6_planner {
+namespace lite6_kinematics {
 namespace {
 constexpr double kTwoPi = 6.2831853071795864769;
 constexpr double kFKPositionTol = 2e-4;  // metres
@@ -110,7 +110,8 @@ bool KinematicsEngine::init_robot_model(const std::string& urdf, const std::stri
     pinocchio::urdf::buildModel(urdf,pin_model_);
     const auto flange = pin_model_.getFrameId("link6");
     const auto tcp = pin_model_.getFrameId("link_eef");
-    if (flange >= pin_model_.nframes || tcp >= pin_model_.nframes ||
+    const auto nframes = static_cast<pinocchio::FrameIndex>(pin_model_.nframes);
+    if (flange >= nframes || tcp >= nframes ||
         pin_model_.frames[flange].parentJoint != pin_model_.frames[tcp].parentJoint) {
       throw std::runtime_error("Expected a fixed flange-to-TCP transform");
     }
@@ -555,4 +556,4 @@ IKResult KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
   return IKResult::ERR_NO_MATH_SOLUTION;
 }
 
-} // namespace lite6_planner
+} // namespace lite6_kinematics

@@ -31,7 +31,7 @@ class SysIdEngine:
 
     def __init__(self):
         desc = get_package_share_directory('lite6_description')
-        planner = get_package_share_directory('lite6_planner')
+        kinematics = get_package_share_directory('lite6_kinematics')
         # Full dynamics uses measured fingers; preflight uses their complete swept envelope.
         self.dynamics_model = pin.buildModelFromUrdf(os.path.join(desc, 'urdf', 'lite6.urdf'))
         self.dynamics_data = self.dynamics_model.createData()
@@ -40,7 +40,7 @@ class SysIdEngine:
         urdf = os.path.join(desc, 'urdf', 'lite6_arm.urdf')
         self.model = pin.buildModelFromUrdf(urdf)
         self.data = self.model.createData()
-        with open(os.path.join(planner, 'config', 'kinematic_limits.yaml')) as stream:
+        with open(os.path.join(kinematics, 'config', 'kinematic_limits.yaml')) as stream:
             limits = yaml.safe_load(stream)['joint_limits']
         self.limits = np.array([
             [limits[f'joint{i}'][key] for key in
@@ -56,8 +56,8 @@ class SysIdEngine:
             self.model, urdf, pin.COLLISION, package_dirs=[os.path.dirname(desc)])
         self.geometry.addAllCollisionPairs()
         pin.removeCollisionPairs(self.model, self.geometry,
-                                 os.path.join(planner, 'config', 'lite6.srdf'))
-        with open(os.path.join(planner, 'config', 'ik_config.yaml')) as stream:
+                                 os.path.join(kinematics, 'config', 'lite6.srdf'))
+        with open(os.path.join(kinematics, 'config', 'ik_config.yaml')) as stream:
             ground = yaml.safe_load(stream)['ground_plane']
         frame = self.model.getFrameId('link_base')
         ground_id = self.geometry.addGeometryObject(pin.GeometryObject(

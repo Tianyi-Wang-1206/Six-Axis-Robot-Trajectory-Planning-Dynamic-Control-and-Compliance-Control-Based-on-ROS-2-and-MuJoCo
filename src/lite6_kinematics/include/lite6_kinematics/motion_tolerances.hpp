@@ -1,7 +1,7 @@
-#ifndef LITE6_PLANNER_MOTION_TOLERANCES_HPP_
-#define LITE6_PLANNER_MOTION_TOLERANCES_HPP_
+#ifndef LITE6_KINEMATICS_MOTION_TOLERANCES_HPP_
+#define LITE6_KINEMATICS_MOTION_TOLERANCES_HPP_
 
-namespace lite6_planner::tolerance {
+namespace lite6_kinematics::tolerance {
 
 // Numerical allowance for joint targets, IK and geometric path calculations [rad].
 inline constexpr double kJointPosition = 1e-8;
@@ -18,5 +18,5 @@ inline constexpr double kTrajectoryPosition = 1e-6;      // rad
 inline constexpr double kTrajectoryVelocity = 1e-5;      // rad/s
 inline constexpr double kTrajectoryAcceleration = 1e-4;  // rad/s^2
 
-} // namespace lite6_planner::tolerance
+} // namespace lite6_kinematics::tolerance
 #endif

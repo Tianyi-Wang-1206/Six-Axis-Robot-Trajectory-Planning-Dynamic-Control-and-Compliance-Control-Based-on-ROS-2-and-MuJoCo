@@ -369,7 +369,9 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   integral_effort_.setZero();
   tau_point_ff_.setZero();
   compliance_blocks_trajectory_.store(false);
-  emergency_pending_.store(false);
+  emergency_pending_.store(false, std::memory_order_release);
+  estop_rt_ack_generation_.store(
+    estop_generation_.load(std::memory_order_acquire), std::memory_order_release);
   compliance_stopping_elapsed_ = 0.0;
   rigid_cancel_braking_ = false;
   rigid_cancel_elapsed_ = 0.0;
@@ -1205,16 +1207,19 @@ void Lite6CTCController::configure_command_service()
         std::chrono::milliseconds(lite6_interfaces::contract::kControllerCmdWaitTimeoutMs);
 
       if (req->command == Cmd::CMD_ESTOP) {
-        // E-STOP fast path: no epoch check, no command mutex, no ring slot. The RT
-        // loop latches it after every command received before this request.
-        // The request is never withdrawn; the wait below only reports the outcome.
-        emergency_pending_.store(true, std::memory_order_release);
-        estop_generation_.fetch_add(1ULL, std::memory_order_acq_rel);
+        // E-STOP fast path: no epoch check, no command mutex, no ring slot.
+        // A single monotonic estop_generation_ counter signals the RT loop; we wait
+        // until the RT loop acknowledges target_estop_gen and reports MODE_ESTOP so no
+        // unconsumed latch can survive past ACK_APPLIED and ambush a later CMD_CLEAR_ESTOP.
+        const uint64_t target_estop_gen =
+          estop_generation_.fetch_add(1ULL, std::memory_order_acq_rel) + 1ULL;
         resp->cmd_seq = command_sequence_.fetch_add(1ULL, std::memory_order_acq_rel) + 1ULL;
         while (std::chrono::steady_clock::now() < deadline &&
                trajectory_enabled_.load(std::memory_order_acquire))
         {
-          if (current_mode_atomic_.load(std::memory_order_acquire) == CS::MODE_ESTOP) {
+          if (current_mode_atomic_.load(std::memory_order_acquire) == CS::MODE_ESTOP &&
+              estop_rt_ack_generation_.load(std::memory_order_acquire) >= target_estop_gen)
+          {
             resp->accepted = true;
             resp->ack_result = Resp::ACK_APPLIED;
             fill_snapshot();
@@ -1341,9 +1346,35 @@ void Lite6CTCController::process_controller_commands(double /*dt*/)
   using CS = lite6_interfaces::msg::ControllerStatus;
   using Resp = lite6_interfaces::srv::ControllerCommand::Response;
 
+  // Latch pending internal (compliance saturation) or external (CMD_ESTOP fast-path)
+  // emergencies BEFORE applying ring commands, so a racing CMD_CLEAR_ESTOP is rejected
+  // cleanly instead of receiving ACK_APPLIED (MODE_NORMAL) and immediately re-latching ESTOP.
+  const bool internal_emerg = emergency_pending_.exchange(false, std::memory_order_acq_rel);
+  const uint64_t current_estop_generation = estop_generation_.load(std::memory_order_acquire);
+  const uint64_t prev_ack_generation =
+    estop_rt_ack_generation_.load(std::memory_order_relaxed);
+  const bool external_emerg = (current_estop_generation > prev_ack_generation);
+  const bool estop_pending = internal_emerg || external_emerg;
+
+  if (estop_pending) {
+    if (compliance_saturation_estop_pending_) {
+      latch_estop_reason(
+        CS::ESTOP_COMPLIANCE_SATURATION,
+        pending_estop_joint_, pending_estop_value_, pending_estop_limit_);
+      compliance_saturation_estop_pending_ = false;
+    } else {
+      latch_estop_reason(CS::ESTOP_EXTERNAL);
+    }
+    if (system_state_ != SystemState::ESTOP) {
+      begin_deceleration_tracker();
+      transition_system_state(SystemState::ESTOP);
+    }
+    estop_rt_ack_generation_.store(current_estop_generation, std::memory_order_release);
+    status_publish_pending_ = true;
+  }
+
   PendingControllerCommand batch[32];
   const size_t count = cmd_ring_.pop_batch(batch, 32);
-  const uint64_t current_estop_generation = estop_generation_.load(std::memory_order_acquire);
 
   for (size_t i = 0; i < count; ++i) {
     const auto & cmd = batch[i];
@@ -1354,8 +1385,8 @@ void Lite6CTCController::process_controller_commands(double /*dt*/)
     {
       // Withdrawn by its timed-out service call: never applied.
       res = Resp::ACK_RT_TIMEOUT;
-    } else if (cmd.estop_generation != current_estop_generation) {
-      // Received before a later CMD_ESTOP request: superseded, never applied after it.
+    } else if (estop_pending || cmd.estop_generation != current_estop_generation) {
+      // Superseded by an E-STOP in this cycle or after request arrival: never applied.
       res = Resp::ACK_REJECTED_STATE;
     } else {
       res = apply_controller_command(cmd);
@@ -1371,27 +1402,18 @@ void Lite6CTCController::process_controller_commands(double /*dt*/)
     status_publish_pending_ = true;
   }
 
-  // Emergency latching runs after the batch, so an E-STOP always wins over any
-  // command processed in the same cycle. The CMD_ESTOP service sets this flag
-  // before bumping estop_generation_, so commands received earlier are either
-  // processed in this batch (and overridden here) or rejected as superseded.
-  const bool emerg = emergency_pending_.exchange(false, std::memory_order_acq_rel);
-  if (!emerg) {
-    return;
-  }
-  if (compliance_saturation_estop_pending_) {
-    latch_estop_reason(
-      CS::ESTOP_COMPLIANCE_SATURATION,
-      pending_estop_joint_, pending_estop_value_, pending_estop_limit_);
-    compliance_saturation_estop_pending_ = false;
-  } else {
+  // Catch any CMD_ESTOP that arrived while the batch loop ran so E-STOP still wins
+  // within the same 1 kHz cycle.
+  const uint64_t post_estop_generation = estop_generation_.load(std::memory_order_acquire);
+  if (post_estop_generation > estop_rt_ack_generation_.load(std::memory_order_relaxed)) {
     latch_estop_reason(CS::ESTOP_EXTERNAL);
+    if (system_state_ != SystemState::ESTOP) {
+      begin_deceleration_tracker();
+      transition_system_state(SystemState::ESTOP);
+    }
+    estop_rt_ack_generation_.store(post_estop_generation, std::memory_order_release);
+    status_publish_pending_ = true;
   }
-  if (system_state_ != SystemState::ESTOP) {
-    begin_deceleration_tracker();
-    transition_system_state(SystemState::ESTOP);
-  }
-  status_publish_pending_ = true;
 }
 
 uint8_t Lite6CTCController::apply_controller_command(const PendingControllerCommand & cmd)

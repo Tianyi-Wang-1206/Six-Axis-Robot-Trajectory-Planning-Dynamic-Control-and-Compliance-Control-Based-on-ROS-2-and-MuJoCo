@@ -17,6 +17,7 @@ class ComplianceTab(QWidget):
         super().__init__(parent)
         self.worker = worker
         self.pending = False
+        self._pending_since = 0.0
         self._command_done_signal.connect(self._on_command_done)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
@@ -152,19 +153,26 @@ class ComplianceTab(QWidget):
 
     def _on_command_done(self):
         self.pending = False
+        self._pending_since = 0.0
         self.refresh()
 
     def request(self, event, settings=None, expected_revision=0):
         self.pending = True
+        self._pending_since = time.monotonic()
         def done(_):
             # ROS callback runs on the executor thread; marshal completion to Qt thread.
             self._command_done_signal.emit()
         if not self.worker._send_command(event, compliance=settings,
                                          expected_revision=expected_revision, done=done):
             self.pending = False
+            self._pending_since = 0.0
         self.refresh()
 
     def refresh(self):
+        if self.pending and self._pending_since > 0.0 and (time.monotonic() - self._pending_since > 5.0):
+            # Unstick button gating if a service future was dropped across a planner restart.
+            self.pending = False
+            self._pending_since = 0.0
         with self.worker.state_lock:
             state = self.worker.supervisor_state
             fresh = bool(state and state.controller_fresh and state.joint_states_fresh and

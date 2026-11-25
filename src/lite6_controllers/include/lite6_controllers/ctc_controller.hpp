@@ -475,6 +475,8 @@ private:
   std::atomic<uint64_t> cmd_gate_{0};
   // Incremented by every CMD_ESTOP request (fast path, bypasses cmd_ring_).
   std::atomic<uint64_t> estop_generation_{0};
+  // Highest estop_generation_ acknowledged and latched by the 1 kHz RT loop.
+  std::atomic<uint64_t> estop_rt_ack_generation_{0};
   std::atomic<uint64_t> controller_epoch_atomic_{0};
   std::atomic<uint64_t> mode_epoch_atomic_{0};
   std::atomic<uint8_t> current_mode_atomic_{lite6_interfaces::msg::ControllerStatus::MODE_UNKNOWN};

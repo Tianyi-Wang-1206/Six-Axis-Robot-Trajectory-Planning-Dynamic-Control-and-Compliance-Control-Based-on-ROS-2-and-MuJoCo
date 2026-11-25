@@ -2,7 +2,7 @@
 #define LITE6_STUDIO_PLANNER__S_CURVE_SOLVER_HPP_
 
 #include "lite6_studio_planner/dsl_ast.hpp"
-#include "lite6_planner/kinematics_engine.hpp"
+#include "lite6_kinematics/kinematics_engine.hpp"
 
 #include <array>
 #include <vector>
@@ -49,7 +49,7 @@ public:
   void build(
     const std::array<double, 6> & q0,
     const std::array<double, 6> & q1,
-    const std::array<lite6_planner::JointLimit, 6> & limits,
+    const std::array<lite6_kinematics::JointLimit, 6> & limits,
     double vel_scale,
     double acc_scale,
     double jerk_scale = 1.0);

@@ -2,7 +2,7 @@
 #define LITE6_STUDIO_PLANNER__CARTESIAN_COLLOCATION_SOLVER_HPP_
 
 #include "lite6_interfaces/msg/compile_diagnostic.hpp"
-#include "lite6_planner/kinematics_engine.hpp"
+#include "lite6_kinematics/kinematics_engine.hpp"
 #include "lite6_studio_planner/curve_geometry.hpp"
 #include "lite6_studio_planner/dsl_ast.hpp"
 #include "lite6_studio_planner/topp_jerk_solver.hpp"
@@ -60,11 +60,11 @@ class CartesianCollocationSolver
 {
 public:
   static bool solve(
-    const lite6_planner::KinematicsEngine & engine,
+    const lite6_kinematics::KinematicsEngine & engine,
     const std::array<double, 6> & start_q,
     const std::vector<CartesianCollocationWaypoint> & waypoints,
-    const std::array<lite6_planner::JointLimit, 6> & joint_limits,
-    const lite6_planner::CartesianLimit & cart_limits,
+    const std::array<lite6_kinematics::JointLimit, 6> & joint_limits,
+    const lite6_kinematics::CartesianLimit & cart_limits,
     const MotionOptions & options,
     CartesianCollocationResult & out_result,
     std::vector<lite6_interfaces::msg::CompileDiagnostic> & out_diagnostics);

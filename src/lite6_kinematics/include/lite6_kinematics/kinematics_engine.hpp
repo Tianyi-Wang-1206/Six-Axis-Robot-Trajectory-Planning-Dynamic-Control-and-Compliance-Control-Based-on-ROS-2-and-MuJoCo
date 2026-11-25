@@ -1,5 +1,5 @@
-#ifndef LITE6_PLANNER_KINEMATICS_ENGINE_HPP_
-#define LITE6_PLANNER_KINEMATICS_ENGINE_HPP_
+#ifndef LITE6_KINEMATICS_KINEMATICS_ENGINE_HPP_
+#define LITE6_KINEMATICS_KINEMATICS_ENGINE_HPP_
 
 #include <array>
 #include <string>
@@ -8,9 +8,9 @@
 #include <pinocchio/multibody/model.hpp>
 #include <pinocchio/multibody/data.hpp>
 #include <pinocchio/multibody/geometry.hpp>
-#include "lite6_planner/motion_tolerances.hpp"
+#include "lite6_kinematics/motion_tolerances.hpp"
 
-namespace lite6_planner {
+namespace lite6_kinematics {
 
 struct JointLimit {
   double min_pos = 0.0, max_pos = 0.0;
@@ -96,5 +96,5 @@ private:
   pinocchio::GeometryModel geom_model_;
 };
 
-} // namespace lite6_planner
+} // namespace lite6_kinematics
 #endif

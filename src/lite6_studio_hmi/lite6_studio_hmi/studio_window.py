@@ -81,6 +81,7 @@ _ESTOP_REASON_NAMES = {
     ControllerStatus.ESTOP_CONTROL_EXCEPTION: "Controller Exception",
     ControllerStatus.ESTOP_IMPEDANCE_TRAJECTORY_DEVIATION: "Impedance Deviation Limit",
     ControllerStatus.ESTOP_IMPEDANCE_TRAJECTORY_GOAL_TIMEOUT: "Impedance Goal Timeout",
+    ControllerStatus.ESTOP_COMPLIANCE_STOPPING_TIMEOUT: "Compliance Exit Deceleration Timeout",
 }
 
 _GRIPPER_STATE_NAMES = {
@@ -983,7 +984,21 @@ class StudioMainWindow(QMainWindow):
             "source": source, "auto_load": auto_load,
             "baseline_revision": (self._latest_studio_state.program_revision
                                   if self._latest_studio_state else 0),
+            "finished": False,
         }
+        self._prune_compile_requests()
+
+    def _prune_compile_requests(self):
+        # Drop stale entries while keeping the active request and a small recent window
+        # so delayed compile/state reconciliation still works without unbounded growth.
+        max_keep = 16
+        if len(self._compile_requests) <= max_keep:
+            return
+        for rid in sorted(self._compile_requests.keys()):
+            if len(self._compile_requests) <= max_keep:
+                break
+            if rid != self._active_compile_request_id:
+                self._compile_requests.pop(rid, None)
 
     def _on_run_or_resume(self):
         st = self._current_state_code()
@@ -1012,23 +1027,38 @@ class StudioMainWindow(QMainWindow):
             self._refresh_button_states()
 
     def _reconcile_loaded_source(self, msg):
-        request = self._compile_requests.get(int(msg.last_compile_request_id))
+        req_id = int(msg.last_compile_request_id)
+        request = self._compile_requests.get(req_id)
         if (request and request["auto_load"] and msg.loaded_program_id
                 and msg.program_revision > request["baseline_revision"]):
             self._compiled_program_id = msg.loaded_program_id
             self._compiled_program_revision = int(msg.program_revision)
             self._compiled_source = request["source"]
             self._mark_source_dirty(self.editor.toPlainText() != self._compiled_source)
-            if int(msg.last_compile_request_id) == self._active_compile_request_id:
+            if req_id == self._active_compile_request_id:
                 self._compile_in_flight = False
+            if request.get("finished"):
+                self._compile_requests.pop(req_id, None)
+        # Drop any older finished requests superseded by this loaded program revision.
+        for rid in list(self._compile_requests.keys()):
+            if rid < req_id and rid != self._active_compile_request_id:
+                if self._compile_requests[rid].get("finished"):
+                    self._compile_requests.pop(rid, None)
 
     def on_compile_finished(self, resp):
-        request = self._compile_requests.get(int(resp.request_id))
+        req_id = int(resp.request_id)
+        request = self._compile_requests.get(req_id)
         if request is None:
             return
+        request["finished"] = True
         if self._latest_studio_state is not None:
             self._reconcile_loaded_source(self._latest_studio_state)
-        if int(resp.request_id) != self._active_compile_request_id:
+        if not resp.success or not request["auto_load"]:
+            self._compile_requests.pop(req_id, None)
+        elif (self._latest_studio_state is not None
+              and int(self._latest_studio_state.last_compile_request_id) >= req_id):
+            self._compile_requests.pop(req_id, None)
+        if req_id != self._active_compile_request_id:
             self._refresh_button_states()
             return
         self._compile_in_flight = False
@@ -1079,6 +1109,10 @@ class StudioMainWindow(QMainWindow):
             )
             self.append_log(summary)
         else:
+            if request["auto_load"]:
+                self._compiled_program_id = ""
+                self._compiled_program_revision = 0
+                self._compiled_source = None
             err_count = sum(1 for d in self._diagnostics if d.severity == CompileDiagnostic.SEVERITY_ERROR)
             summary = f"Compile FAILED ({err_count} error(s)) - click diagnostic row to locate"
             self.lbl_compile_summary.setText(summary)
@@ -1189,6 +1223,8 @@ class StudioMainWindow(QMainWindow):
             and self._compiled_program_id
         ):
             self._compiled_program_id = ""
+            self._compiled_program_revision = 0
+            self._compiled_source = None
             self.lbl_compile_summary.setText("Program cleared - click Compile to build")
             self.lbl_compile_summary.setStyleSheet("color: #475569; font-weight: 600;")
 

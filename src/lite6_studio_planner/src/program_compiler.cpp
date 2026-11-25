@@ -1,5 +1,5 @@
 #include "lite6_studio_planner/program_compiler.hpp"
-#include "lite6_planner/motion_tolerances.hpp"
+#include "lite6_kinematics/motion_tolerances.hpp"
 #include "lite6_interfaces/compliance_validation.hpp"
 
 #include <pinocchio/algorithm/frames.hpp>
@@ -21,7 +21,7 @@ namespace
 {
 
 using D = lite6_interfaces::msg::CompileDiagnostic;
-using IKResult = lite6_planner::IKResult;
+using IKResult = lite6_kinematics::IKResult;
 
 constexpr double kCharLength = 0.25;  // m/rad; matches KinematicsEngine & curve_geometry
 
@@ -249,13 +249,26 @@ bool newton_ik(
 // Samples a phase-synchronized S-curve; path_u maps the normalized progress s in [0, 1].
 SampledTrajectory1kHz scurve_samples(
   const MultiAxisSCurve & scurve, const SourceLocation & loc,
-  double path_u_start, double path_u_end)
+  double path_u_start, double path_u_end,
+  const ProgramCompiler::Cancellation & is_cancelled = {},
+  bool * out_cancelled = nullptr)
 {
+  if (out_cancelled != nullptr) {
+    *out_cancelled = false;
+  }
   SampledTrajectory1kHz sampled;
   const int total_ticks = std::max(1, static_cast<int>(std::llround(scurve.duration() * 1000.0)));
   sampled.duration_sec = static_cast<double>(total_ticks) * 0.001;
   sampled.samples.reserve(static_cast<size_t>(total_ticks + 1));
   for (int tick = 0; tick <= total_ticks; ++tick) {
+    if (tick % 64 == 0 && is_cancelled && is_cancelled()) {
+      if (out_cancelled != nullptr) {
+        *out_cancelled = true;
+      }
+      sampled.samples.clear();
+      sampled.duration_sec = 0.0;
+      return sampled;
+    }
     const double t = static_cast<double>(tick) * 0.001;
     SampledTrajectory1kHz::Sample smp;
     smp.time_sec = t;
@@ -290,8 +303,8 @@ void append_at_rest(SampledTrajectory1kHz & a, const SampledTrajectory1kHz & b)
 }
 
 bool segment_collision_free(
-  const lite6_planner::KinematicsEngine & engine,
-  lite6_planner::KinematicsEngine::CollisionWorkspace & workspace,
+  const lite6_kinematics::KinematicsEngine & engine,
+  lite6_kinematics::KinematicsEngine::CollisionWorkspace & workspace,
   const std::array<double, 6> & q0,
   const std::array<double, 6> & q1)
 {
@@ -315,12 +328,12 @@ bool segment_collision_free(
 
 }  // namespace
 
-ProgramCompiler::ProgramCompiler(const lite6_planner::KinematicsEngine & engine)
+ProgramCompiler::ProgramCompiler(const lite6_kinematics::KinematicsEngine & engine)
 : engine_(engine)
 {
 }
 
-std::array<lite6_planner::JointLimit, 6> ProgramCompiler::motion_limits(bool is_impedance) const
+std::array<lite6_kinematics::JointLimit, 6> ProgramCompiler::motion_limits(bool is_impedance) const
 {
   auto limits = engine_.get_joint_limits();
   if (is_impedance) {
@@ -335,7 +348,9 @@ bool ProgramCompiler::verify_sampled_trajectory_1khz(
   const SampledTrajectory1kHz & sampled,
   bool check_singularity_along_path,
   std::vector<Diagnostic> & diags,
-  bool is_impedance) const
+  bool is_impedance,
+  bool enforce_jerk,
+  const Cancellation & is_cancelled) const
 {
   if (sampled.samples.size() < 2) {
     SourceLocation loc;
@@ -355,6 +370,10 @@ bool ProgramCompiler::verify_sampled_trajectory_1khz(
   // Stage 4: Full 1 kHz Kinematic Limits Verification
   for (size_t k = 0; k < sampled.samples.size(); ++k) {
     const auto & s = sampled.samples[k];
+    if (k % 32 == 0 && is_cancelled && is_cancelled()) {
+      add_diag(diags, D::STAGE_PLANNING, s.loc, "ERR_CANCELLED", "Motion cancelled by supervisor");
+      return false;
+    }
     for (size_t i = 0; i < 6; ++i) {
       if (!std::isfinite(s.q[i]) || !std::isfinite(s.dq[i]) || !std::isfinite(s.ddq[i])) {
         add_diag(
@@ -364,8 +383,8 @@ bool ProgramCompiler::verify_sampled_trajectory_1khz(
         return false;
       }
       const auto & lim = limits[i];
-      if (s.q[i] < lim.min_pos - lite6_planner::tolerance::kTrajectoryPosition ||
-          s.q[i] > lim.max_pos + lite6_planner::tolerance::kTrajectoryPosition) {
+      if (s.q[i] < lim.min_pos - lite6_kinematics::tolerance::kTrajectoryPosition ||
+          s.q[i] > lim.max_pos + lite6_kinematics::tolerance::kTrajectoryPosition) {
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(5)
             << "Joint position limit violated at t=" << s.time_sec << " s: joint" << (i + 1)
@@ -374,7 +393,7 @@ bool ProgramCompiler::verify_sampled_trajectory_1khz(
         add_diag(diags, D::STAGE_KINEMATIC_LIMIT, s.loc, "ERR_JOINT_POS_LIMIT", oss.str());
         return false;
       }
-      if (std::abs(s.dq[i]) > lim.max_vel + lite6_planner::tolerance::kTrajectoryVelocity) {
+      if (std::abs(s.dq[i]) > lim.max_vel + lite6_kinematics::tolerance::kTrajectoryVelocity) {
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(5)
             << "Joint velocity limit violated at t=" << s.time_sec << " s: joint" << (i + 1)
@@ -383,7 +402,7 @@ bool ProgramCompiler::verify_sampled_trajectory_1khz(
         add_diag(diags, D::STAGE_KINEMATIC_LIMIT, s.loc, "ERR_JOINT_VEL_LIMIT", oss.str());
         return false;
       }
-      if (std::abs(s.ddq[i]) > lim.max_acc + lite6_planner::tolerance::kTrajectoryAcceleration) {
+      if (std::abs(s.ddq[i]) > lim.max_acc + lite6_kinematics::tolerance::kTrajectoryAcceleration) {
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(5)
             << "Joint acceleration limit violated at t=" << s.time_sec << " s: joint" << (i + 1)
@@ -394,21 +413,23 @@ bool ProgramCompiler::verify_sampled_trajectory_1khz(
       }
       if (k > 0) {
         const double dt = s.time_sec - sampled.samples[k - 1].time_sec;
-        if (dt <= 1e-9) {
+        if (dt <= 1e-12) {
           add_diag(
             diags, D::STAGE_KINEMATIC_LIMIT, s.loc, "ERR_NONMONOTONE_TIME",
             "Non-monotone sample timestamp at index " + std::to_string(k));
           return false;
         }
-        const double jrk = (s.ddq[i] - sampled.samples[k - 1].ddq[i]) / dt;
-        if (std::abs(jrk) > lim.max_jerk * 1.001 + 1e-3) {
-          std::ostringstream oss;
-          oss << std::fixed << std::setprecision(3)
-              << "Joint jerk limit violated at t=" << s.time_sec << " s: joint" << (i + 1)
-              << " |jerk|=" << std::abs(jrk) << " rad/s^3 exceeds max_jerk=" << lim.max_jerk
-              << " rad/s^3";
-          add_diag(diags, D::STAGE_KINEMATIC_LIMIT, s.loc, "ERR_JOINT_JERK_LIMIT", oss.str());
-          return false;
+        if (enforce_jerk) {
+          const double jrk = (s.ddq[i] - sampled.samples[k - 1].ddq[i]) / dt;
+          if (std::abs(jrk) > lim.max_jerk * 1.001 + 1e-3) {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(3)
+                << "Joint jerk limit violated at t=" << s.time_sec << " s: joint" << (i + 1)
+                << " |jerk|=" << std::abs(jrk) << " rad/s^3 exceeds max_jerk=" << lim.max_jerk
+                << " rad/s^3";
+            add_diag(diags, D::STAGE_KINEMATIC_LIMIT, s.loc, "ERR_JOINT_JERK_LIMIT", oss.str());
+            return false;
+          }
         }
       }
     }
@@ -439,6 +460,10 @@ bool ProgramCompiler::verify_sampled_trajectory_1khz(
   for (size_t k = 1; k < sampled.samples.size(); ++k) {
     const auto & prev = sampled.samples[k - 1];
     const auto & curr = sampled.samples[k];
+    if (k % 32 == 0 && is_cancelled && is_cancelled()) {
+      add_diag(diags, D::STAGE_PLANNING, curr.loc, "ERR_CANCELLED", "Motion cancelled by supervisor");
+      return false;
+    }
     double max_step = 0.0;
     for (size_t i = 0; i < 6; ++i) {
       max_step = std::max(max_step, std::abs(curr.q[i] - prev.q[i]));
@@ -475,8 +500,8 @@ bool ProgramCompiler::validate_and_clamp_start_joints(
   q_out = q_in;
   for (size_t i = 0; i < 6; ++i) {
     if (!std::isfinite(q_out[i]) ||
-        q_out[i] < limits[i].min_pos - lite6_planner::tolerance::kObservedPosition ||
-        q_out[i] > limits[i].max_pos + lite6_planner::tolerance::kObservedPosition) {
+        q_out[i] < limits[i].min_pos - lite6_kinematics::tolerance::kObservedPosition ||
+        q_out[i] > limits[i].max_pos + lite6_kinematics::tolerance::kObservedPosition) {
       std::ostringstream oss;
       oss << std::fixed << std::setprecision(5)
           << "Initial robot joint" << (i + 1) << " position=" << q_out[i]
@@ -503,8 +528,14 @@ bool ProgramCompiler::compile_cartesian_group(
   bool is_impedance,
   const ImpedanceParams & imp_params,
   ExecutionBlock & out_block,
-  std::vector<Diagnostic> & out_diagnostics) const
+  std::vector<Diagnostic> & out_diagnostics,
+  const Cancellation & is_cancelled) const
 {
+  if (is_cancelled && is_cancelled()) {
+    add_diag(out_diagnostics, D::STAGE_PLANNING, group.front().loc, "ERR_CANCELLED",
+      "Motion cancelled by supervisor");
+    return false;
+  }
   auto workspace = engine_.collision_workspace();
   const Eigen::Matrix4d start_pose = engine_.forward_pose(start_q, workspace.data);
   CompositeCartesianPath cart_path;
@@ -565,7 +596,7 @@ bool ProgramCompiler::compile_cartesian_group(
   SampledTrajectory1kHz sampled;
   if (!plan_cartesian_path(
         cart_path, start_q, group.front().options, group.front().loc, is_impedance, sampled,
-        out_diagnostics))
+        out_diagnostics, is_cancelled))
   {
     return false;
   }
@@ -583,7 +614,8 @@ bool ProgramCompiler::build_cartesian_joint_path(
   const CartesianPath & cart_path,
   const std::array<double, 6> & start_q,
   C3JointSpline & out_path,
-  std::vector<Diagnostic> & out_diagnostics) const
+  std::vector<Diagnostic> & out_diagnostics,
+  const Cancellation & is_cancelled) const
 {
   const auto & model = engine_.get_pin_model();
   const auto tcp = engine_.tcp_frame_id();
@@ -636,6 +668,12 @@ bool ProgramCompiler::build_cartesian_joint_path(
 
   double worst_p = 0.0, worst_r = 0.0, worst_u = 0.0;
   for (int refine = 0; refine < 6; ++refine) {
+    if (is_cancelled && is_cancelled()) {
+      add_diag(
+        out_diagnostics, D::STAGE_PLANNING, cart_path.eval_normalized(0.0).loc,
+        "ERR_CANCELLED", "Motion cancelled by supervisor");
+      return false;
+    }
     if (knots.size() > kMaxKnots) {
       add_diag(
         out_diagnostics, D::STAGE_PLANNING, cart_path.eval_normalized(0.0).loc,
@@ -644,6 +682,12 @@ bool ProgramCompiler::build_cartesian_joint_path(
     }
     const size_t n = knots.size();
     for (size_t k = 0; k < n; ++k) {
+      if (k % 8 == 0 && is_cancelled && is_cancelled()) {
+        add_diag(
+          out_diagnostics, D::STAGE_PLANNING, cart_path.eval_normalized(knots[k].u).loc,
+          "ERR_CANCELLED", "Motion cancelled by supervisor");
+        return false;
+      }
       if (knots[k].solved) {
         continue;
       }
@@ -677,7 +721,7 @@ bool ProgramCompiler::build_cartesian_joint_path(
         }
         if (!got_ik) {
           std::vector<std::array<double, 6>> sols;
-          lite6_planner::IKDiagnostics ik_diag;
+          lite6_kinematics::IKDiagnostics ik_diag;
           const auto status = engine_.solve_optimal_ik(
             cs.pose, to_array(predicted), sols, /*continuous=*/true, workspace, &ik_diag);
           if (status != IKResult::SUCCESS) {
@@ -735,6 +779,12 @@ bool ProgramCompiler::build_cartesian_joint_path(
              differential_kinematics(model, data, tcp, qq, v1, v2, q1, out);
     };
     for (size_t k = 0; k < n; ++k) {
+      if (k % 16 == 0 && is_cancelled && is_cancelled()) {
+        add_diag(
+          out_diagnostics, D::STAGE_PLANNING, cart_path.eval_normalized(knots[k].u).loc,
+          "ERR_CANCELLED", "Motion cancelled by supervisor");
+        return false;
+      }
       if (knots[k].m3_valid) {
         continue;
       }
@@ -782,6 +832,12 @@ bool ProgramCompiler::build_cartesian_joint_path(
     bool accurate = true;
     worst_p = worst_r = 0.0;
     for (size_t k = 0; k + 1 < n; ++k) {
+      if (k % 16 == 0 && is_cancelled && is_cancelled()) {
+        add_diag(
+          out_diagnostics, D::STAGE_PLANNING, cart_path.eval_normalized(knots[k].u).loc,
+          "ERR_CANCELLED", "Motion cancelled by supervisor");
+        return false;
+      }
       bool interval_ok = true;
       for (double frac : {0.25, 0.5, 0.75}) {
         const double um = knots[k].u + frac * (knots[k + 1].u - knots[k].u);
@@ -830,27 +886,34 @@ bool ProgramCompiler::plan_cartesian_path(
   const SourceLocation & default_loc,
   bool is_impedance,
   SampledTrajectory1kHz & out_sampled,
-  std::vector<Diagnostic> & out_diagnostics) const
+  std::vector<Diagnostic> & out_diagnostics,
+  const Cancellation & is_cancelled) const
 {
   C3JointSpline joint_path;
-  if (!build_cartesian_joint_path(cart_path, start_q, joint_path, out_diagnostics)) {
+  if (!build_cartesian_joint_path(cart_path, start_q, joint_path, out_diagnostics, is_cancelled)) {
     return false;
   }
   std::string topp_err;
   std::vector<std::string> topp_warnings;
+  TOPPSolveOptions topp_opts;
+  topp_opts.is_cancelled = is_cancelled;
   if (!TOPPJerkSolver::solve(
         joint_path, &cart_path, motion_limits(is_impedance), engine_.get_cartesian_limits(),
         default_options.vel_scale, default_options.acc_scale, default_options.jerk_scale,
-        default_loc, out_sampled, topp_err, &topp_warnings))
+        default_loc, out_sampled, topp_err, &topp_warnings, topp_opts))
   {
-    add_diag(out_diagnostics, D::STAGE_PLANNING, default_loc, "ERR_TOPP_SOLVER", topp_err);
+    const bool was_cancelled = (is_cancelled && is_cancelled());
+    add_diag(
+      out_diagnostics, D::STAGE_PLANNING, default_loc,
+      was_cancelled ? "ERR_CANCELLED" : "ERR_TOPP_SOLVER", topp_err);
     return false;
   }
   for (const auto & w : topp_warnings) {
     add_warning(out_diagnostics, D::STAGE_PLANNING, default_loc, "WARN_TOPP_SUBOPTIMAL", w);
   }
   return verify_sampled_trajectory_1khz(
-    out_sampled, /*check_singularity=*/true, out_diagnostics, is_impedance);
+    out_sampled, /*check_singularity=*/true, out_diagnostics, is_impedance,
+    /*enforce_jerk=*/true, is_cancelled);
 }
 
 double ProgramCompiler::tcp_blend_trim(
@@ -942,7 +1005,8 @@ bool ProgramCompiler::build_joint_group_path(
   const std::array<double, 6> & start_q,
   std::vector<std::array<double, 6>> & out_waypoints,
   JointCompositePath & out_path,
-  std::vector<Diagnostic> & out_diagnostics) const
+  std::vector<Diagnostic> & out_diagnostics,
+  const Cancellation & is_cancelled) const
 {
   const auto & limits = engine_.get_joint_limits();
   auto workspace = engine_.collision_workspace();
@@ -951,34 +1015,47 @@ bool ProgramCompiler::build_joint_group_path(
   raw_waypoints.push_back(start_q);
 
   for (const auto & st : group) {
+    if (is_cancelled && is_cancelled()) {
+      add_diag(out_diagnostics, D::STAGE_PLANNING, st.loc, "ERR_CANCELLED",
+        "Motion cancelled by supervisor");
+      return false;
+    }
     if (st.type == MotionCommandType::MOVE_J) {
+      std::array<double, 6> clamped_target = st.joint_target;
       for (size_t i = 0; i < 6; ++i) {
-        if (st.joint_target[i] < limits[i].min_pos - lite6_planner::tolerance::kJointPosition ||
-            st.joint_target[i] > limits[i].max_pos + lite6_planner::tolerance::kJointPosition) {
+        if (!std::isfinite(clamped_target[i])) {
+          add_diag(
+            out_diagnostics, D::STAGE_KINEMATIC_LIMIT, st.loc, "ERR_NONFINITE_SAMPLE",
+            "MoveJ target joint" + std::to_string(i + 1) + " position is not finite");
+          return false;
+        }
+        if (clamped_target[i] < limits[i].min_pos - lite6_kinematics::tolerance::kJointPosition ||
+            clamped_target[i] > limits[i].max_pos + lite6_kinematics::tolerance::kJointPosition) {
           std::ostringstream oss;
           oss << std::fixed << std::setprecision(5)
               << "MoveJ target violates joint" << (i + 1) << " position limit: value="
-              << st.joint_target[i] << " rad, allowed range=[" << limits[i].min_pos << ", "
+              << clamped_target[i] << " rad, allowed range=[" << limits[i].min_pos << ", "
               << limits[i].max_pos << "] rad";
           add_diag(
             out_diagnostics, D::STAGE_KINEMATIC_LIMIT, st.loc, "ERR_JOINT_POS_LIMIT", oss.str());
           return false;
         }
+        clamped_target[i] = std::clamp(clamped_target[i], limits[i].min_pos, limits[i].max_pos);
       }
       std::string col_detail;
-      if (engine_.check_collision(st.joint_target, workspace, &col_detail)) {
+      if (engine_.check_collision(clamped_target, workspace, &col_detail)) {
         add_diag(
           out_diagnostics, D::STAGE_COLLISION, st.loc, "ERR_COLLISION",
           "MoveJ target configuration is in collision: " + col_detail);
         return false;
       }
-      raw_waypoints.push_back(st.joint_target);
+      raw_waypoints.push_back(clamped_target);
     } else {
       // MoveP: resolve Cartesian target via optimal IK relative to previous waypoint,
       // trying alternative IK branches in cost order if the closest branch collides along
       // the straight joint-space route.
       std::vector<std::array<double, 6>> sols;
-      lite6_planner::IKDiagnostics ik_diag;
+      lite6_kinematics::IKDiagnostics ik_diag;
       const auto status = engine_.solve_optimal_ik(
         st.pose_target, raw_waypoints.back(), sols, /*continuous=*/false, workspace, &ik_diag);
       if (status != IKResult::SUCCESS) {
@@ -989,6 +1066,11 @@ bool ProgramCompiler::build_joint_group_path(
       }
       std::array<double, 6> chosen = sols.front();
       for (const auto & cand : sols) {
+        if (is_cancelled && is_cancelled()) {
+          add_diag(out_diagnostics, D::STAGE_PLANNING, st.loc, "ERR_CANCELLED",
+            "Motion cancelled by supervisor");
+          return false;
+        }
         if (segment_collision_free(engine_, workspace, raw_waypoints.back(), cand)) {
           chosen = cand;
           break;
@@ -1111,11 +1193,12 @@ bool ProgramCompiler::compile_joint_group(
   const std::vector<MotionStatement> & group,
   const std::array<double, 6> & start_q,
   ExecutionBlock & out_block,
-  std::vector<Diagnostic> & out_diagnostics) const
+  std::vector<Diagnostic> & out_diagnostics,
+  const Cancellation & is_cancelled) const
 {
   std::vector<std::array<double, 6>> waypoints;
   JointCompositePath path;
-  if (!build_joint_group_path(group, start_q, waypoints, path, out_diagnostics)) {
+  if (!build_joint_group_path(group, start_q, waypoints, path, out_diagnostics, is_cancelled)) {
     return false;
   }
 
@@ -1127,18 +1210,38 @@ bool ProgramCompiler::compile_joint_group(
     scurve.build(
       start_q, waypoints.back(), engine_.get_joint_limits(),
       st.options.vel_scale, st.options.acc_scale, st.options.jerk_scale);
-    sampled = scurve_samples(scurve, st.loc, 0.0, 1.0);
+    constexpr double kMaxSCurveDurationSec = 300.0;
+    if (!std::isfinite(scurve.duration()) || scurve.duration() <= 0.0 ||
+        scurve.duration() > kMaxSCurveDurationSec)
+    {
+      add_diag(
+        out_diagnostics, D::STAGE_PLANNING, st.loc, "ERR_DURATION_LIMIT",
+        "Computed S-curve trajectory duration=" + std::to_string(scurve.duration()) +
+          " s exceeds 300 s limit");
+      return false;
+    }
+    bool cancelled = false;
+    sampled = scurve_samples(scurve, st.loc, 0.0, 1.0, is_cancelled, &cancelled);
+    if (cancelled) {
+      add_diag(out_diagnostics, D::STAGE_PLANNING, st.loc, "ERR_CANCELLED",
+        "Motion cancelled by supervisor");
+      return false;
+    }
   } else {
     std::string topp_err;
     std::vector<std::string> topp_warnings;
+    TOPPSolveOptions topp_opts;
+    topp_opts.is_cancelled = is_cancelled;
     if (!TOPPJerkSolver::solve(
           path, nullptr, engine_.get_joint_limits(), engine_.get_cartesian_limits(),
           group.front().options.vel_scale, group.front().options.acc_scale,
           group.front().options.jerk_scale, group.front().loc, sampled, topp_err,
-          &topp_warnings))
+          &topp_warnings, topp_opts))
     {
+      const bool was_cancelled = (is_cancelled && is_cancelled());
       add_diag(
-        out_diagnostics, D::STAGE_PLANNING, group.front().loc, "ERR_TOPP_SOLVER", topp_err);
+        out_diagnostics, D::STAGE_PLANNING, group.front().loc,
+        was_cancelled ? "ERR_CANCELLED" : "ERR_TOPP_SOLVER", topp_err);
       return false;
     }
     for (const auto & w : topp_warnings) {
@@ -1147,7 +1250,10 @@ bool ProgramCompiler::compile_joint_group(
     }
   }
 
-  if (!verify_sampled_trajectory_1khz(sampled, /*check_singularity=*/false, out_diagnostics)) {
+  if (!verify_sampled_trajectory_1khz(
+        sampled, /*check_singularity=*/false, out_diagnostics,
+        /*is_impedance=*/false, /*enforce_jerk=*/true, is_cancelled))
+  {
     return false;
   }
 
@@ -1301,8 +1407,8 @@ bool ProgramCompiler::compile_pva_statement(
   for (size_t k = 0; k < M; ++k) {
     const auto & wp = pva.waypoints[k];
     for (size_t i = 0; i < 6; ++i) {
-      if (wp.joint_pos[i] < limits[i].min_pos - lite6_planner::tolerance::kJointPosition ||
-          wp.joint_pos[i] > limits[i].max_pos + lite6_planner::tolerance::kJointPosition) {
+      if (wp.joint_pos[i] < limits[i].min_pos - lite6_kinematics::tolerance::kJointPosition ||
+          wp.joint_pos[i] > limits[i].max_pos + lite6_kinematics::tolerance::kJointPosition) {
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(5)
             << "MovePVA waypoint " << (k + 1) << " violates joint" << (i + 1)
@@ -1574,6 +1680,128 @@ bool ProgramCompiler::compile(
   return true;
 }
 
+bool ProgramCompiler::plan_single_motion(
+  const MotionStatement & motion,
+  const std::array<double, 6> & start_joints,
+  trajectory_msgs::msg::JointTrajectory & out_trajectory,
+  std::vector<Diagnostic> & out_diagnostics,
+  const Cancellation & is_cancelled) const
+{
+  out_trajectory = trajectory_msgs::msg::JointTrajectory{};
+  out_diagnostics.clear();
+
+  if (is_cancelled && is_cancelled()) {
+    add_diag(
+      out_diagnostics, D::STAGE_PLANNING, motion.loc, "ERR_CANCELLED",
+      "Motion cancelled by supervisor");
+    return false;
+  }
+
+  if (!std::isfinite(motion.options.vel_scale) || !std::isfinite(motion.options.acc_scale) ||
+      !std::isfinite(motion.options.jerk_scale) ||
+      motion.options.vel_scale < 0.01 || motion.options.vel_scale > 1.0 ||
+      motion.options.acc_scale < 0.01 || motion.options.acc_scale > 1.0 ||
+      motion.options.jerk_scale < 0.01 || motion.options.jerk_scale > 1.0)
+  {
+    add_diag(
+      out_diagnostics, D::STAGE_SEMANTIC, motion.loc, "ERR_INVALID_SCALE",
+      "Scaling factors must be finite and lie in [0.01, 1.0]");
+    return false;
+  }
+
+  std::array<double, 6> start_q{};
+  if (!validate_and_clamp_start_joints(start_joints, motion.loc, start_q, out_diagnostics)) {
+    return false;
+  }
+
+  MotionStatement single = motion;
+  single.options.blend_radius = 0.0;
+  const std::vector<MotionStatement> group{single};
+
+  ExecutionBlock blk;
+  const bool is_cart =
+    (single.type == MotionCommandType::MOVE_L ||
+     single.type == MotionCommandType::MOVE_C_THREE_POINT ||
+     single.type == MotionCommandType::MOVE_C_CENTER_ANGLE);
+
+  const bool ok = is_cart ?
+    compile_cartesian_group(
+      group, start_q, /*is_impedance=*/false, ImpedanceParams{}, blk,
+      out_diagnostics, is_cancelled) :
+    compile_joint_group(group, start_q, blk, out_diagnostics, is_cancelled);
+  if (!ok) {
+    return false;
+  }
+  out_trajectory = std::move(blk.rigid_trajectory);
+  return true;
+}
+
+bool ProgramCompiler::verify_joint_trajectory(
+  const trajectory_msgs::msg::JointTrajectory & trajectory,
+  bool check_singularity_along_path,
+  bool enforce_jerk,
+  std::vector<Diagnostic> & out_diagnostics,
+  const Cancellation & is_cancelled) const
+{
+  out_diagnostics.clear();
+  const SourceLocation loc{0, 0, -1, "<joint_trajectory>"};
+  constexpr size_t kMaxTrajectoryPoints = 300000;
+  if (trajectory.joint_names != kJointNames || trajectory.points.size() < 2) {
+    add_diag(
+      out_diagnostics, D::STAGE_SEMANTIC, loc, "ERR_INVALID_TRAJECTORY",
+      "Invalid six-axis joint-name/order or point count");
+    return false;
+  }
+  if (trajectory.points.size() > kMaxTrajectoryPoints) {
+    add_diag(
+      out_diagnostics, D::STAGE_SEMANTIC, loc, "ERR_INVALID_TRAJECTORY",
+      "Trajectory exceeds point limit");
+    return false;
+  }
+
+  SampledTrajectory1kHz sampled;
+  sampled.samples.reserve(trajectory.points.size());
+  double prev_time = -1.0;
+  for (size_t k = 0; k < trajectory.points.size(); ++k) {
+    if (k % 64 == 0 && is_cancelled && is_cancelled()) {
+      add_diag(
+        out_diagnostics, D::STAGE_PLANNING, loc, "ERR_CANCELLED",
+        "Motion cancelled by supervisor");
+      return false;
+    }
+    const auto & p = trajectory.points[k];
+    if (p.positions.size() != 6 || p.velocities.size() != 6 || p.accelerations.size() != 6) {
+      add_diag(
+        out_diagnostics, D::STAGE_SEMANTIC, loc, "ERR_INVALID_TRAJECTORY",
+        "Incomplete joint trajectory point");
+      return false;
+    }
+    const double t =
+      static_cast<double>(p.time_from_start.sec) + 1e-9 * p.time_from_start.nanosec;
+    if (!std::isfinite(t) || t <= prev_time + 1e-12) {
+      add_diag(
+        out_diagnostics, D::STAGE_KINEMATIC_LIMIT, loc, "ERR_NONMONOTONE_TIME",
+        "Non-monotone trajectory timestamps");
+      return false;
+    }
+    SampledTrajectory1kHz::Sample smp;
+    smp.time_sec = t;
+    smp.path_u = static_cast<double>(k) / static_cast<double>(trajectory.points.size() - 1);
+    for (size_t i = 0; i < 6; ++i) {
+      smp.q[i] = p.positions[i];
+      smp.dq[i] = p.velocities[i];
+      smp.ddq[i] = p.accelerations[i];
+    }
+    smp.loc = loc;
+    sampled.samples.push_back(smp);
+    prev_time = t;
+  }
+  sampled.duration_sec = prev_time;
+  return verify_sampled_trajectory_1khz(
+    sampled, check_singularity_along_path, out_diagnostics,
+    /*is_impedance=*/false, enforce_jerk, is_cancelled);
+}
+
 bool ProgramCompiler::plan_alignment_bridge(
   const std::array<double, 6> & q_from,
   const std::array<double, 6> & q_to,
@@ -1587,10 +1815,10 @@ bool ProgramCompiler::plan_alignment_bridge(
   std::array<double, 6> q1 = q_to;
   for (size_t i = 0; i < 6; ++i) {
     if (!std::isfinite(q0[i]) || !std::isfinite(q1[i]) ||
-        q0[i] < limits[i].min_pos - lite6_planner::tolerance::kObservedPosition ||
-        q0[i] > limits[i].max_pos + lite6_planner::tolerance::kObservedPosition ||
-        q1[i] < limits[i].min_pos - lite6_planner::tolerance::kObservedPosition ||
-        q1[i] > limits[i].max_pos + lite6_planner::tolerance::kObservedPosition) {
+        q0[i] < limits[i].min_pos - lite6_kinematics::tolerance::kObservedPosition ||
+        q0[i] > limits[i].max_pos + lite6_kinematics::tolerance::kObservedPosition ||
+        q1[i] < limits[i].min_pos - lite6_kinematics::tolerance::kObservedPosition ||
+        q1[i] > limits[i].max_pos + lite6_kinematics::tolerance::kObservedPosition) {
       out_error = "Alignment bridge endpoints exceed joint position limits";
       return false;
     }
@@ -1825,8 +2053,8 @@ ProgramCompiler::PauseSpliceStatus ProgramCompiler::plan_pause_splice(
         const double v_lim = lim.max_vel * opts.vel_scale;
         const double a_lim = lim.max_acc * opts.acc_scale;
         const double j_lim = lim.max_jerk * opts.jerk_scale;
-        if (std::abs(v) > v_lim + lite6_planner::tolerance::kTrajectoryVelocity ||
-            std::abs(a) > a_lim + lite6_planner::tolerance::kTrajectoryAcceleration ||
+        if (std::abs(v) > v_lim + lite6_kinematics::tolerance::kTrajectoryVelocity ||
+            std::abs(a) > a_lim + lite6_kinematics::tolerance::kTrajectoryAcceleration ||
             std::abs(a - prev_ddq[i]) / kDt > j_lim * 1.001 + 1e-3)
         {
           ok = false;
@@ -2126,8 +2354,8 @@ bool ProgramCompiler::replan_remaining_block(
     const double as = full_motion ? opts.acc_scale : std::min(opts.acc_scale, 0.3);
     std::array<double, 6> q_from = q_actual;
     for (size_t i = 0; i < 6; ++i) {
-      if (q_from[i] < limits[i].min_pos - lite6_planner::tolerance::kObservedPosition ||
-          q_from[i] > limits[i].max_pos + lite6_planner::tolerance::kObservedPosition)
+      if (q_from[i] < limits[i].min_pos - lite6_kinematics::tolerance::kObservedPosition ||
+          q_from[i] > limits[i].max_pos + lite6_kinematics::tolerance::kObservedPosition)
       {
         out_error = "Actual configuration is outside joint limits; cannot resume";
         return false;

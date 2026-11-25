@@ -19,8 +19,16 @@ constexpr auto kSettleGap = std::chrono::milliseconds(100);
 constexpr auto kPostRecoverySettle = std::chrono::milliseconds(200);
 constexpr auto kRecoveryPhaseTimeout = std::chrono::seconds(8);
 constexpr auto kStoppingTimeout = std::chrono::seconds(5);
+constexpr auto kPauseTimeout = std::chrono::seconds(10);
 // Bound for the controller to return to NORMAL after an accepted RESET_FAULT.
 constexpr auto kFaultResetTimeout = std::chrono::seconds(3);
+// Prolonged controller-status outage window after which monotonic epoch/seq filters reset
+// so a restarted controller with a smaller epoch (e.g. cross-host or test restart) reconnects.
+constexpr auto kControllerEpochResetTimeout = std::chrono::seconds(2);
+// Minimum spacing between asynchronous watchdog CMD_ESTOP retries and guard window before
+// allowing CMD_RECOVER while controller_mode is still MODE_NORMAL.
+constexpr auto kEstopCmdRetryInterval = std::chrono::milliseconds(150);
+constexpr auto kEstopCmdInFlightGuard = std::chrono::milliseconds(300);
 // An RT fault (fail_controller) makes controller_manager deactivate the CTC; it then
 // stops publishing status and no trajectory command can bring it back.
 constexpr const char * kControllerLostHint =
@@ -115,6 +123,7 @@ void StudioSupervisor::finish_stop_unlocked(const std::string & detail)
   ++session_id_;
   stop_requested_ = false;
   pause_requested_ = false;
+  pause_deadline_ = Clock::time_point{};
   step_mode_ = false;
   snap_.current_block_index = 0;
   snap_.current_line_number = 0;
@@ -133,12 +142,22 @@ void StudioSupervisor::enter_estop_unlocked(
   ++session_id_;
   stop_requested_ = false;
   pause_requested_ = false;
+  pause_deadline_ = Clock::time_point{};
   step_mode_ = false;
   recovery_phase_ = RecoverySubPhase::NONE;
+  recovery_initial_mode_ = CS::MODE_UNKNOWN;
+  recovery_initial_mode_epoch_ = 0;
   fault_reset_pending_ = false;
+  const bool was_latched = snap_.estop_latched;
   snap_.estop_latched = true;
   if (reason != CS::ESTOP_NONE) {
-    snap_.estop_reason = reason;
+    // Preserve an already-latched specific root-cause reason (e.g. PATH_POSITION or
+    // SATURATION) when a redundant operator/external CMD_ESTOP arrives.
+    if (!was_latched || snap_.estop_reason == CS::ESTOP_NONE ||
+        snap_.estop_reason == CS::ESTOP_EXTERNAL || reason != CS::ESTOP_EXTERNAL)
+    {
+      snap_.estop_reason = reason;
+    }
   } else if (snap_.estop_reason == CS::ESTOP_NONE) {
     snap_.estop_reason = CS::ESTOP_EXTERNAL;
   }
@@ -160,8 +179,11 @@ void StudioSupervisor::enter_fault_unlocked(int32_t code, const std::string & de
   ++session_id_;
   stop_requested_ = false;
   pause_requested_ = false;
+  pause_deadline_ = Clock::time_point{};
   step_mode_ = false;
   recovery_phase_ = RecoverySubPhase::NONE;
+  recovery_initial_mode_ = CS::MODE_UNKNOWN;
+  recovery_initial_mode_epoch_ = 0;
   fault_reset_pending_ = false;
   snap_.last_error_code = code;
   snap_.state = S::STATE_FAULT;
@@ -196,6 +218,17 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
   Snapshot notify_snap;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    const auto now = Clock::now();
+    // Reset monotonic epoch/seq filters after a prolonged controller disconnect so a
+    // restarted controller with a smaller epoch (cross-host or mock restart) is accepted.
+    if (controller_stamp_ != Clock::time_point{} &&
+        (now - controller_stamp_) >= kControllerEpochResetTimeout)
+    {
+      last_controller_epoch_ = 0;
+      last_status_seq_ = 0;
+      last_mode_epoch_ = 0;
+    }
+
     if (status.controller_epoch != 0 || status.status_seq != 0) {
       if (status.controller_epoch < last_controller_epoch_) {
         return effects;
@@ -211,10 +244,12 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
         status.controller_epoch != last_controller_epoch_;
       last_controller_epoch_ = status.controller_epoch;
       last_status_seq_ = status.status_seq;
+      last_mode_epoch_ = status.mode_epoch;
       snap_.controller_epoch = status.controller_epoch;
       if (epoch_changed &&
           (snap_.state == S::STATE_RUNNING || snap_.state == S::STATE_STEPPING ||
-           snap_.state == S::STATE_STOPPING || snap_.state == S::STATE_RECOVERING))
+           snap_.state == S::STATE_STOPPING || snap_.state == S::STATE_RECOVERING ||
+           snap_.state == S::STATE_PAUSED))
       {
         effects.cancel_controller_goals = true;
         if (mode == CS::MODE_ESTOP) {
@@ -222,37 +257,58 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
             "Controller reactivated in ESTOP mid-operation (epoch changed)",
             estop_reason, effects);
         } else {
-          enter_fault_unlocked(-12, "Controller reactivated mid-operation (controller_epoch changed)");
+          enter_fault_unlocked(
+            -12, "Controller reactivated mid-operation (controller_epoch changed)");
         }
         changed = true;
       }
+    } else if (status.mode_epoch != 0) {
+      last_mode_epoch_ = status.mode_epoch;
     }
 
-    const auto now = Clock::now();
     const bool was_fresh = fresh_controller_unlocked(now);
+    const bool was_lost_notified = controller_lost_notified_;
     const uint8_t prev_mode = snap_.controller_mode;
     controller_stamp_ = now;
     controller_lost_notified_ = false;
+    if (was_lost_notified) {
+      const std::string suffix = std::string("\n\n") + kControllerLostHint;
+      if (snap_.detail.size() >= suffix.size() &&
+          snap_.detail.compare(snap_.detail.size() - suffix.size(), suffix.size(), suffix) == 0)
+      {
+        snap_.detail.erase(snap_.detail.size() - suffix.size());
+      }
+    }
     snap_.controller_mode = mode;
 
     if (changed) {
       notify_snap = make_snapshot_unlocked(now);
     } else if (mode == CS::MODE_ESTOP) {
+      const bool was_latched = snap_.estop_latched;
       snap_.estop_latched = true;
-      if (estop_reason != CS::ESTOP_NONE) {
+      if (estop_reason != CS::ESTOP_NONE &&
+          (!was_latched || snap_.estop_reason == CS::ESTOP_NONE ||
+           snap_.estop_reason == CS::ESTOP_EXTERNAL || estop_reason != CS::ESTOP_EXTERNAL))
+      {
         snap_.estop_reason = estop_reason;
       }
       if (snap_.state != S::STATE_ESTOP && snap_.state != S::STATE_RECOVERING) {
         enter_estop_unlocked(describe_estop_reason(snap_.estop_reason), snap_.estop_reason, effects);
         changed = true;
-      } else if (
-        snap_.state == S::STATE_RECOVERING &&
-        recovery_phase_ == RecoverySubPhase::POST_SETTLE)
-      {
-        enter_estop_unlocked(
-          "Controller re-entered E-STOP during recovery verification",
-          snap_.estop_reason, effects);
-        changed = true;
+      } else if (snap_.state == S::STATE_RECOVERING) {
+        const bool new_estop_episode =
+          (recovery_phase_ == RecoverySubPhase::POST_SETTLE) ||
+          (recovery_initial_mode_ != CS::MODE_ESTOP) ||
+          (status.mode_epoch != 0 && recovery_initial_mode_epoch_ != 0 &&
+           status.mode_epoch > recovery_initial_mode_epoch_);
+        if (new_estop_episode) {
+          enter_estop_unlocked(
+            recovery_phase_ == RecoverySubPhase::POST_SETTLE ?
+            "Controller re-entered E-STOP during recovery verification" :
+            "New E-STOP latched during recovery; retry RECOVER",
+            snap_.estop_reason, effects);
+          changed = true;
+        }
       }
     } else if (mode == CS::MODE_NORMAL) {
       if (snap_.state == S::STATE_BOOT_INIT) {
@@ -273,7 +329,6 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
         recovery_phase_ = RecoverySubPhase::POST_SETTLE;
         post_settle_start_ = now;
         phase_deadline_ = now + kRecoveryPhaseTimeout;
-        reset_settle_unlocked();
         notify_unlocked("Controller entered NORMAL; verifying stationary settle");
         changed = true;
       }
@@ -282,22 +337,33 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
       mode == CS::MODE_COMPLIANCE_STOPPING ||
       mode == CS::MODE_CARTESIAN_IMPEDANCE)
     {
-      // Permitted during active impedance blocks, pauses, or clean stops.
+      // Permitted only during active execution (RUNNING/STEPPING) or controlled stopping;
+      // PAUSED and idle states require MODE_NORMAL so RESUME/STEP/STOP cannot trap or fault.
       if (snap_.state == S::STATE_BOOT_INIT || snap_.state == S::STATE_IDLE ||
-          snap_.state == S::STATE_COMPILED_READY)
+          snap_.state == S::STATE_COMPILED_READY || snap_.state == S::STATE_PAUSED)
       {
-        enter_fault_unlocked(-10, "Unexpected active compliance/impedance mode in idle controller");
+        enter_fault_unlocked(
+          -10, "Unexpected active compliance/impedance mode while controller must be in MODE_NORMAL");
+        changed = true;
+      } else if (snap_.state == S::STATE_RECOVERING) {
+        effects.cancel_controller_goals = true;
+        effects.send_estop_cmd = true;
+        last_estop_cmd_sent_ = now;
+        enter_estop_unlocked(
+          "Unexpected compliance/impedance mode during E-STOP recovery",
+          CS::ESTOP_TRAJECTORY_MODE_CHANGED, effects);
         changed = true;
       }
     } else {
       // Unexpected external controller mode (SYSID, TEACH, standalone joint impedance, UNKNOWN)
       if (snap_.state == S::STATE_RUNNING || snap_.state == S::STATE_STEPPING ||
-          snap_.state == S::STATE_RECOVERING)
+          snap_.state == S::STATE_STOPPING || snap_.state == S::STATE_RECOVERING)
       {
         effects.cancel_controller_goals = true;
         effects.send_estop_cmd = true;
+        last_estop_cmd_sent_ = now;
         enter_estop_unlocked(
-          "Unexpected controller mode during active trajectory execution",
+          "Unexpected controller mode during active operation",
           CS::ESTOP_TRAJECTORY_MODE_CHANGED, effects);
         changed = true;
       } else if (snap_.state != S::STATE_ESTOP && snap_.state != S::STATE_FAULT) {
@@ -306,7 +372,7 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
       }
     }
 
-    if (!changed && (!was_fresh || prev_mode != mode)) {
+    if (!changed && (!was_fresh || was_lost_notified || prev_mode != mode)) {
       notify_unlocked(snap_.detail);
       changed = true;
     }
@@ -336,6 +402,7 @@ StudioSupervisor::Effects StudioSupervisor::observe_joint_state(
           snap_.state == S::STATE_RECOVERING || snap_.state == S::STATE_STOPPING)
       {
         effects.send_estop_cmd = true;
+        last_estop_cmd_sent_ = now;
         enter_estop_unlocked(
           "Invalid / non-finite /joint_states observation",
           CS::ESTOP_INVALID_STATE, effects);
@@ -373,7 +440,10 @@ StudioSupervisor::Effects StudioSupervisor::observe_joint_state(
           }
         }
       } else if (snap_.state == S::STATE_RECOVERING) {
-        if (recovery_phase_ == RecoverySubPhase::WAIT_SETTLE && settled_unlocked(now)) {
+        if (recovery_phase_ == RecoverySubPhase::WAIT_SETTLE &&
+            fresh_controller_unlocked(now) &&
+            settled_unlocked(now))
+        {
           if (snap_.controller_mode == CS::MODE_NORMAL) {
             recovery_phase_ = RecoverySubPhase::POST_SETTLE;
             post_settle_start_ = now;
@@ -391,9 +461,12 @@ StudioSupervisor::Effects StudioSupervisor::observe_joint_state(
           snap_.controller_mode == CS::MODE_NORMAL &&
           fresh_controller_unlocked(now) &&
           settled_unlocked(now) &&
+          last_settle_obs_ >= post_settle_start_ &&
           (now - post_settle_start_) >= kPostRecoverySettle)
         {
           recovery_phase_ = RecoverySubPhase::NONE;
+          recovery_initial_mode_ = CS::MODE_UNKNOWN;
+          recovery_initial_mode_epoch_ = 0;
           snap_.estop_latched = false;
           snap_.estop_reason = CS::ESTOP_NONE;
           snap_.last_error_code = 0;
@@ -461,6 +534,7 @@ StudioSupervisor::Effects StudioSupervisor::watchdog()
          snap_.state == S::STATE_STOPPING || snap_.state == S::STATE_RECOVERING))
     {
       effects.send_estop_cmd = true;
+      last_estop_cmd_sent_ = now;
       std::string detail =
         "Feedback timeout on /joint_states or /ctc_controller/status during motion";
       if (controller_lost) {
@@ -478,15 +552,23 @@ StudioSupervisor::Effects StudioSupervisor::watchdog()
     } else if (snap_.state == S::STATE_ESTOP && c_fresh &&
                snap_.controller_mode != CS::MODE_ESTOP)
     {
-      effects.send_estop_cmd = true;
+      if (last_estop_cmd_sent_ == Clock::time_point{} ||
+          (now - last_estop_cmd_sent_) >= kEstopCmdRetryInterval)
+      {
+        effects.send_estop_cmd = true;
+        last_estop_cmd_sent_ = now;
+      }
     } else if (snap_.state == S::STATE_RECOVERING) {
       if (recovery_phase_ == RecoverySubPhase::POST_SETTLE &&
           snap_.controller_mode == CS::MODE_NORMAL &&
           c_fresh && j_fresh &&
           settled_unlocked(now) &&
+          last_settle_obs_ >= post_settle_start_ &&
           (now - post_settle_start_) >= kPostRecoverySettle)
       {
         recovery_phase_ = RecoverySubPhase::NONE;
+        recovery_initial_mode_ = CS::MODE_UNKNOWN;
+        recovery_initial_mode_epoch_ = 0;
         snap_.estop_latched = false;
         snap_.estop_reason = CS::ESTOP_NONE;
         snap_.last_error_code = 0;
@@ -504,8 +586,23 @@ StudioSupervisor::Effects StudioSupervisor::watchdog()
           snap_.estop_reason, effects);
         changed = true;
       }
+    } else if ((snap_.state == S::STATE_RUNNING || snap_.state == S::STATE_STEPPING) &&
+               pause_requested_ &&
+               pause_deadline_ != Clock::time_point{} &&
+               now > pause_deadline_)
+    {
+      stop_requested_ = true;
+      pause_requested_ = false;
+      pause_deadline_ = Clock::time_point{};
+      snap_.state = S::STATE_STOPPING;
+      phase_deadline_ = now + kStoppingTimeout;
+      effects.cancel_controller_goals = true;
+      effects.wake_worker = true;
+      notify_unlocked("Pause deadline exceeded; stopping execution cleanly");
+      changed = true;
     } else if (snap_.state == S::STATE_STOPPING && now > phase_deadline_) {
       effects.send_estop_cmd = true;
+      last_estop_cmd_sent_ = now;
       enter_estop_unlocked(
         "Controlled stop deadline exceeded; latched E-STOP",
         CS::ESTOP_EXTERNAL, effects);
@@ -546,13 +643,16 @@ bool StudioSupervisor::begin_compile(bool auto_load, std::string & out_reason)
           "(RUNNING/STEPPING/STOPPING/RECOVERING/BOOT_INIT); STOP program first";
         return false;
     }
+    ++compile_in_flight_;
   }
-  ++compile_in_flight_;
   return true;
 }
 
-void StudioSupervisor::end_compile()
+void StudioSupervisor::end_compile(bool auto_load)
 {
+  if (!auto_load) {
+    return;
+  }
   std::lock_guard<std::mutex> lock(mutex_);
   if (compile_in_flight_ > 0) {
     --compile_in_flight_;
@@ -692,6 +792,7 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
     switch (command) {
       case C::Request::CMD_ESTOP: {
         res.effects.send_estop_cmd = true;
+        last_estop_cmd_sent_ = now;
         enter_estop_unlocked(
           reason.empty() ? "Operator commanded E-STOP" : ("E-STOP: " + reason),
           CS::ESTOP_EXTERNAL, res.effects);
@@ -801,6 +902,7 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
           break;
         }
         pause_requested_ = true;
+        pause_deadline_ = now + kPauseTimeout;
         // No direct goal cancellation: the worker observes pause_requested_ within one
         // 20 ms poll and either splices a stop-along-path tail into a rigid block or
         // cancels impedance / alignment goals itself.
@@ -812,9 +914,29 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
 
       case C::Request::CMD_STOP: {
         if (snap_.state == S::STATE_PAUSED) {
+          if (snap_.controller_mode != CS::MODE_NORMAL &&
+              snap_.controller_mode != CS::MODE_ESTOP)
+          {
+            // Defensive guard: if controller is somehow outside MODE_NORMAL while PAUSED,
+            // transition through STATE_STOPPING so the worker returns it to MODE_NORMAL.
+            ++session_id_;
+            stop_requested_ = true;
+            pause_requested_ = false;
+            pause_deadline_ = Clock::time_point{};
+            step_mode_ = false;
+            snap_.state = S::STATE_STOPPING;
+            phase_deadline_ = now + kStoppingTimeout;
+            res.effects.cancel_controller_goals = true;
+            res.effects.wake_worker = true;
+            notify_unlocked("Stopping from PAUSED; returning controller to MODE_NORMAL");
+            res.accepted = true;
+            changed = true;
+            break;
+          }
           ++session_id_;
           stop_requested_ = false;
           pause_requested_ = false;
+          pause_deadline_ = Clock::time_point{};
           step_mode_ = false;
           snap_.current_block_index = 0;
           snap_.current_line_number = 0;
@@ -835,6 +957,7 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
         }
         stop_requested_ = true;
         pause_requested_ = false;
+        pause_deadline_ = Clock::time_point{};
         snap_.state = S::STATE_STOPPING;
         phase_deadline_ = now + kStoppingTimeout;
         res.effects.cancel_controller_goals = true;
@@ -863,12 +986,22 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
           reject("RECOVER requires controller in MODE_ESTOP (or already MODE_NORMAL)");
           break;
         }
+        if (snap_.controller_mode == CS::MODE_NORMAL &&
+            last_estop_cmd_sent_ != Clock::time_point{} &&
+            (now - last_estop_cmd_sent_) < kEstopCmdInFlightGuard)
+        {
+          reject("E-STOP latch command still in flight; wait briefly and retry RECOVER");
+          break;
+        }
         ++session_id_;
         stop_requested_ = false;
         pause_requested_ = false;
+        pause_deadline_ = Clock::time_point{};
         step_mode_ = false;
         snap_.state = S::STATE_RECOVERING;
         recovery_phase_ = RecoverySubPhase::WAIT_SETTLE;
+        recovery_initial_mode_ = snap_.controller_mode;
+        recovery_initial_mode_epoch_ = last_mode_epoch_;
         phase_deadline_ = now + kRecoveryPhaseTimeout;
         reset_settle_unlocked();
         notify_unlocked("Waiting for stationary settle before E-STOP recovery");
@@ -914,6 +1047,13 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
             snap_.state == S::STATE_STOPPING || snap_.state == S::STATE_RECOVERING)
         {
           reject("Cannot clear program while robot is active");
+          break;
+        }
+        if (snap_.state == S::STATE_PAUSED &&
+            snap_.controller_mode != CS::MODE_NORMAL &&
+            snap_.controller_mode != CS::MODE_ESTOP)
+        {
+          reject("Controller is not in MODE_NORMAL; issue STOP or RESET_FAULT before clearing program");
           break;
         }
         has_program_ = false;
@@ -1063,6 +1203,7 @@ void StudioSupervisor::on_pause_settled(
       notify_snap = make_snapshot_unlocked(Clock::now());
     } else if (snap_.state == S::STATE_RUNNING || snap_.state == S::STATE_STEPPING) {
       pause_requested_ = false;
+      pause_deadline_ = Clock::time_point{};
       step_mode_ = false;
       snap_.state = S::STATE_PAUSED;
       snap_.current_line_number = line_number;
@@ -1102,6 +1243,7 @@ void StudioSupervisor::on_step_block_done(
     } else if (snap_.state == S::STATE_STEPPING) {
       step_mode_ = false;
       pause_requested_ = false;
+      pause_deadline_ = Clock::time_point{};
       snap_.cartesian_pos_error_m.fill(0.0);
       snap_.cartesian_rot_error_rad.fill(0.0);
       if (more_blocks_remaining) {
@@ -1143,6 +1285,7 @@ void StudioSupervisor::on_program_completed(uint64_t session)
       notify_snap = make_snapshot_unlocked(Clock::now());
     } else if (snap_.state == S::STATE_RUNNING || snap_.state == S::STATE_STEPPING) {
       pause_requested_ = false;
+      pause_deadline_ = Clock::time_point{};
       step_mode_ = false;
       snap_.state = has_program_ ? S::STATE_COMPILED_READY : S::STATE_IDLE;
       snap_.current_block_index = snap_.total_blocks;
@@ -1192,21 +1335,43 @@ void StudioSupervisor::on_execution_fault(
     if (session != session_id_) {
       return;
     }
+    const auto now = Clock::now();
     if (trigger_estop) {
       out_effects.send_estop_cmd = true;
+      last_estop_cmd_sent_ = now;
       enter_estop_unlocked(detail, snap_.estop_reason, out_effects);
+      changed = true;
+    } else if (snap_.state == S::STATE_STOPPING || stop_requested_) {
+      if (error_code == -38) {
+        // Returning the controller to MODE_NORMAL failed during a controlled stop.
+        out_effects.cancel_controller_goals = true;
+        enter_fault_unlocked(error_code, detail);
+        changed = true;
+      } else if (snap_.controller_mode == CS::MODE_NORMAL) {
+        // A transient block error (gripper/payload/replan) raced with an accepted STOP;
+        // do not hijack STATE_STOPPING into STATE_FAULT once the controller is in MODE_NORMAL.
+        finish_stop_unlocked("Program execution stopped cleanly");
+        changed = true;
+      } else {
+        // Stay in STATE_STOPPING and wake the worker to finish returning to MODE_NORMAL.
+        out_effects.cancel_controller_goals = true;
+        out_effects.wake_worker = true;
+      }
     } else {
+      out_effects.cancel_controller_goals = true;
       enter_fault_unlocked(error_code, detail);
+      changed = true;
     }
-    changed = true;
-    notify_snap = make_snapshot_unlocked(Clock::now());
+    if (changed) {
+      notify_snap = make_snapshot_unlocked(now);
+    }
   }
   if (changed && on_change_) {
     on_change_(notify_snap);
   }
 }
 
-void StudioSupervisor::note_pause_deferred(const std::string & detail)
+void StudioSupervisor::note_pause_deferred(const std::string & detail, double min_remaining_sec)
 {
   bool changed = false;
   Snapshot notify_snap;
@@ -1215,9 +1380,17 @@ void StudioSupervisor::note_pause_deferred(const std::string & detail)
     if (pause_requested_ &&
         (snap_.state == S::STATE_RUNNING || snap_.state == S::STATE_STEPPING))
     {
+      const auto now = Clock::now();
+      if (min_remaining_sec > 0.0) {
+        const auto extended = now + std::chrono::milliseconds(
+          static_cast<int64_t>((min_remaining_sec + 3.0) * 1000.0));
+        if (extended > pause_deadline_) {
+          pause_deadline_ = extended;
+        }
+      }
       notify_unlocked(detail);
       changed = true;
-      notify_snap = make_snapshot_unlocked(Clock::now());
+      notify_snap = make_snapshot_unlocked(now);
     }
   }
   if (changed && on_change_) {

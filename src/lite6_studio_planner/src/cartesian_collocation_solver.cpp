@@ -1,6 +1,6 @@
 #include "lite6_studio_planner/cartesian_collocation_solver.hpp"
 
-#include "lite6_planner/motion_tolerances.hpp"
+#include "lite6_kinematics/motion_tolerances.hpp"
 #include "lite6_studio_planner/joint_pva_solver.hpp"
 
 #include <pinocchio/algorithm/frames-derivatives.hpp>
@@ -31,7 +31,7 @@ namespace
 {
 
 using D = lite6_interfaces::msg::CompileDiagnostic;
-using IKResult = lite6_planner::IKResult;
+using IKResult = lite6_kinematics::IKResult;
 using Mat6 = Eigen::Matrix<double, 6, 6>;
 using Mat3x6 = Eigen::Matrix<double, 3, 6>;
 
@@ -607,11 +607,11 @@ struct IKBranchCandidate
 
 // Returns up to max_chains continuous, limit-feasible, collision-free IK waypoint chains.
 bool resolve_ik_chains_dp(
-  const lite6_planner::KinematicsEngine & engine,
+  const lite6_kinematics::KinematicsEngine & engine,
   const Vec6 & start_q,
   const std::vector<CartesianCollocationWaypoint> & waypoints,
-  const std::array<lite6_planner::JointLimit, 6> & limits,
-  const lite6_planner::CartesianLimit & cart_limits,
+  const std::array<lite6_kinematics::JointLimit, 6> & limits,
+  const lite6_kinematics::CartesianLimit & cart_limits,
   const MotionOptions & opts,
   size_t max_chains,
   std::vector<ResolvedWaypointChain> & out_chains,
@@ -702,7 +702,7 @@ bool resolve_ik_chains_dp(
     // Use the best candidate from the previous layer as IK seed to retrieve all base branches.
     const std::array<double, 6> seed = to_array(layers[k].front().q);
     std::vector<std::array<double, 6>> raw_sols;
-    lite6_planner::IKDiagnostics ik_diag;
+    lite6_kinematics::IKDiagnostics ik_diag;
     const auto status = engine.solve_optimal_ik(
       wp.pose, seed, raw_sols, /*continuous=*/false, workspace, &ik_diag);
     if (status != IKResult::SUCCESS || raw_sols.empty()) {
@@ -726,8 +726,8 @@ bool resolve_ik_chains_dp(
       // Verify refined q still satisfies joint position limits.
       bool pos_ok = true;
       for (int j = 0; j < 6; ++j) {
-        if (q_ref[j] < limits[static_cast<size_t>(j)].min_pos - lite6_planner::tolerance::kJointPosition ||
-            q_ref[j] > limits[static_cast<size_t>(j)].max_pos + lite6_planner::tolerance::kJointPosition)
+        if (q_ref[j] < limits[static_cast<size_t>(j)].min_pos - lite6_kinematics::tolerance::kJointPosition ||
+            q_ref[j] > limits[static_cast<size_t>(j)].max_pos + lite6_kinematics::tolerance::kJointPosition)
         {
           pos_ok = false;
           break;
@@ -2255,11 +2255,11 @@ void sample_cubic_hermite_segment(
 }
 
 void build_warm_start_mesh(
-  const lite6_planner::KinematicsEngine & engine,
+  const lite6_kinematics::KinematicsEngine & engine,
   const ResolvedWaypointChain & chain,
   const std::vector<CartesianCollocationWaypoint> & waypoints,
-  const std::array<lite6_planner::JointLimit, 6> & limits,
-  const lite6_planner::CartesianLimit & cart_limits,
+  const std::array<lite6_kinematics::JointLimit, 6> & limits,
+  const lite6_kinematics::CartesianLimit & cart_limits,
   const MotionOptions & opts,
   bool prefer_cartesian_ik_seed,
   CollocationMesh & mesh)
@@ -2591,7 +2591,7 @@ struct Verify1kHzReport
 };
 
 Verify1kHzReport sample_and_verify_1khz(
-  const lite6_planner::KinematicsEngine & engine,
+  const lite6_kinematics::KinematicsEngine & engine,
   const CollocationMesh & mesh,
   const std::vector<CartesianCollocationWaypoint> & waypoints,
   SampledTrajectory1kHz & out_sampled,
@@ -2669,21 +2669,21 @@ Verify1kHzReport sample_and_verify_1khz(
       const size_t ju = static_cast<size_t>(j);
       const double pos_exc = std::max({0.0, mesh.q_min[ju] - q[j], q[j] - mesh.q_max[ju]});
       rep.max_pos_exc = std::max(rep.max_pos_exc, pos_exc);
-      if (pos_exc > lite6_planner::tolerance::kTrajectoryPosition) {
+      if (pos_exc > lite6_kinematics::tolerance::kTrajectoryPosition) {
         rep.violating_intervals[cur_i] = true;
         record_err(loc, "ERR_JOINT_POS_LIMIT",
           "Collocation trajectory violates joint" + std::to_string(j + 1) + " position limit");
       }
       const double vr = std::abs(v[j]) / mesh.v_lim[ju];
       rep.max_vel_ratio = std::max(rep.max_vel_ratio, vr);
-      if (std::abs(v[j]) > mesh.v_lim[ju] + lite6_planner::tolerance::kTrajectoryVelocity) {
+      if (std::abs(v[j]) > mesh.v_lim[ju] + lite6_kinematics::tolerance::kTrajectoryVelocity) {
         rep.violating_intervals[cur_i] = true;
         record_err(loc, "ERR_PVA_VEL_LIMIT",
           "Collocation trajectory violates joint" + std::to_string(j + 1) + " velocity limit");
       }
       const double ar = std::abs(a[j]) / mesh.a_lim[ju];
       rep.max_acc_ratio = std::max(rep.max_acc_ratio, ar);
-      if (std::abs(a[j]) > mesh.a_lim[ju] + lite6_planner::tolerance::kTrajectoryAcceleration) {
+      if (std::abs(a[j]) > mesh.a_lim[ju] + lite6_kinematics::tolerance::kTrajectoryAcceleration) {
         rep.violating_intervals[cur_i] = true;
         record_err(loc, "ERR_PVA_ACC_LIMIT",
           "Collocation trajectory violates joint" + std::to_string(j + 1) + " acceleration limit");
@@ -2753,7 +2753,7 @@ Verify1kHzReport sample_and_verify_1khz(
 // Checks whether the sampled 1 kHz trajectory is free of self/environment Coal collisions,
 // returning the first colliding segment index (-1 if completely collision-free).
 int find_first_colliding_segment(
-  const lite6_planner::KinematicsEngine & engine,
+  const lite6_kinematics::KinematicsEngine & engine,
   const SampledTrajectory1kHz & sampled,
   const std::vector<double> & seg_end_times,
   std::string & out_detail)
@@ -2933,11 +2933,11 @@ void CartesianCollocationSolver::evaluate_tcp_derivatives(
 // ============================================================================
 
 bool CartesianCollocationSolver::solve(
-  const lite6_planner::KinematicsEngine & engine,
+  const lite6_kinematics::KinematicsEngine & engine,
   const std::array<double, 6> & start_q_arr,
   const std::vector<CartesianCollocationWaypoint> & waypoints,
-  const std::array<lite6_planner::JointLimit, 6> & joint_limits,
-  const lite6_planner::CartesianLimit & cart_limits,
+  const std::array<lite6_kinematics::JointLimit, 6> & joint_limits,
+  const lite6_kinematics::CartesianLimit & cart_limits,
   const MotionOptions & options,
   CartesianCollocationResult & out_result,
   std::vector<D> & out_diagnostics)

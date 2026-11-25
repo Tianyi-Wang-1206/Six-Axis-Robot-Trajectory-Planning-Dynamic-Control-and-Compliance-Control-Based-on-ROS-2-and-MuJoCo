@@ -2,7 +2,7 @@
 #define LITE6_STUDIO_PLANNER__CURVE_GEOMETRY_HPP_
 
 #include "lite6_studio_planner/dsl_ast.hpp"
-#include "lite6_planner/kinematics_engine.hpp"
+#include "lite6_kinematics/kinematics_engine.hpp"
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>

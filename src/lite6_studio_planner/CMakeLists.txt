@@ -33,7 +33,7 @@ find_package(trajectory_msgs REQUIRED)
 find_package(control_msgs REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(lite6_interfaces REQUIRED)
-find_package(lite6_planner REQUIRED)
+find_package(lite6_kinematics REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(pinocchio REQUIRED)
 find_package(coal REQUIRED)
@@ -57,7 +57,7 @@ ament_target_dependencies(studio_planner_core
   trajectory_msgs
   ament_index_cpp
   lite6_interfaces
-  lite6_planner
+  lite6_kinematics
 )
 target_link_libraries(studio_planner_core
   pinocchio::pinocchio
@@ -82,7 +82,7 @@ ament_export_dependencies(
   control_msgs
   ament_index_cpp
   lite6_interfaces
-  lite6_planner
+  lite6_kinematics
   pinocchio
   coal
   yaml-cpp
@@ -110,7 +110,7 @@ ament_target_dependencies(lite6_studio_planner_node
   control_msgs
   ament_index_cpp
   lite6_interfaces
-  lite6_planner
+  lite6_kinematics
   pinocchio
   coal
   yaml-cpp

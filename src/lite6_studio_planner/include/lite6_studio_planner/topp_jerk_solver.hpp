@@ -3,9 +3,10 @@
 
 #include "lite6_studio_planner/curve_geometry.hpp"
 #include "lite6_studio_planner/s_curve_solver.hpp"
-#include "lite6_planner/kinematics_engine.hpp"
+#include "lite6_kinematics/kinematics_engine.hpp"
 
 #include <array>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -62,6 +63,8 @@ struct TOPPSolveOptions
 {
   // When > 0, overrides the IPM iteration cap (useful for testing suboptimal fallback).
   int max_ipm_iters_override = 0;
+  // Optional cooperative cancellation predicate checked during grid/IPM/sampling loops.
+  std::function<bool()> is_cancelled;
 };
 
 class TOPPJerkSolver
@@ -74,8 +77,8 @@ public:
   static bool solve(
     const JointPath & path,
     const CartesianPath * cart_path,
-    const std::array<lite6_planner::JointLimit, 6> & joint_limits,
-    const lite6_planner::CartesianLimit & cart_limits,
+    const std::array<lite6_kinematics::JointLimit, 6> & joint_limits,
+    const lite6_kinematics::CartesianLimit & cart_limits,
     double default_vel_scale,
     double default_acc_scale,
     double default_jerk_scale,

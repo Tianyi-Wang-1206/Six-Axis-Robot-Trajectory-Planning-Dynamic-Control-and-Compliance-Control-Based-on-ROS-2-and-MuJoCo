@@ -1,4 +1,4 @@
-#include "lite6_planner/kinematics_engine.hpp"
+#include "lite6_kinematics/kinematics_engine.hpp"
 #include "lite6_planner/motion_planner.hpp"
 #include "lite6_planner/supervisor.hpp"
 
@@ -58,10 +58,10 @@ class IndustrialPlannerNode final:public rclcpp::Node {
 public:
   IndustrialPlannerNode():rclcpp::Node("lite6_industrial_planner"),planner_(kinematics_) {
     const auto desc=ament_index_cpp::get_package_share_directory("lite6_description");
-    const auto pkg=ament_index_cpp::get_package_share_directory("lite6_planner");
-    if(!kinematics_.load_ik_config(pkg+"/config/ik_config.yaml")||
-       !kinematics_.init_robot_model(desc+"/urdf/lite6_arm.urdf",pkg+"/config/lite6.srdf")||
-       !kinematics_.load_limits(pkg+"/config/kinematic_limits.yaml"))
+    const auto kin_pkg=ament_index_cpp::get_package_share_directory("lite6_kinematics");
+    if(!kinematics_.load_ik_config(kin_pkg+"/config/ik_config.yaml")||
+       !kinematics_.init_robot_model(desc+"/urdf/lite6_arm.urdf",kin_pkg+"/config/lite6.srdf")||
+       !kinematics_.load_limits(kin_pkg+"/config/kinematic_limits.yaml"))
       throw std::runtime_error("Robot planning model / YAML initialization failed");
     io_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     validation_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -191,7 +191,7 @@ private:
     double duration=0.0;
     bool cancel_pending=false;
   };
-  KinematicsEngine kinematics_;
+  lite6_kinematics::KinematicsEngine kinematics_;
   MotionPlanner planner_;
   Supervisor supervisor_;
   std::mutex joints_mutex_,ctc_mutex_;

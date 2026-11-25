@@ -17,7 +17,7 @@
   <depend>control_msgs</depend>
   <depend>ament_index_cpp</depend>
   <depend>lite6_interfaces</depend>
-  <depend>lite6_planner</depend>
+  <depend>lite6_kinematics</depend>
   <depend>lite6_description</depend>
   <depend>yaml-cpp</depend>
   <depend>pinocchio</depend>

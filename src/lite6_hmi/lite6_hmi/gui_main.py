@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import signal
 import sys
 import math
 from lite6_motion_contract import MAX_PAYLOAD_MASS_KG, MAX_PAYLOAD_COM_RADIUS_M
@@ -1284,11 +1285,21 @@ def main(args=None):
     gui.show()
     worker.start()
 
-    exit_code = app.exec_()
-    
-    # Graceful shutdown of the ROS executor thread before destroying node.
-    worker.stop()
-    rclpy.shutdown()
+    # Allow Ctrl+C / launch SIGINT to exit the Qt event loop gracefully.
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
+    sig_timer = QTimer()
+    sig_timer.start(200)
+    sig_timer.timeout.connect(lambda: None)
+
+    exit_code = 0
+    try:
+        exit_code = app.exec_()
+    finally:
+        sig_timer.stop()
+        # Graceful shutdown of the ROS executor thread before destroying node.
+        worker.stop()
+        if rclpy.ok():
+            rclpy.shutdown()
     sys.exit(exit_code)
 
 if __name__ == '__main__':

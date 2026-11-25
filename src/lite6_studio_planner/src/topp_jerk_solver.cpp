@@ -136,8 +136,8 @@ struct RAStage
 
 double compute_v_max(
   const PathPoint & pp,
-  const std::array<lite6_planner::JointLimit, 6> & jl,
-  const lite6_planner::CartesianLimit & cl,
+  const std::array<lite6_kinematics::JointLimit, 6> & jl,
+  const lite6_kinematics::CartesianLimit & cl,
   double margin)
 {
   double v_cap = 1e6;
@@ -162,8 +162,8 @@ double compute_v_max(
 
 void append_ra_stage_cons(
   const PathPoint & pp,
-  const std::array<lite6_planner::JointLimit, 6> & jl,
-  const lite6_planner::CartesianLimit & cl,
+  const std::array<lite6_kinematics::JointLimit, 6> & jl,
+  const lite6_kinematics::CartesianLimit & cl,
   double margin,
   RAStage & st)
 {
@@ -204,8 +204,8 @@ bool acc_point_differs(const PathPoint & a, const PathPoint & b)
 
 RAStage build_ra_stage(
   const PathPoint & pp,
-  const std::array<lite6_planner::JointLimit, 6> & jl,
-  const lite6_planner::CartesianLimit & cl,
+  const std::array<lite6_kinematics::JointLimit, 6> & jl,
+  const lite6_kinematics::CartesianLimit & cl,
   double margin)
 {
   RAStage st;
@@ -583,8 +583,8 @@ struct ProblemCache
 ProblemCache build_problem_cache(
   const std::vector<NodeData> & nodes,
   const std::vector<MidData> & mids,
-  const std::array<lite6_planner::JointLimit, 6> & jl,
-  const lite6_planner::CartesianLimit & cl,
+  const std::array<lite6_kinematics::JointLimit, 6> & jl,
+  const lite6_kinematics::CartesianLimit & cl,
   double tau_s)
 {
   ProblemCache pc;
@@ -1102,7 +1102,7 @@ void build_initial_guess(
   const std::vector<double> & grid,
   const std::vector<double> & x_ra,
   const std::vector<NodeData> & nodes,
-  const std::array<lite6_planner::JointLimit, 6> & jl,
+  const std::array<lite6_kinematics::JointLimit, 6> & jl,
   std::vector<double> & v_init,
   std::vector<double> & a_init,
   std::vector<double> & dt_init)
@@ -1251,6 +1251,7 @@ struct IPMResult
 {
   bool converged = false;
   bool kkt_optimal = false;
+  bool cancelled = false;
   double eq_inf = 0.0;
   double ineq_inf = 0.0;
   double dual_inf = 0.0;
@@ -1262,8 +1263,8 @@ struct IPMResult
 IPMResult solve_3rd_order_ipm(
   const std::vector<NodeData> & nodes,
   const std::vector<MidData> & mids,
-  const std::array<lite6_planner::JointLimit, 6> & jl,
-  const lite6_planner::CartesianLimit & cl,
+  const std::array<lite6_kinematics::JointLimit, 6> & jl,
+  const lite6_kinematics::CartesianLimit & cl,
   std::vector<double> & v,
   std::vector<double> & a,
   std::vector<double> & dt,
@@ -1271,7 +1272,8 @@ IPMResult solve_3rd_order_ipm(
   std::vector<double> & y2,
   double T_ref,
   bool warm_polish,
-  int max_ipm_iters_override = 0)
+  int max_ipm_iters_override = 0,
+  const std::function<bool()> & is_cancelled = {})
 {
   const size_t N = nodes.size() - 1;
   double V_s = 0.0, A_s = 0.0;
@@ -1539,6 +1541,10 @@ IPMResult solve_3rd_order_ipm(
     : (warm_polish ? 80 : 120);
 
   for (int iter = 0; iter < max_iters; ++iter) {
+    if (is_cancelled && is_cancelled()) {
+      res.cancelled = true;
+      return res;
+    }
     eval_eq(v, a, dt, e1, e2);
 
     kkt.clear();
@@ -2051,8 +2057,8 @@ std::vector<double> collect_boundaries(const JointPath & path, const CartesianPa
 
 double boundary_ramp_du(
   const PathPoint & pp,
-  const std::array<lite6_planner::JointLimit, 6> & jl,
-  const lite6_planner::CartesianLimit & cl)
+  const std::array<lite6_kinematics::JointLimit, 6> & jl,
+  const lite6_kinematics::CartesianLimit & cl)
 {
   double J0 = 1e9, A0 = 1e9;
   const double V0 = compute_v_max(pp, jl, cl, 1.0);
@@ -2081,8 +2087,8 @@ double boundary_ramp_du(
 void build_grid_data(
   const std::vector<double> & grid,
   const PathSampler & sampler,
-  const std::array<lite6_planner::JointLimit, 6> & jl,
-  const lite6_planner::CartesianLimit & cl,
+  const std::array<lite6_kinematics::JointLimit, 6> & jl,
+  const lite6_kinematics::CartesianLimit & cl,
   std::vector<NodeData> & nodes,
   std::vector<MidData> & mids)
 {
@@ -2133,8 +2139,8 @@ double refresh_time_midpoints(
   const std::vector<double> & a,
   const std::vector<double> & dt,
   const PathSampler & sampler,
-  const std::array<lite6_planner::JointLimit, 6> & jl,
-  const lite6_planner::CartesianLimit & cl,
+  const std::array<lite6_kinematics::JointLimit, 6> & jl,
+  const lite6_kinematics::CartesianLimit & cl,
   std::vector<MidData> & mids)
 {
   const size_t N = grid.size() - 1;
@@ -2163,14 +2169,16 @@ struct Verify1kHzResult
   double max_rv = 0.0;
   double max_ra = 0.0;
   double max_rj = 0.0;
+  bool cancelled = false;
 };
 
 Verify1kHzResult evaluate_1khz(
   const CubicTiming & timing,
   const PathSampler & sampler,
-  const std::array<lite6_planner::JointLimit, 6> & jl,
-  const lite6_planner::CartesianLimit & cl,
-  SampledTrajectory1kHz * out)
+  const std::array<lite6_kinematics::JointLimit, 6> & jl,
+  const lite6_kinematics::CartesianLimit & cl,
+  SampledTrajectory1kHz * out,
+  const std::function<bool()> & is_cancelled = {})
 {
   Verify1kHzResult res;
   const int ticks = std::max(2, static_cast<int>(std::ceil(timing.duration() * 1000.0 - 1e-9)));
@@ -2269,6 +2277,10 @@ Verify1kHzResult evaluate_1khz(
   double prev_js = 1.0;
 
   for (int tick = 0; tick <= ticks; ++tick) {
+    if (tick % 64 == 0 && is_cancelled && is_cancelled()) {
+      res.cancelled = true;
+      return res;
+    }
     const double t_s = static_cast<double>(tick) * 0.001;
     double u_s = 0.0, v_s = 0.0, a_s = 0.0, j_s = 0.0;
     timing.eval_at_time(t_s, u_s, v_s, a_s, j_s);
@@ -2324,8 +2336,8 @@ Verify1kHzResult evaluate_1khz(
 bool TOPPJerkSolver::solve(
   const JointPath & path,
   const CartesianPath * cart_path,
-  const std::array<lite6_planner::JointLimit, 6> & joint_limits,
-  const lite6_planner::CartesianLimit & cart_limits,
+  const std::array<lite6_kinematics::JointLimit, 6> & joint_limits,
+  const lite6_kinematics::CartesianLimit & cart_limits,
   double default_vel_scale,
   double default_acc_scale,
   double default_jerk_scale,
@@ -2337,6 +2349,16 @@ bool TOPPJerkSolver::solve(
 {
   out_traj.samples.clear();
   out_traj.duration_sec = 0.0;
+  const auto check_cancel = [&]() -> bool {
+    if (solve_options.is_cancelled && solve_options.is_cancelled()) {
+      err_msg = "Motion cancelled by supervisor";
+      return true;
+    }
+    return false;
+  };
+  if (check_cancel()) {
+    return false;
+  }
   const PathSampler sampler(
     path, cart_path, default_vel_scale, default_acc_scale, default_jerk_scale, default_loc);
 
@@ -2485,9 +2507,16 @@ bool TOPPJerkSolver::solve(
   IPMResult last_ipm;
 
   for (int refine = 0; refine < kMaxCollocationRefines; ++refine) {
+    if (check_cancel()) {
+      return false;
+    }
     last_ipm = solve_3rd_order_ipm(
       nodes, mids, joint_limits, cart_limits, v, a, dt, y1, y2, T_ra, refine > 0,
-      solve_options.max_ipm_iters_override);
+      solve_options.max_ipm_iters_override, solve_options.is_cancelled);
+    if (last_ipm.cancelled || check_cancel()) {
+      err_msg = "Motion cancelled by supervisor";
+      return false;
+    }
     if (!last_ipm.converged) {
       std::ostringstream oss;
       oss << "3rd-order TOPP interior-point solver failed to converge (eq_inf="
@@ -2501,6 +2530,9 @@ bool TOPPJerkSolver::solve(
     constexpr int kMaxMidpointPolishes = 4;
     constexpr double kMidpointRelTol = 1e-3;
     for (int mp = 0; mp < kMaxMidpointPolishes; ++mp) {
+      if (check_cancel()) {
+        return false;
+      }
       std::vector<MidData> mids_next = mids;
       const double max_rel_shift = refresh_time_midpoints(
         grid, v, a, dt, sampler, joint_limits, cart_limits, mids_next);
@@ -2516,7 +2548,11 @@ bool TOPPJerkSolver::solve(
       mids.swap(mids_next);
       const IPMResult polish_ipm = solve_3rd_order_ipm(
         nodes, mids, joint_limits, cart_limits, v, a, dt, y1, y2, T_ra, true,
-        solve_options.max_ipm_iters_override);
+        solve_options.max_ipm_iters_override, solve_options.is_cancelled);
+      if (polish_ipm.cancelled || check_cancel()) {
+        err_msg = "Motion cancelled by supervisor";
+        return false;
+      }
       if (!polish_ipm.converged) {
         v.swap(v_bak);
         a.swap(a_bak);
@@ -2540,7 +2576,12 @@ bool TOPPJerkSolver::solve(
       return false;
     }
 
-    check_res = evaluate_1khz(timing, sampler, joint_limits, cart_limits, nullptr);
+    check_res = evaluate_1khz(
+      timing, sampler, joint_limits, cart_limits, nullptr, solve_options.is_cancelled);
+    if (check_res.cancelled || check_cancel()) {
+      err_msg = "Motion cancelled by supervisor";
+      return false;
+    }
     if (check_res.violations.empty()) {
       accepted = true;
       break;
@@ -2662,7 +2703,14 @@ bool TOPPJerkSolver::solve(
     out_warnings->push_back(oss.str());
   }
 
-  evaluate_1khz(timing, sampler, joint_limits, cart_limits, &out_traj);
+  const Verify1kHzResult final_res = evaluate_1khz(
+    timing, sampler, joint_limits, cart_limits, &out_traj, solve_options.is_cancelled);
+  if (final_res.cancelled || check_cancel()) {
+    out_traj.samples.clear();
+    out_traj.duration_sec = 0.0;
+    err_msg = "Motion cancelled by supervisor";
+    return false;
+  }
   return true;
 }
 

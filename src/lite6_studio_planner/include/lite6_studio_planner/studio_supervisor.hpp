@@ -94,10 +94,11 @@ public:
   Effects watchdog();
 
   // Compile coordination. begin_compile() atomically checks the state (auto_load only)
-  // and registers an in-flight compile; RUN/RESUME/STEP/CLEAR_PROGRAM are rejected
-  // under the same mutex until the matching end_compile().
+  // and registers an in-flight load compile; RUN/RESUME/STEP/CLEAR_PROGRAM are rejected
+  // under the same mutex until the matching end_compile(true). Dry-run compiles
+  // (auto_load == false) do not block execution commands.
   bool begin_compile(bool auto_load, std::string & out_reason);
-  void end_compile();
+  void end_compile(bool auto_load = true);
   void on_compile_dry_run(uint64_t request_id);
   void on_compile_succeeded(
     const std::string & program_id,
@@ -159,8 +160,9 @@ public:
 
   void on_recovery_failed(uint64_t session, const std::string & reason);
 
-  // Shows why an accepted PAUSE is deferred (e.g. an active gripper command).
-  void note_pause_deferred(const std::string & detail);
+  // Shows why an accepted PAUSE is deferred (e.g. an active gripper command) and
+  // optionally extends the pause watchdog deadline to cover a bounded active wait.
+  void note_pause_deferred(const std::string & detail, double min_remaining_sec = 0.0);
 
 private:
   bool fresh_joint_unlocked(Clock::time_point now) const;
@@ -194,8 +196,12 @@ private:
   bool controller_lost_notified_ = false;
 
   RecoverySubPhase recovery_phase_ = RecoverySubPhase::NONE;
+  uint8_t recovery_initial_mode_ = CS::MODE_UNKNOWN;
+  uint64_t recovery_initial_mode_epoch_ = 0;
   Clock::time_point phase_deadline_{};
+  Clock::time_point pause_deadline_{};
   Clock::time_point post_settle_start_{};
+  Clock::time_point last_estop_cmd_sent_{};
 
   Clock::time_point joint_stamp_{};
   Clock::time_point controller_stamp_{};
@@ -206,6 +212,7 @@ private:
   double last_max_abs_dq_ = 0.0;
   uint64_t last_controller_epoch_ = 0;
   uint64_t last_status_seq_ = 0;
+  uint64_t last_mode_epoch_ = 0;
   Clock::time_point settle_start_{};
   Clock::time_point last_settle_obs_{};
 };

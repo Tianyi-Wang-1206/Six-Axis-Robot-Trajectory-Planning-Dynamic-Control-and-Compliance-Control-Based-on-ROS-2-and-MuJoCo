@@ -3,7 +3,7 @@
 
 #include "lite6_studio_planner/dsl_ast.hpp"
 #include "lite6_studio_planner/topp_jerk_solver.hpp"
-#include "lite6_planner/kinematics_engine.hpp"
+#include "lite6_kinematics/kinematics_engine.hpp"
 
 #include <array>
 #include <optional>
@@ -59,7 +59,7 @@ public:
   // hard joint position limits [min_pos, max_pos], and optional exact dt (rounded to 1 ms).
   static bool solve_segment(
     const SegmentInput & seg,
-    const std::array<lite6_planner::JointLimit, 6> & limits,
+    const std::array<lite6_kinematics::JointLimit, 6> & limits,
     double vel_scale,
     double acc_scale,
     double jerk_scale,
@@ -74,7 +74,7 @@ public:
   static bool solve_multi_waypoint(
     const std::array<double, 6> & start_q,
     const std::vector<PVAWaypoint> & waypoints,
-    const std::array<lite6_planner::JointLimit, 6> & limits,
+    const std::array<lite6_kinematics::JointLimit, 6> & limits,
     double vel_scale,
     double acc_scale,
     double jerk_scale,

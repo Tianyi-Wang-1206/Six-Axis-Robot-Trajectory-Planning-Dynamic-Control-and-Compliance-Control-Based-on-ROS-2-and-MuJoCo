@@ -15,6 +15,9 @@
   <exec_depend>controller_manager</exec_depend>
   <exec_depend>ros2_control</exec_depend>
   <exec_depend>lite6_hardware</exec_depend>
+  <exec_depend>lite6_kinematics</exec_depend>
+  <exec_depend>lite6_planner</exec_depend>
+  <exec_depend>lite6_hmi</exec_depend>
   <exec_depend>lite6_studio_planner</exec_depend>
   <exec_depend>lite6_studio_hmi</exec_depend>
 

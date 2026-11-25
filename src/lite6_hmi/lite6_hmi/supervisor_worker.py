@@ -17,7 +17,7 @@ import numpy as np
 import pinocchio as pin
 import rclpy
 from rclpy.action import ActionClient
-from rclpy.executors import SingleThreadedExecutor
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from ament_index_python.packages import get_package_share_directory
@@ -187,6 +187,7 @@ class ROS2Worker(QThread):
         self._calculation_active = False
         self._estop_requested_at = 0.0
         self._direct_estop_sent = False
+        self._manual_estop_active = False
 
         self.sysid_record_data = []
         self.sysid_start_ros_time = None
@@ -303,10 +304,23 @@ class ROS2Worker(QThread):
         self._executor_thread_id = threading.get_ident()
         self._drain_ros_tasks()
         try:
-            self.executor.spin()
+            if not self._stopping and rclpy.ok():
+                self.executor.spin()
+        except ExternalShutdownException:
+            pass
+        except Exception as exc:
+            if not self._stopping and rclpy.ok():
+                try:
+                    self.node.get_logger().warn(f"ROS executor stopped unexpectedly: {exc}")
+                except Exception:
+                    pass
         finally:
-            self._drain_ros_tasks()
-            self.executor.remove_node(self.node)
+            if not self._stopping and rclpy.ok():
+                self._drain_ros_tasks()
+            try:
+                self.executor.remove_node(self.node)
+            except Exception:
+                pass
 
     def stop(self):
         self._stopping = True
@@ -314,7 +328,10 @@ class ROS2Worker(QThread):
             self._ros_wake.trigger()
         except Exception:
             pass
-        self.executor.shutdown(timeout_sec=2.0)
+        try:
+            self.executor.shutdown(timeout_sec=2.0)
+        except Exception:
+            pass
         self.wait(2500)
         with self._bg_threads_lock:
             bg_threads = list(self._bg_threads)
@@ -329,7 +346,10 @@ class ROS2Worker(QThread):
             self.node.destroy_guard_condition(self._ros_wake)
         except Exception:
             pass
-        self.node.destroy_node()
+        try:
+            self.node.destroy_node()
+        except Exception:
+            pass
 
     def _report_error(self, message):
         if not self._stopping:
@@ -485,14 +505,27 @@ class ROS2Worker(QThread):
             )
             # Suppress the fault popup for intentional manual E-STOP presses and
             # for trajectory failures that already report through _goal_result.
+            # Direct CTC E-STOP can beat /supervisor/command CMD_ESTOP and arrive
+            # initially as ESTOP_CONTROLLER_FAULT (from CS::ESTOP_EXTERNAL).
             trajectory_reports_via_action = (
                 msg.estop_reason == SupervisorState.ESTOP_TRAJECTORY
                 and previous is not None
                 and previous.motion_phase != SupervisorState.MOTION_IDLE
             )
+            manual_estop_suppressed = (
+                msg.estop_reason == SupervisorState.ESTOP_MANUAL
+                or (
+                    self._manual_estop_active
+                    and msg.estop_reason in (
+                        SupervisorState.ESTOP_NONE,
+                        SupervisorState.ESTOP_SUPERVISOR,
+                        SupervisorState.ESTOP_CONTROLLER_FAULT,
+                    )
+                )
+            )
             estop_popup = None
             if (entered_estop
-                    and msg.estop_reason != SupervisorState.ESTOP_MANUAL
+                    and not manual_estop_suppressed
                     and not trajectory_reports_via_action):
                 estop_popup = msg.detail or "Controller entered emergency stop mode."
             if msg.mode == SupervisorState.MODE_ESTOP:
@@ -501,6 +534,7 @@ class ROS2Worker(QThread):
             # emergency fallback must be possible in the next operating cycle.
             if msg.mode == SupervisorState.MODE_NORMAL and msg.controller_fresh:
                 self._direct_estop_sent = False
+                self._manual_estop_active = False
             if msg.mode in (SupervisorState.MODE_ESTOP,
                             SupervisorState.MODE_FAULT):
                 if self._begin_pending:
@@ -832,7 +866,20 @@ class ROS2Worker(QThread):
                 float(result.execution_time),
             )
             if result.error_code != IndustrialMotion.Result.SUCCESS:
-                if result.error_code != IndustrialMotion.Result.ERR_CANCELLED:
+                with self.state_lock:
+                    snap = self.supervisor_state
+                    manual_estop_abort = (
+                        result.error_code == IndustrialMotion.Result.ERR_EXECUTION_ABORTED
+                        and (
+                            self._manual_estop_active
+                            or (
+                                snap is not None
+                                and snap.mode == SupervisorState.MODE_ESTOP
+                                and snap.estop_reason == SupervisorState.ESTOP_MANUAL
+                            )
+                        )
+                    )
+                if result.error_code != IndustrialMotion.Result.ERR_CANCELLED and not manual_estop_abort:
                     # Only the Action result opens a notice. SupervisorState
                     # updates the banner, so heartbeat messages never repeat it.
                     self._report_error(
@@ -856,6 +903,8 @@ class ROS2Worker(QThread):
         """
         with self.state_lock:
             self._estop_requested_at = time.monotonic()
+            if reason == "SOFTWARE E-STOP PRESSED":
+                self._manual_estop_active = True
         self._run_on_executor(lambda: self._trigger_estop_on_executor(reason, force_fallback))
 
     def _send_direct_ctc_estop_on_executor(self, reason):
@@ -922,6 +971,10 @@ class ROS2Worker(QThread):
             if self.last_supervisor_rx_time and age > 1.2:
                 # Reset monotonic filter when supervisor feed goes stale so planner restarts are accepted.
                 self._revision = -1
+                if self._motion_pending:
+                    self._goal_epoch += 1
+                    self._motion_pending = False
+                    self.current_goal_handle = None
         if age > 1.2 and now - self.boot_time > 2.0:
             if not already_fallback:
                 self.trigger_estop("SUPERVISOR HEARTBEAT LOST", force_fallback=True)

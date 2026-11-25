@@ -2,23 +2,22 @@
 <package format="3">
   <name>lite6_planner</name>
   <version>0.0.0</version>
-  <description>Analytical Robot motion planning with event-supervised execution.</description>
+  <description>Debugging motion planner adapter and event-supervised execution node backed by lite6_studio_planner.</description>
   <maintainer email="developer@robot.local">developer</maintainer>
   <license>MIT</license>
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_action</depend>
   <depend>lite6_interfaces</depend>
+  <depend>lite6_kinematics</depend>
+  <depend>lite6_studio_planner</depend>
   <depend>action_msgs</depend>
   <depend>control_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>std_msgs</depend>
   <depend>trajectory_msgs</depend>
-  <depend>ruckig</depend>
-  <depend>pinocchio</depend>
-  <depend>coal</depend>
-  <depend>yaml-cpp</depend>
   <depend>ament_index_cpp</depend>
+  <depend>pinocchio</depend>
   <depend>eigen</depend>
   <test_depend>ament_cmake_gtest</test_depend>
   <test_depend>lite6_description</test_depend>

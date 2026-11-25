@@ -266,8 +266,16 @@ Supervisor::Effects Supervisor::observe_controller(const CS& status) {
   if(mode<CS::MODE_NORMAL||mode>CS::MODE_CARTESIAN_IMPEDANCE_TRAJECTORY) return fx;
   const auto previous=state_.controller_mode;
   const uint64_t prev_epoch=last_controller_epoch_;
+  const bool was_lost_notified=controller_lost_notified_;
   seen_controller_=true;controller_time_=Clock::now();
   controller_lost_notified_=false;
+  if(was_lost_notified) {
+    const std::string suffix=std::string("\n\n")+kControllerLostHint;
+    if(state_.detail.size()>=suffix.size()&&
+       state_.detail.compare(state_.detail.size()-suffix.size(),suffix.size(),suffix)==0) {
+      state_.detail.erase(state_.detail.size()-suffix.size());
+    }
+  }
   state_.controller_mode=mode;
   state_.controller_epoch=status.controller_epoch;
   state_.payload_mass=status.payload_mass;
@@ -284,7 +292,7 @@ Supervisor::Effects Supervisor::observe_controller(const CS& status) {
   }
   // Keep the initiating fault visible while the controller acknowledges ESTOP.
   if(state_.mode==S::MODE_ESTOP) {
-    if(previous!=mode) changed_unlocked();
+    if(previous!=mode||was_lost_notified) changed_unlocked();
     return fx;
   }
   if(mode==CS::MODE_ESTOP&&state_.mode!=S::MODE_ESTOP&&state_.mode!=S::MODE_RECOVERING) {
@@ -680,11 +688,29 @@ Supervisor::Reply Supervisor::command(const Command::Request& req) {
     return r;
   }
   switch(req.command) {
-  case C::Request::CMD_ESTOP:
+  case C::Request::CMD_ESTOP: {
     r.accepted=true;
-    fault_unlocked("ESTOP: "+req.reason,true,r.effects,
-      req.reason=="SOFTWARE E-STOP PRESSED"?S::ESTOP_MANUAL:S::ESTOP_SUPERVISOR);
+    const uint8_t req_reason=
+      req.reason=="SOFTWARE E-STOP PRESSED"?S::ESTOP_MANUAL:S::ESTOP_SUPERVISOR;
+    // Preserve an already-latched specific safety cause (e.g. compliance or trajectory
+    // fault) if a redundant manual E-STOP arrives, while allowing an operator E-STOP
+    // to refine a generic controller E-STOP observed from the parallel direct CTC latch.
+    const bool preserve_root_cause=
+      state_.mode==S::MODE_ESTOP&&
+      state_.estop_reason!=S::ESTOP_NONE&&
+      state_.estop_reason!=S::ESTOP_MANUAL&&
+      state_.estop_reason!=S::ESTOP_SUPERVISOR&&
+      state_.estop_reason!=S::ESTOP_CONTROLLER_FAULT;
+    if(preserve_root_cause) {
+      r.effects.ctc_cmd=CTC::Request::CMD_ESTOP;
+      r.effects.expected_controller_epoch=0;
+      r.effects.cmd_reason=req.reason;
+      changed_unlocked();
+    } else {
+      fault_unlocked("ESTOP: "+req.reason,true,r.effects,req_reason);
+    }
     break;
+  }
   case C::Request::CMD_JOINT_IMPEDANCE:
   case C::Request::CMD_CARTESIAN_IMPEDANCE:
   case C::Request::CMD_TEACH:
