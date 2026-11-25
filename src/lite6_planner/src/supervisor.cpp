@@ -1,6 +1,7 @@
 #include "lite6_planner/supervisor.hpp"
 #include <lite6_interfaces/compliance_validation.hpp>
 #include <lite6_interfaces/motion_contract.hpp>
+#include <lite6_interfaces/shm_registers.hpp>
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
@@ -16,16 +17,17 @@ using CS=lite6_interfaces::msg::ControllerStatus;
 using CTC=lite6_interfaces::srv::ControllerCommand;
 constexpr auto kControllerObservationTimeout=
   std::chrono::nanoseconds(lite6_interfaces::contract::kControllerStatusStaleTimeoutNs);
-constexpr auto kJointObservationTimeout=
-  std::chrono::nanoseconds(lite6_interfaces::contract::kJointStateStaleTimeoutNs);
 constexpr auto kModeTimeout=std::chrono::seconds(8);
-constexpr auto kSettleDuration=std::chrono::milliseconds(300);
-constexpr auto kSettleFeedbackGap=std::chrono::milliseconds(100);
+constexpr int64_t kSettleDurationNs=300'000'000LL;
+constexpr int64_t kSettleFeedbackGapNs=100'000'000LL;
 constexpr auto kDispatchTimeout=std::chrono::seconds(15);
 constexpr auto kValidationTimeout=std::chrono::seconds(120);
 constexpr auto kCalculationTimeout=std::chrono::seconds(60);
 constexpr double kSettleSpeed=lite6_interfaces::contract::kPlannerSettleSpeedRadPerSec;
 constexpr double kRadToDeg=57.29577951308232;
+inline int64_t steady_ns(std::chrono::steady_clock::time_point tp) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(tp.time_since_epoch()).count();
+}
 // Grace period before a compliance switch with an unknown CTC outcome is resolved
 // from the observed controller mode (the CTC answers or withdraws within ~0.15 s).
 constexpr auto kSwitchUnknownGrace=std::chrono::milliseconds(1500);
@@ -170,6 +172,9 @@ Supervisor::Supervisor() {
   std::random_device rd;
   next_session_=(static_cast<uint64_t>(rd())<<32) | static_cast<uint64_t>(rd());
   if(next_session_==0) next_session_=1;
+  const int64_t boot_ns=lite6_interfaces::shm::steady_now_ns();
+  planner_epoch_=static_cast<uint64_t>(boot_ns>0?boot_ns:1);
+  state_.planner_epoch=planner_epoch_;
   state_.mode=S::MODE_INITIALIZING;
   state_.motion_phase=S::MOTION_IDLE;
   state_.sysid_phase=S::SYSID_NONE;
@@ -187,7 +192,9 @@ bool Supervisor::fresh_controller_unlocked() const {
   return seen_controller_&&(Clock::now()-controller_time_<kControllerObservationTimeout);
 }
 bool Supervisor::fresh_joint_unlocked() const {
-  return seen_joint_&&(Clock::now()-joint_time_<kJointObservationTimeout);
+  return seen_joint_&&lite6_interfaces::shm::is_stamp_fresh(
+    joint_sample_ns_,lite6_interfaces::shm::steady_now_ns(),
+    lite6_interfaces::contract::kJointStateStaleTimeoutNs);
 }
 bool Supervisor::sync_from_initializing_unlocked() {
   if(state_.mode!=S::MODE_INITIALIZING||!fresh_controller_unlocked()||!fresh_joint_unlocked())
@@ -198,14 +205,27 @@ bool Supervisor::sync_from_initializing_unlocked() {
   changed_unlocked("Ready");
   return true;
 }
-void Supervisor::observe_joint_state(double max_speed) {
+void Supervisor::observe_joint_state(double max_speed,int64_t sample_steady_ns) {
   std::lock_guard<std::mutex> guard(mutex_);
-  const auto now=Clock::now();
-  if(!seen_joint_||now-joint_time_>kSettleFeedbackGap||
-      !std::isfinite(max_speed)||max_speed>kSettleSpeed) stable_since_=Clock::time_point{};
-  if(std::isfinite(max_speed)&&max_speed<=kSettleSpeed&&stable_since_==Clock::time_point{})
-    stable_since_=now;
-  seen_joint_=true; joint_time_=now;
+  const int64_t now_ns=lite6_interfaces::shm::steady_now_ns();
+  // Preserve the source steady-clock timestamp and reject stale, future, or older samples
+  // so joint freshness can never extend beyond the 100 ms contract.
+  if(!lite6_interfaces::shm::is_stamp_fresh(
+        sample_steady_ns,now_ns,lite6_interfaces::contract::kJointStateStaleTimeoutNs)||
+     (seen_joint_&&sample_steady_ns<joint_sample_ns_)) {
+    return;
+  }
+  if(!seen_joint_||
+     !lite6_interfaces::shm::is_stamp_fresh(
+        joint_sample_ns_,sample_steady_ns,kSettleFeedbackGapNs)||
+     !std::isfinite(max_speed)||max_speed>kSettleSpeed) {
+    stable_since_ns_=0;
+  }
+  if(std::isfinite(max_speed)&&max_speed<=kSettleSpeed&&stable_since_ns_==0) {
+    stable_since_ns_=sample_steady_ns;
+  }
+  seen_joint_=true;
+  joint_sample_ns_=sample_steady_ns;
   sync_from_initializing_unlocked();
 }
 void Supervisor::observe_excitation_start(const std::string& key,
@@ -218,7 +238,7 @@ void Supervisor::observe_excitation_start(const std::string& key,
 }
 void Supervisor::settle_unlocked() {
   state_.waiting_for_settle=true;
-  stable_since_=Clock::time_point{};
+  stable_since_ns_=0;
   phase_deadline_=Clock::now()+kModeTimeout;
 }
 void Supervisor::complete_sysid_unlocked() {
@@ -280,7 +300,22 @@ Supervisor::Effects Supervisor::observe_controller(const CS& status) {
   state_.controller_epoch=status.controller_epoch;
   state_.payload_mass=status.payload_mass;
   state_.payload_com_tcp=status.payload_com_tcp;
+  last_cmd_seq_=status.last_cmd_seq;
   if(status.controller_epoch!=0) last_controller_epoch_=status.controller_epoch;
+
+  if(payload_unknown_pending_&&
+     ((payload_unknown_seq_>0&&status.last_cmd_seq>=payload_unknown_seq_)||
+      (payload_unknown_seq_==0&&status.last_cmd_seq>payload_pre_seq_))) {
+    if(status.last_cmd_code==CTC::Request::CMD_SET_PAYLOAD) {
+      payload_unknown_pending_=false;
+      if(status.last_cmd_result==CS::ACK_APPLIED) {
+        changed_unlocked("Payload update confirmed via ControllerStatus telemetry");
+      } else {
+        changed_unlocked("Payload update rejected by CTC (reconciled via ControllerStatus, ack="+
+          std::to_string(status.last_cmd_result)+")");
+      }
+    }
+  }
 
   if(prev_epoch!=0&&status.controller_epoch!=0&&status.controller_epoch!=prev_epoch) {
     if(state_.mode==S::MODE_SYSID||state_.mode==S::MODE_RECOVERING||
@@ -332,30 +367,35 @@ Supervisor::Effects Supervisor::observe_controller(const CS& status) {
   return fx;
 }
 void Supervisor::on_controller_command_ack(uint8_t cmd,bool accepted,uint8_t ack_result,
-    uint8_t current_mode,const std::string& msg,bool outcome_unknown) {
+    uint8_t current_mode,const std::string& msg,bool outcome_unknown,uint64_t cmd_seq) {
   std::lock_guard<std::mutex> guard(mutex_);
+  const bool unknown=outcome_unknown||ack_result==CTC::Response::ACK_OUTCOME_UNKNOWN;
   // SET_PAYLOAD does not change the supervisor mode; report the CTC's
   // actual outcome instead of announcing success when the event is issued.
   if(cmd==CTC::Request::CMD_SET_PAYLOAD) {
     const std::string what="Payload update";
     if(accepted) {
+      payload_unknown_pending_=false;
       changed_unlocked("Payload configuration accepted by CTC");
-    } else if(outcome_unknown) {
-      changed_unlocked(what+" outcome unknown: no /ctc_controller/command response; "
-        "check ControllerStatus before retrying");
+    } else if(unknown) {
+      payload_unknown_pending_=true;
+      payload_unknown_seq_=cmd_seq;
+      payload_pre_seq_=last_cmd_seq_;
+      changed_unlocked(what+" outcome unknown; reconciling via ControllerStatus telemetry");
     } else {
+      payload_unknown_pending_=false;
       changed_unlocked(what+" rejected by CTC ("+std::to_string(ack_result)+"): "+msg);
     }
     return;
   }
   if(accepted) return;
-  if(outcome_unknown) {
+  if(unknown) {
     // Never assume rejection: the command may still have been applied. Compliance
     // switches resolve from the observed mode after a short grace period; recovery
     // and SysID sequences advance on observation or fail via phase_deadline_.
     if(state_.mode==S::MODE_COMPLIANCE_SWITCHING) {
       switch_unknown_deadline_=Clock::now()+kSwitchUnknownGrace;
-      changed_unlocked("No CTC response to compliance command; resolving from observed controller mode");
+      changed_unlocked("CTC compliance command outcome unknown; resolving from observed controller mode");
     }
     return;
   }
@@ -471,8 +511,10 @@ Supervisor::Effects Supervisor::watchdog() {
         "Sequence phase timed out (mode acknowledgement / client response)"),true,fx);
     return fx;
   }
-  if(state_.waiting_for_settle&&stable_since_!=Clock::time_point{}&&
-      now-stable_since_>=kSettleDuration&&now-joint_time_<kSettleFeedbackGap) {
+  const int64_t now_ns=steady_ns(now);
+  if(state_.waiting_for_settle&&stable_since_ns_>0&&
+      lite6_interfaces::shm::is_stamp_fresh(joint_sample_ns_,now_ns,kSettleFeedbackGapNs)&&
+      (joint_sample_ns_-stable_since_ns_)>=kSettleDurationNs) {
     state_.waiting_for_settle=false;
     phase_deadline_=now+kDispatchTimeout;
     if(state_.mode==S::MODE_SYSID) {
@@ -677,7 +719,17 @@ Supervisor::Effects Supervisor::finish_motion(const std::string& key,bool succes
 Supervisor::Reply Supervisor::command(const Command::Request& req) {
   std::lock_guard<std::mutex> guard(mutex_);
   Reply r;
+  r.planner_epoch=planner_epoch_;
   auto reject=[&](const std::string& why){r.message=why;};
+  if(req.command!=C::Request::CMD_ESTOP&&
+     req.expected_planner_epoch>0&&req.expected_planner_epoch!=planner_epoch_) {
+    reject("Planner epoch mismatch: expected "+std::to_string(req.expected_planner_epoch)+
+      ", current "+std::to_string(planner_epoch_));
+    r.session_id=state_.session_id;
+    r.revision=state_.revision;
+    r.mode=state_.mode;
+    return r;
+  }
   if(req.command!=C::Request::CMD_ESTOP&&
      req.expected_revision>0&&req.expected_revision!=state_.revision) {
     reject("Revision mismatch: expected "+std::to_string(req.expected_revision)+
@@ -727,8 +779,11 @@ Supervisor::Reply Supervisor::command(const Command::Request& req) {
        (exiting&&!compliant)) {
       reject("Compliance requires idle NORMAL/compliance mode and fresh feedback");break;
     }
-    if(!exiting&&!same&&(stable_since_==Clock::time_point{}||
-       Clock::now()-stable_since_<kSettleDuration)) {
+    const int64_t now_ns=lite6_interfaces::shm::steady_now_ns();
+    if(!exiting&&!same&&
+       (stable_since_ns_<=0||
+        !lite6_interfaces::shm::is_stamp_fresh(joint_sample_ns_,now_ns,kSettleFeedbackGapNs)||
+        (joint_sample_ns_-stable_since_ns_)<kSettleDurationNs)) {
       reject("Release the arm and wait until stationary before changing compliance mode");break;
     }
     if(!exiting&&!lite6_interfaces::valid_compliance_settings(req.compliance)) {

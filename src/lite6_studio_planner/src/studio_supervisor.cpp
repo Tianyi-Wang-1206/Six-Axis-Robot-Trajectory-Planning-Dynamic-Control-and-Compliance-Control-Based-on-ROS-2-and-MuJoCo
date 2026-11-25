@@ -1,5 +1,6 @@
 #include "lite6_studio_planner/studio_supervisor.hpp"
 #include "lite6_interfaces/motion_contract.hpp"
+#include "lite6_interfaces/shm_registers.hpp"
 
 #include <cmath>
 #include <limits>
@@ -11,12 +12,10 @@ namespace
 {
 constexpr auto kControllerObservationTimeout =
   std::chrono::nanoseconds(lite6_interfaces::contract::kControllerStatusStaleTimeoutNs);
-constexpr auto kJointObservationTimeout =
-  std::chrono::nanoseconds(lite6_interfaces::contract::kJointStateStaleTimeoutNs);
 constexpr auto kGripperTimeout = std::chrono::milliseconds(1500);
-constexpr auto kSettleDuration = std::chrono::milliseconds(300);
-constexpr auto kSettleGap = std::chrono::milliseconds(100);
-constexpr auto kPostRecoverySettle = std::chrono::milliseconds(200);
+constexpr int64_t kSettleDurationNs = 300'000'000LL;
+constexpr int64_t kSettleGapNs = 100'000'000LL;
+constexpr int64_t kPostRecoverySettleNs = 200'000'000LL;
 constexpr auto kRecoveryPhaseTimeout = std::chrono::seconds(8);
 constexpr auto kStoppingTimeout = std::chrono::seconds(5);
 constexpr auto kPauseTimeout = std::chrono::seconds(10);
@@ -39,18 +38,28 @@ constexpr const char * kControllerLostHint =
   "\"{activate_controllers: [ctc_controller], strictness: 2}\" -- then RECOVER.";
 constexpr double kSettleSpeedThreshold =
   lite6_interfaces::contract::kPlannerSettleSpeedRadPerSec;
+
+inline int64_t steady_ns(StudioSupervisor::Clock::time_point tp)
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(tp.time_since_epoch()).count();
+}
 }  // namespace
 
 StudioSupervisor::StudioSupervisor(std::function<void(const Snapshot &)> on_change)
 : on_change_(std::move(on_change))
 {
+  const int64_t boot_ns = lite6_interfaces::shm::steady_now_ns();
+  planner_epoch_ = static_cast<uint64_t>(boot_ns > 0 ? boot_ns : 1);
+  snap_.planner_epoch = planner_epoch_;
   snap_.state = S::STATE_BOOT_INIT;
   snap_.detail = "Waiting for /joint_states and /ctc_controller/status";
 }
 
 bool StudioSupervisor::fresh_joint_unlocked(Clock::time_point now) const
 {
-  return joint_stamp_ != Clock::time_point{} && (now - joint_stamp_) <= kJointObservationTimeout;
+  return lite6_interfaces::shm::is_stamp_fresh(
+    joint_sample_ns_, steady_ns(now),
+    lite6_interfaces::contract::kJointStateStaleTimeoutNs);
 }
 
 bool StudioSupervisor::fresh_controller_unlocked(Clock::time_point now) const
@@ -61,17 +70,17 @@ bool StudioSupervisor::fresh_controller_unlocked(Clock::time_point now) const
 
 bool StudioSupervisor::settled_unlocked(Clock::time_point now) const
 {
+  const int64_t now_ns = steady_ns(now);
   return settling_ &&
-         last_settle_obs_ != Clock::time_point{} &&
-         (now - last_settle_obs_) <= kSettleGap &&
-         (last_settle_obs_ - settle_start_) >= kSettleDuration;
+         lite6_interfaces::shm::is_stamp_fresh(last_settle_obs_ns_, now_ns, kSettleGapNs) &&
+         (last_settle_obs_ns_ - settle_start_ns_) >= kSettleDurationNs;
 }
 
 void StudioSupervisor::reset_settle_unlocked()
 {
   settling_ = false;
-  settle_start_ = Clock::time_point{};
-  last_settle_obs_ = Clock::time_point{};
+  settle_start_ns_ = 0;
+  last_settle_obs_ns_ = 0;
 }
 
 void StudioSupervisor::notify_unlocked(const std::string & detail)
@@ -280,6 +289,11 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
       }
     }
     snap_.controller_mode = mode;
+    snap_.last_cmd_seq = status.last_cmd_seq;
+    snap_.last_cmd_code = status.last_cmd_code;
+    snap_.last_cmd_result = status.last_cmd_result;
+    snap_.payload_mass = status.payload_mass;
+    snap_.payload_com_tcp = status.payload_com_tcp;
 
     if (changed) {
       notify_snap = make_snapshot_unlocked(now);
@@ -327,7 +341,7 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
         recovery_phase_ == RecoverySubPhase::ENABLE_NORMAL)
       {
         recovery_phase_ = RecoverySubPhase::POST_SETTLE;
-        post_settle_start_ = now;
+        post_settle_start_ns_ = steady_ns(now);
         phase_deadline_ = now + kRecoveryPhaseTimeout;
         notify_unlocked("Controller entered NORMAL; verifying stationary settle");
         changed = true;
@@ -387,7 +401,7 @@ StudioSupervisor::Effects StudioSupervisor::observe_controller(const CS & status
 }
 
 StudioSupervisor::Effects StudioSupervisor::observe_joint_state(
-  bool positions_valid, double max_abs_dq, bool dq_valid)
+  bool positions_valid, double max_abs_dq, bool dq_valid, int64_t sample_steady_ns)
 {
   Effects effects;
   bool changed = false;
@@ -395,6 +409,16 @@ StudioSupervisor::Effects StudioSupervisor::observe_joint_state(
   {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto now = Clock::now();
+    const int64_t now_ns = steady_ns(now);
+    // Validate the source steady-clock timestamp against the 100 ms contract (also rejects
+    // future or out-of-order older timestamps so freshness can never exceed the source age).
+    if (!lite6_interfaces::shm::is_stamp_fresh(
+          sample_steady_ns, now_ns, lite6_interfaces::contract::kJointStateStaleTimeoutNs) ||
+        (joint_sample_ns_ > 0 && sample_steady_ns < joint_sample_ns_))
+    {
+      return effects;
+    }
+
     if (!positions_valid || !dq_valid || !std::isfinite(max_abs_dq)) {
       reset_settle_unlocked();
       last_dq_valid_ = false;
@@ -413,16 +437,19 @@ StudioSupervisor::Effects StudioSupervisor::observe_joint_state(
       }
     } else {
       const bool was_fresh = fresh_joint_unlocked(now);
-      joint_stamp_ = now;
+      joint_sample_ns_ = sample_steady_ns;
       last_dq_valid_ = true;
       last_max_abs_dq_ = max_abs_dq;
 
       if (max_abs_dq <= kSettleSpeedThreshold) {
-        if (!settling_ || (now - last_settle_obs_) > kSettleGap) {
-          settle_start_ = now;
+        if (!settling_ ||
+            !lite6_interfaces::shm::is_stamp_fresh(
+              last_settle_obs_ns_, sample_steady_ns, kSettleGapNs))
+        {
+          settle_start_ns_ = sample_steady_ns;
           settling_ = true;
         }
-        last_settle_obs_ = now;
+        last_settle_obs_ns_ = sample_steady_ns;
       } else {
         reset_settle_unlocked();
       }
@@ -446,7 +473,7 @@ StudioSupervisor::Effects StudioSupervisor::observe_joint_state(
         {
           if (snap_.controller_mode == CS::MODE_NORMAL) {
             recovery_phase_ = RecoverySubPhase::POST_SETTLE;
-            post_settle_start_ = now;
+            post_settle_start_ns_ = now_ns;
             phase_deadline_ = now + kRecoveryPhaseTimeout;
             notify_unlocked("Robot settled and controller already NORMAL; finalizing recovery");
           } else {
@@ -461,8 +488,8 @@ StudioSupervisor::Effects StudioSupervisor::observe_joint_state(
           snap_.controller_mode == CS::MODE_NORMAL &&
           fresh_controller_unlocked(now) &&
           settled_unlocked(now) &&
-          last_settle_obs_ >= post_settle_start_ &&
-          (now - post_settle_start_) >= kPostRecoverySettle)
+          last_settle_obs_ns_ >= post_settle_start_ns_ &&
+          (now_ns - post_settle_start_ns_) >= kPostRecoverySettleNs)
         {
           recovery_phase_ = RecoverySubPhase::NONE;
           recovery_initial_mode_ = CS::MODE_UNKNOWN;
@@ -563,8 +590,8 @@ StudioSupervisor::Effects StudioSupervisor::watchdog()
           snap_.controller_mode == CS::MODE_NORMAL &&
           c_fresh && j_fresh &&
           settled_unlocked(now) &&
-          last_settle_obs_ >= post_settle_start_ &&
-          (now - post_settle_start_) >= kPostRecoverySettle)
+          last_settle_obs_ns_ >= post_settle_start_ns_ &&
+          (steady_ns(now) - post_settle_start_ns_) >= kPostRecoverySettleNs)
       {
         recovery_phase_ = RecoverySubPhase::NONE;
         recovery_initial_mode_ = CS::MODE_UNKNOWN;
@@ -752,7 +779,10 @@ void StudioSupervisor::on_compile_failed(uint64_t request_id)
 }
 
 StudioSupervisor::CommandResult StudioSupervisor::handle_command(
-  uint8_t command, uint64_t expected_revision, const std::string & reason)
+  uint8_t command,
+  uint64_t expected_planner_epoch,
+  uint64_t expected_revision,
+  const std::string & reason)
 {
   CommandResult res;
   bool changed = false;
@@ -762,11 +792,20 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
     std::lock_guard<std::mutex> lock(mutex_);
     auto reject = [&](const std::string & msg) {
       res.accepted = false;
+      res.planner_epoch = planner_epoch_;
       res.revision = snap_.revision;
       res.state = snap_.state;
       res.controller_epoch = snap_.controller_epoch;
       res.message = msg;
     };
+
+    if (command != C::Request::CMD_ESTOP &&
+        expected_planner_epoch > 0 && expected_planner_epoch != planner_epoch_)
+    {
+      reject("Planner epoch mismatch: expected " + std::to_string(expected_planner_epoch) +
+        ", current " + std::to_string(planner_epoch_));
+      return res;
+    }
 
     if (command != C::Request::CMD_ESTOP &&
         expected_revision > 0 && expected_revision != snap_.revision)
@@ -1080,6 +1119,7 @@ StudioSupervisor::CommandResult StudioSupervisor::handle_command(
     }
 
     if (res.accepted) {
+      res.planner_epoch = planner_epoch_;
       res.revision = snap_.revision;
       res.state = snap_.state;
       res.controller_epoch = snap_.controller_epoch;
@@ -1129,6 +1169,18 @@ bool StudioSupervisor::pause_requested(uint64_t session) const
 {
   std::lock_guard<std::mutex> lock(mutex_);
   return session == session_id_ && pause_requested_;
+}
+
+bool StudioSupervisor::can_dispatch(uint64_t session, bool honor_pause) const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (session != session_id_ || stop_requested_) {
+    return false;
+  }
+  if (honor_pause && pause_requested_) {
+    return false;
+  }
+  return true;
 }
 
 bool StudioSupervisor::is_step_mode(uint64_t session) const

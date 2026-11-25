@@ -49,6 +49,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SupervisorCommand.srv"
   "srv/GripperCommand.srv"
   "srv/ControllerCommand.srv"
+  "srv/SpliceJointTrajectory.srv"
   "srv/SubmitSysIdTrajectory.srv"
   "srv/CompileProgram.srv"
   "srv/StudioCommand.srv"

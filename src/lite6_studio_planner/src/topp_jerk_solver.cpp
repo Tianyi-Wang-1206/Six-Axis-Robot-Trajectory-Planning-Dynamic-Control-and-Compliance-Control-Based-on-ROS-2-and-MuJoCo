@@ -2225,8 +2225,10 @@ Verify1kHzResult evaluate_1khz(
     }
   };
 
-  // Continuous Stage-4 check at every collocation node (left/right one-sided limits) and
-  // intra-interval sub-samples tau in {0, 0.25, 0.5, 0.75, 1} to catch sub-millisecond peaks.
+  // Finite-sample Stage-4 verification at every collocation node (left/right one-sided limits),
+  // intra-interval sub-samples tau in {0, 0.25, 0.5, 0.75, 1}, and analytic interior cubic
+  // velocity peaks (tau* = -a_i / j_i when a_i > 0 > a_{i+1}). Note: this is dense finite-sample
+  // numerical validation rather than a continuous-time bound proof.
   if (out == nullptr) {
     constexpr double kSubTaus[5] = {0.0, 0.25, 0.5, 0.75, 1.0};
     for (size_t i = 0; i < timing.dt.size(); ++i) {
@@ -2238,6 +2240,19 @@ Verify1kHzResult evaluate_1khz(
       const double eps_i = std::min(1e-9, 1e-3 * h_i);
       const double u_lo = u0 + eps_i;
       const double u_hi = u1 - eps_i;
+      auto check_sub = [&](double u_eval, double v_s, double a_s) {
+        const PathPoint pp = sampler.eval(u_eval);
+        Vec6 dq, ddq;
+        double rv = 0.0, ra = 0.0, rj = 0.0;
+        eval_continuous_ratios(pp, v_s, a_s, j_i, dq, ddq, rv, ra, rj);
+        res.max_rv = std::max(res.max_rv, rv);
+        res.max_ra = std::max(res.max_ra, ra);
+        res.max_rj = std::max(res.max_rj, rj);
+        const double worst = std::max({rv, ra, rj});
+        if (worst > 1.0) {
+          res.violations.push_back({u_eval, worst});
+        }
+      };
       for (int s_idx = 0; s_idx < 5; ++s_idx) {
         double u_eval = u_lo;
         double v_s = 0.0;
@@ -2258,17 +2273,16 @@ Verify1kHzResult evaluate_1khz(
           v_s = std::max(0.0, timing.v[i] + timing.a[i] * d + 0.5 * j_i * d * d);
           a_s = timing.a[i] + j_i * d;
         }
-        const PathPoint pp = sampler.eval(u_eval);
-        Vec6 dq, ddq;
-        double rv = 0.0, ra = 0.0, rj = 0.0;
-        eval_continuous_ratios(pp, v_s, a_s, j_i, dq, ddq, rv, ra, rj);
-        res.max_rv = std::max(res.max_rv, rv);
-        res.max_ra = std::max(res.max_ra, ra);
-        res.max_rj = std::max(res.max_rj, rj);
-        const double worst = std::max({rv, ra, rj});
-        if (worst > 1.0) {
-          res.violations.push_back({u_eval, worst});
-        }
+        check_sub(u_eval, v_s, a_s);
+      }
+      // Also check exact interior cubic speed extremum where a(d) = 0 (a_i > 0 && a_{i+1} < 0).
+      if (timing.a[i] > 0.0 && timing.a[i + 1] < 0.0 && j_i < -1e-12) {
+        const double d_peak = std::clamp(-timing.a[i] / j_i, 0.0, dt_i);
+        const double u_raw = u0 + timing.v[i] * d_peak + 0.5 * timing.a[i] * d_peak * d_peak +
+          (1.0 / 6.0) * j_i * d_peak * d_peak * d_peak;
+        const double v_peak = std::max(
+          0.0, timing.v[i] + timing.a[i] * d_peak + 0.5 * j_i * d_peak * d_peak);
+        check_sub(std::clamp(u_raw, u_lo, u_hi), v_peak, 0.0);
       }
     }
   }
@@ -2695,7 +2709,7 @@ bool TOPPJerkSolver::solve(
     oss << std::scientific << std::setprecision(3)
         << "3rd-order TOPP accepted "
         << (last_ipm.fallback_reason.empty() ? "primal-feasible fallback" : last_ipm.fallback_reason)
-        << " without full KKT optimality (dual_inf=" << last_ipm.dual_inf
+        << " before frozen-midpoint IPM convergence tolerances were met (dual_inf=" << last_ipm.dual_inf
         << ", compl_inf=" << last_ipm.compl_inf
         << ", mu=" << last_ipm.mu
         << ", eq_inf=" << last_ipm.eq_inf

@@ -2497,23 +2497,36 @@ bool eval_boundary_split_min_time(
 
 bool solve_axis_bounded_min_time_impl(
   const AxisState & s0, const AxisState & sf, const AxisLimits & lim,
-  AxisProfile & out_profile, bool * out_clamped, double * out_best_ab, int depth)
+  AxisProfile & out_profile, bool * out_clamped, double * out_best_ab, int depth,
+  SolveStatus * out_status = nullptr)
 {
+  auto set_status = [&](SolveStatus st) {
+    if (out_status != nullptr) {
+      *out_status = st;
+    }
+  };
   if (out_clamped != nullptr) {
     *out_clamped = false;
   }
   if (out_best_ab != nullptr) {
     *out_best_ab = 0.0;
   }
+  if (!validate_axis_state(s0, lim, true, false) || !validate_axis_state(sf, lim, false, true)) {
+    set_status(SolveStatus::INFEASIBLE);
+    return false;
+  }
   const Step1Result s1 = solve_axis_unconstrained_step1(s0, sf, lim);
   if (!s1.ok) {
+    set_status(SolveStatus::INFEASIBLE);
     return false;
   }
   if (!lim.has_pos_limits() || profile_within_pos(s1.min_profile, lim)) {
     out_profile = s1.min_profile;
+    set_status(SolveStatus::OK);
     return true;
   }
   if (depth >= kMaxBoundDepth) {
+    set_status(SolveStatus::SEARCH_FAILED);
     return false;
   }
 
@@ -2588,6 +2601,7 @@ bool solve_axis_bounded_min_time_impl(
   }
 
   if (!any_feas) {
+    set_status(SolveStatus::SEARCH_FAILED);
     return false;
   }
 
@@ -2650,6 +2664,7 @@ bool solve_axis_bounded_min_time_impl(
   if (out_best_ab != nullptr) {
     *out_best_ab = best_ab;
   }
+  set_status(SolveStatus::OK);
   return true;
 }
 
@@ -2657,19 +2672,32 @@ bool solve_axis_bounded_min_time_impl(
 
 bool solve_axis_bounded_min_time(
   const AxisState & s0, const AxisState & sf, const AxisLimits & lim,
-  AxisProfile & out_profile, bool * out_clamped, int depth)
+  AxisProfile & out_profile, bool * out_clamped, int depth,
+  SolveStatus * out_status)
 {
-  return solve_axis_bounded_min_time_impl(s0, sf, lim, out_profile, out_clamped, nullptr, depth);
+  return solve_axis_bounded_min_time_impl(
+    s0, sf, lim, out_profile, out_clamped, nullptr, depth, out_status);
 }
 
 bool solve_axis_bounded_at_duration(
   const AxisState & s0, const AxisState & sf, const AxisLimits & lim,
-  double T_target, AxisProfile & out_profile, double & out_next_feasible_T, int depth)
+  double T_target, AxisProfile & out_profile, double & out_next_feasible_T, int depth,
+  SolveStatus * out_status)
 {
+  auto set_status = [&](SolveStatus st) {
+    if (out_status != nullptr) {
+      *out_status = st;
+    }
+  };
   out_profile.clear();
   out_next_feasible_T = std::numeric_limits<double>::infinity();
 
   if (!(T_target >= 0.0) || !std::isfinite(T_target) || T_target > kMaxInternalDur) {
+    set_status(SolveStatus::INFEASIBLE);
+    return false;
+  }
+  if (!validate_axis_state(s0, lim, true, false) || !validate_axis_state(sf, lim, false, true)) {
+    set_status(SolveStatus::INFEASIBLE);
     return false;
   }
   if (std::abs(sf.q - s0.q) < 1e-11 && std::abs(s0.v) < 1e-10 && std::abs(sf.v) < 1e-10 &&
@@ -2677,6 +2705,7 @@ bool solve_axis_bounded_at_duration(
   {
     out_profile.append_phase(T_target, std::clamp(s0.q, lim.q_min, lim.q_max), 0.0, 0.0, 0.0);
     out_profile.finalize();
+    set_status(SolveStatus::OK);
     return true;
   }
 
@@ -2685,12 +2714,14 @@ bool solve_axis_bounded_at_duration(
   const bool unc_ok = solve_axis_unconstrained_step2(s0, sf, lim, T_target, unc);
   if (unc_ok && (!lim.has_pos_limits() || profile_within_pos(unc, lim))) {
     out_profile = std::move(unc);
+    set_status(SolveStatus::OK);
     return true;
   }
 
   // 2. If unconstrained Step 2 failed, T_target is below T_min or inside a physical blocked interval.
   //    Adding [q_min, q_max] can never make an unconstrained-infeasible T feasible.
   if (!unc_ok) {
+    set_status(SolveStatus::INFEASIBLE);
     const Step1Result s1 = solve_axis_unconstrained_step1(s0, sf, lim);
     if (!s1.ok) {
       return false;
@@ -2710,24 +2741,31 @@ bool solve_axis_bounded_at_duration(
 
   // 3. Here unc_ok == true, but unconstrained profile overshoots [q_min, q_max].
   if (depth >= kMaxBoundDepth) {
+    set_status(SolveStatus::SEARCH_FAILED);
     return false;
   }
 
-  // Compute exact state-constrained minimum-time trajectory first (retaining its contact a_b*).
+  // Compute state-constrained minimum-time trajectory via numerical boundary-contact search.
   AxisProfile min_bounded;
   bool clamped = false;
   double min_best_ab = 0.0;
+  SolveStatus min_status = SolveStatus::INFEASIBLE;
   if (!solve_axis_bounded_min_time_impl(
-        s0, sf, lim, min_bounded, &clamped, &min_best_ab, depth))
+        s0, sf, lim, min_bounded, &clamped, &min_best_ab, depth, &min_status))
   {
+    set_status(min_status);
     return false;
   }
   if (T_target < min_bounded.duration - kTimeTol) {
     out_next_feasible_T = min_bounded.duration;
+    // Unclamped min_bounded is the exact unconstrained minimum (provably infeasible);
+    // clamped min_bounded comes from finite boundary-contact search (not completeness-certified).
+    set_status(clamped ? SolveStatus::SEARCH_FAILED : SolveStatus::INFEASIBLE);
     return false;
   }
   if (std::abs(T_target - min_bounded.duration) <= kTimeTol) {
     out_profile = std::move(min_bounded);
+    set_status(SolveStatus::OK);
     return true;
   }
 
@@ -2816,6 +2854,7 @@ bool solve_axis_bounded_at_duration(
             out_profile = std::move(e1);
             out_profile.append_profile(e2);
             out_profile.finalize();
+            set_status(SolveStatus::OK);
             return true;
           }
         }
@@ -2827,6 +2866,7 @@ bool solve_axis_bounded_at_duration(
       }
       out_profile.append_profile(s2_rail);
       out_profile.finalize();
+      set_status(SolveStatus::OK);
       return true;
     }
 
@@ -2869,6 +2909,7 @@ bool solve_axis_bounded_at_duration(
       if (eval_boundary_split_min_time(s0, sf, lim, q_lim, ab, depth, tmp, dur)) {
         if (std::abs(dur - T_target) <= kTimeTol) {
           out_profile = std::move(tmp);
+          set_status(SolveStatus::OK);
           return true;
         }
         feas_samples.push_back({ab, dur});
@@ -2948,10 +2989,12 @@ bool solve_axis_bounded_at_duration(
       }
       if (matched) {
         out_profile = std::move(best_match);
+        set_status(SolveStatus::OK);
         return true;
       }
       // If a discontinuous jump crossed T_target, extend cleanly through lo (strictly feasible).
       if (try_extend_through_ab(lo)) {
+        set_status(SolveStatus::OK);
         return true;
       }
     }
@@ -2960,6 +3003,7 @@ bool solve_axis_bounded_at_duration(
     for (const auto & s : feas_samples) {
       if (s.dur <= T_target + kTimeTol && std::abs(s.ab) > 1e-12) {
         if (try_extend_through_ab(s.ab)) {
+          set_status(SolveStatus::OK);
           return true;
         }
       }
@@ -2973,27 +3017,32 @@ bool solve_axis_bounded_at_duration(
         out_profile.append_phase(rest_slack_rail, s0.q, 0.0, 0.0, 0.0);
         out_profile.append_profile(min_bounded);
         out_profile.finalize();
+        set_status(SolveStatus::OK);
         return true;
       }
       if (std::abs(sf.v) < 1e-10 && std::abs(sf.a) < 1e-10) {
         out_profile = std::move(min_bounded);
         out_profile.append_phase(rest_slack_rail, sf.q, 0.0, 0.0, 0.0);
         out_profile.finalize();
+        set_status(SolveStatus::OK);
         return true;
       }
     }
+    set_status(SolveStatus::SEARCH_FAILED);
     return false;
   }
 
   // Case C: Zero-acc rail (q_lim, 0, 0) was unreachable (only inward bounce a_b != 0 is feasible).
   // Try min_best_ab first, then scan inward a_b values across [0, a_edge].
   if (clamped && std::abs(min_best_ab) > 1e-12 && try_extend_through_ab(min_best_ab)) {
+    set_status(SolveStatus::OK);
     return true;
   }
   constexpr int kCaseCScan = 24;
   for (int i = 1; i <= kCaseCScan; ++i) {
     const double ab = a_edge * static_cast<double>(i) / kCaseCScan;
     if (try_extend_through_ab(ab)) {
+      set_status(SolveStatus::OK);
       return true;
     }
   }
@@ -3021,6 +3070,7 @@ bool solve_axis_bounded_at_duration(
           }
           out_profile.append_profile(r2);
           out_profile.finalize();
+          set_status(SolveStatus::OK);
           return true;
         }
         out_next_feasible_T = std::min(out_next_feasible_T, tr);
@@ -3038,15 +3088,18 @@ bool solve_axis_bounded_at_duration(
       out_profile.append_phase(rest_slack, s0.q, 0.0, 0.0, 0.0);
       out_profile.append_profile(min_bounded);
       out_profile.finalize();
+      set_status(SolveStatus::OK);
       return true;
     }
     if (std::abs(sf.v) < 1e-10 && std::abs(sf.a) < 1e-10) {
       out_profile = std::move(min_bounded);
       out_profile.append_phase(rest_slack, sf.q, 0.0, 0.0, 0.0);
       out_profile.finalize();
+      set_status(SolveStatus::OK);
       return true;
     }
   }
+  set_status(SolveStatus::SEARCH_FAILED);
   return false;
 }
 
@@ -3086,12 +3139,14 @@ MultiDoFResult solve_multidof(const MultiDoFInput & input)
     }
     if (input.synchronization == Synchronization::NONE) {
       res.ok = true;
+      res.status = SolveStatus::OK;
       res.duration = T_max;
       return res;
     }
     double T_sync = input.exact_duration.has_value() ? *input.exact_duration : quantize_up(T_max);
     if (T_sync < T_max - kTimeTol || T_sync > input.max_duration) {
       res.next_feasible_duration = T_max;
+      res.status = SolveStatus::INFEASIBLE;
       return res;
     }
     for (size_t j = 0; j < N; ++j) {
@@ -3100,17 +3155,20 @@ MultiDoFResult solve_multidof(const MultiDoFInput & input)
             input.limits[j], T_sync, res.profiles[j]))
       {
         res.failed_dof = static_cast<int>(j);
+        res.status = SolveStatus::INFEASIBLE;
         return res;
       }
     }
     res.ok = true;
+    res.status = SolveStatus::OK;
     res.duration = T_sync;
     return res;
   }
 
-  // Position control interface: compute exact bounded minimum duration + unconstrained blocked sets.
+  // Position control interface: compute bounded minimum duration + unconstrained blocked sets.
   std::vector<Step1Result> unc_s1(N);
   std::vector<AxisProfile> min_profs(N);
+  std::vector<bool> min_clamped(N, false);
   double T_min_all = 0.0;
   bool all_zero = true;
 
@@ -3125,15 +3183,22 @@ MultiDoFResult solve_multidof(const MultiDoFInput & input)
     unc_s1[j] = solve_axis_unconstrained_step1(s0, sf, input.limits[j]);
     if (!unc_s1[j].ok) {
       res.failed_dof = static_cast<int>(j);
+      res.status = SolveStatus::INFEASIBLE;
       return res;
     }
     if (!input.limits[j].has_pos_limits() || profile_within_pos(unc_s1[j].min_profile, input.limits[j])) {
       min_profs[j] = unc_s1[j].min_profile;
     } else {
-      if (!solve_axis_bounded_min_time(s0, sf, input.limits[j], min_profs[j])) {
+      bool clamped_j = false;
+      SolveStatus st_j = SolveStatus::INFEASIBLE;
+      if (!solve_axis_bounded_min_time(
+            s0, sf, input.limits[j], min_profs[j], &clamped_j, 0, &st_j))
+      {
         res.failed_dof = static_cast<int>(j);
+        res.status = st_j;
         return res;
       }
+      min_clamped[j] = clamped_j;
     }
     res.independent_min_durations[j] = min_profs[j].duration;
     T_min_all = std::max(T_min_all, min_profs[j].duration);
@@ -3148,6 +3213,7 @@ MultiDoFResult solve_multidof(const MultiDoFInput & input)
       res.profiles[j].finalize();
     }
     res.ok = true;
+    res.status = SolveStatus::OK;
     res.duration = T0;
     return res;
   }
@@ -3156,6 +3222,7 @@ MultiDoFResult solve_multidof(const MultiDoFInput & input)
     res.profiles = std::move(min_profs);
     res.duration = T_min_all;
     res.ok = true;
+    res.status = SolveStatus::OK;
     return res;
   }
 
@@ -3249,6 +3316,7 @@ MultiDoFResult solve_multidof(const MultiDoFInput & input)
             }
             res.duration = s_prof.duration;
             res.ok = true;
+            res.status = SolveStatus::OK;
             return res;
           }
         }
@@ -3260,33 +3328,43 @@ MultiDoFResult solve_multidof(const MultiDoFInput & input)
   if (input.exact_duration.has_value()) {
     const double T_target = *input.exact_duration;
     if (T_target > input.max_duration) {
+      res.status = SolveStatus::INFEASIBLE;
       return res;
     }
     for (size_t j = 0; j < N; ++j) {
       if (min_profs[j].duration > T_target + kTimeTol) {
         res.failed_dof = static_cast<int>(j);
         res.next_feasible_duration = min_profs[j].duration;
+        res.status = (T_target < unc_s1[j].t_min - kTimeTol || !min_clamped[j])
+          ? SolveStatus::INFEASIBLE
+          : SolveStatus::SEARCH_FAILED;
         return res;
       }
     }
     for (size_t j = 0; j < N; ++j) {
       double next_T = 0.0;
+      SolveStatus st_j = SolveStatus::INFEASIBLE;
       if (!solve_axis_bounded_at_duration(
-            input.current[j], input.target[j], input.limits[j], T_target, res.profiles[j], next_T))
+            input.current[j], input.target[j], input.limits[j], T_target,
+            res.profiles[j], next_T, 0, &st_j))
       {
         res.failed_dof = static_cast<int>(j);
         res.next_feasible_duration = std::isfinite(next_T) ? next_T : min_profs[j].duration;
+        res.status = st_j;
         return res;
       }
     }
     res.duration = T_target;
     res.ok = true;
+    res.status = SolveStatus::OK;
     return res;
   }
 
-  // Free-duration Time synchronization: exact blocked-interval union skipping!
+  // Free-duration Time synchronization: unconstrained blocked-interval union skipping +
+  // bounded-position fixed-duration search.
   double T_cand = std::max(T_min_all, input.minimum_duration.value_or(0.0));
   T_cand = quantize_up(T_cand);
+  SolveStatus last_fail_status = SolveStatus::SEARCH_FAILED;
 
   for (int iter = 0; iter < 32; ++iter) {
     if (T_cand > input.max_duration) {
@@ -3320,12 +3398,15 @@ MultiDoFResult solve_multidof(const MultiDoFInput & input)
         continue;
       }
       double next_T = 0.0;
+      SolveStatus st_j = SolveStatus::INFEASIBLE;
       if (!solve_axis_bounded_at_duration(
-            input.current[j], input.target[j], input.limits[j], T_cand, res.profiles[j], next_T))
+            input.current[j], input.target[j], input.limits[j], T_cand,
+            res.profiles[j], next_T, 0, &st_j))
       {
         all_ok = false;
         if (bad_dof < 0) {
           bad_dof = static_cast<int>(j);
+          last_fail_status = st_j;
         }
         if (std::isfinite(next_T) && next_T > max_next) {
           max_next = next_T;
@@ -3335,15 +3416,18 @@ MultiDoFResult solve_multidof(const MultiDoFInput & input)
     if (all_ok) {
       res.duration = T_cand;
       res.ok = true;
+      res.status = SolveStatus::OK;
       return res;
     }
     if (max_next <= T_cand + kTimeTol) {
       res.failed_dof = bad_dof;
+      res.status = last_fail_status;
       break;
     }
     T_cand = quantize_up(max_next);
   }
 
+  res.status = (T_cand > input.max_duration) ? SolveStatus::INFEASIBLE : last_fail_status;
   return res;
 }
 

@@ -30,7 +30,7 @@ from lite6_interfaces.msg import SupervisorState, MotionRejection, GripperState
 from lite6_interfaces.srv import (
     ControllerCommand, SupervisorCommand, SubmitSysIdTrajectory, GripperCommand,
 )
-from lite6_shm_client import StateShmReader, SysIdShmReader, steady_now_ns
+from lite6_shm_client import StateShmReader, SysIdShmReader, is_stamp_fresh, steady_now_ns
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from lite6_hmi.sysid_engine import SysIdEngine
@@ -121,6 +121,7 @@ class ROS2Worker(QThread):
         self.state = Lite6StateMachine.INIT  # UI projection, not writable state
         self.error_msg = ""
         self.supervisor_state = None
+        self._planner_epoch = 0
         self._revision = -1
         self._last_view = (None, None)
         self.boot_time = time.monotonic()
@@ -384,19 +385,21 @@ class ROS2Worker(QThread):
             self._report_error(message)
 
     def _send_command(self, event, session=0, reason="", done=None, compliance=None,
-                      expected_revision=0, payload_mass=0.0, payload_com_tcp=None):
+                      expected_revision=0, payload_mass=0.0, payload_com_tcp=None,
+                      expected_planner_epoch=None):
         if self._executor_thread_id is not None and threading.get_ident() == self._executor_thread_id:
             return self._send_command_on_executor(
                 event, session, reason, done, compliance, expected_revision,
-                payload_mass, payload_com_tcp)
+                payload_mass, payload_com_tcp, expected_planner_epoch)
         return self._run_on_executor(
             lambda: self._send_command_on_executor(
                 event, session, reason, done, compliance, expected_revision,
-                payload_mass, payload_com_tcp))
+                payload_mass, payload_com_tcp, expected_planner_epoch))
 
     def _send_command_on_executor(self, event, session=0, reason="", done=None,
                                   compliance=None, expected_revision=0,
-                                  payload_mass=0.0, payload_com_tcp=None):
+                                  payload_mass=0.0, payload_com_tcp=None,
+                                  expected_planner_epoch=None):
         if not self.command_client.service_is_ready():
             self._report_error("Supervisor command service is unavailable")
             if done is not None:
@@ -404,7 +407,17 @@ class ROS2Worker(QThread):
             return False
         req = SupervisorCommand.Request()
         req.command = event
-        req.expected_revision = int(expected_revision)
+        if event == SupervisorCommand.Request.CMD_ESTOP:
+            req.expected_planner_epoch = 0
+            req.expected_revision = 0
+        else:
+            if expected_planner_epoch is None:
+                with self.state_lock:
+                    exp_epoch = int(self._planner_epoch)
+            else:
+                exp_epoch = int(expected_planner_epoch)
+            req.expected_planner_epoch = exp_epoch
+            req.expected_revision = int(expected_revision)
         req.session_id = int(session)
         req.reason = str(reason)
         if compliance is not None:
@@ -426,14 +439,17 @@ class ROS2Worker(QThread):
 
     def set_payload(self, mass_kg, com_tcp_m, done=None):
         expected_rev = 0
+        expected_epoch = 0
         with self.state_lock:
             if self.supervisor_state is not None:
                 expected_rev = int(self.supervisor_state.revision)
+                expected_epoch = int(getattr(self.supervisor_state, "planner_epoch", 0))
         return self._send_command(
             SupervisorCommand.Request.CMD_SET_PAYLOAD,
             reason=f"HMI set payload {mass_kg:.3f} kg",
             done=done,
             expected_revision=expected_rev,
+            expected_planner_epoch=expected_epoch,
             payload_mass=float(mass_kg),
             payload_com_tcp=list(com_tcp_m),
         )
@@ -453,9 +469,31 @@ class ROS2Worker(QThread):
     def _supervisor_cb(self, msg):
         now = time.monotonic()
         with self.state_lock:
-            # Reset monotonic revision filter if supervisor went stale (e.g. planner restart).
+            # Reset incarnation/revision filters if supervisor went stale (prolonged outage).
             if self.last_supervisor_rx_time and (now - self.last_supervisor_rx_time > 0.8):
+                self._planner_epoch = 0
                 self._revision = -1
+            msg_epoch = int(getattr(msg, "planner_epoch", 0))
+            if msg_epoch != 0 and self._planner_epoch != 0:
+                if msg_epoch < self._planner_epoch:
+                    # Drop delayed message from a superseded planner incarnation.
+                    return
+                if msg_epoch > self._planner_epoch:
+                    # Rapid planner restart detected immediately via planner_epoch.
+                    self._planner_epoch = msg_epoch
+                    self._revision = -1
+                    if self._motion_pending:
+                        self._goal_epoch += 1
+                        self._motion_pending = False
+                        self.current_goal_handle = None
+                    if self._begin_pending:
+                        self._prepare_epoch += 1
+                        self._set_sysid_preparation_status("")
+                    self._sysid_session = 0
+                    self._recovery_session = 0
+                    self._phase_actions.clear()
+            elif msg_epoch != 0:
+                self._planner_epoch = msg_epoch
             # A stale latched / out-of-order message cannot roll back the view.
             if msg.revision < self._revision:
                 return
@@ -652,7 +690,7 @@ class ROS2Worker(QThread):
         if pod is None or seq == self._last_joint_seq:
             return
         now_steady_ns = steady_now_ns()
-        if pod.steady_stamp_ns <= 0 or now_steady_ns - pod.steady_stamp_ns >= 100_000_000:
+        if not is_stamp_fresh(pod.steady_stamp_ns, now_steady_ns, 100_000_000):
             return
         if pod.steady_stamp_ns <= self._last_joint_steady_ns:
             return
@@ -969,7 +1007,8 @@ class ROS2Worker(QThread):
             pending_stop = self._estop_requested_at
             already_fallback = self._direct_estop_sent
             if self.last_supervisor_rx_time and age > 1.2:
-                # Reset monotonic filter when supervisor feed goes stale so planner restarts are accepted.
+                # Reset monotonic filters when supervisor feed goes stale so restarts reconnect.
+                self._planner_epoch = 0
                 self._revision = -1
                 if self._motion_pending:
                     self._goal_epoch += 1
@@ -1029,6 +1068,7 @@ class ROS2Worker(QThread):
                 self._set_sysid_preparation_status("Loading robot model...")
                 self._prepare_epoch += 1
                 epoch = self._prepare_epoch
+                planner_epoch = int(getattr(snap, "planner_epoch", 0))
                 revision = snap.revision
         if has_payload:
             self._report_error(
@@ -1041,7 +1081,7 @@ class ROS2Worker(QThread):
         # At 1 ms the full trajectory has tens of thousands of points. Preflight
         # and ROS message construction must block neither Qt nor ROS callbacks.
         self._spawn_bg_thread(
-            self._prepare_sysid, (epoch, revision, list(prep_pose), list(max_limits)))
+            self._prepare_sysid, (epoch, planner_epoch, revision, list(prep_pose), list(max_limits)))
 
     def _set_sysid_preparation_status(self, status):
         # Caller holds state_lock. This is local work feedback, not a robot mode.
@@ -1055,7 +1095,7 @@ class ROS2Worker(QThread):
                 raise InterruptedError("Friction identification preparation canceled")
             self._set_sysid_preparation_status(status)
 
-    def _prepare_sysid(self, epoch, revision, prep_pose, max_limits):
+    def _prepare_sysid(self, epoch, planner_epoch, revision, prep_pose, max_limits):
         try:
             started = time.monotonic()
             # Each run owns its numerical model and data, including canceled runs.
@@ -1084,7 +1124,9 @@ class ROS2Worker(QThread):
                 snap = self.supervisor_state
                 if self._stopping or epoch != self._prepare_epoch:
                     return
-                if snap is None or snap.revision != revision or not snap.motion_allowed:
+                if (snap is None or
+                        int(getattr(snap, "planner_epoch", 0)) != planner_epoch or
+                        snap.revision != revision or not snap.motion_allowed):
                     self._set_sysid_preparation_status("")
                     state_changed_err = True
                 else:
@@ -1109,6 +1151,7 @@ class ROS2Worker(QThread):
                         f'{len(trajectory.points)} points')
                 if not self._send_command(SupervisorCommand.Request.CMD_BEGIN_SYSID,
                                           expected_revision=revision,
+                                          expected_planner_epoch=planner_epoch,
                                           done=lambda resp: self._begin_sysid_reply(resp, epoch)):
                     with self.state_lock:
                         if (not self._stopping and epoch == self._prepare_epoch and

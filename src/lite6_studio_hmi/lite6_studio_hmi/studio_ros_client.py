@@ -7,7 +7,7 @@ import threading
 import time
 
 from ament_index_python.packages import get_package_share_directory
-from lite6_shm_client import StateShmReader, steady_now_ns
+from lite6_shm_client import StateShmReader, is_stamp_fresh, steady_now_ns
 import numpy as np
 import pinocchio as pin
 import rclpy
@@ -48,6 +48,7 @@ class StudioRosWorker(QThread):
         self._pending = {}
         self._req_seq = 0
         self._compile_req_seq = time.time_ns()
+        self._planner_epoch = 0
         self._revision = -1
         self._last_studio_rx_time = 0.0
         self._boot_time = time.monotonic()
@@ -80,7 +81,9 @@ class StudioRosWorker(QThread):
         self._trigger_wake()
         return self._compile_req_seq
 
-    def request_command(self, command_code, reason="", expected_revision=0):
+    def request_command(
+        self, command_code, reason="", expected_revision=0, expected_planner_epoch=None
+    ):
         self._req_queue.put(
             (
                 "command",
@@ -88,6 +91,9 @@ class StudioRosWorker(QThread):
                     "code": int(command_code),
                     "reason": str(reason),
                     "expected_revision": int(expected_revision),
+                    "expected_planner_epoch": (
+                        None if expected_planner_epoch is None else int(expected_planner_epoch)
+                    ),
                 },
             )
         )
@@ -215,8 +221,20 @@ class StudioRosWorker(QThread):
             return
         now = time.monotonic()
         if self._last_studio_rx_time and (now - self._last_studio_rx_time > 0.8):
-            # Planner restarted or went stale: reset monotonic revision filter.
+            # Prolonged outage: reset incarnation/revision filters so restarts reconnect.
+            self._planner_epoch = 0
             self._revision = -1
+        msg_epoch = int(getattr(msg, "planner_epoch", 0))
+        if msg_epoch != 0 and self._planner_epoch != 0:
+            if msg_epoch < self._planner_epoch:
+                # Drop delayed message from a superseded planner incarnation.
+                return
+            if msg_epoch > self._planner_epoch:
+                # Rapid planner restart detected immediately via planner_epoch.
+                self._planner_epoch = msg_epoch
+                self._revision = -1
+        elif msg_epoch != 0:
+            self._planner_epoch = msg_epoch
         if msg.revision < self._revision:
             return
         self._revision = int(msg.revision)
@@ -252,6 +270,7 @@ class StudioRosWorker(QThread):
             return
         age = now - self._last_studio_rx_time
         if age > 1.2:
+            self._planner_epoch = 0
             self._revision = -1
             if not self._direct_estop_sent:
                 if self._last_studio_state_code in (
@@ -271,9 +290,7 @@ class StudioRosWorker(QThread):
 
     def _emit_telemetry(self, shm_reader, pin_model, pin_data, eef_frame_id):
         pod, _ = shm_reader.read_joint_state()
-        if pod is None or pod.steady_stamp_ns <= 0:
-            return
-        if steady_now_ns() - pod.steady_stamp_ns > 100_000_000:
+        if pod is None or not is_stamp_fresh(pod.steady_stamp_ns, steady_now_ns(), 100_000_000):
             return
         q_list = [float(pod.position[i]) for i in range(6)]
         dq_list = [float(pod.velocity[i]) for i in range(6)]
@@ -418,10 +435,15 @@ class StudioRosWorker(QThread):
                     continue
                 req = StudioCommand.Request()
                 req.command = code
-                req.expected_revision = (
-                    0 if code == StudioCommand.Request.CMD_ESTOP
-                    else int(payload.get("expected_revision", 0))
-                )
+                if code == StudioCommand.Request.CMD_ESTOP:
+                    req.expected_planner_epoch = 0
+                    req.expected_revision = 0
+                else:
+                    exp_epoch = payload.get("expected_planner_epoch")
+                    req.expected_planner_epoch = int(
+                        self._planner_epoch if exp_epoch is None else exp_epoch
+                    )
+                    req.expected_revision = int(payload.get("expected_revision", 0))
                 req.reason = payload["reason"]
                 fut = command_cli.call_async(req)
                 self._register_pending(

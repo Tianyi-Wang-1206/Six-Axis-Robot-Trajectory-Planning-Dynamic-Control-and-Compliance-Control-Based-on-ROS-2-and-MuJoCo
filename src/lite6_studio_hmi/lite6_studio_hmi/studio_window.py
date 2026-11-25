@@ -757,29 +757,43 @@ class StudioMainWindow(QMainWindow):
         self.btn_compile.clicked.connect(self.trigger_compile)
         self.btn_run_resume.clicked.connect(self._on_run_or_resume)
         self.btn_pause.clicked.connect(
-            lambda: self.worker.request_command(StudioCommand.Request.CMD_PAUSE)
+            lambda: self.worker.request_command(
+                StudioCommand.Request.CMD_PAUSE,
+                expected_planner_epoch=self._current_planner_epoch(),
+            )
         )
         self.btn_step.clicked.connect(
             lambda: self.worker.request_command(
-                StudioCommand.Request.CMD_STEP, expected_revision=self._current_revision()
+                StudioCommand.Request.CMD_STEP,
+                expected_revision=self._current_revision(),
+                expected_planner_epoch=self._current_planner_epoch(),
             )
         )
         self.btn_stop.clicked.connect(
-            lambda: self.worker.request_command(StudioCommand.Request.CMD_STOP)
+            lambda: self.worker.request_command(
+                StudioCommand.Request.CMD_STOP,
+                expected_planner_epoch=self._current_planner_epoch(),
+            )
         )
         self.btn_reset_fault.clicked.connect(
             lambda: self.worker.request_command(
-                StudioCommand.Request.CMD_RESET_FAULT, expected_revision=self._current_revision()
+                StudioCommand.Request.CMD_RESET_FAULT,
+                expected_revision=self._current_revision(),
+                expected_planner_epoch=self._current_planner_epoch(),
             )
         )
         self.btn_recover.clicked.connect(
             lambda: self.worker.request_command(
-                StudioCommand.Request.CMD_RECOVER, expected_revision=self._current_revision()
+                StudioCommand.Request.CMD_RECOVER,
+                expected_revision=self._current_revision(),
+                expected_planner_epoch=self._current_planner_epoch(),
             )
         )
         self.btn_clear.clicked.connect(
             lambda: self.worker.request_command(
-                StudioCommand.Request.CMD_CLEAR_PROGRAM, expected_revision=self._current_revision()
+                StudioCommand.Request.CMD_CLEAR_PROGRAM,
+                expected_revision=self._current_revision(),
+                expected_planner_epoch=self._current_planner_epoch(),
             )
         )
         self.btn_estop.clicked.connect(
@@ -828,6 +842,11 @@ class StudioMainWindow(QMainWindow):
         if self._latest_studio_state is None:
             return 0
         return int(self._latest_studio_state.revision)
+
+    def _current_planner_epoch(self):
+        if self._latest_studio_state is None:
+            return 0
+        return int(getattr(self._latest_studio_state, "planner_epoch", 0))
 
     def _refresh_button_states(self):
         st = self._current_state_code()
@@ -982,6 +1001,7 @@ class StudioMainWindow(QMainWindow):
         self._active_compile_request_id = request_id
         self._compile_requests[request_id] = {
             "source": source, "auto_load": auto_load,
+            "planner_epoch": self._current_planner_epoch(),
             "baseline_revision": (self._latest_studio_state.program_revision
                                   if self._latest_studio_state else 0),
             "finished": False,
@@ -1003,13 +1023,18 @@ class StudioMainWindow(QMainWindow):
     def _on_run_or_resume(self):
         st = self._current_state_code()
         rev = self._current_revision()
+        epoch = self._current_planner_epoch()
         if st == StudioState.STATE_PAUSED:
             self.worker.request_command(
-                StudioCommand.Request.CMD_RESUME, expected_revision=rev
+                StudioCommand.Request.CMD_RESUME,
+                expected_revision=rev,
+                expected_planner_epoch=epoch,
             )
         else:
             self.worker.request_command(
-                StudioCommand.Request.CMD_RUN, expected_revision=rev
+                StudioCommand.Request.CMD_RUN,
+                expected_revision=rev,
+                expected_planner_epoch=epoch,
             )
 
     def _on_diag_clicked(self, row, _col):
@@ -1029,7 +1054,14 @@ class StudioMainWindow(QMainWindow):
     def _reconcile_loaded_source(self, msg):
         req_id = int(msg.last_compile_request_id)
         request = self._compile_requests.get(req_id)
-        if (request and request["auto_load"] and msg.loaded_program_id
+        msg_epoch = int(getattr(msg, "planner_epoch", 0))
+        epoch_matches = (
+            request is None
+            or request.get("planner_epoch", 0) == 0
+            or msg_epoch == 0
+            or request.get("planner_epoch", 0) == msg_epoch
+        )
+        if (request and epoch_matches and request["auto_load"] and msg.loaded_program_id
                 and msg.program_revision > request["baseline_revision"]):
             self._compiled_program_id = msg.loaded_program_id
             self._compiled_program_revision = int(msg.program_revision)
@@ -1144,6 +1176,21 @@ class StudioMainWindow(QMainWindow):
         self._refresh_button_states()
 
     def on_studio_state(self, msg):
+        prev_epoch = (
+            int(getattr(self._latest_studio_state, "planner_epoch", 0))
+            if self._latest_studio_state is not None
+            else 0
+        )
+        new_epoch = int(getattr(msg, "planner_epoch", 0))
+        if prev_epoch != 0 and new_epoch != 0 and new_epoch != prev_epoch:
+            self._last_logged_revision = None
+            self._compiled_program_id = ""
+            self._compiled_program_revision = 0
+            self._compiled_source = None
+            self._compile_in_flight = False
+            self.append_log(
+                f"Trajectory planner restarted (epoch {new_epoch}); local program cache cleared."
+            )
         self._latest_studio_state = msg
         self._reconcile_loaded_source(msg)
 
@@ -1212,8 +1259,9 @@ class StudioMainWindow(QMainWindow):
             f"{r_norm_deg:6.2f} deg "
             f"[{math.degrees(re[0]):+6.2f}, {math.degrees(re[1]):+6.2f}, {math.degrees(re[2]):+6.2f}] deg"
         )
-        if msg.revision != self._last_logged_revision and msg.detail:
-            self._last_logged_revision = msg.revision
+        log_key = (int(getattr(msg, "planner_epoch", 0)), int(msg.revision))
+        if log_key != self._last_logged_revision and msg.detail:
+            self._last_logged_revision = log_key
             self.append_log(f"[{name}] {msg.detail}")
 
         if (

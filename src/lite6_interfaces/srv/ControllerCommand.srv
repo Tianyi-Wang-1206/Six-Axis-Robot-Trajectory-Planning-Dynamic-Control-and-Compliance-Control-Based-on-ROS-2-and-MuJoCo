@@ -36,13 +36,15 @@ uint8 ACK_REJECTED_LIMIT=4              # Joint/safety limits prevent safe entry
 uint8 ACK_REJECTED_BUSY=5               # Active rigid/impedance trajectory or COMPLIANCE_STOPPING in progress
 uint8 ACK_REJECTED_EPOCH=6              # expected_epoch does not match active controller_epoch
 uint8 ACK_REJECTED_INVALID_ARG=7        # Unknown command code, non-finite value, or out-of-bounds parameter
-uint8 ACK_RT_TIMEOUT=8                  # 1 kHz RT loop did not consume queued command within wait budget
+uint8 ACK_RT_TIMEOUT=8                  # Definitively NOT applied: withdrawn before RT consumption or queue full
+uint8 ACK_OUTCOME_UNKNOWN=9             # Outcome unknown (claimed by RT or E-STOP latch pending without timely ack); reconcile via ControllerStatus
 
 # True iff ack_result == ACK_APPLIED.
+# When ack_result == ACK_OUTCOME_UNKNOWN, the command may still take effect; reconcile via ControllerStatus.
 bool accepted
 uint8 ack_result
 
-# Monotonic sequence assigned once queued to RT (0 if rejected prior to RT handoff).
+# Monotonic sequence assigned once accepted into the RT handoff path (0 if rejected prior to RT handoff).
 uint64 cmd_seq
 uint64 controller_epoch
 uint64 mode_epoch

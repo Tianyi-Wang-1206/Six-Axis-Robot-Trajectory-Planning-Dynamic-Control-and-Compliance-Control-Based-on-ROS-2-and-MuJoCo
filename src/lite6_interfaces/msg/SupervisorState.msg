@@ -1,6 +1,7 @@
 # Sole authoritative high-level system state (published by Supervisor).
 # revision increases on discrete state transitions, not on each heartbeat.
 builtin_interfaces/Time stamp
+uint64 planner_epoch
 uint64 revision
 
 # Nonzero session ID for the current SysID or recovery operation; zero otherwise.

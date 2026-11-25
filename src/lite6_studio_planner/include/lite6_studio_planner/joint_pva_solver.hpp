@@ -6,6 +6,7 @@
 #include "lite6_kinematics/kinematics_engine.hpp"
 
 #include <array>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -13,26 +14,27 @@
 namespace lite6_studio_planner
 {
 
-// Native 6-DOF 3rd-order time-optimal joint-space multi-waypoint PVA solver built on
-// the standalone analytic 3rd-order OTG engine (third_order_otg.hpp, no external Ruckig):
+// Native 6-DOF 3rd-order joint-space multi-waypoint PVA solver built on the standalone
+// 3rd-order OTG engine (third_order_otg.hpp):
 //
-// Layer A — Exact analytic 3rd-order state-to-state segment solver with hard position
-//   limits [min_pos, max_pos], exact blocked-interval synchronization, and exact dt:
+// Layer A — Synchronized 3rd-order state-to-state segment solver with hard position
+//   limits [min_pos, max_pos], unconstrained blocked-interval synchronization, and exact dt:
 //   - Verifies forward-time and reverse-time minimum braking feasibility from both
 //     endpoints against [min_pos, max_pos] and scaled (v, a, j) limits.
-//   - Enforces hard position limits via continuous 1D Pontryagin optimization over inward
-//     boundary contact acceleration a_b (capturing both touch-and-go bounces and
-//     zero-acceleration boundary arcs with recursive double-sided bounce handling).
-//   - Synchronizes all 6 joints using exact blocked-interval union skipping and supports
-//     exact integer-millisecond segment durations (round_1ms(dt)) with piecewise-constant
-//     jerk throughout.
+//   - Uses analytic unconstrained 3rd-order OTG where position bounds are inactive, and
+//     numerical boundary-contact search (finite grid + Brent refinement + bounded recursion)
+//     when position bounds are active, distinguishing mathematical infeasibility from
+//     numerical search failure.
+//   - Synchronizes all 6 joints and supports 1 ms segment durations (round_1ms(dt)) with
+//     piecewise-constant jerk throughout.
 //
 // Layer B — Deterministic coupled multi-waypoint (v_k, a_k) optimization:
-//   - Pins user-supplied intermediate velocities/accelerations (and rest at start/end).
+//   - Pins user-supplied intermediate velocities/accelerations (and rest at start/end),
+//     computing exact feasible intervals for partially constrained free components.
 //   - Evaluates natural C^2 cubic-spline, direction-preserving Catmull-Rom, and zero seeds.
 //   - Runs per-DoF chain pre-optimization, coupled 6-DOF smooth-max (LogSumExp) projected
 //     L-BFGS continuation over all free (v_k, a_k) simultaneously, and a deterministic
-//     exact 6-DOF synchronized polish (blocked-interval aware, no wall-clock timers).
+//     6-DOF synchronized coordinate polish (no wall-clock timers, cooperatively cancellable).
 class JointPVASolver
 {
 public:
@@ -71,6 +73,7 @@ public:
   // Solves a multi-waypoint joint-space MovePVA starting from rest at start_q and
   // ending at rest at waypoints.back().joint_pos. Unspecified intermediate velocities
   // and accelerations are optimized deterministically to minimize synchronized duration.
+  // Optional is_cancelled predicate aborts with ERR_CANCELLED.
   static bool solve_multi_waypoint(
     const std::array<double, 6> & start_q,
     const std::vector<PVAWaypoint> & waypoints,
@@ -81,7 +84,8 @@ public:
     MultiWaypointResult & out_result,
     SourceLocation & err_loc,
     std::string & err_code,
-    std::string & err_msg);
+    std::string & err_msg,
+    const std::function<bool()> & is_cancelled = {});
 };
 
 }  // namespace lite6_studio_planner

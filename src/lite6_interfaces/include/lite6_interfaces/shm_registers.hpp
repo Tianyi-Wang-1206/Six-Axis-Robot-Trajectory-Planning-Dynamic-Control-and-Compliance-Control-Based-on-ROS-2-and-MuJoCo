@@ -292,9 +292,28 @@ struct alignas(64) SysIdShmSegment
   ShmSpscRing<SysIdSamplePod, kRingCapacity> ring;
 };
 
+enum class ShmOpenStatus : int
+{
+  OK = 0,
+  NOT_FOUND = 1,
+  INCOMPATIBLE = 2,
+  OS_ERROR = 3,
+};
+
+inline const char * shm_open_status_name(ShmOpenStatus status) noexcept
+{
+  switch (status) {
+    case ShmOpenStatus::OK: return "OK";
+    case ShmOpenStatus::NOT_FOUND: return "NOT_FOUND";
+    case ShmOpenStatus::INCOMPATIBLE: return "INCOMPATIBLE";
+    case ShmOpenStatus::OS_ERROR: return "OS_ERROR";
+  }
+  return "UNKNOWN";
+}
+
 namespace detail
 {
-bool open_or_create_region(
+ShmOpenStatus open_or_create_region(
   const char * suffix,
   uint32_t version,
   size_t expected_size,
@@ -314,9 +333,11 @@ public:
   ShmHandle(const ShmHandle &) = delete;
   ShmHandle & operator=(const ShmHandle &) = delete;
 
-  ShmHandle(ShmHandle && other) noexcept : ptr_(other.ptr_)
+  ShmHandle(ShmHandle && other) noexcept
+  : ptr_(other.ptr_), last_status_(other.last_status_)
   {
     other.ptr_ = nullptr;
+    other.last_status_ = ShmOpenStatus::NOT_FOUND;
   }
 
   ShmHandle & operator=(ShmHandle && other) noexcept
@@ -324,12 +345,21 @@ public:
     if (this != &other) {
       close();
       ptr_ = other.ptr_;
+      last_status_ = other.last_status_;
       other.ptr_ = nullptr;
+      other.last_status_ = ShmOpenStatus::NOT_FOUND;
     }
     return *this;
   }
 
-  bool open(bool writable);
+  ShmOpenStatus open_status(bool writable);
+
+  bool open(bool writable)
+  {
+    return open_status(writable) == ShmOpenStatus::OK;
+  }
+
+  ShmOpenStatus last_status() const noexcept { return last_status_; }
 
   void close() noexcept
   {
@@ -347,44 +377,46 @@ public:
 
 private:
   SegmentT * ptr_ = nullptr;
+  ShmOpenStatus last_status_ = ShmOpenStatus::NOT_FOUND;
 };
 
 template<>
-inline bool ShmHandle<StateShmSegment>::open(bool writable)
+inline ShmOpenStatus ShmHandle<StateShmSegment>::open_status(bool writable)
 {
   close();
   void * addr = nullptr;
-  if (!detail::open_or_create_region("state", kShmVersion, sizeof(StateShmSegment), writable, &addr)) {
-    return false;
+  last_status_ = detail::open_or_create_region(
+    "state", kShmVersion, sizeof(StateShmSegment), writable, &addr);
+  if (last_status_ == ShmOpenStatus::OK) {
+    ptr_ = static_cast<StateShmSegment *>(addr);
   }
-  ptr_ = static_cast<StateShmSegment *>(addr);
-  return true;
+  return last_status_;
 }
 
 template<>
-inline bool ShmHandle<PerturbShmSegment>::open(bool writable)
+inline ShmOpenStatus ShmHandle<PerturbShmSegment>::open_status(bool writable)
 {
   close();
   void * addr = nullptr;
-  if (!detail::open_or_create_region(
-        "perturb", kShmVersion, sizeof(PerturbShmSegment), writable, &addr))
-  {
-    return false;
+  last_status_ = detail::open_or_create_region(
+    "perturb", kShmVersion, sizeof(PerturbShmSegment), writable, &addr);
+  if (last_status_ == ShmOpenStatus::OK) {
+    ptr_ = static_cast<PerturbShmSegment *>(addr);
   }
-  ptr_ = static_cast<PerturbShmSegment *>(addr);
-  return true;
+  return last_status_;
 }
 
 template<>
-inline bool ShmHandle<SysIdShmSegment>::open(bool writable)
+inline ShmOpenStatus ShmHandle<SysIdShmSegment>::open_status(bool writable)
 {
   close();
   void * addr = nullptr;
-  if (!detail::open_or_create_region("sysid", kShmVersion, sizeof(SysIdShmSegment), writable, &addr)) {
-    return false;
+  last_status_ = detail::open_or_create_region(
+    "sysid", kShmVersion, sizeof(SysIdShmSegment), writable, &addr);
+  if (last_status_ == ShmOpenStatus::OK) {
+    ptr_ = static_cast<SysIdShmSegment *>(addr);
   }
-  ptr_ = static_cast<SysIdShmSegment *>(addr);
-  return true;
+  return last_status_;
 }
 
 }  // namespace lite6_interfaces::shm

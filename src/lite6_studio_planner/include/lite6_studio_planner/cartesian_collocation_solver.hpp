@@ -9,6 +9,7 @@
 
 #include <Eigen/Dense>
 #include <array>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -67,7 +68,8 @@ public:
     const lite6_kinematics::CartesianLimit & cart_limits,
     const MotionOptions & options,
     CartesianCollocationResult & out_result,
-    std::vector<lite6_interfaces::msg::CompileDiagnostic> & out_diagnostics);
+    std::vector<lite6_interfaces::msg::CompileDiagnostic> & out_diagnostics,
+    const std::function<bool()> & is_cancelled = {});
 
   // Utility exposed for unit testing analytical Pinocchio derivatives against finite differences.
   struct TcpDerivatives

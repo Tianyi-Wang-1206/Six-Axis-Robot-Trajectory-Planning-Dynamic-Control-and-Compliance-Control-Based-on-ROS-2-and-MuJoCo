@@ -20,7 +20,9 @@ uint8 CMD_SET_PAYLOAD=13
 ComplianceSettings compliance
 uint8 command
 
-# Optional optimistic state concurrency guard: 0 skips revision check.
+# Optional optimistic planner incarnation and state revision guards:
+# 0 skips the respective check; CMD_ESTOP always bypasses both guards.
+uint64 expected_planner_epoch 0
 uint64 expected_revision 0
 
 # Known rigid payload parameters for CMD_SET_PAYLOAD.
@@ -36,6 +38,7 @@ string reason
 # it does NOT mean a controller mode switch has completed.
 bool accepted
 uint64 session_id
+uint64 planner_epoch
 uint64 revision
 uint8 mode
 string message

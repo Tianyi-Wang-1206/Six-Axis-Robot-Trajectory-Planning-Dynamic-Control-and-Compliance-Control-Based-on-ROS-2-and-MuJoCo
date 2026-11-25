@@ -1,5 +1,6 @@
 # Authoritative industrial state machine and execution telemetry published by lite6_studio_planner.
 builtin_interfaces/Time stamp
+uint64 planner_epoch
 uint64 revision
 
 uint8 STATE_BOOT_INIT=0

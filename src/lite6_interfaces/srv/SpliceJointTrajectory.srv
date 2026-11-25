@@ -1,0 +1,33 @@
+# Dedicated splice service for smoothly switching an active rigid
+# FollowJointTrajectory goal to a replacement 1 kHz sampled PVA tail in MODE_NORMAL.
+# Replaces magic nonzero header.stamp overloading on FollowJointTrajectory.
+
+# UUID of the active parent FollowJointTrajectory goal to splice onto.
+uint8[16] parent_goal_id
+
+# Optional optimistic controller incarnation guard: 0 skips epoch check;
+# >0 rejects with RESULT_REJECTED_EPOCH if expected_controller_epoch != controller_epoch.
+uint64 expected_controller_epoch 0
+
+# Parent-relative trajectory switch time; must match trajectory.points[0].time_from_start.
+builtin_interfaces/Duration switch_time
+
+# Replacement 1 kHz sampled PVA tail (ZOH playback at 1000 Hz, uniform 1 ms spacing,
+# matching parent state continuously at switch_time and ending at rest).
+trajectory_msgs/JointTrajectory trajectory
+---
+uint8 RESULT_NONE=0
+uint8 RESULT_ADOPTED=1              # Splice tail adopted by the 1 kHz RT loop
+uint8 RESULT_REJECTED_STATE=2       # Controller not active or not in MODE_NORMAL
+uint8 RESULT_REJECTED_EPOCH=3       # expected_controller_epoch mismatch
+uint8 RESULT_REJECTED_PARENT=4      # No matching active rigid parent goal or already spliced/canceling
+uint8 RESULT_REJECTED_INVALID_ARG=5 # Malformed, non-finite, non-1kHz, discontinuous, or non-resting tail
+uint8 RESULT_REJECTED_TIMING=6      # Parent elapsed time already passed switch_time before adoption
+uint8 RESULT_RT_TIMEOUT=7           # Definitively NOT adopted (withdrawn before RT handoff)
+uint8 RESULT_OUTCOME_UNKNOWN=8      # Submitted to RT without timely ack; reconcile via telemetry
+
+# True iff result_code == RESULT_ADOPTED.
+bool adopted
+uint8 result_code
+uint64 controller_epoch
+string message

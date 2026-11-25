@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <thread>
 
 namespace lite6_controllers
 {
@@ -11,6 +12,52 @@ namespace
 double seconds(const builtin_interfaces::msg::Duration & duration)
 {
   return duration.sec + 1e-9 * duration.nanosec;
+}
+
+template<typename PointT>
+size_t advance_sample_index(
+  const std::vector<PointT> & points,
+  size_t current_index,
+  double elapsed,
+  bool uniform_1khz,
+  double t0_sec) noexcept
+{
+  const size_t n = points.size();
+  if (n <= 1) {
+    return 0;
+  }
+  size_t idx = (current_index < n) ? current_index : 0;
+  if (idx + 1 >= n) {
+    return n - 1;
+  }
+  // O(1) nominal 1 kHz step check (stay at idx or advance to idx + 1).
+  if (elapsed < seconds(points[idx + 1].time_from_start)) {
+    return idx;
+  }
+  if (idx + 2 >= n || elapsed < seconds(points[idx + 2].time_from_start)) {
+    return idx + 1;
+  }
+  // Scheduling delay skipped > 1 sample: O(1) direct indexing for validated uniform 1 kHz
+  // trajectories (bounded +/-1 refinement), or O(log N) binary search fallback.
+  if (uniform_1khz) {
+    const double est = (elapsed - t0_sec) * lite6_interfaces::contract::kControlRateHz;
+    if (est >= static_cast<double>(n - 1)) {
+      idx = n - 1;
+    } else if (est > static_cast<double>(idx)) {
+      idx = static_cast<size_t>(est);
+    }
+    while (idx > 0 && seconds(points[idx].time_from_start) > elapsed) {
+      --idx;
+    }
+    while (idx + 1 < n && seconds(points[idx + 1].time_from_start) <= elapsed) {
+      ++idx;
+    }
+    return idx;
+  }
+  const auto it = std::upper_bound(
+    points.begin() + static_cast<std::ptrdiff_t>(idx + 1), points.end(), elapsed,
+    [](double t, const PointT & p) { return t < seconds(p.time_from_start); });
+  return static_cast<size_t>(std::distance(points.begin(), it) - 1);
 }
 
 template <typename ResultEnum>
@@ -32,16 +79,17 @@ uint8_t map_trajectory_estop_reason(ResultEnum reason)
 }
 }  // namespace
 
+// Playback uses 1 kHz sampled PVA with zero-order hold (ZOH). Regular FollowJointTrajectory
+// goals must have a zero header.stamp, start at time_from_start == 0, maintain uniform 1 ms
+// sample spacing within kTrajectorySampleSpacingTolSec, and end at rest.
 bool Lite6CTCController::valid_trajectory_goal(
-  const FollowTrajectory::Goal & goal, bool splice) const
+  const FollowTrajectory::Goal & goal, bool * out_uniform_1khz) const
 {
   const auto & trajectory = goal.trajectory;
-  // A regular goal starts immediately (zero stamp). A splice goal carries the actual
-  // start time of the trajectory it continues (standard JTC header.stamp semantics).
   const bool zero_stamp =
     trajectory.header.stamp.sec == 0 && trajectory.header.stamp.nanosec == 0;
   if (trajectory.joint_names != joint_names_ || trajectory.points.empty() ||
-      zero_stamp == splice ||
+      !zero_stamp ||
       !goal.multi_dof_trajectory.points.empty() ||
       !goal.multi_dof_trajectory.joint_names.empty() ||
       !goal.component_path_tolerance.empty() || !goal.component_goal_tolerance.empty())
@@ -78,8 +126,13 @@ bool Lite6CTCController::valid_trajectory_goal(
     return false;
   }
 
+  const double first_time = seconds(trajectory.points.front().time_from_start);
+  if (first_time != 0.0) return false;
+
   double previous = -1.0;
-  for (const auto & point : trajectory.points) {
+  double max_grid_err = 0.0;
+  for (size_t idx = 0; idx < trajectory.points.size(); ++idx) {
+    const auto & point = trajectory.points[idx];
     const double t = seconds(point.time_from_start);
     if (point.time_from_start.sec < 0 || point.time_from_start.nanosec >= 1000000000u ||
         t <= previous || point.positions.size() != joint_names_.size() ||
@@ -88,6 +141,17 @@ bool Lite6CTCController::valid_trajectory_goal(
         (!point.effort.empty() && point.effort.size() != joint_names_.size()))
     {
       return false;
+    }
+    if (idx > 0) {
+      const double dt = t - previous;
+      if (std::abs(dt - lite6_interfaces::contract::kControlDtSec) >
+          lite6_interfaces::contract::kTrajectorySampleSpacingTolSec)
+      {
+        return false;
+      }
+      const double expected_t = first_time +
+        static_cast<double>(idx) * lite6_interfaces::contract::kControlDtSec;
+      max_grid_err = std::max(max_grid_err, std::abs(t - expected_t));
     }
     for (size_t i = 0; i < joint_names_.size(); ++i) {
       if (!std::isfinite(point.positions[i]) || !std::isfinite(point.velocities[i]) ||
@@ -105,9 +169,6 @@ bool Lite6CTCController::valid_trajectory_goal(
     }
     previous = t;
   }
-  // A splice starts at its switch time on the parent's time base, never at zero.
-  const double first_time = seconds(trajectory.points.front().time_from_start);
-  if (splice ? !(first_time > 0.0) : first_time != 0.0) return false;
   // Holding the final reference must not leave a nonzero feed-forward command.
   const auto & last = trajectory.points.back();
   for (size_t i = 0; i < joint_names_.size(); ++i) {
@@ -116,37 +177,113 @@ bool Lite6CTCController::valid_trajectory_goal(
     if (!last.effort.empty() && std::abs(last.effort[i]) > 1e-8)
       return false;
   }
+  if (out_uniform_1khz != nullptr) {
+    *out_uniform_1khz = (max_grid_err <= 2e-4);
+  }
   return true;
 }
 
-bool Lite6CTCController::valid_splice_goal(const FollowTrajectory::Goal & goal) const
+uint8_t Lite6CTCController::valid_splice_request(
+  const SpliceTrajectory::Request & req,
+  bool * out_uniform_1khz,
+  std::string * out_message) const
 {
+  using Resp = SpliceTrajectory::Response;
+  using CS = lite6_interfaces::msg::ControllerStatus;
   // Caller holds trajectory_mutex_.
+  if (!trajectory_enabled_.load(std::memory_order_acquire) ||
+      current_mode_atomic_.load(std::memory_order_acquire) != CS::MODE_NORMAL)
+  {
+    if (out_message) *out_message = "Splice is permitted only while active in MODE_NORMAL";
+    return Resp::RESULT_REJECTED_STATE;
+  }
+  const uint64_t active_epoch = controller_epoch_atomic_.load(std::memory_order_acquire);
+  if (req.expected_controller_epoch > 0 && req.expected_controller_epoch != active_epoch) {
+    if (out_message) *out_message = "Controller epoch mismatch";
+    return Resp::RESULT_REJECTED_EPOCH;
+  }
   const auto & parent = active_trajectory_;
-  if (!parent || parent->result.load() != TrajectoryResult::RUNNING ||
-      parent->cancel.load() || parent->splice_reserved ||
-      !valid_trajectory_goal(goal, true))
+  if (!parent || parent->result.load(std::memory_order_acquire) != TrajectoryResult::RUNNING ||
+      parent->cancel.load(std::memory_order_acquire) || parent->splice_reserved ||
+      parent->goal->get_goal_id() != req.parent_goal_id ||
+      parent->start_time_pub_ns.load(std::memory_order_acquire) <= 0)
   {
-    return false;
+    if (out_message) *out_message = "No matching started unspliced rigid parent goal";
+    return Resp::RESULT_REJECTED_PARENT;
   }
-  const int64_t parent_start = parent->start_time_pub_ns.load(std::memory_order_acquire);
-  const auto & stamp = goal.trajectory.header.stamp;
-  const int64_t stamp_ns =
-    static_cast<int64_t>(stamp.sec) * 1000000000LL + static_cast<int64_t>(stamp.nanosec);
-  if (parent_start <= 0 || stamp_ns != parent_start) {
-    return false;
+  if (req.switch_time.sec < 0 || req.switch_time.nanosec >= 1000000000u) {
+    if (out_message) *out_message = "Invalid switch_time duration";
+    return Resp::RESULT_REJECTED_INVALID_ARG;
   }
-  // The splice must not override the parent's endpoint tolerances or timing semantics.
-  if (!goal.path_tolerance.empty() || !goal.goal_tolerance.empty() ||
-      goal.goal_time_tolerance.sec != 0 || goal.goal_time_tolerance.nanosec != 0)
-  {
-    return false;
+  const double t_switch = seconds(req.switch_time);
+  const auto & trajectory = req.trajectory;
+  if (!(t_switch > 0.0) || trajectory.joint_names != joint_names_ || trajectory.points.empty()) {
+    if (out_message) *out_message = "Invalid splice trajectory header, joint names, or empty points";
+    return Resp::RESULT_REJECTED_INVALID_ARG;
   }
-  // Seamless switch: the first splice sample must equal the parent sample at the same
-  // time (the trajectory planner copies it verbatim), and must lie strictly before the parent's end.
+  const double first_time = seconds(trajectory.points.front().time_from_start);
+  if (std::abs(first_time - t_switch) > 1e-9) {
+    if (out_message) *out_message = "Splice trajectory must begin at switch_time";
+    return Resp::RESULT_REJECTED_INVALID_ARG;
+  }
+
+  double previous = -1.0;
+  double max_grid_err = 0.0;
+  for (size_t idx = 0; idx < trajectory.points.size(); ++idx) {
+    const auto & point = trajectory.points[idx];
+    const double t = seconds(point.time_from_start);
+    if (point.time_from_start.sec < 0 || point.time_from_start.nanosec >= 1000000000u ||
+        t <= previous || point.positions.size() != joint_names_.size() ||
+        point.velocities.size() != joint_names_.size() ||
+        point.accelerations.size() != joint_names_.size() ||
+        (!point.effort.empty() && point.effort.size() != joint_names_.size()))
+    {
+      if (out_message) *out_message = "Malformed splice trajectory point";
+      return Resp::RESULT_REJECTED_INVALID_ARG;
+    }
+    if (idx > 0) {
+      const double dt = t - previous;
+      if (std::abs(dt - lite6_interfaces::contract::kControlDtSec) >
+          lite6_interfaces::contract::kTrajectorySampleSpacingTolSec)
+      {
+        if (out_message) *out_message = "Splice trajectory requires uniform 1 kHz (1 ms) sample spacing";
+        return Resp::RESULT_REJECTED_INVALID_ARG;
+      }
+      const double expected_t = first_time +
+        static_cast<double>(idx) * lite6_interfaces::contract::kControlDtSec;
+      max_grid_err = std::max(max_grid_err, std::abs(t - expected_t));
+    }
+    for (size_t i = 0; i < joint_names_.size(); ++i) {
+      if (!std::isfinite(point.positions[i]) || !std::isfinite(point.velocities[i]) ||
+          !std::isfinite(point.accelerations[i]))
+      {
+        if (out_message) *out_message = "Non-finite PVA in splice trajectory";
+        return Resp::RESULT_REJECTED_INVALID_ARG;
+      }
+      if (!point.effort.empty() &&
+          (!std::isfinite(point.effort[i]) ||
+           std::abs(point.effort[i]) > max_effort_[static_cast<Eigen::Index>(i)]))
+      {
+        if (out_message) *out_message = "Invalid feedforward effort in splice trajectory";
+        return Resp::RESULT_REJECTED_INVALID_ARG;
+      }
+    }
+    previous = t;
+  }
+  const auto & last = trajectory.points.back();
+  for (size_t i = 0; i < joint_names_.size(); ++i) {
+    if (std::abs(last.velocities[i]) > 1e-8 || std::abs(last.accelerations[i]) > 1e-8 ||
+        (!last.effort.empty() && std::abs(last.effort[i]) > 1e-8))
+    {
+      if (out_message) *out_message = "Splice trajectory must end at rest";
+      return Resp::RESULT_REJECTED_INVALID_ARG;
+    }
+  }
+
+  // Seamless switch: the first splice sample must equal the parent sample at switch_time,
+  // strictly before the parent's final sample.
   const auto & parent_points = parent->goal->get_goal()->trajectory.points;
-  const auto & first = goal.trajectory.points.front();
-  const double t_switch = seconds(first.time_from_start);
+  const auto & first = trajectory.points.front();
   const auto it = std::lower_bound(
     parent_points.begin(), parent_points.end(), t_switch - 1e-7,
     [](const trajectory_msgs::msg::JointTrajectoryPoint & p, double t) {
@@ -155,10 +292,12 @@ bool Lite6CTCController::valid_splice_goal(const FollowTrajectory::Goal & goal) 
   if (it == parent_points.end() || std::next(it) == parent_points.end() ||
       std::abs(seconds(it->time_from_start) - t_switch) > 1e-7)
   {
-    return false;
+    if (out_message) *out_message = "switch_time does not match an interior parent sample";
+    return Resp::RESULT_REJECTED_INVALID_ARG;
   }
   if (it->effort.empty() != first.effort.empty()) {
-    return false;
+    if (out_message) *out_message = "Splice effort presence mismatches parent";
+    return Resp::RESULT_REJECTED_INVALID_ARG;
   }
   constexpr double kContinuityTol = 1e-9;
   for (size_t i = 0; i < joint_names_.size(); ++i) {
@@ -167,10 +306,14 @@ bool Lite6CTCController::valid_splice_goal(const FollowTrajectory::Goal & goal) 
         std::abs(it->accelerations[i] - first.accelerations[i]) > kContinuityTol ||
         (!first.effort.empty() && std::abs(it->effort[i] - first.effort[i]) > kContinuityTol))
     {
-      return false;
+      if (out_message) *out_message = "Splice initial PVA does not continuously match parent at switch_time";
+      return Resp::RESULT_REJECTED_INVALID_ARG;
     }
   }
-  return true;
+  if (out_uniform_1khz != nullptr) {
+    *out_uniform_1khz = (max_grid_err <= 2e-4);
+  }
+  return Resp::RESULT_ADOPTED;
 }
 
 void Lite6CTCController::populate_goal_tolerances(
@@ -218,17 +361,6 @@ void Lite6CTCController::configure_trajectory_action()
       using CS = lite6_interfaces::msg::ControllerStatus;
       std::lock_guard<std::mutex> lock(trajectory_mutex_);
       const uint8_t mode = current_mode_atomic_.load(std::memory_order_acquire);
-      const auto & stamp = goal->trajectory.header.stamp;
-      if (stamp.sec != 0 || stamp.nanosec != 0) {
-        // Splice goal: continues (and partially replaces) the active rigid trajectory.
-        if (!trajectory_enabled_.load(std::memory_order_acquire) ||
-            !valid_splice_goal(*goal))
-        {
-          return rclcpp_action::GoalResponse::REJECT;
-        }
-        active_trajectory_->splice_reserved = true;
-        return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
-      }
       if (!trajectory_enabled_.load(std::memory_order_acquire) ||
           compliance_blocks_trajectory_.load() ||
           (mode != CS::MODE_NORMAL && mode != CS::MODE_SYSID) ||
@@ -240,8 +372,6 @@ void Lite6CTCController::configure_trajectory_action()
     },
     [this](const std::shared_ptr<TrajectoryGoal> goal) {
       std::lock_guard<std::mutex> lock(trajectory_mutex_);
-      // A splice is resolved by the RT thread at its switch time; it cannot be canceled.
-      // Cancel the parent goal instead.
       if (!active_trajectory_ || active_trajectory_->goal != goal ||
           active_trajectory_->result.load() != TrajectoryResult::RUNNING)
         return rclcpp_action::CancelResponse::REJECT;
@@ -250,40 +380,150 @@ void Lite6CTCController::configure_trajectory_action()
     },
     [this](const std::shared_ptr<TrajectoryGoal> goal) {
       std::lock_guard<std::mutex> lock(trajectory_mutex_);
-      const auto & stamp = goal->get_goal()->trajectory.header.stamp;
-      if (stamp.sec != 0 || stamp.nanosec != 0) {
-        auto child = std::make_shared<TrajectoryExecution>(goal);
-        child->is_splice = true;
-        child->splice_switch_time =
-          seconds(goal->get_goal()->trajectory.points.front().time_from_start);
-        pending_splices_.push_back(child);
-        const auto & parent = active_trajectory_;
-        if (!trajectory_enabled_.load() || !parent || !parent->splice_reserved ||
-            parent->splice_owner || parent->result.load() != TrajectoryResult::RUNNING)
-        {
-          child->result.store(TrajectoryResult::SPLICE_REJECTED);
-          return;
-        }
-        child->splice_parent = parent;
-        parent->splice_owner = child;
-        // Publish only after ownership is established; the RT thread adopts or rejects it.
-        parent->splice.store(child.get(), std::memory_order_release);
-        return;
-      }
       if (active_trajectory_) {
         retired_trajectories_.push_back(std::move(active_trajectory_));
       }
+      bool uniform_1khz = true;
+      (void)valid_trajectory_goal(*goal->get_goal(), &uniform_1khz);
       active_trajectory_ = std::make_shared<TrajectoryExecution>(goal);
+      active_trajectory_->uniform_1khz = uniform_1khz;
+      active_trajectory_->t0_sec =
+        seconds(goal->get_goal()->trajectory.points.front().time_from_start);
       populate_goal_tolerances(*goal->get_goal(), *active_trajectory_);
       if (!trajectory_enabled_.load()) {
         active_trajectory_->result.store(TrajectoryResult::DEACTIVATED);
       }
       trajectory_buffer_.writeFromNonRT(active_trajectory_);
     });
+
+  splice_service_ = get_node()->create_service<SpliceTrajectory>(
+    "~/splice_joint_trajectory",
+    [this](
+      const std::shared_ptr<SpliceTrajectory::Request> req,
+      std::shared_ptr<SpliceTrajectory::Response> resp)
+    {
+      using Resp = SpliceTrajectory::Response;
+      std::shared_ptr<TrajectoryExecution> parent;
+      std::shared_ptr<SpliceExecution> splice;
+      uint64_t active_epoch = 0;
+      double wait_sec = 0.25;
+      {
+        std::lock_guard<std::mutex> lock(trajectory_mutex_);
+        bool uniform_1khz = true;
+        std::string msg;
+        const uint8_t check = valid_splice_request(*req, &uniform_1khz, &msg);
+        active_epoch = controller_epoch_atomic_.load(std::memory_order_acquire);
+        if (check != Resp::RESULT_ADOPTED) {
+          resp->adopted = false;
+          resp->result_code = check;
+          resp->controller_epoch = active_epoch;
+          resp->message = msg;
+          return;
+        }
+        parent = active_trajectory_;
+        splice = std::make_shared<SpliceExecution>();
+        splice->trajectory = req->trajectory;
+        splice->switch_time = seconds(req->switch_time);
+        splice->t0_sec = splice->switch_time;
+        splice->uniform_1khz = uniform_1khz;
+        splice->controller_epoch = active_epoch;
+
+        const double est_elapsed = parent->elapsed_pub.load(std::memory_order_relaxed);
+        wait_sec = std::clamp(
+          std::max(0.0, splice->switch_time - est_elapsed) + 0.25, 0.20, 2.0);
+
+        parent->splice_reserved = true;
+        parent->splice_owner = splice;
+        parent->splice.store(splice.get(), std::memory_order_release);
+      }
+
+      const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(wait_sec));
+      auto finalize = [&](SpliceState st) {
+        resp->controller_epoch = controller_epoch_atomic_.load(std::memory_order_acquire);
+        switch (st) {
+          case SpliceState::ADOPTED:
+            resp->adopted = true;
+            resp->result_code = Resp::RESULT_ADOPTED;
+            resp->message = "Splice adopted by 1 kHz RT loop";
+            return;
+          case SpliceState::REJECTED_TIMING:
+            resp->adopted = false;
+            resp->result_code = Resp::RESULT_REJECTED_TIMING;
+            resp->message = "Splice switch_time already passed or endpoint reached";
+            return;
+          case SpliceState::REJECTED_STATE:
+            resp->adopted = false;
+            resp->result_code = Resp::RESULT_REJECTED_STATE;
+            resp->message = "Controller left MODE_NORMAL or changed activation epoch";
+            return;
+          case SpliceState::REJECTED_PARENT:
+            resp->adopted = false;
+            resp->result_code = Resp::RESULT_REJECTED_PARENT;
+            resp->message = "Parent goal ended or was canceled before switch_time";
+            return;
+          case SpliceState::WITHDRAWN:
+          default:
+            resp->adopted = false;
+            resp->result_code = Resp::RESULT_RT_TIMEOUT;
+            resp->message = "Splice withdrawn before RT adoption (definitively not adopted)";
+            return;
+        }
+      };
+
+      while (std::chrono::steady_clock::now() < deadline) {
+        const auto st = static_cast<SpliceState>(splice->state.load(std::memory_order_acquire));
+        if (st != SpliceState::PENDING) {
+          finalize(st);
+          return;
+        }
+        if (!trajectory_enabled_.load(std::memory_order_acquire) ||
+            controller_epoch_atomic_.load(std::memory_order_acquire) != active_epoch)
+        {
+          uint8_t expected = static_cast<uint8_t>(SpliceState::PENDING);
+          if (splice->state.compare_exchange_strong(
+                expected, static_cast<uint8_t>(SpliceState::REJECTED_STATE),
+                std::memory_order_acq_rel, std::memory_order_acquire))
+          {
+            finalize(SpliceState::REJECTED_STATE);
+            return;
+          }
+          finalize(static_cast<SpliceState>(expected));
+          return;
+        }
+        if (parent->result.load(std::memory_order_acquire) != TrajectoryResult::RUNNING ||
+            parent->cancel.load(std::memory_order_acquire))
+        {
+          uint8_t expected = static_cast<uint8_t>(SpliceState::PENDING);
+          if (splice->state.compare_exchange_strong(
+                expected, static_cast<uint8_t>(SpliceState::REJECTED_PARENT),
+                std::memory_order_acq_rel, std::memory_order_acquire))
+          {
+            finalize(SpliceState::REJECTED_PARENT);
+            return;
+          }
+          finalize(static_cast<SpliceState>(expected));
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(250));
+      }
+
+      uint8_t expected = static_cast<uint8_t>(SpliceState::PENDING);
+      if (splice->state.compare_exchange_strong(
+            expected, static_cast<uint8_t>(SpliceState::WITHDRAWN),
+            std::memory_order_acq_rel, std::memory_order_acquire))
+      {
+        finalize(SpliceState::WITHDRAWN);
+        return;
+      }
+      finalize(static_cast<SpliceState>(expected));
+    },
+    rclcpp::ServicesQoS(), command_callback_group_);
+
   trajectory_monitor_ = get_node()->create_wall_timer(
     std::chrono::milliseconds(20), [this] {
       monitor_trajectory();
-      monitor_splices();
       monitor_impedance_trajectory();
     });
 }
@@ -297,8 +537,21 @@ void Lite6CTCController::update_trajectory_reference(
     tau_point_ff_.setZero();
     return;
   }
+  auto reject_pending_splice = [&](SpliceState reason) {
+    if (!execution->splice_resolved) {
+      if (auto * splice = execution->splice.load(std::memory_order_acquire)) {
+        uint8_t expected = static_cast<uint8_t>(SpliceState::PENDING);
+        splice->state.compare_exchange_strong(
+          expected, static_cast<uint8_t>(reason),
+          std::memory_order_acq_rel, std::memory_order_acquire);
+      }
+      execution->splice_resolved = true;
+    }
+  };
+
   const size_t n = joint_names_.size();
   if (execution->cancel.load()) {
+    reject_pending_splice(SpliceState::REJECTED_PARENT);
     tau_point_ff_.setZero();
     if (!execution->started) {
       execution->cancel_applied = true;
@@ -321,8 +574,10 @@ void Lite6CTCController::update_trajectory_reference(
   }
   if (execution->started) {
     execution->elapsed += period.seconds();
+    execution->elapsed_pub.store(execution->elapsed, std::memory_order_relaxed);
   } else {
     if (system_state_ != SystemState::NORMAL && system_state_ != SystemState::SYS_ID) {
+      reject_pending_splice(SpliceState::REJECTED_STATE);
       execution->result.store(TrajectoryResult::MODE_CHANGED);
       tau_point_ff_.setZero();
       return;
@@ -332,32 +587,50 @@ void Lite6CTCController::update_trajectory_reference(
     execution->started = true;
     execution->start_time_ns = time.nanoseconds();
     execution->start_time_pub_ns.store(execution->start_time_ns, std::memory_order_release);
+    execution->elapsed_pub.store(0.0, std::memory_order_relaxed);
     execution->start_mode = static_cast<int>(system_state_);
   }
 
-  // Path-preserving splice: decided once on first sight (rejected if its switch time
-  // has already passed or the endpoint is already held), then adopted exactly at its
-  // switch time. Its first sample equals the parent sample at that time, so the
-  // reference switches without a discontinuity.
+  // Path-preserving splice: decided once on first sight (rejected if epoch/mode changed,
+  // switch_time already passed, or endpoint already held), then adopted atomically at
+  // switch_time via CAS on splice->state (racing cleanly against service withdrawal).
   if (!execution->splice_resolved) {
     auto * splice = execution->splice.load(std::memory_order_acquire);
     if (splice != nullptr) {
-      auto running = TrajectoryResult::RUNNING;
+      uint8_t expected = static_cast<uint8_t>(SpliceState::PENDING);
       if (!execution->splice_seen) {
         execution->splice_seen = true;
-        if (execution->endpoint_applied || execution->elapsed > splice->splice_switch_time) {
+        if (system_state_ != SystemState::NORMAL || splice->controller_epoch != controller_epoch_) {
           execution->splice_resolved = true;
-          splice->result.compare_exchange_strong(running, TrajectoryResult::SPLICE_REJECTED);
+          splice->state.compare_exchange_strong(
+            expected, static_cast<uint8_t>(SpliceState::REJECTED_STATE),
+            std::memory_order_acq_rel, std::memory_order_acquire);
+        } else if (execution->endpoint_applied || execution->elapsed > splice->switch_time) {
+          execution->splice_resolved = true;
+          splice->state.compare_exchange_strong(
+            expected, static_cast<uint8_t>(SpliceState::REJECTED_TIMING),
+            std::memory_order_acq_rel, std::memory_order_acquire);
         }
       }
-      if (!execution->splice_resolved && execution->elapsed >= splice->splice_switch_time &&
-          splice->result.compare_exchange_strong(running, TrajectoryResult::SUCCEEDED))
-      {
-        execution->splice_resolved = true;
-        execution->tail = splice;
-        execution->last_sample_index = 0;
-        execution->endpoint_applied = false;
-        execution->on_tail.store(true, std::memory_order_release);
+      if (!execution->splice_resolved && execution->elapsed >= splice->switch_time) {
+        if (system_state_ != SystemState::NORMAL || splice->controller_epoch != controller_epoch_) {
+          execution->splice_resolved = true;
+          splice->state.compare_exchange_strong(
+            expected, static_cast<uint8_t>(SpliceState::REJECTED_STATE),
+            std::memory_order_acq_rel, std::memory_order_acquire);
+        } else if (splice->state.compare_exchange_strong(
+                     expected, static_cast<uint8_t>(SpliceState::ADOPTED),
+                     std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+          execution->splice_resolved = true;
+          execution->tail = splice;
+          execution->last_sample_index = 0;
+          execution->endpoint_applied = false;
+          execution->on_tail.store(true, std::memory_order_release);
+        } else {
+          // Service already withdrew the splice before adoption.
+          execution->splice_resolved = true;
+        }
       }
     }
   }
@@ -368,18 +641,17 @@ void Lite6CTCController::update_trajectory_reference(
     return;
   }
 
-  const auto & points = (execution->tail != nullptr) ?
-    execution->tail->goal->get_goal()->trajectory.points :
+  const bool on_tail = (execution->tail != nullptr);
+  const auto & points = on_tail ?
+    execution->tail->trajectory.points :
     execution->goal->get_goal()->trajectory.points;
-  size_t index = execution->last_sample_index;
-  if (index >= points.size()) index = 0;
-  while (index + 1 < points.size() &&
-         seconds(points[index + 1].time_from_start) <= execution->elapsed) {
-    ++index;
-  }
+  const bool uniform_1khz = on_tail ? execution->tail->uniform_1khz : execution->uniform_1khz;
+  const double t0_sec = on_tail ? execution->tail->t0_sec : execution->t0_sec;
+  const size_t index = advance_sample_index(
+    points, execution->last_sample_index, execution->elapsed, uniform_1khz, t0_sec);
   execution->last_sample_index = index;
   const auto & point = points[index];
-  // Zero-order hold of the latest due sample: preserve Ruckig q/dq/ddq verbatim.
+  // Zero-order hold of the latest due 1 kHz PVA sample.
   for (size_t i = 0; i < n; ++i) {
     reference_interfaces_[i] = point.positions[i];
     reference_interfaces_[n + i] = point.velocities[i];
@@ -434,6 +706,15 @@ void Lite6CTCController::fail_trajectory(
   request_execution_stop();
   auto * execution = current_execution_;
   if (!execution || execution->result.load() != TrajectoryResult::RUNNING) return;
+  if (!execution->splice_resolved) {
+    if (auto * splice = execution->splice.load(std::memory_order_acquire)) {
+      uint8_t expected = static_cast<uint8_t>(SpliceState::PENDING);
+      splice->state.compare_exchange_strong(
+        expected, static_cast<uint8_t>(SpliceState::REJECTED_PARENT),
+        std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+    execution->splice_resolved = true;
+  }
   execution->failure_joint = joint;
   execution->failure_value = value;
   execution->failure_limit = limit;
@@ -585,14 +866,25 @@ void Lite6CTCController::finish_trajectory_cycle(double dt)
     execution->settled_duration = 0.0;
     execution->was_settled = false;
   }
-  const auto & end_source = (execution->tail != nullptr) ? execution->tail->goal : execution->goal;
-  const double end_time = seconds(end_source->get_goal()->trajectory.points.back().time_from_start);
+  const auto & end_points = (execution->tail != nullptr) ?
+    execution->tail->trajectory.points :
+    execution->goal->get_goal()->trajectory.points;
+  const double end_time = seconds(end_points.back().time_from_start);
   const double time_tol = execution->goal_time_tol > 0.0 ?
     execution->goal_time_tol : goal_time_tolerance_;
   // The deadline includes the continuous settling window, not just first entry.
   if (execution->elapsed > end_time + time_tol) {
     fail_trajectory(TrajectoryResult::GOAL_TIMEOUT, worst_joint, worst_ratio, 1.0);
   } else if (execution->settled_duration >= goal_settle_duration_) {
+    if (!execution->splice_resolved) {
+      if (auto * splice = execution->splice.load(std::memory_order_acquire)) {
+        uint8_t expected = static_cast<uint8_t>(SpliceState::PENDING);
+        splice->state.compare_exchange_strong(
+          expected, static_cast<uint8_t>(SpliceState::REJECTED_PARENT),
+          std::memory_order_acq_rel, std::memory_order_acquire);
+      }
+      execution->splice_resolved = true;
+    }
     execution->result.store(TrajectoryResult::SUCCEEDED);
   }
 }
@@ -600,7 +892,7 @@ void Lite6CTCController::finish_trajectory_cycle(double dt)
 void Lite6CTCController::monitor_trajectory()
 {
   std::shared_ptr<TrajectoryExecution> execution;
-  std::shared_ptr<TrajectoryExecution> splice_child;
+  std::shared_ptr<SpliceExecution> splice_child;
   {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
     if (active_trajectory_) {
@@ -631,7 +923,7 @@ void Lite6CTCController::monitor_trajectory()
       feedback->joint_names = joint_names_;
       const auto & fb_points =
         (splice_child && execution->on_tail.load(std::memory_order_acquire)) ?
-        splice_child->goal->get_goal()->trajectory.points :
+        splice_child->trajectory.points :
         goal->get_goal()->trajectory.points;
       const size_t sample_idx = std::min(execution->sample.load(), fb_points.size() - 1);
       feedback->desired = fb_points[sample_idx];
@@ -707,44 +999,6 @@ void Lite6CTCController::monitor_trajectory()
         ", limit=" + std::to_string(execution->failure_limit);
     }
     goal->abort(result);
-  }
-}
-void Lite6CTCController::monitor_splices()
-{
-  std::vector<std::shared_ptr<TrajectoryExecution>> finished;
-  {
-    std::lock_guard<std::mutex> lock(trajectory_mutex_);
-    for (auto it = pending_splices_.begin(); it != pending_splices_.end();) {
-      auto & child = *it;
-      if (child->result.load() == TrajectoryResult::RUNNING) {
-        // The RT thread only adopts while the parent runs. Once the parent is terminal
-        // (or gone) an unadopted splice can never take effect.
-        const auto parent = child->splice_parent.lock();
-        if (!parent || parent->result.load() != TrajectoryResult::RUNNING) {
-          auto running = TrajectoryResult::RUNNING;
-          child->result.compare_exchange_strong(running, TrajectoryResult::SPLICE_REJECTED);
-        }
-      }
-      if (child->result.load() != TrajectoryResult::RUNNING) {
-        finished.push_back(child);
-        it = pending_splices_.erase(it);
-      } else {
-        ++it;
-      }
-    }
-  }
-  for (const auto & child : finished) {
-    auto result = std::make_shared<FollowTrajectory::Result>();
-    if (child->result.load() == TrajectoryResult::SUCCEEDED) {
-      result->error_code = FollowTrajectory::Result::SUCCESSFUL;
-      result->error_string = "Splice adopted; the parent goal now follows the spliced reference";
-      child->goal->succeed(result);
-    } else {
-      result->error_code = FollowTrajectory::Result::OLD_HEADER_TIMESTAMP;
-      result->error_string =
-        "Splice rejected: switch time already passed, endpoint reached, or parent goal ended";
-      child->goal->abort(result);
-    }
   }
 }
 

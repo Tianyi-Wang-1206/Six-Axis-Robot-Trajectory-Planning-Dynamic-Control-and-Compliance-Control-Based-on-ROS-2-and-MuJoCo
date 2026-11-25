@@ -57,16 +57,27 @@ class SysIdSamplePod(ctypes.Structure):
     ]
 
 
+SHM_OPEN_OK = 0
+SHM_OPEN_NOT_FOUND = 1
+SHM_OPEN_INCOMPATIBLE = 2
+SHM_OPEN_OS_ERROR = 3
+
 _LIB = _load_bridge_lib()
 
 _LIB.lite6_shm_steady_now_ns.argtypes = []
 _LIB.lite6_shm_steady_now_ns.restype = ctypes.c_int64
+
+_LIB.lite6_shm_is_stamp_fresh.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
+_LIB.lite6_shm_is_stamp_fresh.restype = ctypes.c_int
 
 _LIB.lite6_shm_joint_pod_size.argtypes = []
 _LIB.lite6_shm_joint_pod_size.restype = ctypes.c_size_t
 
 _LIB.lite6_shm_sysid_pod_size.argtypes = []
 _LIB.lite6_shm_sysid_pod_size.restype = ctypes.c_size_t
+
+_LIB.lite6_shm_state_open_ex.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+_LIB.lite6_shm_state_open_ex.restype = ctypes.c_void_p
 
 _LIB.lite6_shm_state_open.argtypes = [ctypes.c_int]
 _LIB.lite6_shm_state_open.restype = ctypes.c_void_p
@@ -80,6 +91,9 @@ _LIB.lite6_shm_read_joint_state.argtypes = [
     ctypes.POINTER(ctypes.c_uint64),
 ]
 _LIB.lite6_shm_read_joint_state.restype = ctypes.c_int
+
+_LIB.lite6_shm_sysid_open_ex.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+_LIB.lite6_shm_sysid_open_ex.restype = ctypes.c_void_p
 
 _LIB.lite6_shm_sysid_open.argtypes = [ctypes.c_int]
 _LIB.lite6_shm_sysid_open.restype = ctypes.c_void_p
@@ -118,19 +132,41 @@ def steady_now_ns() -> int:
     return int(_LIB.lite6_shm_steady_now_ns())
 
 
+def is_stamp_fresh(stamp_ns: int, now_ns: int, max_age_ns: int) -> bool:
+    """Return True iff stamp_ns is positive, not in the future, and within max_age_ns."""
+    return bool(_LIB.lite6_shm_is_stamp_fresh(int(stamp_ns), int(now_ns), int(max_age_ns)))
+
+
 class StateShmReader:
     """Read-only shared-memory reader for the joint state register."""
 
     def __init__(self):
-        self._handle = _LIB.lite6_shm_state_open(0)
-        if not self._handle:
-            raise RuntimeError("Failed to open read-only Lite6 state shared memory")
+        self._handle = None
         self._pod = JointStatePod()
         self._seq = ctypes.c_uint64(0)
+        self._try_open()
+
+    def _try_open(self) -> bool:
+        if self._handle:
+            return True
+        status = ctypes.c_int(SHM_OPEN_OS_ERROR)
+        handle = _LIB.lite6_shm_state_open_ex(0, ctypes.byref(status))
+        if handle:
+            self._handle = handle
+            return True
+        if status.value == SHM_OPEN_NOT_FOUND:
+            return False
+        if status.value == SHM_OPEN_INCOMPATIBLE:
+            raise RuntimeError(
+                "Incompatible Lite6 state shared memory segment (magic/version/size mismatch)"
+            )
+        raise RuntimeError(
+            f"Failed to open read-only Lite6 state shared memory (status={status.value})"
+        )
 
     def read_joint_state(self):
         """Return (JointStatePod, seq) when valid, or (None, 0)."""
-        if not self._handle:
+        if not self._handle and not self._try_open():
             return None, 0
         ok = _LIB.lite6_shm_read_joint_state(
             self._handle, ctypes.byref(self._pod), ctypes.byref(self._seq)
@@ -152,9 +188,16 @@ class SysIdShmReader:
     """SPSC shared-memory ring consumer for lossless 1 kHz SysID samples."""
 
     def __init__(self, batch_size: int = 256):
-        self._handle = _LIB.lite6_shm_sysid_open(1)
+        status = ctypes.c_int(SHM_OPEN_OS_ERROR)
+        self._handle = _LIB.lite6_shm_sysid_open_ex(1, ctypes.byref(status))
         if not self._handle:
-            raise RuntimeError("Failed to open Lite6 SysID shared memory")
+            if status.value == SHM_OPEN_INCOMPATIBLE:
+                raise RuntimeError(
+                    "Incompatible Lite6 SysID shared memory segment (magic/version/size mismatch)"
+                )
+            raise RuntimeError(
+                f"Failed to open Lite6 SysID shared memory (status={status.value})"
+            )
         self._batch_size = int(batch_size)
         self._batch_buf = (SysIdSamplePod * self._batch_size)()
 

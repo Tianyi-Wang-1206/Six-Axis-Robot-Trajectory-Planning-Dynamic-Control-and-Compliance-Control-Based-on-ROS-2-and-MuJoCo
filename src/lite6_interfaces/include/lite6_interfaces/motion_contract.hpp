@@ -6,9 +6,10 @@
 namespace lite6_interfaces::contract
 {
 
-// Primary 1 kHz control and sampling cadence.
+// Primary 1 kHz control and sampling cadence (sampled PVA ZOH playback).
 inline constexpr double kControlRateHz = 1000.0;
 inline constexpr double kControlDtSec = 0.001;
+inline constexpr double kTrajectorySampleSpacingTolSec = 1e-6;
 
 // Nested speed and velocity tolerance hierarchy:
 //   kPlannerSettleSpeedRadPerSec < kControllerEntryMaxSpeedRadPerSec <= kClearEstopMaxSpeedRadPerSec

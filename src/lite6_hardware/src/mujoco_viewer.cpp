@@ -81,11 +81,25 @@ public:
     options_.sitegroup[4] = 0;
     reset_camera();
 
-    if (!state_shm_.open(false)) {
-      throw std::runtime_error("Cannot open read-only state shared memory");
-    }
-    if (!perturb_shm_.open(true)) {
-      throw std::runtime_error("Cannot open perturbation shared memory");
+    {
+      using lite6_interfaces::shm::ShmOpenStatus;
+      using lite6_interfaces::shm::shm_open_status_name;
+      const auto state_st = state_shm_.open_status(false);
+      if (state_st == ShmOpenStatus::NOT_FOUND) {
+        RCLCPP_INFO(
+          node_->get_logger(),
+          "State shared memory not present yet; will attach lazily when ros2_control starts");
+      } else if (state_st != ShmOpenStatus::OK) {
+        throw std::runtime_error(
+          std::string("Cannot open read-only state shared memory (") +
+          shm_open_status_name(state_st) + ")");
+      }
+      const auto perturb_st = perturb_shm_.open_status(true);
+      if (perturb_st != ShmOpenStatus::OK) {
+        throw std::runtime_error(
+          std::string("Cannot open perturbation shared memory (") +
+          shm_open_status_name(perturb_st) + ")");
+      }
     }
 
     glfwWindowHint(GLFW_SAMPLES, 8);
@@ -233,7 +247,16 @@ private:
   }
   void poll_shm_state()
   {
-    if (!state_shm_.valid()) {return;}
+    if (!state_shm_.valid()) {
+      const auto st = state_shm_.open_status(false);
+      if (st == lite6_interfaces::shm::ShmOpenStatus::INCOMPATIBLE) {
+        throw std::runtime_error(
+          "Incompatible read-only state shared memory segment (magic/version/size mismatch)");
+      }
+      if (st != lite6_interfaces::shm::ShmOpenStatus::OK) {
+        return;
+      }
+    }
     const int64_t steady_now = now_ns();
     const int64_t alive_ns = state_shm_->visual_alive_ns.load(std::memory_order_acquire);
 
@@ -241,7 +264,7 @@ private:
     uint64_t vis_seq = 0;
     if (state_shm_->visual_state.read(vis, vis_seq) && vis.valid != 0) {
       const int64_t latest_stamp = std::max(vis.published_steady_ns, alive_ns);
-      if (latest_stamp > 0 && steady_now - latest_stamp < 250000000LL) {
+      if (lite6_interfaces::shm::is_stamp_fresh(latest_stamp, steady_now, 250000000LL)) {
         bool ok = std::isfinite(vis.simulation_time);
         for (size_t i = 0; i < 6 && ok; ++i) {
           ok = std::isfinite(vis.position[i]) && std::isfinite(vis.velocity[i]);
@@ -283,7 +306,7 @@ private:
           last_state_ = Clock::now();
         }
       }
-    } else if (alive_ns > 0 && steady_now - alive_ns < 250000000LL) {
+    } else if (lite6_interfaces::shm::is_stamp_fresh(alive_ns, steady_now, 250000000LL)) {
       active_ = false;
       last_state_ = Clock::now();
     }
@@ -291,7 +314,7 @@ private:
     lite6_interfaces::shm::ShadowStatePod shadow{};
     uint64_t shadow_seq = 0;
     if (state_shm_->shadow_state.read(shadow, shadow_seq) && shadow.valid != 0 &&
-      shadow.stamp_ns > 0 && steady_now - shadow.stamp_ns < 500000000LL)
+      lite6_interfaces::shm::is_stamp_fresh(shadow.stamp_ns, steady_now, 500000000LL))
     {
       bool ok = true;
       for (size_t i = 0; i < 6; ++i) {

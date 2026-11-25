@@ -767,8 +767,11 @@ bool ProgramCompiler::build_cartesian_joint_path(
       }
     }
 
-    // d3q/du3 by clean central difference of the exact analytic d2q/du2 (only at new knots
-    // and their immediate neighbors whose spacing shrank).
+    // d3q/du3 by central difference of the exact analytic d2q/du2 (only at new knots
+    // and their immediate neighbors whose spacing shrank). Exact on globally C^3 Cartesian
+    // paths (CompositeCartesianPath and C3CartesianSpline); acts as a local smoothing
+    // approximation across any interior knot of a custom C^2-only path with discontinuous
+    // angular jerk before constructing the C^3 septic Hermite joint spline.
     auto q2_at = [&](size_t k, double uu, Vec6 & out) -> bool {
       const double du = uu - knots[k].u;
       const Vec6 guess = knots[k].q + du * (knots[k].m1 + 0.5 * du * knots[k].m2);
@@ -1271,8 +1274,15 @@ bool ProgramCompiler::compile_pva_statement(
   bool is_impedance,
   const ImpedanceParams & imp_params,
   ExecutionBlock & out_block,
-  std::vector<Diagnostic> & out_diagnostics) const
+  std::vector<Diagnostic> & out_diagnostics,
+  const Cancellation & is_cancelled) const
 {
+  if (is_cancelled && is_cancelled()) {
+    add_diag(
+      out_diagnostics, D::STAGE_PLANNING, pva.loc, "ERR_CANCELLED",
+      "Motion cancelled by supervisor");
+    return false;
+  }
   const auto limits = motion_limits(is_impedance);
   const auto & cart_limits = engine_.get_cartesian_limits();
   auto workspace = engine_.collision_workspace();
@@ -1345,7 +1355,8 @@ bool ProgramCompiler::compile_pva_statement(
         return false;
       }
       if (!plan_cartesian_path(
-            cart_spline, start_q, pva.options, pva.loc, is_impedance, sampled, out_diagnostics))
+            cart_spline, start_q, pva.options, pva.loc, is_impedance, sampled, out_diagnostics,
+            is_cancelled))
       {
         return false;
       }
@@ -1380,14 +1391,14 @@ bool ProgramCompiler::compile_pva_statement(
     CartesianCollocationResult coll_res;
     if (!CartesianCollocationSolver::solve(
           engine_, start_q, coll_wps, limits, cart_limits, pva.options,
-          coll_res, out_diagnostics))
+          coll_res, out_diagnostics, is_cancelled))
     {
       return false;
     }
 
     sampled = std::move(coll_res.trajectory);
     if (!verify_sampled_trajectory_1khz(
-          sampled, /*check_singularity=*/true, out_diagnostics, is_impedance))
+          sampled, /*check_singularity=*/true, out_diagnostics, is_impedance, true, is_cancelled))
     {
       return false;
     }
@@ -1428,7 +1439,14 @@ bool ProgramCompiler::compile_pva_statement(
       scurve.build(
         start_q, q_nodes[1], limits,
         pva.options.vel_scale, pva.options.acc_scale, pva.options.jerk_scale);
-      sampled = scurve_samples(scurve, pva.waypoints.front().loc, 0.0, 1.0);
+      bool cancelled = false;
+      sampled = scurve_samples(
+        scurve, pva.waypoints.front().loc, 0.0, 1.0, is_cancelled, &cancelled);
+      if (cancelled) {
+        add_diag(out_diagnostics, D::STAGE_PLANNING, pva.loc, "ERR_CANCELLED",
+          "Motion cancelled by supervisor");
+        return false;
+      }
     } else {
       // Pure (P) sequence: C^3 joint spline + 3rd-order direct-transcription TOPP timing.
       const std::vector<double> knot_u = C3JointSpline::chord_length_parameters(q_nodes);
@@ -1440,12 +1458,17 @@ bool ProgramCompiler::compile_pva_statement(
       }
       std::string topp_err;
       std::vector<std::string> topp_warnings;
+      TOPPSolveOptions topp_opts;
+      topp_opts.is_cancelled = is_cancelled;
       if (!TOPPJerkSolver::solve(
             spline, nullptr, limits, cart_limits,
             pva.options.vel_scale, pva.options.acc_scale, pva.options.jerk_scale,
-            pva.loc, sampled, topp_err, &topp_warnings))
+            pva.loc, sampled, topp_err, &topp_warnings, topp_opts))
       {
-        add_diag(out_diagnostics, D::STAGE_PLANNING, pva.loc, "ERR_TOPP_SOLVER", topp_err);
+        const bool was_cancelled = (is_cancelled && is_cancelled());
+        add_diag(
+          out_diagnostics, D::STAGE_PLANNING, pva.loc,
+          was_cancelled ? "ERR_CANCELLED" : "ERR_TOPP_SOLVER", topp_err);
         return false;
       }
       for (const auto & w : topp_warnings) {
@@ -1467,7 +1490,7 @@ bool ProgramCompiler::compile_pva_statement(
     if (!JointPVASolver::solve_multi_waypoint(
           start_q, pva.waypoints, limits,
           pva.options.vel_scale, pva.options.acc_scale, pva.options.jerk_scale,
-          pva_res, pva_err_loc, pva_err_code, pva_err_msg))
+          pva_res, pva_err_loc, pva_err_code, pva_err_msg, is_cancelled))
     {
       const uint8_t stage =
         (pva_err_code == "ERR_JOINT_POS_LIMIT" ||
@@ -1483,7 +1506,7 @@ bool ProgramCompiler::compile_pva_statement(
   }
 
   if (!verify_sampled_trajectory_1khz(
-        sampled, /*check_singularity=*/false, out_diagnostics, is_impedance))
+        sampled, /*check_singularity=*/false, out_diagnostics, is_impedance, true, is_cancelled))
   {
     return false;
   }
@@ -1500,10 +1523,18 @@ bool ProgramCompiler::compile(
   const std::string & source_code,
   const std::array<double, 6> & start_joints,
   CompiledProgram & out_program,
-  std::vector<Diagnostic> & out_diagnostics) const
+  std::vector<Diagnostic> & out_diagnostics,
+  const Cancellation & is_cancelled) const
 {
   out_program = CompiledProgram{};
   out_diagnostics.clear();
+
+  if (is_cancelled && is_cancelled()) {
+    add_diag(
+      out_diagnostics, D::STAGE_PLANNING, SourceLocation{}, "ERR_CANCELLED",
+      "Compilation cancelled by supervisor");
+    return false;
+  }
 
   // Stages 1 & 2: Lexical, Syntax, and Semantic Analysis
   ASTProgram ast;
@@ -1531,6 +1562,12 @@ bool ProgramCompiler::compile(
     size_t i = 0;
     while (i < stmts.size()) {
       const auto & st = stmts[i];
+      if (is_cancelled && is_cancelled()) {
+        add_diag(
+          out_diagnostics, D::STAGE_PLANNING, st.loc, "ERR_CANCELLED",
+          "Compilation cancelled by supervisor");
+        return false;
+      }
       if (st.kind == StatementKind::MOTION) {
         const auto mtype = st.motion->type;
         const bool is_cart =
@@ -1593,8 +1630,9 @@ bool ProgramCompiler::compile(
 
         ExecutionBlock blk;
         const bool ok = is_cart ?
-          compile_cartesian_group(group, curr_q, is_impedance, imp_params, blk, out_diagnostics) :
-          compile_joint_group(group, curr_q, blk, out_diagnostics);
+          compile_cartesian_group(
+            group, curr_q, is_impedance, imp_params, blk, out_diagnostics, is_cancelled) :
+          compile_joint_group(group, curr_q, blk, out_diagnostics, is_cancelled);
         if (!ok) {
           return false;
         }
@@ -1604,7 +1642,8 @@ bool ProgramCompiler::compile(
       } else if (st.kind == StatementKind::MOVE_PVA) {
         ExecutionBlock blk;
         if (!compile_pva_statement(
-              *st.move_pva, curr_q, is_impedance, imp_params, blk, out_diagnostics)) {
+              *st.move_pva, curr_q, is_impedance, imp_params, blk, out_diagnostics, is_cancelled))
+        {
           return false;
         }
         curr_q = blk.end_joints;
@@ -1808,8 +1847,13 @@ bool ProgramCompiler::plan_alignment_bridge(
   double vel_scale,
   double acc_scale,
   trajectory_msgs::msg::JointTrajectory & out_traj,
-  std::string & out_error) const
+  std::string & out_error,
+  const Cancellation & is_cancelled) const
 {
+  if (is_cancelled && is_cancelled()) {
+    out_error = "Motion cancelled by supervisor";
+    return false;
+  }
   const auto & limits = engine_.get_joint_limits();
   std::array<double, 6> q0 = q_from;
   std::array<double, 6> q1 = q_to;
@@ -1829,10 +1873,16 @@ bool ProgramCompiler::plan_alignment_bridge(
   MultiAxisSCurve scurve;
   scurve.build(q0, q1, limits, std::clamp(vel_scale, 0.05, 1.0), std::clamp(acc_scale, 0.05, 1.0));
   const SourceLocation bridge_loc{0, 0, -1, "<alignment_bridge>"};
-  const SampledTrajectory1kHz sampled = scurve_samples(scurve, bridge_loc, 0.0, 1.0);
+  bool cancelled = false;
+  const SampledTrajectory1kHz sampled = scurve_samples(
+    scurve, bridge_loc, 0.0, 1.0, is_cancelled, &cancelled);
+  if (cancelled) {
+    out_error = "Motion cancelled by supervisor";
+    return false;
+  }
 
   std::vector<Diagnostic> diags;
-  if (!verify_sampled_trajectory_1khz(sampled, false, diags)) {
+  if (!verify_sampled_trajectory_1khz(sampled, false, diags, false, true, is_cancelled)) {
     out_error = first_error_message(diags, "Alignment bridge failed verification");
     return false;
   }
@@ -1910,8 +1960,9 @@ ProgramCompiler::PauseSpliceStatus ProgramCompiler::plan_pause_splice(
     return full;
   };
 
-  // Original reference at block time tau: cubic Hermite position from (q, dq) and
-  // linear velocity/acceleration between neighboring 1 kHz samples.
+  // Original reference at block time tau: single consistent quintic Hermite polynomial
+  // per 1 ms interval matching endpoint (q, dq, ddq) at both ends, ensuring
+  // dq = d/dtau q and ddq = d^2/dtau^2 q identically (and exact on constant-jerk cubics).
   auto eval_orig = [&](double tau, Vec6 & q, Vec6 & dq, Vec6 & ddq) {
     tau = std::clamp(tau, 0.0, t_end);
     size_t a = std::min(n - 2, static_cast<size_t>(std::max(0.0, std::floor(tau / kDt))));
@@ -1924,19 +1975,30 @@ ProgramCompiler::PauseSpliceStatus ProgramCompiler::plan_pause_splice(
     const auto & pa = pts[a];
     const auto & pb = pts[a + 1];
     const double h = std::max(1e-9, t_of(pb) - t_of(pa));
+    const double h2 = h * h;
     const double s = std::clamp((tau - t_of(pa)) / h, 0.0, 1.0);
     const double s2 = s * s;
     const double s3 = s2 * s;
-    const double h00 = 2.0 * s3 - 3.0 * s2 + 1.0;
-    const double h10 = s3 - 2.0 * s2 + s;
-    const double h01 = -2.0 * s3 + 3.0 * s2;
-    const double h11 = s3 - s2;
+    const double s4 = s3 * s;
+    const double s5 = s4 * s;
     for (int i = 0; i < 6; ++i) {
       const size_t j = static_cast<size_t>(i);
-      q[i] = h00 * pa.positions[j] + h10 * h * pa.velocities[j] +
-        h01 * pb.positions[j] + h11 * h * pb.velocities[j];
-      dq[i] = (1.0 - s) * pa.velocities[j] + s * pb.velocities[j];
-      ddq[i] = (1.0 - s) * pa.accelerations[j] + s * pb.accelerations[j];
+      const double q0 = pa.positions[j];
+      const double v0 = pa.velocities[j];
+      const double a0 = pa.accelerations[j];
+      const double q1 = pb.positions[j];
+      const double v1 = pb.velocities[j];
+      const double a1 = pb.accelerations[j];
+      const double d = q1 - q0;
+      const double c0 = q0;
+      const double c1 = v0 * h;
+      const double c2 = 0.5 * a0 * h2;
+      const double c3 = 10.0 * d - (6.0 * v0 + 4.0 * v1) * h - (1.5 * a0 - 0.5 * a1) * h2;
+      const double c4 = -15.0 * d + (8.0 * v0 + 7.0 * v1) * h + (1.5 * a0 - a1) * h2;
+      const double c5 = 6.0 * d - 3.0 * (v0 + v1) * h - 0.5 * (a0 - a1) * h2;
+      q[i] = c0 + c1 * s + c2 * s2 + c3 * s3 + c4 * s4 + c5 * s5;
+      dq[i] = (c1 + 2.0 * c2 * s + 3.0 * c3 * s2 + 4.0 * c4 * s3 + 5.0 * c5 * s4) / h;
+      ddq[i] = (2.0 * c2 + 6.0 * c3 * s + 12.0 * c4 * s2 + 20.0 * c5 * s3) / h2;
     }
   };
 
@@ -2123,8 +2185,19 @@ bool ProgramCompiler::replan_remaining_block(
   size_t pause_sample_idx,
   const std::array<double, 6> & q_actual,
   ExecutionBlock & out_resumed_block,
-  std::string & out_error) const
+  std::string & out_error,
+  const Cancellation & is_cancelled) const
 {
+  auto cancelled_now = [&]() -> bool {
+    if (is_cancelled && is_cancelled()) {
+      out_error = "Motion cancelled by supervisor";
+      return true;
+    }
+    return false;
+  };
+  if (cancelled_now()) {
+    return false;
+  }
   const bool is_imp = (original_block.type == ExecutionBlockType::IMPEDANCE_TRAJECTORY);
   const size_t total_pts = is_imp ?
     original_block.impedance_goal.points.size() :
@@ -2237,10 +2310,15 @@ bool ProgramCompiler::replan_remaining_block(
   bool check_singularity = has_cartesian_path;
   bool straight_to_end = has_cartesian_path ? u_r >= 1.0 : (total_pts - 1 - resume_idx) <= 5;
   if (!straight_to_end) {
+    if (cancelled_now()) {
+      return false;
+    }
     std::vector<Diagnostic> diags;
     if (has_cartesian_path) {
       const RestrictedCartesianPath sub(original_block.cartesian_path, u_r);
-      if (!plan_cartesian_path(sub, get_pt_q(resume_idx), opts, loc_r, is_imp, rest, diags)) {
+      if (!plan_cartesian_path(
+            sub, get_pt_q(resume_idx), opts, loc_r, is_imp, rest, diags, is_cancelled))
+      {
         return diag_error(diags, "Resumed Cartesian path planning failed");
       }
       map_path_u(rest);
@@ -2259,7 +2337,7 @@ bool ProgramCompiler::replan_remaining_block(
           JointCompositePath full;
           if (!build_joint_group_path(
                 original_block.source_motions, original_block.path_start_joints,
-                waypoints, full, diags))
+                waypoints, full, diags, is_cancelled))
           {
             return diag_error(diags, "Cannot rebuild joint path for resume");
           }
@@ -2271,9 +2349,12 @@ bool ProgramCompiler::replan_remaining_block(
           }
           const JointCompositePath sub = full.restricted(u_r);
           std::string topp_err;
+          TOPPSolveOptions topp_opts;
+          topp_opts.is_cancelled = is_cancelled;
           if (!TOPPJerkSolver::solve(
                 sub, nullptr, limits, engine_.get_cartesian_limits(),
-                opts.vel_scale, opts.acc_scale, opts.jerk_scale, loc_r, rest, topp_err))
+                opts.vel_scale, opts.acc_scale, opts.jerk_scale, loc_r, rest, topp_err,
+                nullptr, topp_opts))
           {
             out_error = "Resumed joint path planning failed: " + topp_err;
             return false;
@@ -2313,9 +2394,12 @@ bool ProgramCompiler::replan_remaining_block(
           C3JointSpline spline;
           spline.build(knots);
           std::string topp_err;
+          TOPPSolveOptions topp_opts;
+          topp_opts.is_cancelled = is_cancelled;
           if (!TOPPJerkSolver::solve(
                 spline, nullptr, limits, engine_.get_cartesian_limits(),
-                opts.vel_scale, opts.acc_scale, opts.jerk_scale, loc_r, rest, topp_err))
+                opts.vel_scale, opts.acc_scale, opts.jerk_scale, loc_r, rest, topp_err,
+                nullptr, topp_opts))
           {
             out_error = "Resumed trajectory planning failed: " + topp_err;
             return false;
@@ -2336,6 +2420,10 @@ bool ProgramCompiler::replan_remaining_block(
       }
     }
 
+  }
+
+  if (cancelled_now()) {
+    return false;
   }
 
   // 4. Rejoin: rest-to-rest straight joint motion from the actual configuration.
@@ -2364,15 +2452,22 @@ bool ProgramCompiler::replan_remaining_block(
     }
     MultiAxisSCurve scurve;
     scurve.build(q_from, join_q, limits, vs, as, opts.jerk_scale);
+    bool cancelled = false;
     combined = scurve_samples(
-      scurve, loc_r, u_r, straight_to_end ? 1.0 : u_r);
+      scurve, loc_r, u_r, straight_to_end ? 1.0 : u_r, is_cancelled, &cancelled);
+    if (cancelled) {
+      out_error = "Motion cancelled by supervisor";
+      return false;
+    }
   }
   if (!straight_to_end) {
     append_at_rest(combined, rest);
   }
 
   std::vector<Diagnostic> diags;
-  if (!verify_sampled_trajectory_1khz(combined, check_singularity, diags, is_imp)) {
+  if (!verify_sampled_trajectory_1khz(
+        combined, check_singularity, diags, is_imp, true, is_cancelled))
+  {
     return diag_error(diags, "Resumed trajectory failed verification");
   }
 
@@ -2390,9 +2485,16 @@ bool ProgramCompiler::replan_block_from_start(
   const ExecutionBlock & original_block,
   const std::array<double, 6> & q_actual,
   ExecutionBlock & out_replanned_block,
-  std::vector<Diagnostic> & out_diagnostics) const
+  std::vector<Diagnostic> & out_diagnostics,
+  const Cancellation & is_cancelled) const
 {
   out_diagnostics.clear();
+  if (is_cancelled && is_cancelled()) {
+    add_diag(
+      out_diagnostics, D::STAGE_PLANNING, original_block.loc, "ERR_CANCELLED",
+      "Motion cancelled by supervisor");
+    return false;
+  }
   std::array<double, 6> start_q{};
   if (!validate_and_clamp_start_joints(q_actual, original_block.loc, start_q, out_diagnostics)) {
     return false;
@@ -2403,14 +2505,14 @@ bool ProgramCompiler::replan_block_from_start(
     case BlockSourceKind::CARTESIAN_GROUP:
       return compile_cartesian_group(
         original_block.source_motions, start_q, is_imp, original_block.impedance_params,
-        out_replanned_block, out_diagnostics);
+        out_replanned_block, out_diagnostics, is_cancelled);
     case BlockSourceKind::JOINT_GROUP:
       return compile_joint_group(
-        original_block.source_motions, start_q, out_replanned_block, out_diagnostics);
+        original_block.source_motions, start_q, out_replanned_block, out_diagnostics, is_cancelled);
     case BlockSourceKind::MOVE_PVA:
       return compile_pva_statement(
         original_block.source_pva, start_q, is_imp, original_block.impedance_params,
-        out_replanned_block, out_diagnostics);
+        out_replanned_block, out_diagnostics, is_cancelled);
     case BlockSourceKind::NONE:
     default:
       add_diag(

@@ -224,17 +224,42 @@ hardware_interface::CallbackReturn Lite6MujocoSystem::on_init(
 hardware_interface::CallbackReturn Lite6MujocoSystem::on_configure(
   const rclcpp_lifecycle::State &)
 {
-  if (!state_shm_->valid() && !state_shm_->open(true)) {
-    RCLCPP_ERROR(rclcpp::get_logger("Lite6MujocoSystem"), "Failed to open state shared memory");
-    return hardware_interface::CallbackReturn::ERROR;
+  using lite6_interfaces::shm::ShmOpenStatus;
+  using lite6_interfaces::shm::shm_open_status_name;
+  if (!state_shm_->valid()) {
+    const auto st = state_shm_->open_status(true);
+    if (st != ShmOpenStatus::OK) {
+      RCLCPP_ERROR(
+        rclcpp::get_logger("Lite6MujocoSystem"),
+        "Failed to open state shared memory (%s)", shm_open_status_name(st));
+      return hardware_interface::CallbackReturn::ERROR;
+    }
   }
-  if (!perturb_shm_.valid() && !perturb_shm_.open(false)) {
-    RCLCPP_ERROR(rclcpp::get_logger("Lite6MujocoSystem"), "Failed to open perturbation shared memory");
-    return hardware_interface::CallbackReturn::ERROR;
+  if (!perturb_shm_->valid()) {
+    const auto st = perturb_shm_->open_status(false);
+    if (st == ShmOpenStatus::OK) {
+      perturb_shm_ptr_->store(perturb_shm_->get(), std::memory_order_release);
+    } else if (st == ShmOpenStatus::NOT_FOUND) {
+      RCLCPP_INFO(
+        rclcpp::get_logger("Lite6MujocoSystem"),
+        "Perturbation shared memory not present yet; will attach lazily when viewer starts");
+    } else {
+      RCLCPP_ERROR(
+        rclcpp::get_logger("Lite6MujocoSystem"),
+        "Failed to open read-only perturbation shared memory (%s)", shm_open_status_name(st));
+      return hardware_interface::CallbackReturn::ERROR;
+    }
+  } else {
+    perturb_shm_ptr_->store(perturb_shm_->get(), std::memory_order_release);
   }
-  if (!sysid_shm_->valid() && !sysid_shm_->open(true)) {
-    RCLCPP_ERROR(rclcpp::get_logger("Lite6MujocoSystem"), "Failed to open SysID shared memory");
-    return hardware_interface::CallbackReturn::ERROR;
+  if (!sysid_shm_->valid()) {
+    const auto st = sysid_shm_->open_status(true);
+    if (st != ShmOpenStatus::OK) {
+      RCLCPP_ERROR(
+        rclcpp::get_logger("Lite6MujocoSystem"),
+        "Failed to open SysID shared memory (%s)", shm_open_status_name(st));
+      return hardware_interface::CallbackReturn::ERROR;
+    }
   }
   if (const auto node = get_node()) {
     clock_ = node->get_clock();
@@ -456,9 +481,10 @@ hardware_interface::return_type Lite6MujocoSystem::write(
 
 void Lite6MujocoSystem::refresh_mouse_target(int64_t now_ns)
 {
-  if (!perturb_shm_.valid()) {return;}
+  const auto * seg = perturb_shm_ptr_->load(std::memory_order_acquire);
+  if (seg == nullptr) {return;}
   lite6_interfaces::shm::MousePerturbationPod message{};
-  if (!perturb_shm_->mouse_perturbation.read_if_updated(message, last_mouse_seq_)) {
+  if (!seg->mouse_perturbation.read_if_updated(message, last_mouse_seq_)) {
     return;
   }
   MouseTarget target;
@@ -467,8 +493,8 @@ void Lite6MujocoSystem::refresh_mouse_target(int64_t now_ns)
       return std::all_of(begin, end,
         [](double v) {return std::isfinite(v) && std::abs(v) <= 100.0;});
     };
-  const bool valid = message.issued_ns > 0 && message.issued_ns <= now_ns &&
-    now_ns - message.issued_ns < 200000000 &&
+  const bool valid =
+    lite6_interfaces::shm::is_stamp_fresh(message.issued_ns, now_ns, 200000000LL) &&
     std::find(perturb_bodies_.begin(), perturb_bodies_.end(), message.body_id) !=
       perturb_bodies_.end() &&
     (message.active == mjPERT_TRANSLATE || message.active == mjPERT_ROTATE) &&
@@ -502,8 +528,7 @@ bool Lite6MujocoSystem::advance_physics(int64_t boundary_ns, EffortCommand & app
   refresh_mouse_target(now);
   if (last_mouse_target_.issued_ns >= activation_ns_ &&
     last_mouse_target_.issued_ns <= boundary_ns &&
-    now >= last_mouse_target_.issued_ns &&
-    now - last_mouse_target_.issued_ns < 200000000 &&
+    lite6_interfaces::shm::is_stamp_fresh(last_mouse_target_.issued_ns, now, 200000000LL) &&
     last_mouse_target_.perturb.active)
   {
     mjv_applyPerturbForce(m_model, m_data, &last_mouse_target_.perturb);
@@ -697,15 +722,33 @@ void Lite6MujocoSystem::configure_diagnostics()
   const auto clock = node->get_clock();
   const auto diagnostics = diagnostics_;
   const auto state_shm = state_shm_;
+  const auto perturb_shm = perturb_shm_;
+  const auto perturb_shm_ptr = perturb_shm_ptr_;
   const auto sysid_shm = sysid_shm_;
   const auto hardware_name = info_.name;
+  auto perturb_incompat_logged = std::make_shared<bool>(false);
   // No captured hardware pointer: an in-flight callback remains valid even
   // during plugin destruction. All ROS formatting/publication is non-RT.
   diagnostics_timer_ = node->create_wall_timer(std::chrono::milliseconds(100),
-    [diagnostics, publisher, clock, hardware_name, state_shm, sysid_shm] {
+    [diagnostics, publisher, clock, hardware_name, state_shm, perturb_shm, perturb_shm_ptr,
+     sysid_shm, perturb_incompat_logged] {
       const int64_t now = steady_now_ns();
       if (state_shm && state_shm->valid()) {
         state_shm->get()->visual_alive_ns.store(now, std::memory_order_release);
+      }
+      if (perturb_shm && !perturb_shm->valid()) {
+        const auto st = perturb_shm->open_status(false);
+        if (st == lite6_interfaces::shm::ShmOpenStatus::OK) {
+          perturb_shm_ptr->store(perturb_shm->get(), std::memory_order_release);
+          *perturb_incompat_logged = false;
+        } else if (st == lite6_interfaces::shm::ShmOpenStatus::INCOMPATIBLE &&
+                   !*perturb_incompat_logged)
+        {
+          *perturb_incompat_logged = true;
+          RCLCPP_ERROR(
+            rclcpp::get_logger("Lite6MujocoSystem"),
+            "Incompatible perturbation shared memory segment detected (magic/version/size mismatch)");
+        }
       }
       bool sysid_obs = false;
       if (sysid_shm && sysid_shm->valid() &&
@@ -713,7 +756,7 @@ void Lite6MujocoSystem::configure_diagnostics()
       {
         const int64_t hb =
           sysid_shm->get()->consumer_heartbeat_ns.load(std::memory_order_acquire);
-        if (now - hb <= 1500000000LL) {
+        if (lite6_interfaces::shm::is_stamp_fresh(hb, now, 1500000000LL)) {
           sysid_obs = true;
         } else {
           sysid_shm->get()->consumer_active.store(0U, std::memory_order_release);

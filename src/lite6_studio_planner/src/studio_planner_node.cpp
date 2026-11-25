@@ -14,6 +14,7 @@
 #include "lite6_interfaces/srv/compile_program.hpp"
 #include "lite6_interfaces/srv/controller_command.hpp"
 #include "lite6_interfaces/srv/gripper_command.hpp"
+#include "lite6_interfaces/srv/splice_joint_trajectory.hpp"
 #include "lite6_interfaces/srv/studio_command.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -67,6 +68,7 @@ public:
   using FollowImpedanceTrajectory = lite6_interfaces::action::FollowImpedanceTrajectory;
   using CompileProgram = lite6_interfaces::srv::CompileProgram;
   using ControllerCommand = lite6_interfaces::srv::ControllerCommand;
+  using SpliceJointTrajectory = lite6_interfaces::srv::SpliceJointTrajectory;
   using StudioCommand = lite6_interfaces::srv::StudioCommand;
   using GripperCommand = lite6_interfaces::srv::GripperCommand;
   using GripperState = lite6_interfaces::msg::GripperState;
@@ -95,8 +97,18 @@ public:
     client_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     ctc_cmd_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
-    if (!state_shm_.open(false)) {
-      throw std::runtime_error("Failed to open read-only state shared memory");
+    const auto shm_status = state_shm_.open_status(false);
+    if (shm_status == lite6_interfaces::shm::ShmOpenStatus::INCOMPATIBLE ||
+        shm_status == lite6_interfaces::shm::ShmOpenStatus::OS_ERROR)
+    {
+      throw std::runtime_error(
+        std::string("Failed to open read-only state shared memory: ") +
+        lite6_interfaces::shm::shm_open_status_name(shm_status));
+    }
+    if (shm_status == lite6_interfaces::shm::ShmOpenStatus::NOT_FOUND) {
+      RCLCPP_INFO(
+        get_logger(),
+        "State shared memory not created yet; waiting lazily for hardware interface");
     }
 
     const auto state_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
@@ -130,6 +142,8 @@ public:
       this, "/ctc_controller/follow_joint_trajectory", client_group_);
     imp_client_ = rclcpp_action::create_client<FollowImpedanceTrajectory>(
       this, "/ctc_controller/follow_impedance_trajectory", client_group_);
+    splice_client_ = create_client<SpliceJointTrajectory>(
+      "/ctc_controller/splice_joint_trajectory", rclcpp::ServicesQoS(), client_group_);
     gripper_client_ = create_client<GripperCommand>(
       "/gripper/command", rclcpp::ServicesQoS(), client_group_);
 
@@ -171,6 +185,14 @@ public:
   }
 
 private:
+  template <typename ActionT>
+  struct InFlightAction
+  {
+    std::mutex mutex;
+    bool cancelled = false;
+    typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr handle;
+  };
+
   enum class ActionOutcome
   {
     SUCCEEDED,
@@ -191,6 +213,7 @@ private:
   {
     StudioState msg;
     msg.stamp = now();
+    msg.planner_epoch = snap.planner_epoch;
     msg.revision = snap.revision;
     msg.state = snap.state;
     msg.loaded_program_id = snap.loaded_program_id;
@@ -261,8 +284,8 @@ private:
     auto future = ctc_cmd_client_->async_send_request(req);
     if (future.wait_for(std::chrono::milliseconds(250)) != std::future_status::ready) {
       ctc_cmd_client_->remove_pending_request(future);
-      // No response: outcome unknown (callers must decide from observed controller mode).
-      out_ack = ControllerCommand::Response::ACK_RT_TIMEOUT;
+      // No response: outcome unknown (callers must reconcile via observed telemetry).
+      out_ack = ControllerCommand::Response::ACK_OUTCOME_UNKNOWN;
       out_msg = "Timed out waiting for /ctc_controller/command response";
       return false;
     }
@@ -282,10 +305,16 @@ private:
     }
     auto req = std::make_shared<GripperCommand::Request>();
     req->command = GripperCommand::Request::STOP;
-    auto future = gripper_client_->async_send_request(req);
-    if (wait_ack) {
-      if (future.wait_for(std::chrono::milliseconds(250)) != std::future_status::ready) {
-        gripper_client_->remove_pending_request(future);
+    std::optional<rclcpp::Client<GripperCommand>::FutureAndRequestId> future;
+    {
+      // Serialize gripper STOP with guarded worker dispatches so a superseded worker
+      // can never issue OPEN/CLOSE after an E-STOP or STOP gripper halt.
+      std::lock_guard<std::mutex> lock(dispatch_mutex_);
+      future.emplace(gripper_client_->async_send_request(req));
+    }
+    if (wait_ack && future.has_value()) {
+      if (future->future.wait_for(std::chrono::milliseconds(250)) != std::future_status::ready) {
+        gripper_client_->remove_pending_request(*future);
       }
     }
   }
@@ -295,9 +324,11 @@ private:
     if (effects.send_estop_cmd) {
       send_controller_command_async(
         ControllerCommand::Request::CMD_ESTOP, 0, "Trajectory supervisor E-STOP");
-      if (gripper_block_active_.load(std::memory_order_acquire)) {
-        send_gripper_stop(false);
-      }
+    }
+    if ((effects.send_estop_cmd || effects.cancel_controller_goals) &&
+        gripper_block_active_.load(std::memory_order_acquire))
+    {
+      send_gripper_stop(false);
     }
     if (effects.send_enter_normal_cmd) {
       send_controller_command_async(
@@ -318,23 +349,39 @@ private:
 
   void cancel_active_controller_goals()
   {
-    rclcpp_action::ClientGoalHandle<FollowJointTrajectory>::SharedPtr rigid_gh;
-    rclcpp_action::ClientGoalHandle<FollowImpedanceTrajectory>::SharedPtr imp_gh;
+    std::shared_ptr<InFlightAction<FollowJointTrajectory>> rigid_disp;
+    std::shared_ptr<InFlightAction<FollowImpedanceTrajectory>> imp_disp;
     {
-      std::lock_guard<std::mutex> lock(goal_mutex_);
-      rigid_gh = active_rigid_goal_;
-      imp_gh = active_imp_goal_;
+      std::lock_guard<std::mutex> lock(dispatch_mutex_);
+      rigid_disp = active_rigid_dispatch_;
+      imp_disp = active_imp_dispatch_;
     }
-    if (rigid_gh) {
-      try {
-        (void)rigid_client_->async_cancel_goal(rigid_gh);
-      } catch (const std::exception &) {
+    if (rigid_disp) {
+      rclcpp_action::ClientGoalHandle<FollowJointTrajectory>::SharedPtr rigid_gh;
+      {
+        std::lock_guard<std::mutex> lock(rigid_disp->mutex);
+        rigid_disp->cancelled = true;
+        rigid_gh = rigid_disp->handle;
+      }
+      if (rigid_gh) {
+        try {
+          (void)rigid_client_->async_cancel_goal(rigid_gh);
+        } catch (const std::exception &) {
+        }
       }
     }
-    if (imp_gh) {
-      try {
-        (void)imp_client_->async_cancel_goal(imp_gh);
-      } catch (const std::exception &) {
+    if (imp_disp) {
+      rclcpp_action::ClientGoalHandle<FollowImpedanceTrajectory>::SharedPtr imp_gh;
+      {
+        std::lock_guard<std::mutex> lock(imp_disp->mutex);
+        imp_disp->cancelled = true;
+        imp_gh = imp_disp->handle;
+      }
+      if (imp_gh) {
+        try {
+          (void)imp_client_->async_cancel_goal(imp_gh);
+        } catch (const std::exception &) {
+        }
       }
     }
   }
@@ -342,7 +389,18 @@ private:
   void poll_joint_state_shm()
   {
     if (!state_shm_.valid()) {
-      return;
+      const auto status = state_shm_.open_status(false);
+      if (status != lite6_interfaces::shm::ShmOpenStatus::OK) {
+        if (status == lite6_interfaces::shm::ShmOpenStatus::INCOMPATIBLE ||
+            status == lite6_interfaces::shm::ShmOpenStatus::OS_ERROR)
+        {
+          RCLCPP_ERROR_THROTTLE(
+            get_logger(), *get_clock(), 2000,
+            "State shared memory open failed (%s); refusing to attach",
+            lite6_interfaces::shm::shm_open_status_name(status));
+        }
+        return;
+      }
     }
     lite6_interfaces::shm::JointStatePod pod{};
     uint64_t seq = 0;
@@ -350,8 +408,8 @@ private:
       return;
     }
     const int64_t now_ns = lite6_interfaces::shm::steady_now_ns();
-    if (pod.steady_stamp_ns <= 0 ||
-        now_ns - pod.steady_stamp_ns > lite6_interfaces::contract::kJointStateStaleTimeoutNs)
+    if (!lite6_interfaces::shm::is_stamp_fresh(
+          pod.steady_stamp_ns, now_ns, lite6_interfaces::contract::kJointStateStaleTimeoutNs))
     {
       return;
     }
@@ -384,10 +442,12 @@ private:
       std::lock_guard<std::mutex> lock(state_data_mutex_);
       latest_q_ = q;
       latest_dq_ = dq;
+      latest_joint_steady_ns_ = pod.steady_stamp_ns;
       has_latest_joint_ = true;
     }
 
-    const auto effects = supervisor_->observe_joint_state(pos_valid, max_abs_dq, dq_valid);
+    const auto effects =
+      supervisor_->observe_joint_state(pos_valid, max_abs_dq, dq_valid, pod.steady_stamp_ns);
     apply_effects(effects);
   }
 
@@ -429,8 +489,8 @@ private:
       uint64_t seq = 0;
       const int64_t now_ns = lite6_interfaces::shm::steady_now_ns();
       if (state_shm_->joint_state.read(pod, seq) && pod.valid != 0 &&
-          pod.steady_stamp_ns > 0 &&
-          now_ns - pod.steady_stamp_ns <= lite6_interfaces::contract::kJointStateStaleTimeoutNs)
+          lite6_interfaces::shm::is_stamp_fresh(
+            pod.steady_stamp_ns, now_ns, lite6_interfaces::contract::kJointStateStaleTimeoutNs))
       {
         bool finite_ok = true;
         double max_dq = 0.0;
@@ -449,7 +509,11 @@ private:
       }
     }
     std::lock_guard<std::mutex> lock(state_data_mutex_);
-    if (!has_latest_joint_) {
+    const int64_t now_ns = lite6_interfaces::shm::steady_now_ns();
+    if (!has_latest_joint_ ||
+        !lite6_interfaces::shm::is_stamp_fresh(
+          latest_joint_steady_ns_, now_ns, lite6_interfaces::contract::kJointStateStaleTimeoutNs))
+    {
       return false;
     }
     out_q = latest_q_;
@@ -465,6 +529,7 @@ private:
     std::shared_ptr<CompileProgram::Response> resp)
   {
     resp->request_id = req->request_id;
+    resp->planner_epoch = supervisor_->planner_epoch();
     resp->program_revision = 0;
 
     std::lock_guard<std::mutex> compile_lock(compile_mutex_);
@@ -511,7 +576,11 @@ private:
 
     auto compiled = std::make_shared<CompiledProgram>();
     std::vector<Diagnostic> diags;
-    const bool ok = compiler_->compile(req->source_code, start_joints, *compiled, diags);
+    auto shutdown_cancel = [this]() {
+      return !rclcpp::ok() || worker_exit_.load(std::memory_order_acquire);
+    };
+    const bool ok =
+      compiler_->compile(req->source_code, start_joints, *compiled, diags, shutdown_cancel);
     if (!ok) {
       if (req->auto_load) {
         {
@@ -560,13 +629,18 @@ private:
     std::lock_guard<std::mutex> cmd_lock(command_mutex_);
     const uint8_t cmd = req->command;
 
-    // Hold exec_mutex_ across supervisor state transition and execution-cursor reset
-    // (consistent with worker lock order exec_mutex_ -> supervisor_->mutex_) so the
-    // worker thread can never wake on the new session and observe a stale cursor.
+    // Hold exec_mutex_ and dispatch_mutex_ across the supervisor transition (lock order:
+    // command_mutex_ -> exec_mutex_ -> dispatch_mutex_ -> supervisor_->mutex_) so the worker
+    // can never wake on a stale cursor OR dispatch a goal/gripper/payload command after
+    // STOP/ESTOP/PAUSE has been accepted.
     StudioSupervisor::CommandResult result;
     {
       std::lock_guard<std::mutex> exec_lock(exec_mutex_);
-      result = supervisor_->handle_command(cmd, req->expected_revision, req->reason);
+      {
+        std::lock_guard<std::mutex> dispatch_lock(dispatch_mutex_);
+        result = supervisor_->handle_command(
+          cmd, req->expected_planner_epoch, req->expected_revision, req->reason);
+      }
       // STEP from COMPILED_READY always starts at block 0: a cursor left behind by a
       // step-to-end, FAULT, or controller-originated E-STOP must not be reused.
       const bool step_from_ready =
@@ -589,6 +663,7 @@ private:
     apply_effects(result.effects);
 
     resp->accepted = result.accepted;
+    resp->planner_epoch = result.planner_epoch;
     resp->revision = result.revision;
     resp->state = result.state;
     resp->controller_epoch = result.controller_epoch;
@@ -633,12 +708,10 @@ private:
     }
     const auto start_tp = std::chrono::steady_clock::now();
     while (!client->action_server_is_ready()) {
-      if (!rclcpp::ok() || session != supervisor_->active_session()) {
+      if (!rclcpp::ok() || worker_exit_.load() || session != supervisor_->active_session()) {
         return ActionOutcome::SESSION_SUPERSEDED;
       }
-      if (honor_pause_stop &&
-          (supervisor_->stop_requested(session) || supervisor_->pause_requested(session)))
-      {
+      if (honor_pause_stop && !supervisor_->can_dispatch(session, true)) {
         return ActionOutcome::CANCELED;
       }
       if (std::chrono::steady_clock::now() - start_tp > std::chrono::seconds(3)) {
@@ -647,6 +720,8 @@ private:
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+
+    auto dispatch = std::make_shared<InFlightAction<ActionT>>();
 
     struct FeedbackGate {
       std::mutex mutex;
@@ -681,10 +756,16 @@ private:
 
     typename rclcpp_action::Client<ActionT>::SendGoalOptions opts;
     opts.goal_response_callback =
-      [client, feedback_gate](
+      [client, feedback_gate, dispatch](
         const typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr & accepted) {
         if (!accepted) {
           return;
+        }
+        bool cancel_requested = false;
+        {
+          std::lock_guard<std::mutex> lock(dispatch->mutex);
+          dispatch->handle = accepted;
+          cancel_requested = dispatch->cancelled;
         }
         bool abandoned;
         {
@@ -694,12 +775,14 @@ private:
             feedback_gate->accepted_goal = accepted;
           }
         }
-        if (abandoned) {
+        if (abandoned || cancel_requested) {
           try {
             (void)client->async_cancel_goal(accepted);
           } catch (const std::exception &) {
           }
-          client->stop_callbacks(accepted);
+          if (abandoned) {
+            client->stop_callbacks(accepted);
+          }
         }
       };
     if (feedback_gate->callback) {
@@ -714,13 +797,50 @@ private:
         };
     }
 
-    if (out_goal_dispatched) {
-      *out_goal_dispatched = true;
-    }
-    auto gh_future = client->async_send_goal(goal, opts);
-    while (gh_future.wait_for(std::chrono::milliseconds(20)) != std::future_status::ready) {
-      if (!rclcpp::ok() || session != supervisor_->active_session()) {
+    (void)is_rigid_action;
+    std::shared_future<typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr> gh_future;
+    {
+      // Guarded dispatch: atomically revalidate session/STOP/PAUSE and register the in-flight
+      // dispatch under dispatch_mutex_ so STOP/ESTOP/PAUSE can never be raced by a new goal.
+      std::lock_guard<std::mutex> lock(dispatch_mutex_);
+      if (!rclcpp::ok() || worker_exit_.load() || session != supervisor_->active_session()) {
         return ActionOutcome::SESSION_SUPERSEDED;
+      }
+      if (honor_pause_stop && !supervisor_->can_dispatch(session, true)) {
+        return ActionOutcome::CANCELED;
+      }
+      if constexpr (std::is_same_v<ActionT, FollowJointTrajectory>) {
+        active_rigid_dispatch_ = dispatch;
+      } else {
+        active_imp_dispatch_ = dispatch;
+      }
+      if (out_goal_dispatched) {
+        *out_goal_dispatched = true;
+      }
+      gh_future = client->async_send_goal(goal, opts);
+    }
+    ScopeExit clear_guard{[this, dispatch]() {
+      std::lock_guard<std::mutex> lock(dispatch_mutex_);
+      if constexpr (std::is_same_v<ActionT, FollowJointTrajectory>) {
+        if (active_rigid_dispatch_ == dispatch) {
+          active_rigid_dispatch_.reset();
+        }
+      } else {
+        if (active_imp_dispatch_ == dispatch) {
+          active_imp_dispatch_.reset();
+        }
+      }
+    }};
+
+    while (gh_future.wait_for(std::chrono::milliseconds(20)) != std::future_status::ready) {
+      if (!rclcpp::ok() || worker_exit_.load() || session != supervisor_->active_session()) {
+        std::lock_guard<std::mutex> lock(dispatch->mutex);
+        dispatch->cancelled = true;
+        return ActionOutcome::SESSION_SUPERSEDED;
+      }
+      if (honor_pause_stop && supervisor_->stop_requested(session)) {
+        std::lock_guard<std::mutex> lock(dispatch->mutex);
+        dispatch->cancelled = true;
       }
       if (std::chrono::steady_clock::now() - start_tp > std::chrono::seconds(5)) {
         out_error = "Timed out waiting for controller goal response";
@@ -730,29 +850,20 @@ private:
 
     auto goal_handle = gh_future.get();
     if (!goal_handle) {
+      if (!rclcpp::ok() || worker_exit_.load() || session != supervisor_->active_session()) {
+        return ActionOutcome::SESSION_SUPERSEDED;
+      }
+      if (honor_pause_stop && supervisor_->stop_requested(session)) {
+        return ActionOutcome::CANCELED;
+      }
       out_error = "Controller rejected trajectory goal";
       return ActionOutcome::FAULT;
     }
 
-    auto set_active = [&](const auto & gh) {
-      std::lock_guard<std::mutex> lock(goal_mutex_);
-      if constexpr (std::is_same_v<ActionT, FollowJointTrajectory>) {
-        active_rigid_goal_ = gh;
-      } else {
-        active_imp_goal_ = gh;
-      }
-    };
-    auto clear_active = [&]() {
-      std::lock_guard<std::mutex> lock(goal_mutex_);
-      if constexpr (std::is_same_v<ActionT, FollowJointTrajectory>) {
-        active_rigid_goal_.reset();
-      } else {
-        active_imp_goal_.reset();
-      }
-    };
-    (void)is_rigid_action;
-    set_active(goal_handle);
-    ScopeExit clear_guard{clear_active};
+    {
+      std::lock_guard<std::mutex> lock(dispatch->mutex);
+      dispatch->handle = goal_handle;
+    }
 
     bool cancel_sent = false;
     // Set once a pause was turned into a path-preserving splice or a natural finish;
@@ -891,13 +1002,15 @@ private:
           sent_clear_cmd = true;
           last_clear_cmd_tp = now_tp;
           // Transient rejections are retried: SPEED (still moving), BUSY (trajectory
-          // or stopping ramp finishing), RT_TIMEOUT (withdrawn or no response).
+          // or stopping ramp finishing), RT_TIMEOUT (withdrawn), OUTCOME_UNKNOWN (reconcile
+          // via observed controller mode before retrying).
           // STATE while the controller already reports NORMAL means an earlier
           // CLEAR_ESTOP took effect; the NORMAL observation advances the phase.
           const bool transient =
             ack == ControllerCommand::Response::ACK_REJECTED_SPEED ||
             ack == ControllerCommand::Response::ACK_REJECTED_BUSY ||
             ack == ControllerCommand::Response::ACK_RT_TIMEOUT ||
+            ack == ControllerCommand::Response::ACK_OUTCOME_UNKNOWN ||
             (ack == ControllerCommand::Response::ACK_REJECTED_STATE &&
              ack_mode == ControllerStatus::MODE_NORMAL);
           if (!ok && !transient) {
@@ -950,6 +1063,7 @@ private:
             ok ||
             ack == ControllerCommand::Response::ACK_REJECTED_BUSY ||
             ack == ControllerCommand::Response::ACK_RT_TIMEOUT ||
+            ack == ControllerCommand::Response::ACK_OUTCOME_UNKNOWN ||
             (ack == ControllerCommand::Response::ACK_REJECTED_STATE &&
              (ack_mode == ControllerStatus::MODE_NORMAL ||
               ack_mode == ControllerStatus::MODE_COMPLIANCE_STOPPING));
@@ -1033,6 +1147,45 @@ private:
       return std::clamp(pct, 0.0, 100.0);
     };
 
+    auto is_planning_cancelled = [this, session]() {
+      return !rclcpp::ok() || worker_exit_.load(std::memory_order_acquire) ||
+             !supervisor_->can_dispatch(session, true);
+    };
+    auto handle_pre_dispatch_interrupt = [&](const ExecutionBlock & ref_blk) -> bool {
+      if (!rclcpp::ok() || worker_exit_.load(std::memory_order_acquire) ||
+          session != supervisor_->active_session())
+      {
+        return true;
+      }
+      if (supervisor_->stop_requested(session)) {
+        if (ensure_normal_or_fault(session, -38)) {
+          std::lock_guard<std::mutex> lock(exec_mutex_);
+          reset_exec_cursor_unlocked();
+          supervisor_->on_stop_completed(session);
+        }
+        return true;
+      }
+      if (supervisor_->pause_requested(session)) {
+        if (ensure_normal_or_fault(session, -38)) {
+          std::lock_guard<std::mutex> lock(exec_mutex_);
+          if (supervisor_->stop_requested(session)) {
+            reset_exec_cursor_unlocked();
+          } else {
+            exec_block_idx_ = block_idx;
+            paused_mid_block_ = resume_mid;
+            paused_sample_idx_ = pause_sample;
+            paused_remaining_wait_sec_ = resume_wait_sec;
+            paused_block_snapshot_ = resume_mid ? paused_blk : nullptr;
+          }
+          supervisor_->on_pause_settled(
+            session, ref_blk.loc.line, ref_blk.loc.statement_index,
+            static_cast<int32_t>(block_idx), 0.0, calc_total_pct(block_idx, 0.0));
+        }
+        return true;
+      }
+      return false;
+    };
+
     while (rclcpp::ok() && !worker_exit_ && block_idx < total_blocks) {
       if (session != supervisor_->active_session()) {
         return;
@@ -1083,9 +1236,12 @@ private:
         }
         auto replanned = std::make_shared<ExecutionBlock>();
         std::string replan_err;
-        if (!compiler_->replan_remaining_block(
-              *paused_blk, pause_sample, q_actual, *replanned, replan_err))
-        {
+        const bool replanned_ok = compiler_->replan_remaining_block(
+          *paused_blk, pause_sample, q_actual, *replanned, replan_err, is_planning_cancelled);
+        if (handle_pre_dispatch_interrupt(*paused_blk)) {
+          return;
+        }
+        if (!replanned_ok) {
           StudioSupervisor::Effects eff;
           supervisor_->on_execution_fault(
             session, -3, "Mid-block resume replanning failed: " + replan_err, false, eff);
@@ -1142,9 +1298,12 @@ private:
             const auto orig_end_joints = block_ptr->end_joints;
             ExecutionBlock replanned_blk;
             std::vector<Diagnostic> diags;
-            if (!compiler_->replan_block_from_start(
-                  *block_ptr, q_actual, replanned_blk, diags))
-            {
+            const bool replanned_ok = compiler_->replan_block_from_start(
+              *block_ptr, q_actual, replanned_blk, diags, is_planning_cancelled);
+            if (handle_pre_dispatch_interrupt(*block_ptr)) {
+              return;
+            }
+            if (!replanned_ok) {
               std::string reason = "Unknown planning error";
               for (const auto & d : diags) {
                 if (d.severity == Diagnostic::SEVERITY_ERROR) {
@@ -1178,9 +1337,13 @@ private:
         } else if (max_diff > kAlignmentThresholdRad) {
           trajectory_msgs::msg::JointTrajectory bridge_traj;
           std::string bridge_err;
-          if (!compiler_->plan_alignment_bridge(
-                q_actual, block_ptr->start_joints, 0.35, 0.35, bridge_traj, bridge_err))
-          {
+          const bool bridge_ok = compiler_->plan_alignment_bridge(
+            q_actual, block_ptr->start_joints, 0.35, 0.35, bridge_traj, bridge_err,
+            is_planning_cancelled);
+          if (handle_pre_dispatch_interrupt(*block_ptr)) {
+            return;
+          }
+          if (!bridge_ok) {
             StudioSupervisor::Effects eff;
             supervisor_->on_execution_fault(
               session, -5, "Pre-alignment planning failed: " + bridge_err, false, eff);
@@ -1392,8 +1555,8 @@ private:
   {
     std::optional<size_t> confirmed_end_sample;
     std::optional<size_t> unconfirmed_end_sample;
-    std::shared_future<rclcpp_action::ClientGoalHandle<FollowJointTrajectory>::WrappedResult>
-      unconfirmed_result_future;
+    std::optional<rclcpp::Client<SpliceJointTrajectory>::FutureAndRequestId>
+      unconfirmed_response_future;
   };
 
   bool execute_rigid_block(
@@ -1438,8 +1601,14 @@ private:
 
     // PAUSE: stop ON the programmed path by splicing a re-timed tail into the running goal.
     PauseSpliceState splice_state;
+    ScopeExit cleanup_splice_req{[this, &splice_state]() {
+      if (splice_state.unconfirmed_response_future.has_value()) {
+        splice_client_->remove_pending_request(*splice_state.unconfirmed_response_future);
+        splice_state.unconfirmed_response_future.reset();
+      }
+    }};
     auto on_pause = [&](const rclcpp_action::GoalUUID & goal_id) {
-      return request_pause_splice(blk, goal_id, fb_timing, splice_state);
+      return request_pause_splice(session, blk, goal_id, fb_timing, splice_state);
     };
     std::string err;
     bool goal_dispatched = false;
@@ -1454,17 +1623,20 @@ private:
           ActionOutcome::CANCELED, err, calc_total_pct, true);
       }
       if (splice_state.unconfirmed_end_sample.has_value()) {
-        // Resolve splice timeout race: if the splice was actually adopted by CTC RT while
-        // request_pause_splice() timed out, the parent goal settled at the stop tail rather
-        // than the programmed block end. Never silently skip the rest of the block.
+        // Resolve splice timeout / unknown-outcome race: if the splice was actually adopted by
+        // CTC RT, the parent goal settled at the stop tail rather than the programmed block end.
+        // Never silently skip the rest of the block.
         bool adopted = false;
-        if (splice_state.unconfirmed_result_future.valid() &&
-            splice_state.unconfirmed_result_future.wait_for(std::chrono::milliseconds(100)) ==
-            std::future_status::ready)
-        {
-          adopted =
-            splice_state.unconfirmed_result_future.get().code ==
-            rclcpp_action::ResultCode::SUCCEEDED;
+        if (splice_state.unconfirmed_response_future.has_value()) {
+          if (splice_state.unconfirmed_response_future->future.wait_for(
+                std::chrono::milliseconds(100)) == std::future_status::ready)
+          {
+            const auto resp = splice_state.unconfirmed_response_future->future.get();
+            adopted = resp && resp->adopted;
+          } else {
+            splice_client_->remove_pending_request(*splice_state.unconfirmed_response_future);
+          }
+          splice_state.unconfirmed_response_future.reset();
         }
         if (!adopted) {
           std::array<double, 6> q_actual{};
@@ -1494,15 +1666,19 @@ private:
       goal_dispatched);
   }
 
-  // Plans a stop-along-path tail for the running rigid goal and splices it into the
-  // CTC execution (FollowJointTrajectory goal whose header.stamp is the running goal's
-  // actual start). Falls back to CANCEL whenever the splice cannot be confirmed.
+  // Plans a stop-along-path tail for the running rigid goal and submits it through the
+  // dedicated /ctc_controller/splice_joint_trajectory service with explicit parent_goal_id
+  // and switch_time. Falls back to CANCEL whenever the splice cannot be confirmed.
   PauseHandling request_pause_splice(
+    uint64_t session,
     const ExecutionBlock & blk,
     const rclcpp_action::GoalUUID & goal_id,
     RigidFeedbackTiming & fb_timing,
     PauseSpliceState & out_splice)
   {
+    if (!splice_client_ || !splice_client_->service_is_ready()) {
+      return PauseHandling::CANCEL;
+    }
     std::array<uint8_t, 16> traj_id{};
     builtin_interfaces::msg::Time traj_start;
     {
@@ -1544,46 +1720,64 @@ private:
     }
     const double t_switch = tail.points.front().time_from_start.sec +
       1e-9 * tail.points.front().time_from_start.nanosec;
-    tail.header.stamp = traj_start;
+    auto req = std::make_shared<SpliceJointTrajectory::Request>();
+    req->parent_goal_id = goal_id;
+    req->expected_controller_epoch = supervisor_->snapshot().controller_epoch;
+    req->switch_time = tail.points.front().time_from_start;
+    tail.header.stamp.sec = 0;
+    tail.header.stamp.nanosec = 0;
     tail.joint_names = kJointNames;
+    req->trajectory = std::move(tail);
 
-    FollowJointTrajectory::Goal splice_goal;
-    splice_goal.trajectory = std::move(tail);
-    // Record unconfirmed_end_sample before dispatching so a timeout race cannot silently skip
-    // the remainder of the block if CTC RT adopts the splice before parent cancellation lands.
-    out_splice.unconfirmed_end_sample = end_sample;
-    auto gh_future = rigid_client_->async_send_goal(splice_goal);
+    std::optional<rclcpp::Client<SpliceJointTrajectory>::FutureAndRequestId> splice_future;
+    {
+      // Guarded dispatch: STOP / E-STOP / session supersede prevent issuing a pause splice.
+      std::lock_guard<std::mutex> lock(dispatch_mutex_);
+      if (!rclcpp::ok() || worker_exit_.load(std::memory_order_acquire) ||
+          !supervisor_->can_dispatch(session, /*honor_pause=*/false))
+      {
+        return PauseHandling::CANCEL;
+      }
+      // Record unconfirmed_end_sample before dispatching so a timeout race cannot silently skip
+      // the remainder of the block if CTC RT adopts the splice before parent cancellation lands.
+      out_splice.unconfirmed_end_sample = end_sample;
+      splice_future.emplace(splice_client_->async_send_request(req));
+    }
     auto time_left = [&]() {
       return std::chrono::duration<double>(std::max(0.0, t_switch - block_time_now()));
     };
-    if (gh_future.wait_for(time_left()) != std::future_status::ready) {
-      return PauseHandling::CANCEL;
-    }
-    const auto splice_gh = gh_future.get();
-    if (!splice_gh) {
-      out_splice.unconfirmed_end_sample.reset();
-      RCLCPP_WARN(get_logger(), "Controller rejected the pause splice; canceling instead");
-      return PauseHandling::CANCEL;
-    }
-    // The CTC resolves the splice at its switch time (result relayed within ~20 ms).
-    auto res_future = rigid_client_->async_get_result(splice_gh);
-    out_splice.unconfirmed_result_future = res_future;
-    if (res_future.wait_for(time_left() + std::chrono::milliseconds(300)) !=
+    if (splice_future->future.wait_for(time_left() + std::chrono::milliseconds(300)) !=
         std::future_status::ready)
     {
+      out_splice.unconfirmed_response_future = std::move(splice_future);
       return PauseHandling::CANCEL;
     }
-    const auto wrapped = res_future.get();
-    if (wrapped.code != rclcpp_action::ResultCode::SUCCEEDED) {
+    const auto resp = splice_future->future.get();
+    if (!resp) {
       out_splice.unconfirmed_end_sample.reset();
-      out_splice.unconfirmed_result_future = {};
-      RCLCPP_WARN(get_logger(), "Pause splice was not adopted in time; canceling instead");
+      RCLCPP_WARN(get_logger(), "Null response from /ctc_controller/splice_joint_trajectory");
       return PauseHandling::CANCEL;
     }
-    out_splice.confirmed_end_sample = end_sample;
+    if (resp->adopted) {
+      out_splice.confirmed_end_sample = end_sample;
+      out_splice.unconfirmed_end_sample.reset();
+      return PauseHandling::SPLICED;
+    }
+    if (resp->result_code == SpliceJointTrajectory::Response::RESULT_OUTCOME_UNKNOWN) {
+      // Outcome uncertain: keep unconfirmed_end_sample so parent completion reconciles end pose.
+      RCLCPP_WARN(
+        get_logger(),
+        "Pause splice outcome unknown (%s); canceling parent goal and reconciling on completion",
+        resp->message.c_str());
+      return PauseHandling::CANCEL;
+    }
+    // RESULT_RT_TIMEOUT and RESULT_REJECTED_* guarantee the splice was NOT adopted.
     out_splice.unconfirmed_end_sample.reset();
-    out_splice.unconfirmed_result_future = {};
-    return PauseHandling::SPLICED;
+    RCLCPP_WARN(
+      get_logger(),
+      "Pause splice was not adopted (code=%u: %s); canceling instead",
+      static_cast<unsigned>(resp->result_code), resp->message.c_str());
+    return PauseHandling::CANCEL;
   }
 
   bool execute_impedance_block(
@@ -1720,23 +1914,65 @@ private:
       session, blk.loc.line, blk.loc.statement_index,
       static_cast<int32_t>(block_idx), 10.0, calc_total_pct(block_idx, 0.1));
 
-    if (!gripper_client_->wait_for_service(std::chrono::seconds(2))) {
-      StudioSupervisor::Effects eff;
-      supervisor_->on_execution_fault(
-        session, -30, "Gripper service /gripper/command is unavailable", false, eff);
-      apply_effects(eff);
-      return false;
+    const auto wait_srv_start = std::chrono::steady_clock::now();
+    while (!gripper_client_->service_is_ready()) {
+      if (!rclcpp::ok() || worker_exit_.load(std::memory_order_acquire) ||
+          session != supervisor_->active_session())
+      {
+        return false;
+      }
+      if (supervisor_->stop_requested(session)) {
+        if (ensure_normal_or_fault(session, -38)) {
+          std::lock_guard<std::mutex> lock(exec_mutex_);
+          reset_exec_cursor_unlocked();
+          supervisor_->on_stop_completed(session);
+        }
+        return false;
+      }
+      if (std::chrono::steady_clock::now() - wait_srv_start > std::chrono::seconds(2)) {
+        StudioSupervisor::Effects eff;
+        supervisor_->on_execution_fault(
+          session, -30, "Gripper service /gripper/command is unavailable", false, eff);
+        apply_effects(eff);
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 
     auto req = std::make_shared<GripperCommand::Request>();
     req->command = static_cast<uint8_t>(blk.gripper_cmd.action);
-    auto future = gripper_client_->async_send_request(req);
+    std::optional<rclcpp::Client<GripperCommand>::FutureAndRequestId> future;
+    {
+      // Guarded dispatch: revalidate session/STOP under dispatch_mutex_ so a superseded
+      // worker can never issue OPEN/CLOSE after an E-STOP or STOP gripper halt.
+      std::lock_guard<std::mutex> lock(dispatch_mutex_);
+      if (!rclcpp::ok() || worker_exit_.load(std::memory_order_acquire) ||
+          session != supervisor_->active_session())
+      {
+        return false;
+      }
+      if (!supervisor_->stop_requested(session)) {
+        future.emplace(gripper_client_->async_send_request(req));
+      }
+    }
+    if (!future.has_value()) {
+      if (ensure_normal_or_fault(session, -38)) {
+        std::lock_guard<std::mutex> lock(exec_mutex_);
+        reset_exec_cursor_unlocked();
+        supervisor_->on_stop_completed(session);
+      }
+      return false;
+    }
     const auto req_start = std::chrono::steady_clock::now();
-    while (future.wait_for(std::chrono::milliseconds(20)) != std::future_status::ready) {
-      if (session != supervisor_->active_session() || !rclcpp::ok()) {
+    while (future->future.wait_for(std::chrono::milliseconds(20)) != std::future_status::ready) {
+      if (session != supervisor_->active_session() || !rclcpp::ok() ||
+          worker_exit_.load(std::memory_order_acquire))
+      {
+        gripper_client_->remove_pending_request(*future);
         return false;
       }
       if (supervisor_->stop_requested(session)) {
+        gripper_client_->remove_pending_request(*future);
         if (blk.gripper_cmd.action != GripperActionType::STOP) {
           send_gripper_stop(true);
         }
@@ -1749,6 +1985,7 @@ private:
         return false;
       }
       if (std::chrono::steady_clock::now() - req_start > std::chrono::seconds(3)) {
+        gripper_client_->remove_pending_request(*future);
         StudioSupervisor::Effects eff;
         supervisor_->on_execution_fault(
           session, -31, "Timed out waiting for /gripper/command service response", false, eff);
@@ -1757,7 +1994,7 @@ private:
       }
     }
 
-    const auto resp = future.get();
+    const auto resp = future->future.get();
     if (!resp || !resp->accepted) {
       StudioSupervisor::Effects eff;
       supervisor_->on_execution_fault(
@@ -1946,39 +2183,192 @@ private:
       return false;
     }
 
-    if (!ctc_cmd_client_->wait_for_service(std::chrono::milliseconds(250))) {
-      StudioSupervisor::Effects eff;
-      supervisor_->on_execution_fault(
-        session, -35, "/ctc_controller/command service unavailable for SetPayload", false, eff);
-      apply_effects(eff);
-      return false;
+    const auto wait_srv_start = std::chrono::steady_clock::now();
+    while (!ctc_cmd_client_->service_is_ready()) {
+      if (!rclcpp::ok() || worker_exit_.load(std::memory_order_acquire) ||
+          session != supervisor_->active_session())
+      {
+        return false;
+      }
+      if (supervisor_->stop_requested(session)) {
+        if (ensure_normal_or_fault(session, -38)) {
+          std::lock_guard<std::mutex> lock(exec_mutex_);
+          reset_exec_cursor_unlocked();
+          supervisor_->on_stop_completed(session);
+        }
+        return false;
+      }
+      if (supervisor_->pause_requested(session)) {
+        if (ensure_normal_or_fault(session, -38)) {
+          std::lock_guard<std::mutex> lock(exec_mutex_);
+          exec_block_idx_ = block_idx;
+          paused_mid_block_ = false;
+          paused_sample_idx_ = 0;
+          paused_block_snapshot_.reset();
+          supervisor_->on_pause_settled(
+            session, blk.loc.line, blk.loc.statement_index,
+            static_cast<int32_t>(block_idx), 0.0, calc_total_pct(block_idx, 0.0));
+        }
+        return false;
+      }
+      if (std::chrono::steady_clock::now() - wait_srv_start > std::chrono::milliseconds(250)) {
+        StudioSupervisor::Effects eff;
+        supervisor_->on_execution_fault(
+          session, -35, "/ctc_controller/command service unavailable for SetPayload", false, eff);
+        apply_effects(eff);
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 
+    const auto pre_snap = supervisor_->snapshot();
+    const uint64_t pre_cmd_seq = pre_snap.last_cmd_seq;
     auto req = std::make_shared<ControllerCommand::Request>();
     req->command = ControllerCommand::Request::CMD_SET_PAYLOAD;
-    req->expected_epoch = supervisor_->snapshot().controller_epoch;
+    req->expected_epoch = pre_snap.controller_epoch;
     req->payload_mass = blk.payload_cmd.mass_kg;
     req->payload_com_tcp = blk.payload_cmd.com_tcp;
     req->reason = "Trajectory DSL SetPayload";
 
-    auto future = ctc_cmd_client_->async_send_request(req);
-    if (future.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready) {
-      ctc_cmd_client_->remove_pending_request(future);
+    std::optional<rclcpp::Client<ControllerCommand>::FutureAndRequestId> future;
+    {
+      // Guarded dispatch: do not issue CMD_SET_PAYLOAD after STOP/PAUSE/session supersede.
+      std::lock_guard<std::mutex> lock(dispatch_mutex_);
+      if (!rclcpp::ok() || worker_exit_.load(std::memory_order_acquire) ||
+          session != supervisor_->active_session())
+      {
+        return false;
+      }
+      if (supervisor_->can_dispatch(session, /*honor_pause=*/true)) {
+        future.emplace(ctc_cmd_client_->async_send_request(req));
+      }
+    }
+    if (!future.has_value()) {
+      if (supervisor_->stop_requested(session)) {
+        if (ensure_normal_or_fault(session, -38)) {
+          std::lock_guard<std::mutex> lock(exec_mutex_);
+          reset_exec_cursor_unlocked();
+          supervisor_->on_stop_completed(session);
+        }
+      } else if (supervisor_->pause_requested(session)) {
+        if (ensure_normal_or_fault(session, -38)) {
+          std::lock_guard<std::mutex> lock(exec_mutex_);
+          exec_block_idx_ = block_idx;
+          paused_mid_block_ = false;
+          paused_sample_idx_ = 0;
+          paused_block_snapshot_.reset();
+          supervisor_->on_pause_settled(
+            session, blk.loc.line, blk.loc.statement_index,
+            static_cast<int32_t>(block_idx), 0.0, calc_total_pct(block_idx, 0.0));
+        }
+      }
+      return false;
+    }
+
+    auto reconcile_payload_unknown = [&](uint64_t expected_cmd_seq, std::string & detail) -> bool {
+      const auto reconcile_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+      while (rclcpp::ok() && !worker_exit_.load(std::memory_order_acquire)) {
+        if (session != supervisor_->active_session()) {
+          return false;
+        }
+        const auto snap = supervisor_->snapshot();
+        if (snap.controller_fresh && snap.controller_epoch == pre_snap.controller_epoch) {
+          const bool payload_matches =
+            std::abs(snap.payload_mass - blk.payload_cmd.mass_kg) <= 1e-6 &&
+            std::abs(snap.payload_com_tcp[0] - blk.payload_cmd.com_tcp[0]) <= 1e-6 &&
+            std::abs(snap.payload_com_tcp[1] - blk.payload_cmd.com_tcp[1]) <= 1e-6 &&
+            std::abs(snap.payload_com_tcp[2] - blk.payload_cmd.com_tcp[2]) <= 1e-6;
+          if (expected_cmd_seq > 0) {
+            if (snap.last_cmd_seq == expected_cmd_seq &&
+                snap.last_cmd_code == ControllerCommand::Request::CMD_SET_PAYLOAD)
+            {
+              if (snap.last_cmd_result == ControllerStatus::ACK_APPLIED) {
+                return true;
+              }
+              detail = "ControllerStatus confirmed SetPayload rejection (ack=" +
+                std::to_string(snap.last_cmd_result) + ")";
+              return false;
+            }
+            if (snap.last_cmd_seq > expected_cmd_seq && payload_matches) {
+              return true;
+            }
+          } else if (snap.last_cmd_seq > pre_cmd_seq) {
+            if (snap.last_cmd_code == ControllerCommand::Request::CMD_SET_PAYLOAD) {
+              if (snap.last_cmd_result == ControllerStatus::ACK_APPLIED) {
+                return true;
+              }
+              detail = "ControllerStatus confirmed SetPayload rejection (ack=" +
+                std::to_string(snap.last_cmd_result) + ")";
+              return false;
+            }
+            if (payload_matches) {
+              return true;
+            }
+          }
+        }
+        if (std::chrono::steady_clock::now() > reconcile_deadline) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+      detail = "SetPayload outcome unknown and not confirmed by ControllerStatus within 500 ms";
+      return false;
+    };
+
+    if (future->future.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready) {
+      ctc_cmd_client_->remove_pending_request(*future);
+      std::string reconcile_err;
+      if (reconcile_payload_unknown(0, reconcile_err)) {
+        RCLCPP_WARN(
+          get_logger(),
+          "Reconciled SetPayload RPC timeout via ControllerStatus telemetry");
+        supervisor_->update_execution_progress(
+          session, blk.loc.line, blk.loc.statement_index,
+          static_cast<int32_t>(block_idx), 100.0, calc_total_pct(block_idx, 1.0));
+        return true;
+      }
+      if (session != supervisor_->active_session()) {
+        return false;
+      }
       StudioSupervisor::Effects eff;
       supervisor_->on_execution_fault(
-        session, -36, "Timed out waiting for /ctc_controller/command SetPayload response",
-        false, eff);
+        session, -36, reconcile_err, false, eff);
       apply_effects(eff);
       return false;
     }
 
-    const auto resp = future.get();
-    if (!resp || !resp->accepted) {
+    const auto resp = future->future.get();
+    if (!resp) {
       StudioSupervisor::Effects eff;
       supervisor_->on_execution_fault(
-        session, -37,
-        resp ? ("Controller rejected SetPayload: " + resp->message) : "Null SetPayload response",
-        false, eff);
+        session, -37, "Null SetPayload response", false, eff);
+      apply_effects(eff);
+      return false;
+    }
+    if (!resp->accepted) {
+      if (resp->ack_result == ControllerCommand::Response::ACK_OUTCOME_UNKNOWN) {
+        std::string reconcile_err;
+        if (reconcile_payload_unknown(resp->cmd_seq, reconcile_err)) {
+          RCLCPP_WARN(
+            get_logger(),
+            "Reconciled SetPayload ACK_OUTCOME_UNKNOWN via ControllerStatus telemetry");
+          supervisor_->update_execution_progress(
+            session, blk.loc.line, blk.loc.statement_index,
+            static_cast<int32_t>(block_idx), 100.0, calc_total_pct(block_idx, 1.0));
+          return true;
+        }
+        if (session != supervisor_->active_session()) {
+          return false;
+        }
+        StudioSupervisor::Effects eff;
+        supervisor_->on_execution_fault(session, -36, reconcile_err, false, eff);
+        apply_effects(eff);
+        return false;
+      }
+      StudioSupervisor::Effects eff;
+      supervisor_->on_execution_fault(
+        session, -37, "Controller rejected SetPayload: " + resp->message, false, eff);
       apply_effects(eff);
       return false;
     }
@@ -2011,6 +2401,7 @@ private:
   rclcpp::Subscription<GripperState>::SharedPtr gripper_sub_;
   rclcpp_action::Client<FollowJointTrajectory>::SharedPtr rigid_client_;
   rclcpp_action::Client<FollowImpedanceTrajectory>::SharedPtr imp_client_;
+  rclcpp::Client<SpliceJointTrajectory>::SharedPtr splice_client_;
   rclcpp::Client<GripperCommand>::SharedPtr gripper_client_;
   rclcpp::Service<CompileProgram>::SharedPtr compile_srv_;
   rclcpp::Service<StudioCommand>::SharedPtr command_srv_;
@@ -2026,13 +2417,16 @@ private:
   mutable std::mutex state_data_mutex_;
   std::array<double, 6> latest_q_{};
   std::array<double, 6> latest_dq_{};
+  int64_t latest_joint_steady_ns_ = 0;
   bool has_latest_joint_ = false;
   GripperState latest_gripper_;
   bool has_latest_gripper_ = false;
 
-  std::mutex goal_mutex_;
-  rclcpp_action::ClientGoalHandle<FollowJointTrajectory>::SharedPtr active_rigid_goal_;
-  rclcpp_action::ClientGoalHandle<FollowImpedanceTrajectory>::SharedPtr active_imp_goal_;
+  // Serializes guarded worker dispatches (action goals, splice, gripper, payload) against
+  // STOP/PAUSE/ESTOP command acceptance and cancellation registration.
+  std::mutex dispatch_mutex_;
+  std::shared_ptr<InFlightAction<FollowJointTrajectory>> active_rigid_dispatch_;
+  std::shared_ptr<InFlightAction<FollowImpedanceTrajectory>> active_imp_dispatch_;
 
   std::mutex exec_mutex_;
   std::shared_ptr<const CompiledProgram> loaded_program_;

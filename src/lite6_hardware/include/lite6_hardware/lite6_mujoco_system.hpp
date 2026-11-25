@@ -118,7 +118,12 @@ private:
   std::shared_ptr<lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::StateShmSegment>>
     state_shm_ = std::make_shared<
     lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::StateShmSegment>>();
-  lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::PerturbShmSegment> perturb_shm_;
+  std::shared_ptr<lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::PerturbShmSegment>>
+    perturb_shm_ = std::make_shared<
+    lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::PerturbShmSegment>>();
+  std::shared_ptr<std::atomic<const lite6_interfaces::shm::PerturbShmSegment *>>
+    perturb_shm_ptr_ = std::make_shared<
+    std::atomic<const lite6_interfaces::shm::PerturbShmSegment *>>(nullptr);
   std::shared_ptr<lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::SysIdShmSegment>>
     sysid_shm_ = std::make_shared<
     lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::SysIdShmSegment>>();

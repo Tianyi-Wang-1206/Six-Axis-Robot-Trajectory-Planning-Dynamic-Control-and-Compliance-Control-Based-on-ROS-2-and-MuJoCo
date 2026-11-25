@@ -54,6 +54,8 @@ uint8 ACK_REJECTED_LIMIT=4
 uint8 ACK_REJECTED_BUSY=5
 uint8 ACK_REJECTED_EPOCH=6
 uint8 ACK_REJECTED_INVALID_ARG=7
+uint8 ACK_RT_TIMEOUT=8
+uint8 ACK_OUTCOME_UNKNOWN=9
 
 # Monotonic publish sequence, controller activation epoch, and mode-transition counter.
 uint64 status_seq

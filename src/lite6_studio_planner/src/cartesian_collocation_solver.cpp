@@ -615,9 +615,17 @@ bool resolve_ik_chains_dp(
   const MotionOptions & opts,
   size_t max_chains,
   std::vector<ResolvedWaypointChain> & out_chains,
-  std::vector<D> & out_diagnostics)
+  std::vector<D> & out_diagnostics,
+  const std::function<bool()> & is_cancelled = {})
 {
   const size_t M = waypoints.size();
+  if (is_cancelled && is_cancelled()) {
+    add_diag(
+      out_diagnostics, D::STAGE_PLANNING,
+      waypoints.empty() ? SourceLocation{} : waypoints.front().loc,
+      "ERR_CANCELLED", "Motion cancelled by supervisor");
+    return false;
+  }
   const auto & model = engine.get_pin_model();
   const auto tcp = engine.tcp_frame_id();
   const double sing_thresh = engine.get_singularity_threshold();
@@ -632,6 +640,12 @@ bool resolve_ik_chains_dp(
 
   // Validate waypoint Cartesian limits up front.
   for (size_t k = 0; k < M; ++k) {
+    if (is_cancelled && is_cancelled()) {
+      add_diag(
+        out_diagnostics, D::STAGE_PLANNING, waypoints[k].loc,
+        "ERR_CANCELLED", "Motion cancelled by supervisor");
+      return false;
+    }
     const auto & wp = waypoints[k];
     if (k + 1 < M && wp.acceleration.has_value() && !wp.velocity.has_value()) {
       add_diag(
@@ -1137,6 +1151,7 @@ struct IpmSolveStats
   bool converged = false;
   bool kkt_optimal = false;
   bool primal_feasible = false;
+  bool cancelled = false;
   int iterations = 0;
   double eq_inf = 0.0;
   double ineq_inf = 0.0;
@@ -1150,7 +1165,8 @@ IpmSolveStats run_collocation_ipm(
   pinocchio::FrameIndex tcp_frame_id,
   CollocationMesh & mesh,
   int max_iters,
-  double init_mu)
+  double init_mu,
+  const std::function<bool()> & is_cancelled = {})
 {
   IpmSolveStats stats;
   const size_t N = mesh.N;
@@ -1469,6 +1485,10 @@ IpmSolveStats run_collocation_ipm(
   int stall_count = 0;
 
   for (int iter = 0; iter < max_iters; ++iter) {
+    if (is_cancelled && is_cancelled()) {
+      stats.cancelled = true;
+      return stats;
+    }
     stats.iterations = iter + 1;
 
     // 1. Evaluate residuals, gradients, and assemble bordered banded KKT system.
@@ -2262,7 +2282,8 @@ void build_warm_start_mesh(
   const lite6_kinematics::CartesianLimit & cart_limits,
   const MotionOptions & opts,
   bool prefer_cartesian_ik_seed,
-  CollocationMesh & mesh)
+  CollocationMesh & mesh,
+  const std::function<bool()> & is_cancelled = {})
 {
   const size_t M = waypoints.size();
   const auto & model = engine.get_pin_model();
@@ -2341,7 +2362,10 @@ void build_warm_start_mesh(
   std::string dummy_code, dummy_msg;
   const bool have_otg = !prefer_cartesian_ik_seed && JointPVASolver::solve_multi_waypoint(
     to_array(chain.q[0]), j_wps, limits, opts.vel_scale, opts.acc_scale, opts.jerk_scale,
-    otg_res, dummy_loc, dummy_code, dummy_msg);
+    otg_res, dummy_loc, dummy_code, dummy_msg, is_cancelled);
+  if (is_cancelled && is_cancelled()) {
+    return;
+  }
 
   // Choose initial per-segment collocation interval counts N_s.
   mesh.T.resize(M);
@@ -2577,6 +2601,7 @@ void refine_mesh_intervals(
 struct Verify1kHzReport
 {
   bool all_ok = true;
+  bool cancelled = false;
   double max_pos_exc = 0.0;
   double max_vel_ratio = 0.0;
   double max_acc_ratio = 0.0;
@@ -2595,7 +2620,8 @@ Verify1kHzReport sample_and_verify_1khz(
   const CollocationMesh & mesh,
   const std::vector<CartesianCollocationWaypoint> & waypoints,
   SampledTrajectory1kHz & out_sampled,
-  std::vector<double> & out_knot_times)
+  std::vector<double> & out_knot_times,
+  const std::function<bool()> & is_cancelled = {})
 {
   Verify1kHzReport rep;
   rep.violating_intervals.assign(mesh.N, false);
@@ -2628,6 +2654,11 @@ Verify1kHzReport sample_and_verify_1khz(
 
   size_t cur_i = 0;
   for (int tick = 0; tick <= total_ticks; ++tick) {
+    if (tick % 64 == 0 && is_cancelled && is_cancelled()) {
+      rep.all_ok = false;
+      rep.cancelled = true;
+      return rep;
+    }
     const double t_tick = static_cast<double>(tick) * 0.001;
     // Map [0, T_grid] linearly onto [0, T_total] (exact 1:1 after 1 ms snapping).
     const double t = (tick == total_ticks) ? T_total : std::min(T_total, t_tick * (T_total / T_grid));
@@ -2756,8 +2787,13 @@ int find_first_colliding_segment(
   const lite6_kinematics::KinematicsEngine & engine,
   const SampledTrajectory1kHz & sampled,
   const std::vector<double> & seg_end_times,
-  std::string & out_detail)
+  std::string & out_detail,
+  const std::function<bool()> & is_cancelled = {},
+  bool * out_cancelled = nullptr)
 {
+  if (out_cancelled != nullptr) {
+    *out_cancelled = false;
+  }
   auto workspace = engine.collision_workspace();
   auto segment_of_time = [&](double t) -> int {
     for (size_t s = 0; s < seg_end_times.size(); ++s) {
@@ -2771,12 +2807,24 @@ int find_first_colliding_segment(
   if (sampled.samples.empty()) {
     return -1;
   }
+  if (is_cancelled && is_cancelled()) {
+    if (out_cancelled != nullptr) {
+      *out_cancelled = true;
+    }
+    return -1;
+  }
   if (engine.check_collision(sampled.samples[0].q, workspace, &out_detail)) {
     return 0;
   }
   std::array<double, 6> last_checked = sampled.samples[0].q;
   constexpr double kCollisionCheckStepRad = 0.025;
   for (size_t k = 1; k < sampled.samples.size(); ++k) {
+    if (k % 64 == 0 && is_cancelled && is_cancelled()) {
+      if (out_cancelled != nullptr) {
+        *out_cancelled = true;
+      }
+      return -1;
+    }
     const auto & curr = sampled.samples[k];
     double max_step = 0.0;
     for (size_t i = 0; i < 6; ++i) {
@@ -2940,9 +2988,22 @@ bool CartesianCollocationSolver::solve(
   const lite6_kinematics::CartesianLimit & cart_limits,
   const MotionOptions & options,
   CartesianCollocationResult & out_result,
-  std::vector<D> & out_diagnostics)
+  std::vector<D> & out_diagnostics,
+  const std::function<bool()> & is_cancelled)
 {
   if (waypoints.empty()) {
+    return false;
+  }
+  auto check_cancelled = [&]() -> bool {
+    if (is_cancelled && is_cancelled()) {
+      add_diag(
+        out_diagnostics, D::STAGE_PLANNING, waypoints.front().loc,
+        "ERR_CANCELLED", "Motion cancelled by supervisor");
+      return true;
+    }
+    return false;
+  };
+  if (check_cancelled()) {
     return false;
   }
 
@@ -2954,7 +3015,7 @@ bool CartesianCollocationSolver::solve(
   std::vector<ResolvedWaypointChain> chains;
   if (!resolve_ik_chains_dp(
         engine, start_q, waypoints, joint_limits, cart_limits, options, 3,
-        chains, out_diagnostics))
+        chains, out_diagnostics, is_cancelled))
   {
     return false;
   }
@@ -2968,16 +3029,25 @@ bool CartesianCollocationSolver::solve(
     std::string & out_col_detail,
     Verify1kHzReport & out_rep) -> bool
   {
+    if (is_cancelled && is_cancelled()) {
+      return false;
+    }
     CollocationMesh mesh;
     build_warm_start_mesh(
       engine, active_chain, active_wps, joint_limits, cart_limits, options,
-      use_cart_warm_start, mesh);
+      use_cart_warm_start, mesh, is_cancelled);
+    if (is_cancelled && is_cancelled()) {
+      return false;
+    }
 
     // Stage 2: Initial coarse-mesh IPM solve.
     int total_iters = 0;
     const double initial_mu = mesh.any_free_T ? 0.08 : 0.01;
-    auto stats = run_collocation_ipm(model, tcp, mesh, 85, initial_mu);
+    auto stats = run_collocation_ipm(model, tcp, mesh, 85, initial_mu, is_cancelled);
     total_iters += stats.iterations;
+    if (stats.cancelled) {
+      return false;
+    }
     if (!stats.primal_feasible) {
       // Retry with a slightly adjusted initial barrier (and time inflation if free T exists).
       if (mesh.any_free_T) {
@@ -2986,15 +3056,15 @@ bool CartesianCollocationSolver::solve(
             mesh.T[s] = std::min(55.0, mesh.T[s] * 1.4);
           }
         }
-        auto stats2 = run_collocation_ipm(model, tcp, mesh, 90, 0.2);
+        auto stats2 = run_collocation_ipm(model, tcp, mesh, 90, 0.2, is_cancelled);
         total_iters += stats2.iterations;
         stats = stats2;
       } else {
-        auto stats2 = run_collocation_ipm(model, tcp, mesh, 110, 1e-3);
+        auto stats2 = run_collocation_ipm(model, tcp, mesh, 110, 1e-3, is_cancelled);
         total_iters += stats2.iterations;
         stats = stats2;
       }
-      if (!stats.primal_feasible) {
+      if (stats.cancelled || !stats.primal_feasible) {
         return false;
       }
     }
@@ -3006,9 +3076,13 @@ bool CartesianCollocationSolver::solve(
     bool rep_fresh = false;
     auto run_refinement_rounds = [&](int max_rounds, int ipm_iters, double refine_mu) {
       for (int round = 0; round < max_rounds; ++round) {
-        out_rep = sample_and_verify_1khz(engine, mesh, active_wps, sampled, knot_times);
+        if (is_cancelled && is_cancelled()) {
+          return;
+        }
+        out_rep = sample_and_verify_1khz(
+          engine, mesh, active_wps, sampled, knot_times, is_cancelled);
         rep_fresh = true;
-        if (out_rep.all_ok) {
+        if (out_rep.cancelled || out_rep.all_ok) {
           break;
         }
         // Bisect violating intervals (plus immediate neighbors for smooth curvature capture).
@@ -3035,14 +3109,20 @@ bool CartesianCollocationSolver::solve(
         refine_mesh_intervals(mesh, active_chain, to_split);
         ++refinements;
         mesh.cart_safety = std::max(0.96, mesh.cart_safety - 0.008);
-        auto r_stats = run_collocation_ipm(model, tcp, mesh, ipm_iters, refine_mu);
+        auto r_stats = run_collocation_ipm(model, tcp, mesh, ipm_iters, refine_mu, is_cancelled);
         total_iters += r_stats.iterations;
         stats = r_stats;
         rep_fresh = false;
+        if (stats.cancelled) {
+          break;
+        }
       }
     };
 
     run_refinement_rounds(4, 50, 1e-3);
+    if (is_cancelled && is_cancelled()) {
+      return false;
+    }
 
     // Snap free segment durations to exact 1 ms boundaries (ceil to preserve limit headroom)
     // and run a fast fixed-duration polish (+ localized post-snap refinement if needed) so
@@ -3057,25 +3137,35 @@ bool CartesianCollocationSolver::solve(
         }
       }
       mesh.rebuild_metadata(active_chain);
-      auto p_stats = run_collocation_ipm(model, tcp, mesh, 55, 5e-4);
+      auto p_stats = run_collocation_ipm(model, tcp, mesh, 55, 5e-4, is_cancelled);
       total_iters += p_stats.iterations;
       stats = p_stats;
+      if (stats.cancelled) {
+        return false;
+      }
       if (stats.eq_inf > 1e-5) {
-        auto p_stats2 = run_collocation_ipm(model, tcp, mesh, 60, 1e-4);
+        auto p_stats2 = run_collocation_ipm(model, tcp, mesh, 60, 1e-4, is_cancelled);
         total_iters += p_stats2.iterations;
         stats = p_stats2;
+        if (stats.cancelled) {
+          return false;
+        }
       }
       rep_fresh = false;
       run_refinement_rounds(3, 45, 5e-4);
+      if (is_cancelled && is_cancelled()) {
+        return false;
+      }
     }
 
     if (stats.eq_inf > 1e-5) {
       return false;
     }
     if (!rep_fresh) {
-      out_rep = sample_and_verify_1khz(engine, mesh, active_wps, sampled, knot_times);
+      out_rep = sample_and_verify_1khz(
+        engine, mesh, active_wps, sampled, knot_times, is_cancelled);
     }
-    if (!out_rep.all_ok) {
+    if (out_rep.cancelled || !out_rep.all_ok) {
       return false;
     }
 
@@ -3084,7 +3174,12 @@ bool CartesianCollocationSolver::solve(
     for (size_t s = 0; s < mesh.M; ++s) {
       seg_end_times[s] = knot_times[mesh.wp_node[s + 1]];
     }
-    out_colliding_seg = find_first_colliding_segment(engine, sampled, seg_end_times, out_col_detail);
+    bool col_cancelled = false;
+    out_colliding_seg = find_first_colliding_segment(
+      engine, sampled, seg_end_times, out_col_detail, is_cancelled, &col_cancelled);
+    if (col_cancelled) {
+      return false;
+    }
 
     std::vector<SourceLocation> seg_locs;
     seg_locs.reserve(active_wps.size());
@@ -3122,8 +3217,14 @@ bool CartesianCollocationSolver::solve(
 
   // Try each DP IK branch chain (starting with the globally optimal chain).
   for (size_t ch_idx = 0; ch_idx < chains.size(); ++ch_idx) {
+    if (check_cancelled()) {
+      return false;
+    }
     const auto & chain = chains[ch_idx];
     for (int seed_mode = 0; seed_mode < 2; ++seed_mode) {
+      if (check_cancelled()) {
+        return false;
+      }
       const bool use_cart_seed = (seed_mode == 1);
       CartesianCollocationResult cand_res;
       int col_seg = -1;
@@ -3133,6 +3234,9 @@ bool CartesianCollocationSolver::solve(
       if (!try_solve_with_waypoints(
             waypoints, chain, use_cart_seed, cand_res, col_seg, col_detail, rep))
       {
+        if (check_cancelled()) {
+          return false;
+        }
         if (!rep.first_error_code.empty()) {
           last_rep = rep;
         }
@@ -3186,6 +3290,9 @@ bool CartesianCollocationSolver::solve(
         }};
 
         for (const auto & off : offsets) {
+          if (check_cancelled()) {
+            return false;
+          }
           Eigen::Matrix4d T_mid = Eigen::Matrix4d::Identity();
           T_mid.topRightCorner<3, 1>() = p_chord + off;
           T_mid.topLeftCorner<3, 3>() = ra.slerp(0.5, rb).toRotationMatrix();
@@ -3208,8 +3315,11 @@ bool CartesianCollocationSolver::solve(
           std::vector<D> aug_diags;
           if (!resolve_ik_chains_dp(
                 engine, start_q, aug_wps, joint_limits, cart_limits, options, 1,
-                aug_chains, aug_diags))
+                aug_chains, aug_diags, is_cancelled))
           {
+            if (check_cancelled()) {
+              return false;
+            }
             continue;
           }
           CartesianCollocationResult aug_res;

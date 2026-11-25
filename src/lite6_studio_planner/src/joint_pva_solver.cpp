@@ -283,7 +283,17 @@ bool solve_segment_6dof(
   if (!res.ok) {
     const size_t bad_j = (res.failed_dof >= 0 && res.failed_dof < 6)
       ? static_cast<size_t>(res.failed_dof) : 0;
-    if (seg.explicit_dt.has_value()) {
+    if (res.status == otg::SolveStatus::SEARCH_FAILED) {
+      err_code = "ERR_PVA_SEARCH_FAILED";
+      std::ostringstream oss;
+      oss << "MovePVA numerical position-bounded OTG search failed on joint" << (bad_j + 1);
+      if (seg.explicit_dt.has_value()) {
+        oss << std::fixed << std::setprecision(4)
+            << " at explicit dt=" << round_1ms(*seg.explicit_dt) << " s";
+      }
+      oss << " (could not find a boundary-constrained profile within search/depth budget)";
+      err_msg = oss.str();
+    } else if (seg.explicit_dt.has_value()) {
       const double T_target = round_1ms(*seg.explicit_dt);
       const double t_ref = std::isfinite(res.next_feasible_duration)
         ? res.next_feasible_duration
@@ -453,6 +463,203 @@ void fit_clamped_cubic_seed_1dof(
   }
 }
 
+// Computes the exact closed interval [out_a_lo, out_a_hi] of free accelerations `a` that make
+// (q, v_fixed, a) simultaneously forward- and reverse-time braking-feasible within hard limits
+// (optionally tightened by headroom <= 1.0 on v/a/j caps).
+// Exploits monotonicity: both U(a) = min_upper_excursion(q, |v|, a) and
+// L(a) = max_lower_excursion(q, -|v|, a) are monotonically non-decreasing in `a`.
+bool compute_feasible_acc_range_for_fixed_v(
+  double q, double v, const DoFLimit & lim, double headroom,
+  double & out_a_lo, double & out_a_hi,
+  std::string * out_code = nullptr, std::string * out_reason = nullptr)
+{
+  const otg::AxisLimits hard = to_hard_axis_limits(lim);
+  if (!std::isfinite(q) || !std::isfinite(v)) {
+    if (out_code) *out_code = "ERR_NONFINITE_SAMPLE";
+    if (out_reason) *out_reason = "non-finite waypoint position or velocity";
+    return false;
+  }
+  if (q < lim.q_min - kPosTol || q > lim.q_max + kPosTol) {
+    if (out_code) *out_code = "ERR_JOINT_POS_LIMIT";
+    if (out_reason) {
+      std::ostringstream oss;
+      oss << std::fixed << std::setprecision(5)
+          << "position=" << q << " rad outside [" << lim.q_min << ", " << lim.q_max << "] rad";
+      *out_reason = oss.str();
+    }
+    return false;
+  }
+  if (std::abs(v) > lim.v_lim + 1e-9) {
+    if (out_code) *out_code = "ERR_PVA_VEL_LIMIT";
+    if (out_reason) {
+      std::ostringstream oss;
+      oss << std::fixed << std::setprecision(5)
+          << "|v|=" << std::abs(v) << " rad/s exceeds scaled limit=" << lim.v_lim << " rad/s";
+      *out_reason = oss.str();
+    }
+    return false;
+  }
+
+  const double v_cap_use = std::max(std::abs(v), lim.v_lim * headroom);
+  const double a_cap_lim = lim.a_lim * headroom;
+  const double j_use = lim.j_lim * headroom;
+  const double a_vel_max = std::sqrt(std::max(0.0, 2.0 * j_use * std::max(0.0, v_cap_use - std::abs(v))));
+  const double a_cap = std::min(a_cap_lim, a_vel_max);
+
+  const double v_abs = std::abs(v);
+  auto upper_ok = [&](double a) -> bool {
+    return otg::min_upper_excursion(q, v_abs, a, -lim.a_lim, lim.j_lim) <= lim.q_max + kPosTol;
+  };
+  auto lower_ok = [&](double a) -> bool {
+    return otg::max_lower_excursion(q, -v_abs, a, lim.a_lim, lim.j_lim) >= lim.q_min - kPosTol;
+  };
+
+  if (!upper_ok(-a_cap)) {
+    if (out_code) *out_code = "ERR_JOINT_POS_LIMIT";
+    if (out_reason) {
+      const double q_hi = otg::min_upper_excursion(q, v_abs, -a_cap, -lim.a_lim, lim.j_lim);
+      std::ostringstream oss;
+      oss << std::fixed << std::setprecision(5)
+          << "even at maximum inward acceleration a=" << (-a_cap)
+          << " rad/s^2, braking excursion reaches " << q_hi
+          << " rad > upper limit " << lim.q_max << " rad";
+      *out_reason = oss.str();
+    }
+    return false;
+  }
+  if (!lower_ok(a_cap)) {
+    if (out_code) *out_code = "ERR_JOINT_POS_LIMIT";
+    if (out_reason) {
+      const double q_lo = otg::max_lower_excursion(q, -v_abs, a_cap, lim.a_lim, lim.j_lim);
+      std::ostringstream oss;
+      oss << std::fixed << std::setprecision(5)
+          << "even at maximum inward acceleration a=" << a_cap
+          << " rad/s^2, braking excursion reaches " << q_lo
+          << " rad < lower limit " << lim.q_min << " rad";
+      *out_reason = oss.str();
+    }
+    return false;
+  }
+
+  // Upper feasible bound a_hi: largest a in [-a_cap, +a_cap] with upper_ok(a).
+  double a_hi = a_cap;
+  if (!upper_ok(a_cap)) {
+    double lo = -a_cap, hi = a_cap;
+    for (int it = 0; it < 50; ++it) {
+      const double mid = 0.5 * (lo + hi);
+      if (upper_ok(mid)) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    }
+    a_hi = lo;
+  }
+
+  // Lower feasible bound a_lo: smallest a in [-a_cap, +a_cap] with lower_ok(a).
+  double a_lo = -a_cap;
+  if (!lower_ok(-a_cap)) {
+    double lo = -a_cap, hi = a_cap;
+    for (int it = 0; it < 50; ++it) {
+      const double mid = 0.5 * (lo + hi);
+      if (lower_ok(mid)) {
+        hi = mid;
+      } else {
+        lo = mid;
+      }
+    }
+    a_lo = hi;
+  }
+
+  if (a_lo > a_hi + 1e-12) {
+    if (out_code) *out_code = "ERR_JOINT_POS_LIMIT";
+    if (out_reason) {
+      std::ostringstream oss;
+      oss << std::fixed << std::setprecision(5)
+          << "no free acceleration satisfies both lower and upper braking bounds at q=" << q
+          << " rad, v=" << v << " rad/s";
+      *out_reason = oss.str();
+    }
+    return false;
+  }
+  if (a_lo > a_hi) {
+    const double mid = 0.5 * (a_lo + a_hi);
+    a_lo = a_hi = mid;
+  }
+  const double a_mid = 0.5 * (a_lo + a_hi);
+  if (!otg::validate_axis_state({q, v, a_mid}, hard, true, true)) {
+    if (out_code && out_reason) {
+      validate_dof_state_diag(q, v, a_mid, lim, true, true, *out_code, *out_reason);
+    }
+    return false;
+  }
+  out_a_lo = a_lo;
+  out_a_hi = a_hi;
+  return true;
+}
+
+// Computes the exact symmetric feasible interval [-out_v_max, +out_v_max] of free velocities `v`
+// that make (q, v, a_fixed) simultaneously forward- and reverse-time braking-feasible.
+bool compute_feasible_vel_range_for_fixed_a(
+  double q, double a, const DoFLimit & lim, double headroom,
+  double & out_v_max,
+  std::string * out_code = nullptr, std::string * out_reason = nullptr)
+{
+  const otg::AxisLimits hard = to_hard_axis_limits(lim);
+  if (!std::isfinite(q) || !std::isfinite(a)) {
+    if (out_code) *out_code = "ERR_NONFINITE_SAMPLE";
+    if (out_reason) *out_reason = "non-finite waypoint position or acceleration";
+    return false;
+  }
+  if (q < lim.q_min - kPosTol || q > lim.q_max + kPosTol) {
+    if (out_code) *out_code = "ERR_JOINT_POS_LIMIT";
+    if (out_reason) {
+      std::ostringstream oss;
+      oss << std::fixed << std::setprecision(5)
+          << "position=" << q << " rad outside [" << lim.q_min << ", " << lim.q_max << "] rad";
+      *out_reason = oss.str();
+    }
+    return false;
+  }
+  if (std::abs(a) > lim.a_lim + 1e-9) {
+    if (out_code) *out_code = "ERR_PVA_ACC_LIMIT";
+    if (out_reason) {
+      std::ostringstream oss;
+      oss << std::fixed << std::setprecision(5)
+          << "|a|=" << std::abs(a) << " rad/s^2 exceeds scaled limit=" << lim.a_lim << " rad/s^2";
+      *out_reason = oss.str();
+    }
+    return false;
+  }
+
+  // Because U(|v|, a) increases and L(-|v|, a) decreases monotonically with |v|, a feasible
+  // velocity exists iff v = 0 is feasible under the hard limits.
+  if (!otg::validate_axis_state({q, 0.0, a}, hard, true, true)) {
+    if (out_code && out_reason) {
+      validate_dof_state_diag(q, 0.0, a, lim, true, true, *out_code, *out_reason);
+    }
+    return false;
+  }
+
+  const double dv_a = (a * a) / (2.0 * (lim.j_lim * headroom));
+  const double v_cap = std::max(0.0, lim.v_lim * headroom - dv_a);
+  if (otg::validate_axis_state({q, v_cap, a}, hard, true, true)) {
+    out_v_max = v_cap;
+    return true;
+  }
+  double lo = 0.0, hi = v_cap;
+  for (int it = 0; it < 50; ++it) {
+    const double mid = 0.5 * (lo + hi);
+    if (otg::validate_axis_state({q, mid, a}, hard, true, true)) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  out_v_max = lo;
+  return true;
+}
+
 void project_node_respecting_masks(
   double q, bool v_fixed, bool a_fixed,
   double & v, double & a, const DoFLimit & lim)
@@ -463,43 +670,28 @@ void project_node_respecting_masks(
     return;
   }
   if (!v_fixed && a_fixed) {
-    // Keep pinned a fixed; project v into valid velocity + braking interval.
-    const double a_use = a;
-    const double dv_a = (a_use * a_use) / (2.0 * lim.j_lim);
-    const double v_hi = std::max(0.0, lim.v_lim * kHeadroom - dv_a);
-    v = std::clamp(v, -v_hi, v_hi);
-    if (!otg::validate_axis_state({q, v, a_use}, al, true, true)) {
-      double lo = 0.0, hi = 1.0;
-      for (int it = 0; it < 20; ++it) {
-        const double m = 0.5 * (lo + hi);
-        if (otg::validate_axis_state({q, m * v, a_use}, al, true, true)) {
-          lo = m;
-        } else {
-          hi = m;
-        }
+    // Keep pinned a fixed; clamp v into the exact feasible symmetric velocity interval.
+    double v_max = 0.0;
+    if (!compute_feasible_vel_range_for_fixed_a(q, a, lim, kHeadroom, v_max)) {
+      if (!compute_feasible_vel_range_for_fixed_a(q, a, lim, 1.0, v_max)) {
+        v = 0.0;
+        return;
       }
-      v *= lo;
     }
+    v = std::clamp(v, -v_max, v_max);
     return;
   }
   if (v_fixed && !a_fixed) {
-    // Keep pinned v fixed; project a into valid acceleration + braking interval.
-    const double v_use = v;
-    const double a_vel_max = std::sqrt(std::max(0.0, 2.0 * lim.j_lim * (lim.v_lim - std::abs(v_use))));
-    const double a_cap = std::min(lim.a_lim * kHeadroom, a_vel_max);
-    a = std::clamp(a, -a_cap, a_cap);
-    if (!otg::validate_axis_state({q, v_use, a}, al, true, true)) {
-      double lo = 0.0, hi = 1.0;
-      for (int it = 0; it < 20; ++it) {
-        const double m = 0.5 * (lo + hi);
-        if (otg::validate_axis_state({q, v_use, m * a}, al, true, true)) {
-          lo = m;
-        } else {
-          hi = m;
-        }
+    // Keep pinned v fixed; clamp a into the exact feasible acceleration interval [a_lo, a_hi].
+    // Do NOT assume scaling toward zero leads toward feasibility: near a position boundary,
+    // a = 0 can be infeasible while an inward nonzero acceleration is strictly feasible.
+    double a_lo = 0.0, a_hi = 0.0;
+    if (!compute_feasible_acc_range_for_fixed_v(q, v, lim, kHeadroom, a_lo, a_hi)) {
+      if (!compute_feasible_acc_range_for_fixed_v(q, v, lim, 1.0, a_lo, a_hi)) {
+        return;
       }
-      a *= lo;
     }
+    a = std::clamp(a, a_lo, a_hi);
   }
 }
 
@@ -598,12 +790,25 @@ bool JointPVASolver::solve_multi_waypoint(
   MultiWaypointResult & out_result,
   SourceLocation & err_loc,
   std::string & err_code,
-  std::string & err_msg)
+  std::string & err_msg,
+  const std::function<bool()> & is_cancelled)
 {
   out_result = MultiWaypointResult{};
+  auto check_cancel = [&](const SourceLocation & loc) -> bool {
+    if (is_cancelled && is_cancelled()) {
+      err_loc = loc;
+      err_code = "ERR_CANCELLED";
+      err_msg = "Motion cancelled by supervisor";
+      return true;
+    }
+    return false;
+  };
   if (waypoints.empty()) {
     err_code = "ERR_EMPTY_PVA";
     err_msg = "MovePVA requires at least one waypoint";
+    return false;
+  }
+  if (check_cancel(waypoints.front().loc)) {
     return false;
   }
 
@@ -665,20 +870,29 @@ bool JointPVASolver::solve_multi_waypoint(
         a_fixed[k + 1] = true;
       }
       for (size_t j = 0; j < 6; ++j) {
-        if (v_fixed[k + 1] || a_fixed[k + 1]) {
-          std::string code, reason;
-          const double v_chk = v_fixed[k + 1] ? v_nodes[k + 1][j] : 0.0;
-          const double a_chk = a_fixed[k + 1] ? a_nodes[k + 1][j] : 0.0;
-          if (!validate_dof_state_diag(
-                q_nodes[k + 1][j], v_chk, a_chk, lims[j],
-                /*check_forward=*/true, /*check_reverse=*/true, code, reason))
-          {
-            err_loc = wp.loc;
-            err_code = code;
-            err_msg = "MovePVA waypoint " + std::to_string(k + 1) +
-              " joint" + std::to_string(j + 1) + ": " + reason;
-            return false;
-          }
+        std::string code, reason;
+        bool ok = true;
+        if (v_fixed[k + 1] && a_fixed[k + 1]) {
+          ok = validate_dof_state_diag(
+            q_nodes[k + 1][j], v_nodes[k + 1][j], a_nodes[k + 1][j], lims[j],
+            /*check_forward=*/true, /*check_reverse=*/true, code, reason);
+        } else if (v_fixed[k + 1] && !a_fixed[k + 1]) {
+          double a_lo = 0.0, a_hi = 0.0;
+          ok = compute_feasible_acc_range_for_fixed_v(
+            q_nodes[k + 1][j], v_nodes[k + 1][j], lims[j], 1.0,
+            a_lo, a_hi, &code, &reason);
+        } else if (!v_fixed[k + 1] && a_fixed[k + 1]) {
+          double v_max = 0.0;
+          ok = compute_feasible_vel_range_for_fixed_a(
+            q_nodes[k + 1][j], a_nodes[k + 1][j], lims[j], 1.0,
+            v_max, &code, &reason);
+        }
+        if (!ok) {
+          err_loc = wp.loc;
+          err_code = code;
+          err_msg = "MovePVA waypoint " + std::to_string(k + 1) +
+            " joint" + std::to_string(j + 1) + ": " + reason;
+          return false;
         }
       }
     }
@@ -762,43 +976,59 @@ bool JointPVASolver::solve_multi_waypoint(
       }
     }
 
-    // Seed 2: Direction-preserving time-weighted Catmull-Rom velocity + zero acceleration.
+    // Seed 2: Direction-preserving time-weighted Catmull-Rom velocity + projected free acceleration.
     auto v_catmull = v_nodes;
-    auto a_zero = a_nodes;
+    auto a_catmull = a_nodes;
     for (size_t k = 1; k < M; ++k) {
       if (!a_fixed[k]) {
-        a_zero[k].fill(0.0);
+        a_catmull[k].fill(0.0);
       }
-      if (!v_fixed[k]) {
-        const double tm = est_dt[k - 1];
-        const double tp = est_dt[k];
-        for (size_t j = 0; j < 6; ++j) {
+      const double tm = est_dt[k - 1];
+      const double tp = est_dt[k];
+      for (size_t j = 0; j < 6; ++j) {
+        if (!v_fixed[k]) {
           const double sm = (q_nodes[k][j] - q_nodes[k - 1][j]) / tm;
           const double sp = (q_nodes[k + 1][j] - q_nodes[k][j]) / tp;
           v_catmull[k][j] = (sm * sp > 0.0) ? ((tp * sm + tm * sp) / (tm + tp)) : 0.0;
+        }
+        if (!v_fixed[k] || !a_fixed[k]) {
           project_node_respecting_masks(
-            q_nodes[k][j], v_fixed[k], a_fixed[k], v_catmull[k][j], a_zero[k][j], lims[j]);
+            q_nodes[k][j], v_fixed[k], a_fixed[k], v_catmull[k][j], a_catmull[k][j], lims[j]);
         }
       }
     }
 
-    // Seed 3: Zero free states.
+    // Seed 3: Zero free states projected into the exact feasible range.
     auto v_zero = v_nodes;
+    auto a_zero = a_nodes;
     for (size_t k = 1; k < M; ++k) {
       if (!v_fixed[k]) {
         v_zero[k].fill(0.0);
       }
+      if (!a_fixed[k]) {
+        a_zero[k].fill(0.0);
+      }
+      if (!v_fixed[k] || !a_fixed[k]) {
+        for (size_t j = 0; j < 6; ++j) {
+          project_node_respecting_masks(
+            q_nodes[k][j], v_fixed[k], a_fixed[k], v_zero[k][j], a_zero[k][j], lims[j]);
+        }
+      }
+    }
+
+    if (check_cancel(waypoints.front().loc)) {
+      return false;
     }
 
     double best_sync_obj = eval_total_sync(v_spline, a_spline);
     v_nodes = v_spline;
     a_nodes = a_spline;
 
-    const double cat_obj = eval_total_sync(v_catmull, a_zero);
+    const double cat_obj = eval_total_sync(v_catmull, a_catmull);
     if (cat_obj < best_sync_obj) {
       best_sync_obj = cat_obj;
       v_nodes = v_catmull;
-      a_nodes = a_zero;
+      a_nodes = a_catmull;
     }
     const double zero_obj = eval_total_sync(v_zero, a_zero);
     if (zero_obj < best_sync_obj) {
@@ -832,7 +1062,7 @@ bool JointPVASolver::solve_multi_waypoint(
       };
 
       v_nodes = v_catmull;
-      a_nodes = a_zero;
+      a_nodes = a_catmull;
       double cur_vio = violation_cost(v_nodes, a_nodes);
       const double spl_vio = violation_cost(v_spline, a_spline);
       if (spl_vio < cur_vio) {
@@ -849,6 +1079,9 @@ bool JointPVASolver::solve_multi_waypoint(
 
       if (std::isfinite(cur_vio) && cur_vio > 0.0) {
         for (int sweep = 0; sweep < 10 && cur_vio > 1e-6; ++sweep) {
+          if (check_cancel(waypoints.front().loc)) {
+            return false;
+          }
           const double scale = std::pow(0.55, sweep);
           for (size_t k = 1; k < M; ++k) {
             for (size_t j = 0; j < 6; ++j) {
@@ -908,10 +1141,10 @@ bool JointPVASolver::solve_multi_waypoint(
       for (size_t k = 1; k < M; ++k) {
         for (size_t j = 0; j < 6; ++j) {
           if (!v_fixed[k]) {
-            vars.push_back({k, j, false, lims[j].v_lim * kHeadroom});
+            vars.push_back({k, j, false, a_fixed[k] ? lims[j].v_lim : (lims[j].v_lim * kHeadroom)});
           }
           if (!a_fixed[k]) {
-            vars.push_back({k, j, true, lims[j].a_lim * kHeadroom});
+            vars.push_back({k, j, true, v_fixed[k] ? lims[j].a_lim : (lims[j].a_lim * kHeadroom)});
           }
         }
       }
@@ -1114,6 +1347,9 @@ bool JointPVASolver::solve_multi_waypoint(
           std::vector<double> g;
           eval_grad_j(vj_c, aj_c, seg_c, g);
           for (int it = 0; it < 10; ++it) {
+            if (check_cancel(waypoints.front().loc)) {
+              return false;
+            }
             double gnorm = 0.0;
             for (double gv : g) {
               gnorm = std::max(gnorm, std::abs(gv));
@@ -1331,6 +1567,9 @@ bool JointPVASolver::solve_multi_waypoint(
         compute_sparse_grad(v_lbfgs, a_lbfgs, tmat, g);
 
         for (int it = 0; it < 16; ++it) {
+          if (check_cancel(waypoints.front().loc)) {
+            return false;
+          }
           double gnorm = 0.0;
           for (double gv : g) {
             gnorm = std::max(gnorm, std::abs(gv));
@@ -1479,12 +1718,18 @@ bool JointPVASolver::solve_multi_waypoint(
       }
 
       for (int sweep = 0; sweep < 5; ++sweep) {
+        if (check_cancel(waypoints.front().loc)) {
+          return false;
+        }
         const auto v_prev = v_nodes;
         const auto a_prev = a_nodes;
         const double obj_before = best_sync_obj;
         bool any_improved = false;
 
         for (size_t k = 1; k < M; ++k) {
+          if (check_cancel(waypoints[k].loc)) {
+            return false;
+          }
           if (v_fixed[k] && a_fixed[k]) {
             continue;
           }
@@ -1604,6 +1849,9 @@ bool JointPVASolver::solve_multi_waypoint(
   std::vector<SegmentSolution6DoF> seg_sols(M);
   double total_dur = 0.0;
   for (size_t m = 0; m < M; ++m) {
+    if (check_cancel(waypoints[m].loc)) {
+      return false;
+    }
     SegmentInput seg_in;
     seg_in.q0 = q_nodes[m];
     seg_in.v0 = v_nodes[m];

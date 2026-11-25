@@ -107,8 +107,17 @@ public:
         }
         publish_state();
       },sensor_options);
-    if(!state_shm_.open(false))
-      throw std::runtime_error("Failed to open read-only state shared memory");
+    const auto shm_status=state_shm_.open_status(false);
+    if(shm_status==lite6_interfaces::shm::ShmOpenStatus::INCOMPATIBLE||
+       shm_status==lite6_interfaces::shm::ShmOpenStatus::OS_ERROR) {
+      throw std::runtime_error(
+        std::string("Failed to open read-only state shared memory: ")+
+        lite6_interfaces::shm::shm_open_status_name(shm_status));
+    }
+    if(shm_status==lite6_interfaces::shm::ShmOpenStatus::NOT_FOUND) {
+      RCLCPP_INFO(get_logger(),
+        "State shared memory not created yet; waiting lazily for hardware interface");
+    }
     joint_poll_timer_=create_wall_timer(10ms,[this]{poll_joint_state_shm();},joint_group_);
     poll_joint_state_shm();
     ctc_=rclcpp_action::create_client<FJT>(this,"/ctc_controller/follow_joint_trajectory");
@@ -126,14 +135,16 @@ public:
         const bool compliance=(req->command>=8&&req->command<=10)||req->command==12;
         if(compliance&&!lite6_interfaces::valid_compliance_settings(req->compliance)) {
           const auto snap=supervisor_.snapshot();
-          resp->accepted=false;resp->session_id=snap.session_id;
+          resp->accepted=false;resp->planner_epoch=snap.planner_epoch;
+          resp->session_id=snap.session_id;
           resp->revision=snap.revision;resp->mode=snap.mode;
           resp->message="Invalid compliance gains / sensitivity";return;
         }
         if(req->command==SC::Request::CMD_SET_PAYLOAD&&
            !lite6_interfaces::valid_payload_params(req->payload_mass,req->payload_com_tcp)) {
           const auto snap=supervisor_.snapshot();
-          resp->accepted=false;resp->session_id=snap.session_id;
+          resp->accepted=false;resp->planner_epoch=snap.planner_epoch;
+          resp->session_id=snap.session_id;
           resp->revision=snap.revision;resp->mode=snap.mode;
           resp->message="Invalid payload parameters";return;
         }
@@ -145,18 +156,21 @@ public:
           reply=supervisor_.command(*req);
           sent=do_effects(reply.effects,&pending);
         }
-        resp->accepted=reply.accepted;resp->session_id=reply.session_id;
+        resp->accepted=reply.accepted;resp->planner_epoch=reply.planner_epoch;
+        resp->session_id=reply.session_id;
         resp->revision=reply.revision;resp->mode=reply.mode;resp->message=reply.message;
         // Wait for the CTC response outside transition_mutex_ so status/heartbeat
         // callbacks keep refreshing controller and joint freshness meanwhile.
         const bool cmd_ok=sent&&await_ctc_command(pending);
         if(!cmd_ok&&req->command!=SC::Request::CMD_ESTOP&&reply.accepted) {
           const auto snap=supervisor_.snapshot();
-          resp->accepted=false;resp->revision=snap.revision;resp->mode=snap.mode;
+          resp->accepted=false;resp->planner_epoch=snap.planner_epoch;
+          resp->revision=snap.revision;resp->mode=snap.mode;
           resp->message=snap.detail;
         } else if(cmd_ok&&reply.accepted&&pending.request) {
           // The CTC acknowledgement may have advanced the state (e.g. payload result).
           const auto snap=supervisor_.snapshot();
+          resp->planner_epoch=snap.planner_epoch;
           resp->revision=snap.revision;resp->mode=snap.mode;resp->message=snap.detail;
         }
         publish_state();
@@ -194,7 +208,8 @@ private:
   lite6_kinematics::KinematicsEngine kinematics_;
   MotionPlanner planner_;
   Supervisor supervisor_;
-  std::mutex joints_mutex_,ctc_mutex_;
+  mutable std::mutex joints_mutex_;
+  std::mutex ctc_mutex_;
   // Serialize a state transition with its mode-command publication. Otherwise
   // a pending NORMAL command could be published after a concurrent ESTOP.
   std::mutex transition_mutex_;
@@ -206,6 +221,7 @@ private:
   uint64_t last_joint_seq_=0;
   int64_t last_joint_steady_ns_=0;
   MotionPlanner::InitialState actual_{};
+  int64_t actual_steady_ns_=0;
   std::unique_ptr<CTCOperation> operation_;
   std::mutex planner_queue_mutex_;
   std::condition_variable planner_cv_;
@@ -240,8 +256,10 @@ private:
     lite6_interfaces::shm::JointStatePod pod{};
     if(!state_shm_->joint_state.read(pod,out_seq)||pod.valid==0) return false;
     const int64_t now_ns=lite6_interfaces::shm::steady_now_ns();
-    if(pod.steady_stamp_ns<=0||
-       now_ns-pod.steady_stamp_ns>lite6_interfaces::contract::kJointStateStaleTimeoutNs) return false;
+    if(!lite6_interfaces::shm::is_stamp_fresh(
+          pod.steady_stamp_ns,now_ns,lite6_interfaces::contract::kJointStateStaleTimeoutNs)) {
+      return false;
+    }
     max_speed=0.0;
     for(int i=0;i<6;++i) {
       out.q[i]=pod.position[i];out.dq[i]=pod.velocity[i];
@@ -251,7 +269,29 @@ private:
     out_steady_ns=pod.steady_stamp_ns;
     return true;
   }
+  bool read_fresh_cached_joints(MotionPlanner::InitialState& out) const {
+    std::lock_guard<std::mutex> lock(joints_mutex_);
+    const int64_t now_ns=lite6_interfaces::shm::steady_now_ns();
+    if(!lite6_interfaces::shm::is_stamp_fresh(
+          actual_steady_ns_,now_ns,lite6_interfaces::contract::kJointStateStaleTimeoutNs)) {
+      return false;
+    }
+    out=actual_;
+    return true;
+  }
   void poll_joint_state_shm() {
+    if(!state_shm_.valid()) {
+      const auto status=state_shm_.open_status(false);
+      if(status!=lite6_interfaces::shm::ShmOpenStatus::OK) {
+        if(status==lite6_interfaces::shm::ShmOpenStatus::INCOMPATIBLE||
+           status==lite6_interfaces::shm::ShmOpenStatus::OS_ERROR) {
+          RCLCPP_ERROR_THROTTLE(get_logger(),*get_clock(),2000,
+            "State shared memory open failed (%s); refusing to attach",
+            lite6_interfaces::shm::shm_open_status_name(status));
+        }
+        return;
+      }
+    }
     MotionPlanner::InitialState candidate;
     double max_speed=0.0;
     uint64_t seq=0;
@@ -261,10 +301,11 @@ private:
     {
       std::lock_guard<std::mutex> lock(joints_mutex_);
       actual_=candidate;
+      actual_steady_ns_=steady_ns;
     }
     last_joint_seq_=seq;
     last_joint_steady_ns_=steady_ns;
-    supervisor_.observe_joint_state(max_speed);
+    supervisor_.observe_joint_state(max_speed,steady_ns);
   }
   using CtcCommand=lite6_interfaces::srv::ControllerCommand;
   struct PendingCtcCommand {
@@ -301,8 +342,10 @@ private:
     ctc_cmd_client_->async_send_request(req,
       [this,cmd](rclcpp::Client<CtcCommand>::SharedFuture future) {
         const auto resp=future.get();
+        const bool unknown=resp->ack_result==CtcCommand::Response::ACK_OUTCOME_UNKNOWN;
         supervisor_.on_controller_command_ack(
-          cmd,resp->accepted,resp->ack_result,resp->current_mode,resp->message);
+          cmd,resp->accepted,resp->ack_result,resp->current_mode,resp->message,
+          unknown,resp->cmd_seq);
         publish_state();
       });
     return true;
@@ -312,15 +355,17 @@ private:
     if(!pending.request) return true;
     if(pending.request->future.wait_for(250ms)!=std::future_status::ready) {
       ctc_cmd_client_->remove_pending_request(*pending.request);
-      // No response: the CTC may have applied it, so do not assume rejection.
+      // No response: the CTC may have applied it, so mark outcome unknown and reconcile.
       supervisor_.on_controller_command_ack(
-        pending.cmd,false,CtcCommand::Response::ACK_RT_TIMEOUT,0,
-        "Timed out waiting for /ctc_controller/command response",true);
+        pending.cmd,false,CtcCommand::Response::ACK_OUTCOME_UNKNOWN,0,
+        "Timed out waiting for /ctc_controller/command response",true,0);
       return false;
     }
     const auto resp=pending.request->future.get();
+    const bool unknown=resp->ack_result==CtcCommand::Response::ACK_OUTCOME_UNKNOWN;
     supervisor_.on_controller_command_ack(
-      pending.cmd,resp->accepted,resp->ack_result,resp->current_mode,resp->message);
+      pending.cmd,resp->accepted,resp->ack_result,resp->current_mode,resp->message,
+      unknown,resp->cmd_seq);
     return resp->accepted;
   }
   bool do_effects(const Supervisor::Effects& effects,PendingCtcCommand* pending=nullptr) {
@@ -434,9 +479,10 @@ private:
       }
       MotionPlanner::InitialState start;
       double dummy_speed=0.0; uint64_t dummy_seq=0; int64_t dummy_ns=0;
-      if(!read_shm_joints(start,dummy_speed,dummy_seq,dummy_ns)) {
-        std::lock_guard<std::mutex> lock(joints_mutex_);
-        start=actual_;
+      if(!read_shm_joints(start,dummy_speed,dummy_seq,dummy_ns)&&
+         !read_fresh_cached_joints(start)) {
+        throw MotionError(Motion::Result::ERR_NOT_READY,
+          "Fresh joint state feedback unavailable for motion planning");
       }
       if(shutdown_.load()||!supervisor_.permitted(key))
         throw MotionError(Motion::Result::ERR_CANCELLED,"Supervisor withdrew authorization");
@@ -629,9 +675,13 @@ private:
     {
       MotionPlanner::InitialState current;
       double dummy_speed=0.0; uint64_t dummy_seq=0; int64_t dummy_ns=0;
-      if(!read_shm_joints(current,dummy_speed,dummy_seq,dummy_ns)) {
-        std::lock_guard<std::mutex> lock(joints_mutex_);
-        current=actual_;
+      if(!read_shm_joints(current,dummy_speed,dummy_seq,dummy_ns)&&
+         !read_fresh_cached_joints(current)) {
+        resp.accepted=false;
+        resp.message="Fresh joint state feedback unavailable for friction identification validation";
+        supervisor_.end_excitation_validation(req.session_id);
+        resp.revision=supervisor_.snapshot().revision;
+        return;
       }
       for(int i=0;i<6;++i) {
         if(std::abs(req.trajectory.points.front().positions[i]-current.q[i])>0.05||

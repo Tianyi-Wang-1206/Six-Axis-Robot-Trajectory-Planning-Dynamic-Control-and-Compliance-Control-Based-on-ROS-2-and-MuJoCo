@@ -14,6 +14,7 @@
 #include "realtime_tools/realtime_buffer.hpp"
 #include "lite6_interfaces/msg/controller_status.hpp"
 #include "lite6_interfaces/srv/controller_command.hpp"
+#include "lite6_interfaces/srv/splice_joint_trajectory.hpp"
 #include "lite6_interfaces/action/follow_impedance_trajectory.hpp"
 #include "lite6_interfaces/motion_contract.hpp"
 #include "lite6_interfaces/shm_registers.hpp"
@@ -52,10 +53,27 @@ private:
 
   using FollowTrajectory = control_msgs::action::FollowJointTrajectory;
   using TrajectoryGoal = rclcpp_action::ServerGoalHandle<FollowTrajectory>;
+  using SpliceTrajectory = lite6_interfaces::srv::SpliceJointTrajectory;
   enum class TrajectoryResult {
     RUNNING, SUCCEEDED, CANCELED, DEACTIVATED, PATH_POSITION, PATH_VELOCITY,
     GOAL_TIMEOUT, SATURATION, INVALID_STATE, INVALID_COMMAND, COMMAND_WRITE, MODE_CHANGED,
-    CONTROL_EXCEPTION, SPLICE_REJECTED
+    CONTROL_EXCEPTION
+  };
+  enum class SpliceState : uint8_t {
+    PENDING = 0,
+    ADOPTED = 1,
+    REJECTED_TIMING = 2,
+    REJECTED_PARENT = 3,
+    REJECTED_STATE = 4,
+    WITHDRAWN = 5
+  };
+  struct SpliceExecution {
+    trajectory_msgs::msg::JointTrajectory trajectory;
+    double switch_time = 0.0;
+    double t0_sec = 0.0;
+    bool uniform_1khz = true;
+    uint64_t controller_epoch = 0;
+    std::atomic<uint8_t> state{static_cast<uint8_t>(SpliceState::PENDING)};
   };
   struct TrajectoryExecution {
     explicit TrajectoryExecution(std::shared_ptr<TrajectoryGoal> handle) : goal(std::move(handle)) {}
@@ -63,22 +81,21 @@ private:
     std::atomic<bool> cancel{false};
     std::atomic<TrajectoryResult> result{TrajectoryResult::RUNNING};
     std::atomic<size_t> sample{0};
-    // Actual first-cycle time [ns], published by the RT thread once the goal starts.
+    // Actual first-cycle time [ns] and elapsed time [s], published by RT.
     std::atomic<int64_t> start_time_pub_ns{0};
-    // Path-preserving splice. A splice goal (header.stamp == this execution's actual
-    // start) replaces the remaining reference from its first sample onward, e.g. a
-    // stop-along-path tail for a pause. Parent side: splice_owner is set once under
-    // trajectory_mutex_ before splice is published; the RT thread only uses splice.
-    std::shared_ptr<TrajectoryExecution> splice_owner;
-    std::atomic<TrajectoryExecution *> splice{nullptr};
+    std::atomic<double> elapsed_pub{0.0};
+    // Populated during non-RT validation before RT handoff.
+    bool uniform_1khz = true;
+    double t0_sec = 0.0;
+    // Path-preserving splice submitted via /ctc_controller/splice_joint_trajectory.
+    // splice_owner is set once under trajectory_mutex_ before splice is published;
+    // the RT thread accesses splice lock-free and never frees it.
+    std::shared_ptr<SpliceExecution> splice_owner;
+    std::atomic<SpliceExecution *> splice{nullptr};
     bool splice_reserved = false;  // Non-RT, under trajectory_mutex_.
     std::atomic<bool> on_tail{false};
-    // Child side (immutable after construction / before publication).
-    bool is_splice = false;
-    double splice_switch_time = 0.0;
-    std::weak_ptr<TrajectoryExecution> splice_parent;
     // Control thread only: adopted splice tail and its resolution state.
-    TrajectoryExecution * tail = nullptr;
+    SpliceExecution * tail = nullptr;
     bool splice_seen = false;
     bool splice_resolved = false;
     std::array<std::atomic<double>, 6> actual_pos{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
@@ -109,10 +126,13 @@ private:
     double failure_limit = 0.0;
   };
   void configure_trajectory_action();
-  bool valid_trajectory_goal(const FollowTrajectory::Goal & goal, bool splice = false) const;
-  // Non-RT, under trajectory_mutex_: validates a splice goal against the active execution.
-  bool valid_splice_goal(const FollowTrajectory::Goal & goal) const;
-  void monitor_splices();
+  bool valid_trajectory_goal(
+    const FollowTrajectory::Goal & goal, bool * out_uniform_1khz = nullptr) const;
+  // Non-RT, under trajectory_mutex_: validates a SpliceJointTrajectory request.
+  uint8_t valid_splice_request(
+    const SpliceTrajectory::Request & req,
+    bool * out_uniform_1khz = nullptr,
+    std::string * out_message = nullptr) const;
   void populate_goal_tolerances(
     const FollowTrajectory::Goal & goal, TrajectoryExecution & exec) const;
   void monitor_trajectory();
@@ -142,10 +162,9 @@ private:
   bool trajectory_reserved_ = false;
   std::shared_ptr<TrajectoryExecution> active_trajectory_;
   std::vector<std::shared_ptr<TrajectoryExecution>> retired_trajectories_;
-  // Accepted splice goals awaiting their adopted/rejected terminal result.
-  std::vector<std::shared_ptr<TrajectoryExecution>> pending_splices_;
   realtime_tools::RealtimeBuffer<std::shared_ptr<TrajectoryExecution>> trajectory_buffer_;
   rclcpp_action::Server<FollowTrajectory>::SharedPtr trajectory_server_;
+  rclcpp::Service<SpliceTrajectory>::SharedPtr splice_service_;
   rclcpp::TimerBase::SharedPtr trajectory_monitor_;
 
   std::vector<std::string> joint_names_;
@@ -282,6 +301,9 @@ private:
     std::atomic<size_t> sample{0};
     std::array<std::atomic<double>, 3> pos_error{{0.0, 0.0, 0.0}};
     std::array<std::atomic<double>, 3> rot_error{{0.0, 0.0, 0.0}};
+    // Populated during non-RT validation before RT handoff.
+    bool uniform_1khz = true;
+    double t0_sec = 0.0;
     // Control thread only fields.
     size_t last_sample_index = 0;
     double elapsed = 0.0;
@@ -298,7 +320,8 @@ private:
     const char * failure_detail = nullptr;
   };
   bool configure_impedance_trajectory();
-  bool valid_impedance_trajectory_goal(const FollowImpedance::Goal & goal) const;
+  bool valid_impedance_trajectory_goal(
+    const FollowImpedance::Goal & goal, bool * out_uniform_1khz = nullptr) const;
   void update_impedance_trajectory_reference(const rclcpp::Time & time, const rclcpp::Duration & period);
   void compute_impedance_trajectory(double dt);
   void check_impedance_trajectory_path();
@@ -433,6 +456,9 @@ private:
 
   struct PendingControllerCommand {
     uint64_t cmd_seq = 0;
+    // Active controller incarnation captured when the command was queued;
+    // verified at RT application so no command can cross an activation boundary.
+    uint64_t controller_epoch = 0;
     // E-STOP generation observed when the service request arrived. A command
     // received before a later E-STOP request is rejected instead of applied after it.
     uint64_t estop_generation = 0;
@@ -464,6 +490,9 @@ private:
   rclcpp::Clock::SharedPtr node_clock_;
   // Serializes non-E-STOP commands: the single producer of cmd_ring_.
   std::mutex cmd_service_mutex_;
+  // Leaf mutex (never held across waits) synchronizing non-RT enqueue with
+  // on_activate/on_deactivate epoch and queue resets.
+  std::mutex cmd_queue_mutex_;
   // Reentrant so CMD_ESTOP never waits behind a pending command's RT handshake.
   rclcpp::CallbackGroup::SharedPtr command_callback_group_;
   rclcpp::Service<lite6_interfaces::srv::ControllerCommand>::SharedPtr command_service_;
@@ -473,14 +502,19 @@ private:
   // The RT loop and a timed-out service call race on a CAS to 0; exactly one wins, so
   // ACK_RT_TIMEOUT always means the command was withdrawn and will never be applied.
   std::atomic<uint64_t> cmd_gate_{0};
+  // Highest cmd_seq definitively discarded during on_activate before RT could claim it.
+  std::atomic<uint64_t> last_cmd_discarded_seq_{0};
   // Incremented by every CMD_ESTOP request (fast path, bypasses cmd_ring_).
   std::atomic<uint64_t> estop_generation_{0};
+  // Highest cmd_seq assigned to a fast-path CMD_ESTOP so RT preserves sequence correlation.
+  std::atomic<uint64_t> estop_latest_cmd_seq_{0};
   // Highest estop_generation_ acknowledged and latched by the 1 kHz RT loop.
   std::atomic<uint64_t> estop_rt_ack_generation_{0};
   std::atomic<uint64_t> controller_epoch_atomic_{0};
   std::atomic<uint64_t> mode_epoch_atomic_{0};
   std::atomic<uint8_t> current_mode_atomic_{lite6_interfaces::msg::ControllerStatus::MODE_UNKNOWN};
   std::atomic<uint64_t> last_cmd_ack_seq_{0};
+  std::atomic<uint64_t> last_cmd_ack_controller_epoch_{0};
   std::atomic<uint8_t> last_cmd_ack_code_{lite6_interfaces::srv::ControllerCommand::Request::CMD_NONE};
   std::atomic<uint8_t> last_cmd_ack_result_{lite6_interfaces::srv::ControllerCommand::Response::ACK_NONE};
   std::atomic<uint8_t> last_cmd_ack_mode_{lite6_interfaces::msg::ControllerStatus::MODE_UNKNOWN};

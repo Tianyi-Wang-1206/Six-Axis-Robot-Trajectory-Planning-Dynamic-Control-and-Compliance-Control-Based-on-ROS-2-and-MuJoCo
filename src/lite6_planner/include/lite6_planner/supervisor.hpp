@@ -35,6 +35,7 @@ public:
   };
   struct Reply {
     bool accepted = false;
+    uint64_t planner_epoch = 0;
     uint64_t session_id = 0;
     uint64_t revision = 0;
     uint8_t mode = 0;
@@ -43,13 +44,15 @@ public:
   };
 
   Supervisor();
-  void observe_joint_state(double max_speed);
+  uint64_t planner_epoch() const { return planner_epoch_; }
+  void observe_joint_state(double max_speed, int64_t sample_steady_ns);
   void observe_excitation_start(const std::string& key, const builtin_interfaces::msg::Time& start);
   Effects observe_controller(const lite6_interfaces::msg::ControllerStatus& status);
-  // outcome_unknown=true: no response arrived from /ctc_controller/command, so the
-  // command may or may not have been applied; decide from observed controller mode.
+  // outcome_unknown=true (or ack_result==ACK_OUTCOME_UNKNOWN): the command may or may
+  // not have been applied; reconcile from observed ControllerStatus telemetry.
   void on_controller_command_ack(uint8_t cmd, bool accepted, uint8_t ack_result,
-    uint8_t current_mode, const std::string& msg, bool outcome_unknown=false);
+    uint8_t current_mode, const std::string& msg, bool outcome_unknown=false,
+    uint64_t cmd_seq=0);
   Effects watchdog();
   State snapshot() const;
   Reply command(const Command::Request& req);
@@ -79,14 +82,21 @@ private:
   void complete_sysid_unlocked();
   bool sync_from_initializing_unlocked();
   mutable std::mutex mutex_;
+  uint64_t planner_epoch_=0;
   State state_;
-  Clock::time_point controller_time_{},joint_time_{},phase_deadline_{};
-  Clock::time_point stable_since_{};
+  Clock::time_point controller_time_{},phase_deadline_{};
+  int64_t joint_sample_ns_=0;
+  int64_t stable_since_ns_=0;
   std::string sysid_failure_;
   uint8_t compliance_target_=0;
   uint8_t pre_switch_mode_=State::MODE_NORMAL;
-  // Set when a compliance switch command's outcome is unknown (client-side timeout).
+  // Set when a compliance switch command's outcome is unknown (client timeout or ACK_OUTCOME_UNKNOWN).
   Clock::time_point switch_unknown_deadline_{};
+  // Telemetry reconciliation state for CMD_SET_PAYLOAD with unknown outcome.
+  bool payload_unknown_pending_=false;
+  uint64_t payload_unknown_seq_=0;
+  uint64_t payload_pre_seq_=0;
+  uint64_t last_cmd_seq_=0;
   // Latched once per controller-status outage to show the reactivation hint.
   bool controller_lost_notified_=false;
   uint64_t last_controller_epoch_=0;

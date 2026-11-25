@@ -112,7 +112,8 @@ public:
     const std::string & source_code,
     const std::array<double, 6> & start_joints,
     CompiledProgram & out_program,
-    std::vector<Diagnostic> & out_diagnostics) const;
+    std::vector<Diagnostic> & out_diagnostics,
+    const Cancellation & is_cancelled = {}) const;
 
   // Plans and 1 kHz-verifies a single rigid MotionStatement (MoveJ, MoveP, MoveL,
   // MoveC 3-point, or MoveC center-angle) directly from start_joints without DSL
@@ -141,7 +142,8 @@ public:
     double vel_scale,
     double acc_scale,
     trajectory_msgs::msg::JointTrajectory & out_traj,
-    std::string & out_error) const;
+    std::string & out_error,
+    const Cancellation & is_cancelled = {}) const;
 
   // Dynamically replans the remaining portion of an interrupted trajectory block from q_actual
   // at sample index pause_sample_idx to the end of the block (for smooth Pause -> Resume).
@@ -150,7 +152,8 @@ public:
     size_t pause_sample_idx,
     const std::array<double, 6> & q_actual,
     ExecutionBlock & out_resumed_block,
-    std::string & out_error) const;
+    std::string & out_error,
+    const Cancellation & is_cancelled = {}) const;
 
   enum class PauseSpliceStatus
   {
@@ -179,7 +182,8 @@ public:
     const ExecutionBlock & original_block,
     const std::array<double, 6> & q_actual,
     ExecutionBlock & out_replanned_block,
-    std::vector<Diagnostic> & out_diagnostics) const;
+    std::vector<Diagnostic> & out_diagnostics,
+    const Cancellation & is_cancelled = {}) const;
 
 private:
   const lite6_kinematics::KinematicsEngine & engine_;
@@ -261,7 +265,8 @@ private:
     bool is_impedance,
     const ImpedanceParams & imp_params,
     ExecutionBlock & out_block,
-    std::vector<Diagnostic> & out_diagnostics) const;
+    std::vector<Diagnostic> & out_diagnostics,
+    const Cancellation & is_cancelled = {}) const;
 
   bool verify_sampled_trajectory_1khz(
     const SampledTrajectory1kHz & sampled,

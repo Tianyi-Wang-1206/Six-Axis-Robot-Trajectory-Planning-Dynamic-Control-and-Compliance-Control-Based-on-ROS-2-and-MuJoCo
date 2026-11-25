@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <cctype>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -31,55 +32,28 @@ std::string sanitize_namespace(const char * raw)
   return out.empty() ? std::string("default") : out;
 }
 
-std::string build_region_name(const char * suffix)
+std::string build_region_name(const char * suffix, uint32_t version)
 {
   const std::string ns = sanitize_namespace(std::getenv("LITE6_SHM_NAMESPACE"));
-  return "/lite6_shm_" + ns + "_" + std::string(suffix ? suffix : "seg") + "_" +
+  return "/lite6_shm_" + ns + "_" + std::string(suffix ? suffix : "seg") + "_v" +
+         std::to_string(version) + "_" +
          std::to_string(static_cast<unsigned long>(::geteuid()));
 }
 
-bool initialize_if_needed(int fd, uint32_t version, size_t expected_size)
+bool header_is_ready(const ShmHeader * hdr, uint32_t version, size_t expected_size) noexcept
 {
-  struct stat st{};
-  if (::fstat(fd, &st) != 0) {
-    return false;
-  }
+  return hdr->magic == kShmMagic &&
+         hdr->version == version &&
+         hdr->size_bytes == expected_size &&
+         hdr->init_state.load(std::memory_order_acquire) == kInitReady;
+}
 
-  bool need_init = (static_cast<size_t>(st.st_size) != expected_size);
-  if (need_init) {
-    if (::ftruncate(fd, static_cast<off_t>(expected_size)) != 0) {
-      return false;
-    }
-  }
-
-  void * init_map = ::mmap(nullptr, expected_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  if (init_map == MAP_FAILED) {
-    return false;
-  }
-
-  auto * hdr = static_cast<ShmHeader *>(init_map);
-  if (!need_init) {
-    const bool valid_header =
-      (hdr->magic == kShmMagic) &&
-      (hdr->version == version) &&
-      (hdr->size_bytes == expected_size) &&
-      (hdr->init_state.load(std::memory_order_acquire) == kInitReady);
-    if (!valid_header) {
-      need_init = true;
-    }
-  }
-
-  if (need_init) {
-    std::memset(init_map, 0, expected_size);
-    hdr->magic = kShmMagic;
-    hdr->version = version;
-    hdr->size_bytes = expected_size;
-    hdr->init_state.store(kInitReady, std::memory_order_release);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-  }
-
-  ::munmap(init_map, expected_size);
-  return true;
+bool header_is_clean_uninit(const ShmHeader * hdr) noexcept
+{
+  return hdr->magic == 0U &&
+         hdr->version == 0U &&
+         hdr->size_bytes == 0U &&
+         hdr->init_state.load(std::memory_order_acquire) == kInitUninit;
 }
 
 }  // namespace
@@ -87,7 +61,7 @@ bool initialize_if_needed(int fd, uint32_t version, size_t expected_size)
 namespace detail
 {
 
-bool open_or_create_region(
+ShmOpenStatus open_or_create_region(
   const char * suffix,
   uint32_t version,
   size_t expected_size,
@@ -95,36 +69,123 @@ bool open_or_create_region(
   void ** out_addr)
 {
   if (!out_addr || expected_size < sizeof(ShmHeader)) {
-    return false;
+    return ShmOpenStatus::OS_ERROR;
   }
   *out_addr = nullptr;
 
-  const std::string name = build_region_name(suffix);
+  const std::string name = build_region_name(suffix, version);
+
+  if (!writable) {
+    // Read-only consumers never create, truncate, or modify the backing region.
+    const int fd = ::shm_open(name.c_str(), O_RDONLY, 0);
+    if (fd < 0) {
+      return (errno == ENOENT) ? ShmOpenStatus::NOT_FOUND : ShmOpenStatus::OS_ERROR;
+    }
+    if (::flock(fd, LOCK_SH) != 0) {
+      ::close(fd);
+      return ShmOpenStatus::OS_ERROR;
+    }
+
+    struct stat st{};
+    if (::fstat(fd, &st) != 0) {
+      ::flock(fd, LOCK_UN);
+      ::close(fd);
+      return ShmOpenStatus::OS_ERROR;
+    }
+    if (st.st_size == 0) {
+      ::flock(fd, LOCK_UN);
+      ::close(fd);
+      return ShmOpenStatus::NOT_FOUND;
+    }
+    if (static_cast<size_t>(st.st_size) != expected_size) {
+      ::flock(fd, LOCK_UN);
+      ::close(fd);
+      return ShmOpenStatus::INCOMPATIBLE;
+    }
+
+    void * map = ::mmap(nullptr, expected_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+      ::flock(fd, LOCK_UN);
+      ::close(fd);
+      return ShmOpenStatus::OS_ERROR;
+    }
+
+    const auto * hdr = static_cast<const ShmHeader *>(map);
+    ShmOpenStatus status = ShmOpenStatus::OK;
+    if (header_is_ready(hdr, version, expected_size)) {
+      *out_addr = map;
+    } else if (header_is_clean_uninit(hdr)) {
+      ::munmap(map, expected_size);
+      status = ShmOpenStatus::NOT_FOUND;
+    } else {
+      ::munmap(map, expected_size);
+      status = ShmOpenStatus::INCOMPATIBLE;
+    }
+
+    ::flock(fd, LOCK_UN);
+    ::close(fd);
+    return status;
+  }
+
+  // Writable producer path: create if absent, initialize only if brand-new/uninitialized,
+  // and reject size/header mismatches instead of truncating or zeroing live memory.
   const int fd = ::shm_open(name.c_str(), O_CREAT | O_RDWR, 0600);
   if (fd < 0) {
-    return false;
+    return ShmOpenStatus::OS_ERROR;
   }
-
   if (::flock(fd, LOCK_EX) != 0) {
     ::close(fd);
-    return false;
+    return ShmOpenStatus::OS_ERROR;
   }
 
-  const bool ok = initialize_if_needed(fd, version, expected_size);
-  void * final_map = MAP_FAILED;
-  if (ok) {
-    const int prot = writable ? (PROT_READ | PROT_WRITE) : PROT_READ;
-    final_map = ::mmap(nullptr, expected_size, prot, MAP_SHARED, fd, 0);
+  struct stat st{};
+  if (::fstat(fd, &st) != 0) {
+    ::flock(fd, LOCK_UN);
+    ::close(fd);
+    return ShmOpenStatus::OS_ERROR;
+  }
+
+  bool brand_new = false;
+  if (st.st_size == 0) {
+    if (::ftruncate(fd, static_cast<off_t>(expected_size)) != 0) {
+      ::flock(fd, LOCK_UN);
+      ::close(fd);
+      return ShmOpenStatus::OS_ERROR;
+    }
+    brand_new = true;
+  } else if (static_cast<size_t>(st.st_size) != expected_size) {
+    ::flock(fd, LOCK_UN);
+    ::close(fd);
+    return ShmOpenStatus::INCOMPATIBLE;
+  }
+
+  void * map = ::mmap(nullptr, expected_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (map == MAP_FAILED) {
+    ::flock(fd, LOCK_UN);
+    ::close(fd);
+    return ShmOpenStatus::OS_ERROR;
+  }
+
+  auto * hdr = static_cast<ShmHeader *>(map);
+  ShmOpenStatus status = ShmOpenStatus::OK;
+  if (brand_new || header_is_clean_uninit(hdr)) {
+    std::memset(map, 0, expected_size);
+    hdr->magic = kShmMagic;
+    hdr->version = version;
+    hdr->size_bytes = expected_size;
+    hdr->init_state.store(kInitReady, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    *out_addr = map;
+  } else if (header_is_ready(hdr, version, expected_size)) {
+    *out_addr = map;
+  } else {
+    ::munmap(map, expected_size);
+    status = ShmOpenStatus::INCOMPATIBLE;
   }
 
   ::flock(fd, LOCK_UN);
   ::close(fd);
-
-  if (!ok || final_map == MAP_FAILED) {
-    return false;
-  }
-  *out_addr = final_map;
-  return true;
+  return status;
 }
 
 void close_region(void * addr, size_t size_bytes)
@@ -144,6 +205,11 @@ int64_t lite6_shm_steady_now_ns(void)
   return lite6_interfaces::shm::steady_now_ns();
 }
 
+int lite6_shm_is_stamp_fresh(int64_t stamp_ns, int64_t now_ns, int64_t max_age_ns)
+{
+  return lite6_interfaces::shm::is_stamp_fresh(stamp_ns, now_ns, max_age_ns) ? 1 : 0;
+}
+
 size_t lite6_shm_joint_pod_size(void)
 {
   return sizeof(lite6_interfaces::shm::JointStatePod);
@@ -154,14 +220,23 @@ size_t lite6_shm_sysid_pod_size(void)
   return sizeof(lite6_interfaces::shm::SysIdSamplePod);
 }
 
-void * lite6_shm_state_open(int writable)
+void * lite6_shm_state_open_ex(int writable, int * out_status)
 {
   auto * handle = new lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::StateShmSegment>();
-  if (!handle->open(writable != 0)) {
+  const auto status = handle->open_status(writable != 0);
+  if (out_status) {
+    *out_status = static_cast<int>(status);
+  }
+  if (status != lite6_interfaces::shm::ShmOpenStatus::OK) {
     delete handle;
     return nullptr;
   }
   return handle;
+}
+
+void * lite6_shm_state_open(int writable)
+{
+  return lite6_shm_state_open_ex(writable, nullptr);
 }
 
 void lite6_shm_state_close(void * handle)
@@ -193,14 +268,23 @@ int lite6_shm_read_joint_state(
   return out->valid != 0 ? 1 : 0;
 }
 
-void * lite6_shm_sysid_open(int writable)
+void * lite6_shm_sysid_open_ex(int writable, int * out_status)
 {
   auto * handle = new lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::SysIdShmSegment>();
-  if (!handle->open(writable != 0)) {
+  const auto status = handle->open_status(writable != 0);
+  if (out_status) {
+    *out_status = static_cast<int>(status);
+  }
+  if (status != lite6_interfaces::shm::ShmOpenStatus::OK) {
     delete handle;
     return nullptr;
   }
   return handle;
+}
+
+void * lite6_shm_sysid_open(int writable)
+{
+  return lite6_shm_sysid_open_ex(writable, nullptr);
 }
 
 void lite6_shm_sysid_close(void * handle)
@@ -273,7 +357,8 @@ int lite6_shm_unlink_region(const char * suffix)
   if (!suffix) {
     return -1;
   }
-  const std::string name = lite6_interfaces::shm::build_region_name(suffix);
+  const std::string name =
+    lite6_interfaces::shm::build_region_name(suffix, lite6_interfaces::shm::kShmVersion);
   return ::shm_unlink(name.c_str());
 }
 

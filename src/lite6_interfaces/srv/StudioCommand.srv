@@ -10,11 +10,14 @@ uint8 CMD_RECOVER=8
 uint8 CMD_CLEAR_PROGRAM=9
 
 uint8 command
-# Optional optimistic revision guard: 0 skips check (CMD_ESTOP always bypasses revision guard).
+# Optional optimistic planner incarnation and revision guards:
+# 0 skips the respective check (CMD_ESTOP always bypasses both guards).
+uint64 expected_planner_epoch 0
 uint64 expected_revision 0
 string reason
 ---
 bool accepted
+uint64 planner_epoch
 uint64 revision
 uint8 state
 uint64 controller_epoch

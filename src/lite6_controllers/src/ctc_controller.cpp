@@ -442,42 +442,56 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   tau_applied_prev_.setZero();
   has_applied_tau_ = false;
   imp_ref_kinematics_cached_ = false;
-  cmd_ring_.discard_all();
-  cmd_gate_.store(0ULL, std::memory_order_release);
-  controller_epoch_atomic_.store(controller_epoch_, std::memory_order_release);
-  mode_epoch_atomic_.store(mode_epoch_, std::memory_order_release);
-  current_mode_atomic_.store(
-    controller_mode_for_state(system_state_), std::memory_order_release);
-  last_cmd_ack_code_.store(last_cmd_code_, std::memory_order_relaxed);
-  last_cmd_ack_result_.store(last_cmd_result_, std::memory_order_relaxed);
-  last_cmd_ack_mode_.store(
-    controller_mode_for_state(system_state_), std::memory_order_relaxed);
-  last_cmd_ack_mode_epoch_.store(mode_epoch_, std::memory_order_relaxed);
-  last_cmd_ack_seq_.store(0ULL, std::memory_order_release);
+  {
+    // Coordinate queue/epoch reset with non-RT service producers so no command
+    // checked against an older epoch can be enqueued after activation begins.
+    std::lock_guard<std::mutex> qlock(cmd_queue_mutex_);
+    const uint64_t discarded = cmd_gate_.exchange(0ULL, std::memory_order_acq_rel);
+    if (discarded != 0ULL) {
+      last_cmd_discarded_seq_.store(discarded, std::memory_order_release);
+    }
+    cmd_ring_.discard_all();
+    estop_rt_ack_generation_.store(
+      estop_generation_.load(std::memory_order_acquire), std::memory_order_release);
+    estop_latest_cmd_seq_.store(0ULL, std::memory_order_release);
+    controller_epoch_atomic_.store(controller_epoch_, std::memory_order_release);
+    mode_epoch_atomic_.store(mode_epoch_, std::memory_order_release);
+    current_mode_atomic_.store(
+      controller_mode_for_state(system_state_), std::memory_order_release);
+    trajectory_enabled_.store(true, std::memory_order_release);
+  }
 
   // Force a fresh mode observation (NORMAL, or ESTOP on re-activation) on the first
   // successful update. Never infer a mode from the last command sent before reactivation.
   status_publish_counter_ = 0;
   status_publish_pending_ = true;
   publish_shadow_shm(&q_, true);
-  trajectory_enabled_.store(true, std::memory_order_release);
   return controller_interface::CallbackReturn::SUCCESS;
 }
 
 controller_interface::CallbackReturn Lite6CTCController::on_deactivate(const rclcpp_lifecycle::State &)
 {
-  trajectory_enabled_.store(false, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> qlock(cmd_queue_mutex_);
+    trajectory_enabled_.store(false, std::memory_order_release);
+    current_mode_atomic_.store(
+      lite6_interfaces::msg::ControllerStatus::MODE_UNKNOWN, std::memory_order_release);
+  }
   has_applied_tau_ = false;
   recovery_bias_active_ = false;
   recovery_bias_elapsed_ = 0.0;
   recovery_bias_init_.setZero();
-  current_mode_atomic_.store(
-    lite6_interfaces::msg::ControllerStatus::MODE_UNKNOWN, std::memory_order_release);
   publish_shadow_shm(nullptr, false);
   std::lock_guard<std::mutex> lock(trajectory_mutex_);
   if (active_trajectory_) {
     auto expected = TrajectoryResult::RUNNING;
     active_trajectory_->result.compare_exchange_strong(expected, TrajectoryResult::DEACTIVATED);
+    if (active_trajectory_->splice_owner) {
+      uint8_t pending_state = static_cast<uint8_t>(SpliceState::PENDING);
+      active_trajectory_->splice_owner->state.compare_exchange_strong(
+        pending_state, static_cast<uint8_t>(SpliceState::REJECTED_STATE),
+        std::memory_order_acq_rel, std::memory_order_acquire);
+    }
   }
   if (active_impedance_trajectory_) {
     auto expected = ImpedanceTrajectoryResult::RUNNING;
@@ -1208,12 +1222,18 @@ void Lite6CTCController::configure_command_service()
 
       if (req->command == Cmd::CMD_ESTOP) {
         // E-STOP fast path: no epoch check, no command mutex, no ring slot.
-        // A single monotonic estop_generation_ counter signals the RT loop; we wait
-        // until the RT loop acknowledges target_estop_gen and reports MODE_ESTOP so no
-        // unconsumed latch can survive past ACK_APPLIED and ambush a later CMD_CLEAR_ESTOP.
+        // Publish cmd_seq before incrementing estop_generation_ so the RT loop
+        // correlates this E-STOP sequence into ControllerStatus.last_cmd_*.
+        const uint64_t estop_seq =
+          command_sequence_.fetch_add(1ULL, std::memory_order_acq_rel) + 1ULL;
+        uint64_t prev_seq = estop_latest_cmd_seq_.load(std::memory_order_relaxed);
+        while (estop_seq > prev_seq &&
+               !estop_latest_cmd_seq_.compare_exchange_weak(
+                 prev_seq, estop_seq, std::memory_order_release, std::memory_order_relaxed))
+        {}
         const uint64_t target_estop_gen =
           estop_generation_.fetch_add(1ULL, std::memory_order_acq_rel) + 1ULL;
-        resp->cmd_seq = command_sequence_.fetch_add(1ULL, std::memory_order_acq_rel) + 1ULL;
+        resp->cmd_seq = estop_seq;
         while (std::chrono::steady_clock::now() < deadline &&
                trajectory_enabled_.load(std::memory_order_acquire))
         {
@@ -1229,53 +1249,66 @@ void Lite6CTCController::configure_command_service()
           std::this_thread::sleep_for(std::chrono::microseconds(250));
         }
         resp->accepted = false;
-        resp->ack_result = Resp::ACK_RT_TIMEOUT;
+        resp->ack_result = Resp::ACK_OUTCOME_UNKNOWN;
         fill_snapshot();
         resp->message =
-          "E-STOP not yet observed from the RT loop; the latch request stays pending";
+          "E-STOP not yet observed from the RT loop; latch request remains pending; reconcile via ControllerStatus";
         return;
       }
 
       std::lock_guard<std::mutex> lock(cmd_service_mutex_);
 
-      const uint64_t active_epoch = controller_epoch_atomic_.load(std::memory_order_acquire);
-      if (req->expected_epoch > 0 && req->expected_epoch != active_epoch) {
-        resp->accepted = false;
-        resp->ack_result = Resp::ACK_REJECTED_EPOCH;
-        resp->cmd_seq = 0;
-        fill_snapshot();
-        resp->message = "Controller epoch mismatch";
-        return;
-      }
-
+      uint64_t active_epoch = 0;
       PendingControllerCommand pending{};
-      pending.cmd_seq = command_sequence_.fetch_add(1ULL, std::memory_order_acq_rel) + 1ULL;
-      pending.estop_generation = request_estop_generation;
-      pending.command = req->command;
-      pending.compliance_recapture = req->compliance.recapture;
-      pending.joint_stiffness = req->compliance.joint_stiffness;
-      pending.joint_damping = req->compliance.joint_damping;
-      pending.translation_stiffness = req->compliance.translation_stiffness;
-      pending.translation_damping = req->compliance.translation_damping;
-      pending.rotation_stiffness = req->compliance.rotation_stiffness;
-      pending.rotation_damping = req->compliance.rotation_damping;
-      pending.sensitivity = req->compliance.sensitivity;
-      pending.nullspace_damping = req->compliance.nullspace_damping;
-      pending.payload_mass = req->payload_mass;
-      for (size_t i = 0; i < 3; ++i) {
-        pending.payload_com_tcp[i] = req->payload_com_tcp[i];
-      }
+      {
+        std::lock_guard<std::mutex> qlock(cmd_queue_mutex_);
+        if (!trajectory_enabled_.load(std::memory_order_acquire)) {
+          resp->accepted = false;
+          resp->ack_result = Resp::ACK_REJECTED_STATE;
+          resp->cmd_seq = 0;
+          fill_snapshot();
+          resp->message = "CTC controller is not active";
+          return;
+        }
+        active_epoch = controller_epoch_atomic_.load(std::memory_order_acquire);
+        if (req->expected_epoch > 0 && req->expected_epoch != active_epoch) {
+          resp->accepted = false;
+          resp->ack_result = Resp::ACK_REJECTED_EPOCH;
+          resp->cmd_seq = 0;
+          fill_snapshot();
+          resp->message = "Controller epoch mismatch";
+          return;
+        }
 
-      // Open the claim gate before the RT loop can observe the command.
-      cmd_gate_.store(pending.cmd_seq, std::memory_order_release);
-      if (!cmd_ring_.push(pending)) {
-        cmd_gate_.store(0ULL, std::memory_order_release);
-        resp->accepted = false;
-        resp->ack_result = Resp::ACK_RT_TIMEOUT;
-        resp->cmd_seq = 0;
-        fill_snapshot();
-        resp->message = "RT command ring buffer full; command not queued";
-        return;
+        pending.cmd_seq = command_sequence_.fetch_add(1ULL, std::memory_order_acq_rel) + 1ULL;
+        pending.controller_epoch = active_epoch;
+        pending.estop_generation = request_estop_generation;
+        pending.command = req->command;
+        pending.compliance_recapture = req->compliance.recapture;
+        pending.joint_stiffness = req->compliance.joint_stiffness;
+        pending.joint_damping = req->compliance.joint_damping;
+        pending.translation_stiffness = req->compliance.translation_stiffness;
+        pending.translation_damping = req->compliance.translation_damping;
+        pending.rotation_stiffness = req->compliance.rotation_stiffness;
+        pending.rotation_damping = req->compliance.rotation_damping;
+        pending.sensitivity = req->compliance.sensitivity;
+        pending.nullspace_damping = req->compliance.nullspace_damping;
+        pending.payload_mass = req->payload_mass;
+        for (size_t i = 0; i < 3; ++i) {
+          pending.payload_com_tcp[i] = req->payload_com_tcp[i];
+        }
+
+        // Open the claim gate before the RT loop can observe the command.
+        cmd_gate_.store(pending.cmd_seq, std::memory_order_release);
+        if (!cmd_ring_.push(pending)) {
+          cmd_gate_.store(0ULL, std::memory_order_release);
+          resp->accepted = false;
+          resp->ack_result = Resp::ACK_RT_TIMEOUT;
+          resp->cmd_seq = 0;
+          fill_snapshot();
+          resp->message = "RT command ring buffer full; command not queued";
+          return;
+        }
       }
 
       auto fill_ack = [&]() {
@@ -1283,7 +1316,7 @@ void Lite6CTCController::configure_command_service()
         resp->accepted = (ack == Resp::ACK_APPLIED);
         resp->ack_result = ack;
         resp->cmd_seq = pending.cmd_seq;
-        resp->controller_epoch = active_epoch;
+        resp->controller_epoch = last_cmd_ack_controller_epoch_.load(std::memory_order_relaxed);
         resp->mode_epoch = last_cmd_ack_mode_epoch_.load(std::memory_order_relaxed);
         resp->current_mode = last_cmd_ack_mode_.load(std::memory_order_relaxed);
         resp->message = resp->accepted ? "Applied" : "Rejected by RT controller";
@@ -1293,6 +1326,7 @@ void Lite6CTCController::configure_command_service()
       };
 
       bool deactivated = false;
+      bool epoch_changed = false;
       while (std::chrono::steady_clock::now() < deadline) {
         if (acked()) {
           fill_ack();
@@ -1302,21 +1336,30 @@ void Lite6CTCController::configure_command_service()
           deactivated = true;
           break;
         }
+        if (controller_epoch_atomic_.load(std::memory_order_acquire) != active_epoch) {
+          epoch_changed = true;
+          break;
+        }
         std::this_thread::sleep_for(std::chrono::microseconds(250));
       }
 
-      // Try to withdraw the command. Success guarantees the RT loop will drop it.
+      // Try to withdraw the command. Success (or confirmed discard during reactivation)
+      // guarantees the RT loop never applied it.
       uint64_t expected_gate = pending.cmd_seq;
       if (cmd_gate_.compare_exchange_strong(
-          expected_gate, 0ULL, std::memory_order_acq_rel, std::memory_order_acquire))
+            expected_gate, 0ULL, std::memory_order_acq_rel, std::memory_order_acquire) ||
+          last_cmd_discarded_seq_.load(std::memory_order_acquire) == pending.cmd_seq)
       {
         resp->accepted = false;
-        resp->ack_result = deactivated ? Resp::ACK_REJECTED_STATE : Resp::ACK_RT_TIMEOUT;
+        resp->ack_result = epoch_changed ? Resp::ACK_REJECTED_EPOCH :
+          (deactivated ? Resp::ACK_REJECTED_STATE : Resp::ACK_RT_TIMEOUT);
         resp->cmd_seq = pending.cmd_seq;
         fill_snapshot();
-        resp->message = deactivated ?
-          "CTC controller deactivated before applying the command; command withdrawn" :
-          "Timed out waiting for 1 kHz RT controller handshake; command withdrawn (not applied)";
+        resp->message = epoch_changed ?
+          "Controller reactivated before applying the command; command discarded (not applied)" :
+          (deactivated ?
+            "CTC controller deactivated before applying the command; command withdrawn (not applied)" :
+            "Timed out waiting for 1 kHz RT controller handshake; command withdrawn (not applied)");
         return;
       }
 
@@ -1333,16 +1376,18 @@ void Lite6CTCController::configure_command_service()
         std::this_thread::sleep_for(std::chrono::microseconds(100));
       }
       resp->accepted = false;
-      resp->ack_result = Resp::ACK_REJECTED_STATE;
+      resp->ack_result = Resp::ACK_OUTCOME_UNKNOWN;
       resp->cmd_seq = pending.cmd_seq;
       fill_snapshot();
-      resp->message = "RT loop claimed the command but stopped before acknowledging it";
+      resp->message =
+        "RT loop claimed the command without timely acknowledgement; outcome unknown, reconcile via ControllerStatus";
     },
     rclcpp::ServicesQoS(), command_callback_group_);
 }
 
 void Lite6CTCController::process_controller_commands(double /*dt*/)
 {
+  using Cmd = lite6_interfaces::srv::ControllerCommand::Request;
   using CS = lite6_interfaces::msg::ControllerStatus;
   using Resp = lite6_interfaces::srv::ControllerCommand::Response;
 
@@ -1369,6 +1414,14 @@ void Lite6CTCController::process_controller_commands(double /*dt*/)
       begin_deceleration_tracker();
       transition_system_state(SystemState::ESTOP);
     }
+    if (external_emerg) {
+      const uint64_t estop_seq = estop_latest_cmd_seq_.load(std::memory_order_acquire);
+      if (estop_seq > last_cmd_seq_) {
+        last_cmd_seq_ = estop_seq;
+        last_cmd_code_ = Cmd::CMD_ESTOP;
+        last_cmd_result_ = Resp::ACK_APPLIED;
+      }
+    }
     estop_rt_ack_generation_.store(current_estop_generation, std::memory_order_release);
     status_publish_pending_ = true;
   }
@@ -1385,15 +1438,21 @@ void Lite6CTCController::process_controller_commands(double /*dt*/)
     {
       // Withdrawn by its timed-out service call: never applied.
       res = Resp::ACK_RT_TIMEOUT;
+    } else if (cmd.controller_epoch != controller_epoch_) {
+      // Command was queued under a previous controller activation epoch: never applied.
+      res = Resp::ACK_REJECTED_EPOCH;
     } else if (estop_pending || cmd.estop_generation != current_estop_generation) {
       // Superseded by an E-STOP in this cycle or after request arrival: never applied.
       res = Resp::ACK_REJECTED_STATE;
     } else {
       res = apply_controller_command(cmd);
     }
-    last_cmd_seq_ = cmd.cmd_seq;
-    last_cmd_code_ = cmd.command;
-    last_cmd_result_ = res;
+    if (cmd.cmd_seq > last_cmd_seq_) {
+      last_cmd_seq_ = cmd.cmd_seq;
+      last_cmd_code_ = cmd.command;
+      last_cmd_result_ = res;
+    }
+    last_cmd_ack_controller_epoch_.store(controller_epoch_, std::memory_order_relaxed);
     last_cmd_ack_code_.store(cmd.command, std::memory_order_relaxed);
     last_cmd_ack_result_.store(res, std::memory_order_relaxed);
     last_cmd_ack_mode_.store(current_mode_code(), std::memory_order_relaxed);
@@ -1410,6 +1469,12 @@ void Lite6CTCController::process_controller_commands(double /*dt*/)
     if (system_state_ != SystemState::ESTOP) {
       begin_deceleration_tracker();
       transition_system_state(SystemState::ESTOP);
+    }
+    const uint64_t estop_seq = estop_latest_cmd_seq_.load(std::memory_order_acquire);
+    if (estop_seq > last_cmd_seq_) {
+      last_cmd_seq_ = estop_seq;
+      last_cmd_code_ = Cmd::CMD_ESTOP;
+      last_cmd_result_ = Resp::ACK_APPLIED;
     }
     estop_rt_ack_generation_.store(post_estop_generation, std::memory_order_release);
     status_publish_pending_ = true;

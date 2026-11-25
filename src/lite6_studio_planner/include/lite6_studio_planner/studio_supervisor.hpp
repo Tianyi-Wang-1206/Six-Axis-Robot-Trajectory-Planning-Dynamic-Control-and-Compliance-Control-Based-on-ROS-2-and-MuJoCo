@@ -47,6 +47,7 @@ public:
   struct CommandResult
   {
     bool accepted = false;
+    uint64_t planner_epoch = 0;
     uint64_t revision = 0;
     uint8_t state = S::STATE_BOOT_INIT;
     // State observed atomically with the command decision (before any transition).
@@ -58,6 +59,7 @@ public:
 
   struct Snapshot
   {
+    uint64_t planner_epoch = 0;
     uint64_t revision = 0;
     uint8_t state = S::STATE_BOOT_INIT;
     std::string loaded_program_id;
@@ -81,15 +83,23 @@ public:
     uint64_t controller_epoch = 0;
     uint64_t program_revision = 0;
     uint64_t last_compile_request_id = 0;
+    // Mirrored controller command/payload telemetry for unknown-outcome reconciliation.
+    uint64_t last_cmd_seq = 0;
+    uint8_t last_cmd_code = 0;
+    uint8_t last_cmd_result = 0;
+    double payload_mass = 0.0;
+    std::array<double, 3> payload_com_tcp{};
   };
 
   explicit StudioSupervisor(std::function<void(const Snapshot &)> on_change = {});
 
+  uint64_t planner_epoch() const { return planner_epoch_; }
   Snapshot snapshot() const;
 
-  // Sensor & controller observers (capture Clock::now() under mutex_ for monotonic ordering)
+  // Sensor & controller observers (joint freshness uses the source steady-clock timestamp)
   Effects observe_controller(const CS & status);
-  Effects observe_joint_state(bool positions_valid, double max_abs_dq, bool dq_valid);
+  Effects observe_joint_state(
+    bool positions_valid, double max_abs_dq, bool dq_valid, int64_t sample_steady_ns);
   void observe_gripper(uint8_t gripper_state, bool ready);
   Effects watchdog();
 
@@ -108,7 +118,11 @@ public:
   void on_compile_failed(uint64_t request_id);
 
   // Command handling
-  CommandResult handle_command(uint8_t command, uint64_t expected_revision, const std::string & reason);
+  CommandResult handle_command(
+    uint8_t command,
+    uint64_t expected_planner_epoch,
+    uint64_t expected_revision,
+    const std::string & reason);
 
   // Worker synchronization queries & callbacks (session-checked)
   uint64_t active_session() const;
@@ -117,6 +131,7 @@ public:
   RecoverySubPhase recovery_subphase() const;
   bool stop_requested(uint64_t session) const;
   bool pause_requested(uint64_t session) const;
+  bool can_dispatch(uint64_t session, bool honor_pause) const;
   bool is_step_mode(uint64_t session) const;
   bool is_fresh_joint() const;
 
@@ -181,6 +196,7 @@ private:
   mutable std::mutex mutex_;
   std::function<void(const Snapshot &)> on_change_;
 
+  uint64_t planner_epoch_ = 0;
   Snapshot snap_;
   uint64_t session_id_ = 1;
   bool has_program_ = false;
@@ -200,10 +216,10 @@ private:
   uint64_t recovery_initial_mode_epoch_ = 0;
   Clock::time_point phase_deadline_{};
   Clock::time_point pause_deadline_{};
-  Clock::time_point post_settle_start_{};
+  int64_t post_settle_start_ns_ = 0;
   Clock::time_point last_estop_cmd_sent_{};
 
-  Clock::time_point joint_stamp_{};
+  int64_t joint_sample_ns_ = 0;
   Clock::time_point controller_stamp_{};
   Clock::time_point gripper_stamp_{};
 
@@ -213,8 +229,8 @@ private:
   uint64_t last_controller_epoch_ = 0;
   uint64_t last_status_seq_ = 0;
   uint64_t last_mode_epoch_ = 0;
-  Clock::time_point settle_start_{};
-  Clock::time_point last_settle_obs_{};
+  int64_t settle_start_ns_ = 0;
+  int64_t last_settle_obs_ns_ = 0;
 };
 
 }  // namespace lite6_studio_planner

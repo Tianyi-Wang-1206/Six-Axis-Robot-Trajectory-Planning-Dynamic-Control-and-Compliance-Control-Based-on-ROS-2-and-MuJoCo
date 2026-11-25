@@ -33,6 +33,13 @@ enum class DurationDiscretization
   DISCRETE
 };
 
+enum class SolveStatus
+{
+  OK = 0,
+  INFEASIBLE = 1,     // Mathematically infeasible (invalid state, below unconstrained T_min, or blocked)
+  SEARCH_FAILED = 2   // Numerical bounded-position search did not find a solution within search/depth budget
+};
+
 // Kinematic and hard position bounds for a single degree of freedom.
 // Supports asymmetric velocity and acceleration limits:
 //   q_min <= q(t) <= q_max
@@ -181,21 +188,24 @@ bool solve_axis_unconstrained_step2(
   double T_target,
   AxisProfile & out_profile);
 
-// Exact 1-DOF state-constrained minimum-time solver enforcing q(t) in [q_min, q_max].
-// Uses continuous 1D Pontryagin optimization over inward boundary contact acceleration a_b
-// (covering both touch-and-go bounces and zero-acceleration boundary arcs, with recursion
-// for double-sided bounces).
+// Numerical 1-DOF state-constrained minimum-time search enforcing q(t) in [q_min, q_max].
+// Uses finite-grid sampling + Brent 1D refinement over inward boundary contact acceleration a_b
+// (covering touch-and-go bounces and zero-acceleration boundary arcs) with bounded recursion
+// for double-sided bounces. Because the boundary-contact search is numerical and depth-bounded,
+// failures distinguish SolveStatus::INFEASIBLE from SolveStatus::SEARCH_FAILED.
 bool solve_axis_bounded_min_time(
   const AxisState & s0,
   const AxisState & sf,
   const AxisLimits & lim,
   AxisProfile & out_profile,
   bool * out_clamped = nullptr,
-  int depth = 0);
+  int depth = 0,
+  SolveStatus * out_status = nullptr);
 
-// Exact 1-DOF state-constrained fixed-duration solver enforcing q(t) in [q_min, q_max]
-// at exact duration T_target. If infeasible at T_target, sets out_next_feasible_T to a
-// strictly larger candidate duration (or +inf if none).
+// Numerical 1-DOF state-constrained fixed-duration search enforcing q(t) in [q_min, q_max]
+// at duration T_target. If no solution is found at T_target, sets out_next_feasible_T to a
+// strictly larger candidate duration (or +inf if none) and distinguishes
+// SolveStatus::INFEASIBLE (provably infeasible unconstrained) from SolveStatus::SEARCH_FAILED.
 bool solve_axis_bounded_at_duration(
   const AxisState & s0,
   const AxisState & sf,
@@ -203,7 +213,8 @@ bool solve_axis_bounded_at_duration(
   double T_target,
   AxisProfile & out_profile,
   double & out_next_feasible_T,
-  int depth = 0);
+  int depth = 0,
+  SolveStatus * out_status = nullptr);
 
 // Multi-DOF native 3rd-order time-optimal trajectory generator input and output.
 struct MultiDoFInput
@@ -223,6 +234,7 @@ struct MultiDoFInput
 struct MultiDoFResult
 {
   bool ok = false;
+  SolveStatus status = SolveStatus::INFEASIBLE;
   double duration = 0.0;
   std::vector<double> independent_min_durations;
   std::vector<AxisProfile> profiles;
@@ -231,7 +243,8 @@ struct MultiDoFResult
 };
 
 // Solves synchronized N-DOF 3rd-order state-to-state trajectory generation with hard
-// position limits, exact blocked-interval handling, and optional exact/minimum duration.
+// position limits (numerical boundary-contact search), unconstrained blocked-interval
+// handling, and optional exact/minimum duration.
 MultiDoFResult solve_multidof(const MultiDoFInput & input);
 
 }  // namespace otg

@@ -82,6 +82,74 @@ void so3_Jl_and_dJl(
   dJl = dc1 * P + c1 * dP + dc2 * P2 + c2 * dP2;
 }
 
+// Left Jacobian J_l(phi) of SO(3) along with its exact 1st and 2nd derivatives along (dphi, ddphi).
+// Parameterizing c1(s) = (1 - cos(sqrt(s))) / s and c2(s) = (sqrt(s) - sin(sqrt(s))) / s^(3/2)
+// in s = ||phi||^2 avoids coordinate singularities at phi = 0.
+void so3_Jl_dJl_ddJl(
+  const Eigen::Vector3d & phi,
+  const Eigen::Vector3d & dphi,
+  const Eigen::Vector3d & ddphi,
+  Eigen::Matrix3d & Jl,
+  Eigen::Matrix3d & dJl,
+  Eigen::Matrix3d & ddJl)
+{
+  const double s = phi.squaredNorm();
+  const double th = std::sqrt(s);
+  const double ds = 2.0 * phi.dot(dphi);
+  const double dds = 2.0 * (dphi.squaredNorm() + phi.dot(ddphi));
+
+  double c1 = 0.0, c1_s = 0.0, c1_ss = 0.0;
+  double c2 = 0.0, c2_s = 0.0, c2_ss = 0.0;
+  if (th < 1e-2) {
+    const double s2 = s * s;
+    const double s3 = s2 * s;
+    c1 = 0.5 - s / 24.0 + s2 / 720.0 - s3 / 40320.0;
+    c1_s = -1.0 / 24.0 + s / 360.0 - s2 / 13440.0 + s3 / 907200.0;
+    c1_ss = 1.0 / 360.0 - s / 6720.0 + s2 / 302400.0;
+
+    c2 = (1.0 / 6.0) - s / 120.0 + s2 / 5040.0 - s3 / 362880.0;
+    c2_s = -1.0 / 120.0 + s / 2520.0 - s2 / 120960.0 + s3 / 9979200.0;
+    c2_ss = 1.0 / 2520.0 - s / 60480.0 + s2 / 3326400.0;
+  } else {
+    const double t = th;
+    const double t2 = s;
+    const double t3 = t2 * t;
+    const double t4 = t2 * t2;
+    const double t5 = t4 * t;
+    const double sn = std::sin(t);
+    const double cs = std::cos(t);
+
+    c1 = (1.0 - cs) / t2;
+    const double dc1_dt = (t * sn - 2.0 * (1.0 - cs)) / t3;
+    const double d2c1_dt2 = (t2 * cs - 4.0 * t * sn + 6.0 * (1.0 - cs)) / t4;
+    c1_s = dc1_dt / (2.0 * t);
+    c1_ss = (d2c1_dt2 - dc1_dt / t) / (4.0 * t2);
+
+    c2 = (t - sn) / t3;
+    const double dc2_dt = (3.0 * sn - t * cs - 2.0 * t) / t4;
+    const double d2c2_dt2 = ((t2 - 12.0) * sn + 6.0 * t * cs + 6.0 * t) / t5;
+    c2_s = dc2_dt / (2.0 * t);
+    c2_ss = (d2c2_dt2 - dc2_dt / t) / (4.0 * t2);
+  }
+
+  const double dc1 = c1_s * ds;
+  const double ddc1 = c1_ss * ds * ds + c1_s * dds;
+  const double dc2 = c2_s * ds;
+  const double ddc2 = c2_ss * ds * ds + c2_s * dds;
+
+  const Eigen::Matrix3d P = so3_hat(phi);
+  const Eigen::Matrix3d dP = so3_hat(dphi);
+  const Eigen::Matrix3d ddP = so3_hat(ddphi);
+  const Eigen::Matrix3d P2 = P * P;
+  const Eigen::Matrix3d dP2 = dP * P + P * dP;
+  const Eigen::Matrix3d ddP2 = ddP * P + 2.0 * (dP * dP) + P * ddP;
+
+  Jl = Eigen::Matrix3d::Identity() + c1 * P + c2 * P2;
+  dJl = dc1 * P + c1 * dP + dc2 * P2 + c2 * dP2;
+  ddJl = ddc1 * P + 2.0 * dc1 * dP + c1 * ddP +
+    ddc2 * P2 + 2.0 * dc2 * dP2 + c2 * ddP2;
+}
+
 // Inverse left Jacobian J_l^{-1}(phi) of SO(3) and its derivative along dphi.
 // Valid for ||phi|| < pi.
 void so3_Jl_inv_and_dJl_inv(
@@ -1030,17 +1098,24 @@ bool C3CartesianSpline::build(
   }
 
   std::vector<Eigen::Vector3d> pm3(n + 1, Eigen::Vector3d::Zero());
+  std::vector<Eigen::Vector3d> wj_nodal(n + 1, Eigen::Vector3d::Zero());
   for (size_t i = 1; i < n; ++i) {
     const double hm = u[i] - u[i - 1];
     const double hp = u[i + 1] - u[i];
     const Eigen::Vector3d sl_m = (pm2[i] - pm2[i - 1]) / hm;
     const Eigen::Vector3d sl_p = (pm2[i + 1] - pm2[i]) / hp;
     pm3[i] = (hp * sl_m + hm * sl_p) / (hm + hp);
+
+    const Eigen::Vector3d wsl_m = (wa_nodal[i] - wa_nodal[i - 1]) / hm;
+    const Eigen::Vector3d wsl_p = (wa_nodal[i + 1] - wa_nodal[i]) / hp;
+    wj_nodal[i] = (hp * wsl_m + hm * wsl_p) / (hm + hp);
   }
   pm3[0] = (pm2[1] - pm2[0]) / (u[1] - u[0]);
   pm3[n] = (pm2[n] - pm2[n - 1]) / (u[n] - u[n - 1]);
+  wj_nodal[0] = (wa_nodal[1] - wa_nodal[0]) / (u[1] - u[0]);
+  wj_nodal[n] = (wa_nodal[n] - wa_nodal[n - 1]) / (u[n] - u[n - 1]);
 
-  // 2. Build per-segment septic position and Lie-algebra SO(3) Hermite polynomials.
+  // 2. Build per-segment septic position and globally C^3 Lie-algebra SO(3) Hermite polynomials.
   segments_.reserve(n);
   for (size_t k = 0; k < n; ++k) {
     const double h = u[k + 1] - u[k];
@@ -1053,24 +1128,34 @@ bool C3CartesianSpline::build(
       p[k], pm1[k], pm2[k], pm3[k],
       p[k + 1], pm1[k + 1], pm2[k + 1], pm3[k + 1], h);
 
-    // At tau = 0: theta = 0, J_l(0) = I, dJ_l(0) * dtheta(0) = 0.
+    // World angular derivatives on segment k (R(u) = R_k exp(theta(u))):
+    //   w_w = R_k (J_l dth)
+    //   a_w = R_k (dJ_l dth + J_l ddth)
+    //   j_w = R_k (ddJ_l dth + 2 dJ_l ddth + J_l dddth)
+    // Match (w_nodal, wa_nodal, wj_nodal) at both ends for global C^3 rotation continuity.
     const Eigen::Vector3d th0 = Eigen::Vector3d::Zero();
     const Eigen::Vector3d dth0 = R[k].transpose() * w_nodal[k];
     const Eigen::Vector3d ddth0 = R[k].transpose() * wa_nodal[k];
+    Eigen::Matrix3d Jl0, dJl0, ddJl0;
+    so3_Jl_dJl_ddJl(th0, dth0, ddth0, Jl0, dJl0, ddJl0);
+    const Eigen::Vector3d dddth0 =
+      R[k].transpose() * wj_nodal[k] - ddJl0 * dth0 - 2.0 * (dJl0 * ddth0);
 
-    // At tau = 1: theta = delta_rot[k], w_w = R_k J_l(delta) dth1,
-    // a_w = R_k (dJ_l(delta, dth1) dth1 + J_l(delta) ddth1).
     const Eigen::Vector3d th1 = delta_rot[k];
     Eigen::Matrix3d Jli, dJli_unused;
     so3_Jl_inv_and_dJl_inv(th1, Eigen::Vector3d::Zero(), Jli, dJli_unused);
     const Eigen::Vector3d dth1 = Jli * (R[k].transpose() * w_nodal[k + 1]);
-    Eigen::Matrix3d Jl_unused, dJl;
-    so3_Jl_and_dJl(th1, dth1, Jl_unused, dJl);
-    const Eigen::Vector3d ddth1 = Jli * (R[k].transpose() * wa_nodal[k + 1] - dJl * dth1);
+    Eigen::Matrix3d Jl1_unused, dJl1_step;
+    so3_Jl_and_dJl(th1, dth1, Jl1_unused, dJl1_step);
+    const Eigen::Vector3d ddth1 = Jli * (R[k].transpose() * wa_nodal[k + 1] - dJl1_step * dth1);
+    Eigen::Matrix3d Jl1, dJl1, ddJl1;
+    so3_Jl_dJl_ddJl(th1, dth1, ddth1, Jl1, dJl1, ddJl1);
+    const Eigen::Vector3d dddth1 =
+      Jli * (R[k].transpose() * wj_nodal[k + 1] - ddJl1 * dth1 - 2.0 * (dJl1 * ddth1));
 
     seg.r_c = make_septic_hermite<Eigen::Vector3d>(
-      th0, dth0, ddth0, Eigen::Vector3d::Zero(),
-      th1, dth1, ddth1, Eigen::Vector3d::Zero(), h);
+      th0, dth0, ddth0, dddth0,
+      th1, dth1, ddth1, dddth1, h);
     segments_.push_back(seg);
   }
   return true;

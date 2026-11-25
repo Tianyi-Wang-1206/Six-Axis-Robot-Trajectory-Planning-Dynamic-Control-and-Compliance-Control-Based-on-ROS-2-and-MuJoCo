@@ -20,6 +20,49 @@ double to_seconds(const builtin_interfaces::msg::Duration & duration)
   return duration.sec + 1e-9 * duration.nanosec;
 }
 
+template<typename PointT>
+size_t advance_impedance_sample_index(
+  const std::vector<PointT> & points,
+  size_t current_index,
+  double elapsed,
+  bool uniform_1khz,
+  double t0_sec) noexcept
+{
+  const size_t n = points.size();
+  if (n <= 1) {
+    return 0;
+  }
+  size_t idx = (current_index < n) ? current_index : 0;
+  if (idx + 1 >= n) {
+    return n - 1;
+  }
+  if (elapsed < to_seconds(points[idx + 1].time_from_start)) {
+    return idx;
+  }
+  if (idx + 2 >= n || elapsed < to_seconds(points[idx + 2].time_from_start)) {
+    return idx + 1;
+  }
+  if (uniform_1khz) {
+    const double est = (elapsed - t0_sec) * lite6_interfaces::contract::kControlRateHz;
+    if (est >= static_cast<double>(n - 1)) {
+      idx = n - 1;
+    } else if (est > static_cast<double>(idx)) {
+      idx = static_cast<size_t>(est);
+    }
+    while (idx > 0 && to_seconds(points[idx].time_from_start) > elapsed) {
+      --idx;
+    }
+    while (idx + 1 < n && to_seconds(points[idx + 1].time_from_start) <= elapsed) {
+      ++idx;
+    }
+    return idx;
+  }
+  const auto it = std::upper_bound(
+    points.begin() + static_cast<std::ptrdiff_t>(idx + 1), points.end(), elapsed,
+    [](double t, const PointT & p) { return t < to_seconds(p.time_from_start); });
+  return static_cast<size_t>(std::distance(points.begin(), it) - 1);
+}
+
 uint8_t map_impedance_estop_reason(
   int reason_code)
 {
@@ -183,7 +226,12 @@ bool Lite6CTCController::configure_impedance_trajectory()
       if (active_impedance_trajectory_) {
         retired_impedance_trajectories_.push_back(std::move(active_impedance_trajectory_));
       }
+      bool uniform_1khz = true;
+      (void)valid_impedance_trajectory_goal(*goal->get_goal(), &uniform_1khz);
       active_impedance_trajectory_ = std::make_shared<ImpedanceTrajectoryExecution>(goal);
+      active_impedance_trajectory_->uniform_1khz = uniform_1khz;
+      active_impedance_trajectory_->t0_sec =
+        to_seconds(goal->get_goal()->points.front().time_from_start);
       if (!trajectory_enabled_.load()) {
         active_impedance_trajectory_->result.store(ImpedanceTrajectoryResult::DEACTIVATED);
       }
@@ -192,8 +240,9 @@ bool Lite6CTCController::configure_impedance_trajectory()
   return true;
 }
 
+// Playback uses 1 kHz sampled PVA + impedance targets with zero-order hold (ZOH).
 bool Lite6CTCController::valid_impedance_trajectory_goal(
-  const FollowImpedance::Goal & goal) const
+  const FollowImpedance::Goal & goal, bool * out_uniform_1khz) const
 {
   if (goal.joint_names != joint_names_ || goal.points.empty() ||
       !lite6_interfaces::valid_transition_time(goal.transition_time) ||
@@ -201,13 +250,30 @@ bool Lite6CTCController::valid_impedance_trajectory_goal(
        goal.end_behavior != FollowImpedance::Goal::END_HOLD_CARTESIAN_IMPEDANCE)) {
     return false;
   }
+  const double first_time = to_seconds(goal.points.front().time_from_start);
+  if (first_time != 0.0) {
+    return false;
+  }
   double previous = -1.0;
-  for (const auto & point : goal.points) {
+  double max_grid_err = 0.0;
+  for (size_t idx = 0; idx < goal.points.size(); ++idx) {
+    const auto & point = goal.points[idx];
     const double t = to_seconds(point.time_from_start);
     if (point.time_from_start.sec < 0 || point.time_from_start.nanosec >= 1000000000u ||
         t <= previous || !lite6_interfaces::valid_impedance_trajectory_gains(point) ||
         point.nullspace_stiffness != 0.0) {
       return false;
+    }
+    if (idx > 0) {
+      const double dt = t - previous;
+      if (std::abs(dt - lite6_interfaces::contract::kControlDtSec) >
+          lite6_interfaces::contract::kTrajectorySampleSpacingTolSec)
+      {
+        return false;
+      }
+      const double expected_t = first_time +
+        static_cast<double>(idx) * lite6_interfaces::contract::kControlDtSec;
+      max_grid_err = std::max(max_grid_err, std::abs(t - expected_t));
     }
     for (size_t i = 0; i < joint_names_.size(); ++i) {
       const double q = point.positions[i];
@@ -223,14 +289,14 @@ bool Lite6CTCController::valid_impedance_trajectory_goal(
     }
     previous = t;
   }
-  if (to_seconds(goal.points.front().time_from_start) != 0.0) {
-    return false;
-  }
   const auto & last = goal.points.back();
   for (size_t i = 0; i < joint_names_.size(); ++i) {
     if (std::abs(last.velocities[i]) > 1e-8 || std::abs(last.accelerations[i]) > 1e-8) {
       return false;
     }
+  }
+  if (out_uniform_1khz != nullptr) {
+    *out_uniform_1khz = (max_grid_err <= 2e-4);
   }
   return true;
 }
@@ -369,14 +435,9 @@ void Lite6CTCController::update_impedance_trajectory_reference(
     return;
   }
 
-  size_t index = execution->last_sample_index;
-  if (index >= points.size()) {
-    index = 0;
-  }
-  while (index + 1 < points.size() &&
-         to_seconds(points[index + 1].time_from_start) <= execution->elapsed) {
-    ++index;
-  }
+  const size_t index = advance_impedance_sample_index(
+    points, execution->last_sample_index, execution->elapsed,
+    execution->uniform_1khz, execution->t0_sec);
   execution->last_sample_index = index;
   const auto & point = points[index];
   for (size_t i = 0; i < joint_names_.size(); ++i) {
