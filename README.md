@@ -190,7 +190,7 @@ Motion commands accept optional named scaling and corner-blending arguments:
 | **`Wait`** | `Wait([duration=]<sec>)` | Stationary dwell in `(0.0, 120.0]` s. |
 | **`SetPayload`** | `SetPayload([mass=]<kg>, [com=[x, y, z]])` | Updates online carried mass in `[0.0, 0.6]` kg and TCP-frame CoM offset with `\|\|com\|\| <= 0.30` m (default `[0, 0, 0]`). |
 
-### Minimal `.l6` Program Example
+### `.l6` Program Example
 
 ```text
 # Typed constant declarations (rad is default; deg is also supported)
