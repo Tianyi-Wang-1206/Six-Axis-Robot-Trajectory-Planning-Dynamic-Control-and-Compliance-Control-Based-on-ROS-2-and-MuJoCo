@@ -75,6 +75,13 @@ void GripperControl::initialize(mjModel * model, mjData * data)
     }
   }
   state_ = Snapshot{};
+  const double total_stiction =
+    std::max(0.0, model_->dof_frictionloss[dof_[0]]) +
+    std::max(0.0, model_->dof_frictionloss[dof_[1]]);
+  min_force_override_ = std::max(2.0 * parameters_.grasp_force, total_stiction + 2.0 * parameters_.grasp_force);
+  if (min_force_override_ > parameters_.max_force) {
+    throw std::runtime_error("Configured gripper max_force cannot overcome stiction and grasp threshold");
+  }
   active_max_force_ = parameters_.max_force;
   state_.max_force = active_max_force_;
   stop_drive(State::STOPPED);
@@ -109,8 +116,9 @@ void GripperControl::configure(const rclcpp::Node::SharedPtr & node)
   if (timer_ || !node) {return;}
   const auto channel = channel_;
   const auto params = parameters_;
+  const double min_override = min_force_override_;
   service_ = node->create_service<Service>("/gripper/command",
-    [channel, params](const std::shared_ptr<Service::Request> request,
+    [channel, params, min_override](const std::shared_ptr<Service::Request> request,
                       std::shared_ptr<Service::Response> response) {
       struct InflightGuard
       {
@@ -134,8 +142,16 @@ void GripperControl::configure(const rclcpp::Node::SharedPtr & node)
         return;
       }
       if (!std::isfinite(request->max_force_override) ||
+          request->max_force_override < 0.0 ||
           request->max_force_override > params.max_force) {
-        response->detail = "max_force_override must be finite and <= configured max_force";
+        response->detail = "max_force_override must be finite and in [0.0, configured max_force]";
+        return;
+      }
+      if (request->max_force_override > 0.0 && request->max_force_override < min_override) {
+        response->detail =
+          "Positive max_force_override is below minimum effective drive/grasp force (" +
+          std::to_string(min_override) + " N); use 0.0 for default or >= " +
+          std::to_string(min_override) + " N";
         return;
       }
       Command command;

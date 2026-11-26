@@ -908,8 +908,12 @@ bool CompositeCartesianPath::build(
           eff <= 1e-5 ? "WARN_BLEND_IGNORED" : "WARN_BLEND_CLAMPED",
           oss.str()});
       }
-      raw_prims[i].trim_end -= trim_len[i];
-      raw_prims[i + 1].trim_start += trim_len[i];
+      if (trim_len[i] > 1e-5) {
+        raw_prims[i].trim_end -= trim_len[i];
+        raw_prims[i + 1].trim_start += trim_len[i];
+      } else {
+        trim_len[i] = 0.0;
+      }
     }
   }
 
@@ -996,12 +1000,35 @@ bool C3CartesianSpline::build(
     return false;
   }
 
-  const size_t n = poses.size() - 1;
+  // Collapse consecutive coincident poses so near-zero chord intervals cannot destabilize
+  // the natural cubic tridiagonal system.
+  std::vector<Eigen::Matrix4d> filt_poses;
+  std::vector<SourceLocation> filt_locs;
+  filt_poses.reserve(poses.size());
+  filt_locs.reserve(seg_locs.size());
+  filt_poses.push_back(poses.front());
+  for (size_t k = 1; k < poses.size(); ++k) {
+    const Eigen::Vector3d dp =
+      poses[k].topRightCorner<3, 1>() - filt_poses.back().topRightCorner<3, 1>();
+    const Eigen::Vector3d dr = so3_log(
+      filt_poses.back().topLeftCorner<3, 3>().transpose() * poses[k].topLeftCorner<3, 3>());
+    const double seg_dist = std::max(dp.norm(), kCharLength * dr.norm());
+    if (seg_dist >= 1e-6) {
+      filt_poses.push_back(poses[k]);
+      filt_locs.push_back(seg_locs[k - 1]);
+    }
+  }
+  if (filt_poses.size() < 2) {
+    filt_poses.push_back(poses.back());
+    filt_locs.push_back(seg_locs.back());
+  }
+
+  const size_t n = filt_poses.size() - 1;
   std::vector<Eigen::Vector3d> p(n + 1);
   std::vector<Eigen::Matrix3d> R(n + 1);
   for (size_t k = 0; k <= n; ++k) {
-    p[k] = poses[k].topRightCorner<3, 1>();
-    R[k] = poses[k].topLeftCorner<3, 3>();
+    p[k] = filt_poses[k].topRightCorner<3, 1>();
+    R[k] = filt_poses[k].topLeftCorner<3, 3>();
   }
 
   // Relative rotations and pseudo-arc-length knot spacing.
@@ -1118,7 +1145,7 @@ bool C3CartesianSpline::build(
     seg.u0 = u[k];
     seg.h = h;
     seg.R0 = R[k];
-    seg.loc = seg_locs[k];
+    seg.loc = filt_locs[k];
     seg.p_c = make_septic_hermite(
       p[k], pm1[k], pm2[k], pm3[k],
       p[k + 1], pm1[k + 1], pm2[k + 1], pm3[k + 1], h);
@@ -1245,19 +1272,58 @@ void C3JointSpline::build(
   const std::vector<std::array<double, 6>> & knots,
   const std::vector<double> & u_knots)
 {
-  const int n = static_cast<int>(knots.size()) - 1;
-  if (n < 1) {
+  if (knots.size() < 2) {
     segments_.clear();
     return;
   }
 
-  const std::vector<double> u =
-    (u_knots.size() == knots.size()) ? u_knots : chord_length_parameters(knots);
+  // Collapse consecutive coincident knots so degenerate tiny intervals cannot explode
+  // natural cubic spline derivatives.
+  std::vector<std::array<double, 6>> filt_knots;
+  std::vector<double> filt_u;
+  const bool has_custom_u = (u_knots.size() == knots.size());
+  filt_knots.reserve(knots.size());
+  if (has_custom_u) {
+    filt_u.reserve(u_knots.size());
+  }
+  filt_knots.push_back(knots.front());
+  if (has_custom_u) {
+    filt_u.push_back(u_knots.front());
+  }
+  bool collapsed_any = false;
+  for (size_t k = 1; k < knots.size(); ++k) {
+    double sq = 0.0;
+    for (size_t j = 0; j < 6; ++j) {
+      const double diff = knots[k][j] - filt_knots.back()[j];
+      sq += diff * diff;
+    }
+    if (std::sqrt(sq) >= 1e-6) {
+      filt_knots.push_back(knots[k]);
+      if (has_custom_u) {
+        filt_u.push_back(u_knots[k]);
+      }
+    } else {
+      collapsed_any = true;
+    }
+  }
+  if (filt_knots.size() < 2) {
+    filt_knots.push_back(knots.back());
+    filt_u = {0.0, 1.0};
+    collapsed_any = true;
+  }
+
+  const int n = static_cast<int>(filt_knots.size()) - 1;
+  std::vector<double> u;
+  if (has_custom_u && !collapsed_any) {
+    u = u_knots;
+  } else {
+    u = chord_length_parameters(filt_knots);
+  }
 
   std::vector<Vec6> q(static_cast<size_t>(n + 1));
   for (int i = 0; i <= n; ++i) {
     for (int j = 0; j < 6; ++j) {
-      q[static_cast<size_t>(i)][j] = knots[static_cast<size_t>(i)][static_cast<size_t>(j)];
+      q[static_cast<size_t>(i)][j] = filt_knots[static_cast<size_t>(i)][static_cast<size_t>(j)];
     }
   }
 

@@ -500,26 +500,31 @@ private:
       finish_upper(key,gh,Motion::Result::ERR_INTERNAL,error.what(),0);
     }
   }
-  void dispatch_ctc(const std::string& key,
+  bool dispatch_ctc(const std::string& key,
       const trajectory_msgs::msg::JointTrajectory& trajectory,
-      std::shared_ptr<MotionHandle> upper) {
+      std::shared_ptr<MotionHandle> upper,
+      std::string* out_error=nullptr) {
+    auto fail_dispatch=[&](int32_t code,const std::string& msg) {
+      if(out_error) *out_error=msg;
+      finish_upper(key,upper,code,msg,0);
+      return false;
+    };
     if(!supervisor_.permitted(key)) {
-      finish_upper(key,upper,Motion::Result::ERR_CANCELLED,"Authorization revoked",0);return;
+      return fail_dispatch(Motion::Result::ERR_CANCELLED,"Authorization revoked");
     }
     bool ctc_ready=false;
     for(int attempt=0;attempt<20;++attempt) {
       if(shutdown_.load()||!supervisor_.permitted(key)) {
-        finish_upper(key,upper,Motion::Result::ERR_CANCELLED,
-            "Goal canceled while waiting for CTC server",0);
-        return;
+        return fail_dispatch(Motion::Result::ERR_CANCELLED,
+            "Goal canceled while waiting for CTC server");
       }
       if(ctc_->wait_for_action_server(100ms)) {ctc_ready=true;break;}
     }
     if(!ctc_ready) {
-      finish_upper(key,upper,Motion::Result::ERR_EXECUTION_ABORTED,"CTC unavailable",0);return;
+      return fail_dispatch(Motion::Result::ERR_EXECUTION_ABORTED,"CTC unavailable");
     }
     if(!supervisor_.change_motion_phase(key,S::MOTION_WAITING_CTC)) {
-      finish_upper(key,upper,Motion::Result::ERR_CANCELLED,"Motion canceled before CTC dispatch",0);return;
+      return fail_dispatch(Motion::Result::ERR_CANCELLED,"Motion canceled before CTC dispatch");
     }
     const double duration=sec(trajectory.points.back().time_from_start);
     {
@@ -534,8 +539,9 @@ private:
     // Cancellation may have arrived after the initial authorization check,
     // while the downstream goal slot was being prepared.
     if(!supervisor_.permitted(key)) {
+      if(out_error) *out_error="Authorization revoked before CTC send";
       finish_ctc(key,Motion::Result::ERR_CANCELLED,"Authorization revoked before CTC send");
-      return;
+      return false;
     }
     FJT::Goal g;g.trajectory=trajectory;
     rclcpp_action::Client<FJT>::SendGoalOptions options;
@@ -597,9 +603,12 @@ private:
     };
     try {ctc_->async_send_goal(g,options);}
     catch(const std::exception& e) {
+      if(out_error) *out_error=e.what();
       finish_ctc(key,Motion::Result::ERR_EXECUTION_ABORTED,e.what());
+      return false;
     }
     publish_state();
+    return true;
   }
   void finish_upper(const std::string& key,const std::shared_ptr<MotionHandle>& gh,
       int32_t code,const std::string& message,double duration) {
@@ -701,10 +710,16 @@ private:
       resp.accepted=false;resp.message=why;
       resp.revision=supervisor_.snapshot().revision;return;
     }
+    std::string dispatch_err;
+    if(!dispatch_ctc(key,req.trajectory,nullptr,&dispatch_err)) {
+      resp.accepted=false;
+      resp.revision=supervisor_.snapshot().revision;
+      resp.message=dispatch_err.empty()?"Failed to dispatch trajectory to CTC":dispatch_err;
+      return;
+    }
     resp.accepted=true;
     resp.revision=supervisor_.snapshot().revision;
     resp.message="Trajectory authorized and submitted to CTC; monitor supervisor state for completion";
-    dispatch_ctc(key,req.trajectory,nullptr);
   }
   void on_heartbeat() {
     // Drop bookkeeping for callback-style CTC requests that never got a response.

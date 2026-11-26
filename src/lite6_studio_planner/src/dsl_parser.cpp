@@ -232,6 +232,7 @@ enum class TokenKind
   RBRACE,
   COMMA,
   EQUALS,
+  SEMICOLON,
   END_OF_FILE
 };
 
@@ -395,7 +396,13 @@ std::vector<Token> tokenize(
       ++i;
       continue;
     }
-    if (std::isspace(static_cast<unsigned char>(c)) || c == ';') {
+    if (std::isspace(static_cast<unsigned char>(c))) {
+      ++col;
+      ++i;
+      continue;
+    }
+    if (c == ';') {
+      if (!push_token({TokenKind::SEMICOLON, ";", 0.0, line, col})) break;
       ++col;
       ++i;
       continue;
@@ -611,19 +618,23 @@ public:
   void parse_program(ASTProgram & prog, DiagnosticSink & sink)
   {
     while (!at_eof()) {
+      while (match(TokenKind::SEMICOLON)) {}
+      if (at_eof()) {
+        break;
+      }
       if (!sink.can_accept_more()) {
         sink.mark_stopped_early();
         break;
       }
       try {
-        parse_top_level(prog);
+        parse_top_level(prog, sink);
       } catch (const ParseError & err) {
         record_error(err, sink);
-        if (!sink.can_accept_more()) {
+        if (err.code == "ERR_STATEMENT_LIMIT" || !sink.can_accept_more()) {
           sink.mark_stopped_early();
           break;
         }
-        synchronize();
+        synchronize(false);
       }
     }
     prog.total_leaf_statements = next_stmt_index_;
@@ -708,12 +719,43 @@ private:
     sink.add(std::move(d));
   }
 
-  void synchronize()
+  static bool is_reserved_identifier(const std::string & id)
+  {
+    return id == "Pose" || id == "joint" || id == "pose" ||
+           id == "MoveJ" || id == "MoveP" || id == "MoveL" ||
+           id == "MoveC" || id == "MovePVA" || id == "ImpedanceCartesian" ||
+           id == "Gripper" || id == "Wait" || id == "SetPayload" ||
+           id == "point" || id == "rad" || id == "deg" ||
+           id == "true" || id == "false" || id == "JOINT" || id == "CARTESIAN" ||
+           id == "OPEN" || id == "CLOSE" || id == "STOP";
+  }
+
+  static void validate_cartesian_xyz(
+    double x, double y, double z, const Token & anchor, int stmt_idx)
+  {
+    constexpr double kMaxPoseCoordM = 10.0;
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+        std::abs(x) > kMaxPoseCoordM || std::abs(y) > kMaxPoseCoordM ||
+        std::abs(z) > kMaxPoseCoordM)
+    {
+      throw ParseError(
+        D::STAGE_SEMANTIC, anchor.line, anchor.column, stmt_idx, "ERR_POSE_RANGE",
+        "Cartesian position coordinates must be finite and within [-10.0, 10.0] m");
+    }
+  }
+
+  void synchronize(bool stop_before_rbrace)
   {
     const int err_line = peek().line;
     while (!at_eof()) {
-      if (peek().kind == TokenKind::RBRACE) {
+      if (peek().kind == TokenKind::SEMICOLON) {
         advance();
+        return;
+      }
+      if (peek().kind == TokenKind::RBRACE) {
+        if (!stop_before_rbrace) {
+          advance();
+        }
         return;
       }
       if (peek().line > err_line && peek().kind == TokenKind::IDENT) {
@@ -828,15 +870,31 @@ private:
         const Token & key = expect(TokenKind::IDENT, "Pose parameter name (xyz/rpy/quat)", stmt_idx);
         expect(TokenKind::EQUALS, "'=' after Pose parameter '" + key.lexeme + "'", stmt_idx);
         if (key.lexeme == "xyz") {
+          if (has_xyz) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+              "Duplicate 'xyz' parameter in Pose(...)");
+          }
           const auto v = parse_fixed_vector<3>(stmt_idx);
+          validate_cartesian_xyz(v[0], v[1], v[2], key, stmt_idx);
           xyz = Eigen::Vector3d(v[0], v[1], v[2]);
           has_xyz = true;
         } else if (key.lexeme == "rpy") {
+          if (has_ori) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+              "Duplicate orientation ('rpy'/'quat') parameter in Pose(...)");
+          }
           auto v = parse_fixed_vector<3>(stmt_idx);
           const double scale = parse_optional_angle_unit(stmt_idx);
           rot = rpy_to_rotation(v[0] * scale, v[1] * scale, v[2] * scale);
           has_ori = true;
         } else if (key.lexeme == "quat") {
+          if (has_ori) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+              "Duplicate orientation ('rpy'/'quat') parameter in Pose(...)");
+          }
           const auto qv = parse_fixed_vector<4>(stmt_idx);
           // Convention: [qx, qy, qz, qw]
           Eigen::Quaterniond q(qv[3], qv[0], qv[1], qv[2]);
@@ -872,7 +930,9 @@ private:
     }
 
     // Shorthand 6-vector: [x, y, z, r, p, y] [rad|deg]
+    const Token anchor = peek();
     const auto v = parse_fixed_vector<6>(stmt_idx);
+    validate_cartesian_xyz(v[0], v[1], v[2], anchor, stmt_idx);
     const double scale = parse_optional_angle_unit(stmt_idx);
     Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
     T.topLeftCorner<3, 3>() = rpy_to_rotation(v[3] * scale, v[4] * scale, v[5] * scale);
@@ -941,6 +1001,11 @@ private:
           const Token & key = advance();
           advance();  // '='
           if (key.lexeme == "target") {
+            if (has_target) {
+              throw ParseError(
+                D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+                "Duplicate 'target' argument in " + kw.lexeme);
+            }
             if (m.type == MotionCommandType::MOVE_J) {
               m.joint_target = parse_joint_value(stmt_idx);
             } else {
@@ -984,26 +1049,70 @@ private:
         const Token & key = expect(TokenKind::IDENT, "MoveC parameter name", stmt_idx);
         expect(TokenKind::EQUALS, "'=' after MoveC parameter '" + key.lexeme + "'", stmt_idx);
         if (key.lexeme == "via") {
+          if (has_via) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+              "Duplicate 'via' parameter in MoveC");
+          }
           if (peek().kind == TokenKind::LBRACKET) {
-            const auto p = parse_fixed_vector<3>(stmt_idx);
-            m.pose_via = Eigen::Matrix4d::Identity();
-            m.pose_via(0, 3) = p[0];
-            m.pose_via(1, 3) = p[1];
-            m.pose_via(2, 3) = p[2];
-            m.via_has_orientation = false;
+            // Distinguish 3-element [x, y, z] position-only via from 6-element [x, y, z, r, p, y] pose.
+            size_t count = 0;
+            size_t look = 1;
+            while (peek(look).kind != TokenKind::RBRACKET &&
+                   peek(look).kind != TokenKind::END_OF_FILE && count <= 7)
+            {
+              if (peek(look).kind == TokenKind::NUMBER) {
+                ++count;
+              }
+              ++look;
+            }
+            if (count == 6) {
+              m.pose_via = parse_pose_value(stmt_idx);
+              m.via_has_orientation = true;
+            } else if (count == 3) {
+              const Token anchor = peek();
+              const auto p = parse_fixed_vector<3>(stmt_idx);
+              validate_cartesian_xyz(p[0], p[1], p[2], anchor, stmt_idx);
+              m.pose_via = Eigen::Matrix4d::Identity();
+              m.pose_via(0, 3) = p[0];
+              m.pose_via(1, 3) = p[1];
+              m.pose_via(2, 3) = p[2];
+              m.via_has_orientation = false;
+            } else {
+              throw ParseError(
+                D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_VECTOR_DIM",
+                "MoveC 'via' vector requires 3 elements [x, y, z] or 6 elements [x, y, z, r, p, y]");
+            }
           } else {
             m.pose_via = parse_pose_value(stmt_idx);
             m.via_has_orientation = true;
           }
           has_via = true;
         } else if (key.lexeme == "target") {
+          if (has_target) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+              "Duplicate 'target' parameter in MoveC");
+          }
           m.pose_target = parse_pose_value(stmt_idx);
           has_target = true;
         } else if (key.lexeme == "center") {
+          if (has_center) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+              "Duplicate 'center' parameter in MoveC");
+          }
+          const Token anchor = peek();
           const auto c = parse_fixed_vector<3>(stmt_idx);
+          validate_cartesian_xyz(c[0], c[1], c[2], anchor, stmt_idx);
           m.circle_center = Eigen::Vector3d(c[0], c[1], c[2]);
           has_center = true;
         } else if (key.lexeme == "axis") {
+          if (has_axis) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+              "Duplicate 'axis' parameter in MoveC");
+          }
           const auto a = parse_fixed_vector<3>(stmt_idx);
           m.circle_axis = Eigen::Vector3d(a[0], a[1], a[2]);
           if (m.circle_axis.norm() < 1e-6) {
@@ -1014,6 +1123,11 @@ private:
           m.circle_axis.normalize();
           has_axis = true;
         } else if (key.lexeme == "angle") {
+          if (has_angle) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+              "Duplicate 'angle' parameter in MoveC");
+          }
           const Token & ang = expect(TokenKind::NUMBER, "circle sweep angle", stmt_idx);
           const double scale = parse_optional_angle_unit(stmt_idx);
           m.circle_angle_rad = ang.number * scale;
@@ -1026,6 +1140,11 @@ private:
           }
           has_angle = true;
         } else if (key.lexeme == "target_ori") {
+          if (m.has_explicit_target_ori) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+              "Duplicate 'target_ori' parameter in MoveC");
+          }
           const Eigen::Matrix4d T_ori = parse_pose_value(stmt_idx);
           m.circle_target_rot = T_ori.topLeftCorner<3, 3>();
           m.has_explicit_target_ori = true;
@@ -1102,6 +1221,10 @@ private:
 
     expect(TokenKind::LBRACE, "'{' to open MovePVA waypoint block", stmt_idx);
     while (peek().kind != TokenKind::RBRACE && !at_eof()) {
+      while (match(TokenKind::SEMICOLON)) {}
+      if (peek().kind == TokenKind::RBRACE || at_eof()) {
+        break;
+      }
       const Token & pt_kw = expect(TokenKind::IDENT, "'point(...)' in MovePVA block", stmt_idx);
       if (pt_kw.lexeme != "point") {
         throw ParseError(
@@ -1123,6 +1246,11 @@ private:
         const Token & k = expect(TokenKind::IDENT, "point field (p/v/a/dt)", stmt_idx);
         expect(TokenKind::EQUALS, "'=' after '" + k.lexeme + "'", stmt_idx);
         if (k.lexeme == "p") {
+          if (has_p) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, k.line, k.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+              "Duplicate 'p' parameter in point(...)");
+          }
           if (pva.space == SpaceType::JOINT) {
             wp.joint_pos = parse_joint_value(stmt_idx);
           } else {
@@ -1130,10 +1258,25 @@ private:
           }
           has_p = true;
         } else if (k.lexeme == "v") {
+          if (wp.velocity.has_value()) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, k.line, k.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+              "Duplicate 'v' parameter in point(...)");
+          }
           wp.velocity = parse_fixed_vector<6>(stmt_idx);
         } else if (k.lexeme == "a") {
+          if (wp.acceleration.has_value()) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, k.line, k.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+              "Duplicate 'a' parameter in point(...)");
+          }
           wp.acceleration = parse_fixed_vector<6>(stmt_idx);
         } else if (k.lexeme == "dt") {
+          if (wp.dt.has_value()) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, k.line, k.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+              "Duplicate 'dt' parameter in point(...)");
+          }
           const Token & dt_tok = expect(TokenKind::NUMBER, "segment duration dt [s]", stmt_idx);
           if (dt_tok.number <= 0.005 || dt_tok.number > 120.0) {
             throw ParseError(
@@ -1186,7 +1329,7 @@ private:
     return {{num.number, num.number, num.number}};
   }
 
-  ASTStatement parse_impedance_block(const Token & kw)
+  ASTStatement parse_impedance_block(const Token & kw, DiagnosticSink & sink)
   {
     const int block_idx = next_stmt_index_;
     expect(TokenKind::LPAREN, "'(' after ImpedanceCartesian", block_idx);
@@ -1291,30 +1434,52 @@ private:
     block_stmt.loc = {kw.line, kw.column, block_idx, line_snippet(kw.line)};
     block_stmt.impedance_params = params;
 
+    bool had_inner_error = false;
     while (peek().kind != TokenKind::RBRACE && !at_eof()) {
-      const Token & inner_kw = expect(
-        TokenKind::IDENT, "statement inside ImpedanceCartesian block", next_stmt_index_);
-      consume_statement_budget(inner_kw, next_stmt_index_);
-      if (inner_kw.lexeme == "MoveL" || inner_kw.lexeme == "MoveC" ||
-          inner_kw.lexeme == "MoveJ" || inner_kw.lexeme == "MoveP") {
-        block_stmt.body.push_back(parse_motion_stmt(inner_kw, true));
-      } else if (inner_kw.lexeme == "MovePVA") {
-        block_stmt.body.push_back(parse_move_pva_stmt(inner_kw, true));
-      } else if (inner_kw.lexeme == "Gripper") {
-        block_stmt.body.push_back(parse_gripper_stmt(inner_kw));
-      } else if (inner_kw.lexeme == "Wait") {
-        block_stmt.body.push_back(parse_wait_stmt(inner_kw));
-      } else if (inner_kw.lexeme == "SetPayload") {
-        block_stmt.body.push_back(parse_set_payload_stmt(inner_kw));
-      } else {
-        throw ParseError(
-          D::STAGE_SEMANTIC, inner_kw.line, inner_kw.column, next_stmt_index_,
-          "ERR_INVALID_IMPEDANCE_STMT",
-          "Statement '" + inner_kw.lexeme + "' is not allowed inside ImpedanceCartesian block");
+      while (match(TokenKind::SEMICOLON)) {}
+      if (peek().kind == TokenKind::RBRACE || at_eof()) {
+        break;
+      }
+      if (!sink.can_accept_more()) {
+        sink.mark_stopped_early();
+        break;
+      }
+      try {
+        const Token & inner_kw = expect(
+          TokenKind::IDENT, "statement inside ImpedanceCartesian block", next_stmt_index_);
+        consume_statement_budget(inner_kw, next_stmt_index_);
+        if (inner_kw.lexeme == "MoveL" || inner_kw.lexeme == "MoveC" ||
+            inner_kw.lexeme == "MoveJ" || inner_kw.lexeme == "MoveP") {
+          block_stmt.body.push_back(parse_motion_stmt(inner_kw, true));
+        } else if (inner_kw.lexeme == "MovePVA") {
+          block_stmt.body.push_back(parse_move_pva_stmt(inner_kw, true));
+        } else if (inner_kw.lexeme == "Gripper") {
+          block_stmt.body.push_back(parse_gripper_stmt(inner_kw));
+        } else if (inner_kw.lexeme == "Wait") {
+          block_stmt.body.push_back(parse_wait_stmt(inner_kw));
+        } else if (inner_kw.lexeme == "SetPayload") {
+          block_stmt.body.push_back(parse_set_payload_stmt(inner_kw));
+        } else {
+          throw ParseError(
+            D::STAGE_SEMANTIC, inner_kw.line, inner_kw.column, next_stmt_index_,
+            "ERR_INVALID_IMPEDANCE_STMT",
+            "Statement '" + inner_kw.lexeme + "' is not allowed inside ImpedanceCartesian block");
+        }
+      } catch (const ParseError & err) {
+        had_inner_error = true;
+        if (err.code == "ERR_STATEMENT_LIMIT") {
+          throw;
+        }
+        record_error(err, sink);
+        if (!sink.can_accept_more()) {
+          sink.mark_stopped_early();
+          break;
+        }
+        synchronize(true);
       }
     }
     expect(TokenKind::RBRACE, "'}' to close ImpedanceCartesian block", block_idx);
-    if (block_stmt.body.empty()) {
+    if (block_stmt.body.empty() && !had_inner_error) {
       throw ParseError(
         D::STAGE_SEMANTIC, kw.line, kw.column, block_idx, "ERR_EMPTY_BLOCK",
         "ImpedanceCartesian block cannot be empty");
@@ -1335,6 +1500,11 @@ private:
         const Token & key = advance();
         advance();  // '='
         if (key.lexeme == "action") {
+          if (has_action) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+              "Duplicate 'action' argument in Gripper(...)");
+          }
           const Token & act = expect(TokenKind::IDENT, "'OPEN', 'CLOSE', or 'STOP'", stmt_idx);
           if (act.lexeme == "OPEN") {
             g.action = GripperActionType::OPEN;
@@ -1448,6 +1618,11 @@ private:
         const Token & key = advance();
         advance();  // '='
         if (key.lexeme == "mass") {
+          if (has_mass) {
+            throw ParseError(
+              D::STAGE_SEMANTIC, key.line, key.column, stmt_idx, "ERR_DUPLICATE_PARAM",
+              "Duplicate 'mass' argument in SetPayload(...)");
+          }
           const Token & num = expect(TokenKind::NUMBER, "payload mass [kg]", stmt_idx);
           if (!std::isfinite(num.number) || num.number < lite6_interfaces::contract::kMinPayloadMassKg ||
               num.number > lite6_interfaces::contract::kMaxPayloadMassKg) {
@@ -1510,12 +1685,17 @@ private:
     return st;
   }
 
-  void parse_top_level(ASTProgram & prog)
+  void parse_top_level(ASTProgram & prog, DiagnosticSink & sink)
   {
     const Token & kw = expect(TokenKind::IDENT, "statement or declaration keyword", -1);
     consume_statement_budget(kw, -1);
     if (kw.lexeme == "joint") {
       const Token & name = expect(TokenKind::IDENT, "joint constant identifier", -1);
+      if (is_reserved_identifier(name.lexeme)) {
+        throw ParseError(
+          D::STAGE_SEMANTIC, name.line, name.column, -1, "ERR_RESERVED_KEYWORD",
+          "Cannot use reserved keyword '" + name.lexeme + "' as a constant name");
+      }
       if (joint_consts_.count(name.lexeme) || pose_consts_.count(name.lexeme)) {
         throw ParseError(
           D::STAGE_SEMANTIC, name.line, name.column, -1, "ERR_DUPLICATE_SYMBOL",
@@ -1525,6 +1705,11 @@ private:
       joint_consts_[name.lexeme] = parse_joint_value(-1);
     } else if (kw.lexeme == "pose") {
       const Token & name = expect(TokenKind::IDENT, "pose constant identifier", -1);
+      if (is_reserved_identifier(name.lexeme)) {
+        throw ParseError(
+          D::STAGE_SEMANTIC, name.line, name.column, -1, "ERR_RESERVED_KEYWORD",
+          "Cannot use reserved keyword '" + name.lexeme + "' as a constant name");
+      }
       if (joint_consts_.count(name.lexeme) || pose_consts_.count(name.lexeme)) {
         throw ParseError(
           D::STAGE_SEMANTIC, name.line, name.column, -1, "ERR_DUPLICATE_SYMBOL",
@@ -1539,7 +1724,7 @@ private:
     } else if (kw.lexeme == "MovePVA") {
       prog.statements.push_back(parse_move_pva_stmt(kw, false));
     } else if (kw.lexeme == "ImpedanceCartesian") {
-      prog.statements.push_back(parse_impedance_block(kw));
+      prog.statements.push_back(parse_impedance_block(kw, sink));
     } else if (kw.lexeme == "Gripper") {
       prog.statements.push_back(parse_gripper_stmt(kw));
     } else if (kw.lexeme == "Wait") {

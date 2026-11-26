@@ -679,13 +679,44 @@ bool ProgramCompiler::build_cartesian_joint_path(
     bool m3_valid = false;
   };
 
-  std::vector<Knot> knots;
+  if (!std::isfinite(S) || S < 0.0) {
+    add_diag(
+      out_diagnostics, D::STAGE_PLANNING, cart_path.eval_normalized(0.0).loc,
+      "ERR_PATH_TOO_LONG", "Cartesian path length is invalid or non-finite");
+    return false;
+  }
+
+  std::vector<size_t> piece_sub_counts;
+  piece_sub_counts.reserve(breaks.size());
+  size_t estimated_knots = 1;
   for (size_t b = 0; b + 1 < breaks.size(); ++b) {
     const double span = breaks[b + 1] - breaks[b];
-    const int n_sub = std::max(2, static_cast<int>(std::ceil(span * S / kKnotStep)));
-    for (int k = 0; k < n_sub; ++k) {
+    const double raw_sub = std::ceil(span * S / kKnotStep);
+    if (!std::isfinite(raw_sub) || raw_sub > static_cast<double>(kMaxKnots)) {
+      add_diag(
+        out_diagnostics, D::STAGE_PLANNING, cart_path.eval_normalized(0.0).loc,
+        "ERR_PATH_TOO_LONG", "Cartesian path requires too many IK knots");
+      return false;
+    }
+    const size_t n_sub = std::max<size_t>(2, static_cast<size_t>(raw_sub));
+    if (n_sub > kMaxKnots - estimated_knots) {
+      add_diag(
+        out_diagnostics, D::STAGE_PLANNING, cart_path.eval_normalized(0.0).loc,
+        "ERR_PATH_TOO_LONG", "Cartesian path requires too many IK knots");
+      return false;
+    }
+    estimated_knots += n_sub;
+    piece_sub_counts.push_back(n_sub);
+  }
+
+  std::vector<Knot> knots;
+  knots.reserve(estimated_knots);
+  for (size_t b = 0; b + 1 < breaks.size(); ++b) {
+    const double span = breaks[b + 1] - breaks[b];
+    const size_t n_sub = piece_sub_counts[b];
+    for (size_t k = 0; k < n_sub; ++k) {
       Knot kn;
-      kn.u = breaks[b] + span * k / n_sub;
+      kn.u = breaks[b] + span * static_cast<double>(k) / static_cast<double>(n_sub);
       knots.push_back(kn);
     }
   }
@@ -1471,17 +1502,39 @@ bool ProgramCompiler::compile_pva_statement(
   }
 
   if (!any_vel_or_acc_or_dt) {
-    if (M == 1) {
+    // Collapse consecutive coincident joint waypoints to prevent near-zero spline intervals.
+    std::vector<std::array<double, 6>> dedup_q;
+    std::vector<PVAWaypoint> dedup_wps;
+    dedup_q.reserve(q_nodes.size());
+    dedup_wps.reserve(pva.waypoints.size());
+    dedup_q.push_back(start_q);
+    for (size_t k = 0; k < M; ++k) {
+      double sq = 0.0;
+      for (size_t j = 0; j < 6; ++j) {
+        const double diff = q_nodes[k + 1][j] - dedup_q.back()[j];
+        sq += diff * diff;
+      }
+      if (std::sqrt(sq) >= 1e-6) {
+        dedup_q.push_back(q_nodes[k + 1]);
+        dedup_wps.push_back(pva.waypoints[k]);
+      }
+    }
+    if (dedup_wps.empty()) {
+      dedup_q.push_back(q_nodes.back());
+      dedup_wps.push_back(pva.waypoints.back());
+    }
+
+    if (dedup_wps.size() == 1) {
       MultiAxisSCurve scurve;
       scurve.build(
-        start_q, q_nodes[1], limits,
+        start_q, dedup_q[1], limits,
         pva.options.vel_scale, pva.options.acc_scale, pva.options.jerk_scale);
       constexpr double kMaxSCurveDurationSec = 300.0;
       if (!std::isfinite(scurve.duration()) || scurve.duration() <= 0.0 ||
           scurve.duration() > kMaxSCurveDurationSec)
       {
         add_diag(
-          out_diagnostics, D::STAGE_PLANNING, pva.waypoints.front().loc, "ERR_DURATION_LIMIT",
+          out_diagnostics, D::STAGE_PLANNING, dedup_wps.front().loc, "ERR_DURATION_LIMIT",
           "Computed S-curve trajectory duration=" + std::to_string(scurve.duration()) +
             " s exceeds 300 s limit");
         return false;
@@ -1490,14 +1543,14 @@ bool ProgramCompiler::compile_pva_statement(
         static_cast<size_t>(std::max(1LL, std::llround(scurve.duration() * 1000.0))) + 1;
       if (est_samples > max_samples) {
         add_diag(
-          out_diagnostics, D::STAGE_PLANNING, pva.waypoints.front().loc, "ERR_PROGRAM_RESOURCE_LIMIT",
+          out_diagnostics, D::STAGE_PLANNING, dedup_wps.front().loc, "ERR_PROGRAM_RESOURCE_LIMIT",
           "Compiled program exceeds maximum 1 kHz sample budget (" +
             std::to_string(kMaxProgramSamples1kHz) + " samples)");
         return false;
       }
       bool cancelled = false;
       sampled = scurve_samples(
-        scurve, pva.waypoints.front().loc, 0.0, 1.0, is_cancelled, &cancelled);
+        scurve, dedup_wps.front().loc, 0.0, 1.0, is_cancelled, &cancelled);
       if (cancelled) {
         add_diag(out_diagnostics, D::STAGE_PLANNING, pva.loc, "ERR_CANCELLED",
           "Motion cancelled by supervisor");
@@ -1505,36 +1558,84 @@ bool ProgramCompiler::compile_pva_statement(
       }
     } else {
       // Pure (P) sequence: C^3 joint spline + 3rd-order direct-transcription TOPP timing.
-      const std::vector<double> knot_u = C3JointSpline::chord_length_parameters(q_nodes);
+      const std::vector<double> knot_u = C3JointSpline::chord_length_parameters(dedup_q);
       C3JointSpline spline;
-      spline.build(q_nodes, knot_u);
-      if (knot_u.size() > 2) {
-        spline.set_pinned_boundaries(
-          std::vector<double>(knot_u.begin() + 1, knot_u.end() - 1));
+      spline.build(dedup_q, knot_u);
+
+      // Check whether the natural cubic spline overshoots joint position limits between
+      // in-bounds waypoints; if so, fall back to the hard-bounded 3rd-order JointPVASolver.
+      bool spline_overshoots_limits = false;
+      constexpr int kCheckPerSeg = 24;
+      for (size_t seg = 0; seg + 1 < knot_u.size() && !spline_overshoots_limits; ++seg) {
+        for (int s = 1; s < kCheckPerSeg; ++s) {
+          const double u_chk =
+            knot_u[seg] + (knot_u[seg + 1] - knot_u[seg]) * static_cast<double>(s) / kCheckPerSeg;
+          Vec6 q_chk, dq_chk, ddq_chk, dddq_chk;
+          spline.eval(u_chk, q_chk, dq_chk, ddq_chk, dddq_chk);
+          for (size_t j = 0; j < 6; ++j) {
+            if (q_chk[static_cast<int>(j)] < limits[j].min_pos ||
+                q_chk[static_cast<int>(j)] > limits[j].max_pos)
+            {
+              spline_overshoots_limits = true;
+              break;
+            }
+          }
+          if (spline_overshoots_limits) {
+            break;
+          }
+        }
       }
-      std::string topp_err;
-      std::vector<std::string> topp_warnings;
-      TOPPSolveOptions topp_opts;
-      topp_opts.is_cancelled = is_cancelled;
-      if (!TOPPJerkSolver::solve(
-            spline, nullptr, limits, cart_limits,
-            pva.options.vel_scale, pva.options.acc_scale, pva.options.jerk_scale,
-            pva.loc, sampled, topp_err, &topp_warnings, topp_opts))
-      {
-        const bool was_cancelled = (is_cancelled && is_cancelled());
-        add_diag(
-          out_diagnostics, D::STAGE_PLANNING, pva.loc,
-          was_cancelled ? "ERR_CANCELLED" : "ERR_TOPP_SOLVER", topp_err);
-        return false;
-      }
-      for (const auto & w : topp_warnings) {
-        add_warning(out_diagnostics, D::STAGE_PLANNING, pva.loc, "WARN_TOPP_SUBOPTIMAL", w);
-      }
-      for (auto & s : sampled.samples) {
-        const auto it = std::upper_bound(knot_u.begin() + 1, knot_u.end() - 1, s.path_u);
-        const size_t wp_idx = std::min(
-          M - 1, static_cast<size_t>(std::distance(knot_u.begin() + 1, it)));
-        s.loc = pva.waypoints[wp_idx].loc;
+
+      if (spline_overshoots_limits) {
+        JointPVASolver::MultiWaypointResult pva_res;
+        SourceLocation pva_err_loc = pva.loc;
+        std::string pva_err_code, pva_err_msg;
+        if (!JointPVASolver::solve_multi_waypoint(
+              start_q, dedup_wps, limits,
+              pva.options.vel_scale, pva.options.acc_scale, pva.options.jerk_scale,
+              pva_res, pva_err_loc, pva_err_code, pva_err_msg, is_cancelled))
+        {
+          const uint8_t stage =
+            (pva_err_code == "ERR_JOINT_POS_LIMIT" ||
+             pva_err_code == "ERR_PVA_VEL_LIMIT" ||
+             pva_err_code == "ERR_PVA_ACC_LIMIT" ||
+             pva_err_code == "ERR_PVA_JERK_LIMIT")
+            ? D::STAGE_KINEMATIC_LIMIT
+            : D::STAGE_PLANNING;
+          add_diag(out_diagnostics, stage, pva_err_loc, pva_err_code, pva_err_msg);
+          return false;
+        }
+        sampled = std::move(pva_res.trajectory);
+      } else {
+        if (knot_u.size() > 2) {
+          spline.set_pinned_boundaries(
+            std::vector<double>(knot_u.begin() + 1, knot_u.end() - 1));
+        }
+        std::string topp_err;
+        std::vector<std::string> topp_warnings;
+        TOPPSolveOptions topp_opts;
+        topp_opts.is_cancelled = is_cancelled;
+        if (!TOPPJerkSolver::solve(
+              spline, nullptr, limits, cart_limits,
+              pva.options.vel_scale, pva.options.acc_scale, pva.options.jerk_scale,
+              pva.loc, sampled, topp_err, &topp_warnings, topp_opts))
+        {
+          const bool was_cancelled = (is_cancelled && is_cancelled());
+          add_diag(
+            out_diagnostics, D::STAGE_PLANNING, pva.loc,
+            was_cancelled ? "ERR_CANCELLED" : "ERR_TOPP_SOLVER", topp_err);
+          return false;
+        }
+        for (const auto & w : topp_warnings) {
+          add_warning(out_diagnostics, D::STAGE_PLANNING, pva.loc, "WARN_TOPP_SUBOPTIMAL", w);
+        }
+        const size_t dedup_M = dedup_wps.size();
+        for (auto & s : sampled.samples) {
+          const auto it = std::upper_bound(knot_u.begin() + 1, knot_u.end() - 1, s.path_u);
+          const size_t wp_idx = std::min(
+            dedup_M - 1, static_cast<size_t>(std::distance(knot_u.begin() + 1, it)));
+          s.loc = dedup_wps[wp_idx].loc;
+        }
       }
     }
   } else {
@@ -1944,7 +2045,7 @@ bool ProgramCompiler::verify_joint_trajectory(
   sampled.duration_sec = prev_time;
   return verify_sampled_trajectory_1khz(
     sampled, check_singularity_along_path, out_diagnostics,
-    /*is_impedance=*/false, enforce_jerk, is_cancelled);
+    /*is_impedance=*/false, enforce_jerk, is_cancelled, kMaxTrajectoryPoints);
 }
 
 bool ProgramCompiler::plan_alignment_bridge(
@@ -2176,12 +2277,19 @@ ProgramCompiler::PauseSpliceStatus ProgramCompiler::plan_pause_splice(
       2.1875 * wa0.norm() / std::max(1e-4, kLimitShare * opts0.acc_scale * cart_limits.max_rot_acc)});
   }
 
+  constexpr double kMaxLetFinishRemainingSec = 0.35;
+  constexpr double kMaxPauseStopDurationSec = 1.2;
   for (int attempt = 0; attempt < kMaxSearch; ++attempt, t_d *= 1.12) {
     const int ticks = static_cast<int>(std::ceil(t_d / kDt - 1e-9));
     const double td = ticks * kDt;
-    if (0.5 * td >= remaining - kDt) {
-      // The programmed motion stops sooner than a path-preserving stop could.
-      return PauseSpliceStatus::LET_FINISH;
+    if (0.5 * td >= remaining - kDt || td >= remaining || td > kMaxPauseStopDurationSec) {
+      if (attempt == 0 && remaining <= kMaxLetFinishRemainingSec && 0.5 * td >= remaining - kDt) {
+        // Already near segment end: programmed stop finishes faster than a path-preserving ramp.
+        return PauseSpliceStatus::LET_FINISH;
+      }
+      out_error =
+        "No admissible fast path-preserving stop within limits; cancel braking required";
+      return PauseSpliceStatus::FAILED;
     }
     trajectory_msgs::msg::JointTrajectory tail;
     tail.joint_names = block.rigid_trajectory.joint_names;

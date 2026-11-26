@@ -2,7 +2,7 @@
 # Per-joint acceleration values are simulation tuning, not manufacturer ratings.
 joint_limits:
   joint1: { max_vel: 3.14, max_acc: 8.0,  max_jerk: 200.0, min_pos: -6.28319, max_pos: 6.28319 }
-  joint2: { max_vel: 3.14, max_acc: 6.0,  max_jerk: 200.0, min_pos: -2.61799, max_pos: 2.61799 }
+  joint2: { max_vel: 3.14, max_acc: 6.0,  max_jerk: 200.0, min_pos: -2.617994, max_pos: 2.617994 }
   joint3: { max_vel: 3.14, max_acc: 10.0, max_jerk: 200.0, min_pos:  0.00000, max_pos: 4.97419 }
   joint4: { max_vel: 3.14, max_acc: 16.0, max_jerk: 200.0, min_pos: -6.28319, max_pos: 6.28319 }
   joint5: { max_vel: 3.14, max_acc: 18.0, max_jerk: 200.0, min_pos: -1.62316, max_pos: 1.62316 }

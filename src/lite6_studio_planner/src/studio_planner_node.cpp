@@ -388,9 +388,22 @@ private:
 
   void poll_joint_state_shm()
   {
-    if (!state_shm_.valid()) {
-      const auto status = state_shm_.open_status(false);
-      if (status != lite6_interfaces::shm::ShmOpenStatus::OK) {
+    lite6_interfaces::shm::JointStatePod pod{};
+    uint64_t seq = 0;
+    const int64_t now_ns = lite6_interfaces::shm::steady_now_ns();
+    {
+      std::lock_guard<std::mutex> shm_lock(state_shm_mutex_);
+      auto try_reopen_unlocked = [&]() -> bool {
+        if (now_ns - last_shm_reopen_ns_ < 250000000LL) {
+          return false;
+        }
+        last_shm_reopen_ns_ = now_ns;
+        const auto status = state_shm_.open_status(false);
+        if (status == lite6_interfaces::shm::ShmOpenStatus::OK) {
+          last_joint_seq_ = 0;
+          last_joint_steady_ns_ = 0;
+          return true;
+        }
         if (status == lite6_interfaces::shm::ShmOpenStatus::INCOMPATIBLE ||
             status == lite6_interfaces::shm::ShmOpenStatus::OS_ERROR)
         {
@@ -399,19 +412,26 @@ private:
             "State shared memory open failed (%s); refusing to attach",
             lite6_interfaces::shm::shm_open_status_name(status));
         }
+        return false;
+      };
+
+      if (!state_shm_.valid() && !try_reopen_unlocked()) {
         return;
       }
-    }
-    lite6_interfaces::shm::JointStatePod pod{};
-    uint64_t seq = 0;
-    if (!state_shm_->joint_state.read(pod, seq) || pod.valid == 0) {
-      return;
-    }
-    const int64_t now_ns = lite6_interfaces::shm::steady_now_ns();
-    if (!lite6_interfaces::shm::is_stamp_fresh(
-          pod.steady_stamp_ns, now_ns, lite6_interfaces::contract::kJointStateStaleTimeoutNs))
-    {
-      return;
+      bool ok = state_shm_->joint_state.read(pod, seq) && pod.valid != 0 &&
+        lite6_interfaces::shm::is_stamp_fresh(
+          pod.steady_stamp_ns, now_ns, lite6_interfaces::contract::kJointStateStaleTimeoutNs);
+      if (!ok) {
+        // Reopen when mapped SHM goes stale (e.g. hardware process restarted and unlinked/recreated SHM).
+        if (try_reopen_unlocked() && state_shm_.valid()) {
+          ok = state_shm_->joint_state.read(pod, seq) && pod.valid != 0 &&
+            lite6_interfaces::shm::is_stamp_fresh(
+              pod.steady_stamp_ns, now_ns, lite6_interfaces::contract::kJointStateStaleTimeoutNs);
+        }
+        if (!ok) {
+          return;
+        }
+      }
     }
     if (seq == last_joint_seq_ || pod.steady_stamp_ns <= last_joint_steady_ns_) {
       return;
@@ -488,27 +508,30 @@ private:
     if (!supervisor_->is_fresh_joint()) {
       return false;
     }
-    if (state_shm_.valid()) {
-      lite6_interfaces::shm::JointStatePod pod{};
-      uint64_t seq = 0;
-      const int64_t now_ns = lite6_interfaces::shm::steady_now_ns();
-      if (state_shm_->joint_state.read(pod, seq) && pod.valid != 0 &&
-          lite6_interfaces::shm::is_stamp_fresh(
-            pod.steady_stamp_ns, now_ns, lite6_interfaces::contract::kJointStateStaleTimeoutNs))
-      {
-        bool finite_ok = true;
-        double max_dq = 0.0;
-        for (size_t i = 0; i < 6; ++i) {
-          if (!std::isfinite(pod.position[i]) || !std::isfinite(pod.velocity[i])) {
-            finite_ok = false;
-            break;
+    {
+      std::lock_guard<std::mutex> shm_lock(state_shm_mutex_);
+      if (state_shm_.valid()) {
+        lite6_interfaces::shm::JointStatePod pod{};
+        uint64_t seq = 0;
+        const int64_t now_ns = lite6_interfaces::shm::steady_now_ns();
+        if (state_shm_->joint_state.read(pod, seq) && pod.valid != 0 &&
+            lite6_interfaces::shm::is_stamp_fresh(
+              pod.steady_stamp_ns, now_ns, lite6_interfaces::contract::kJointStateStaleTimeoutNs))
+        {
+          bool finite_ok = true;
+          double max_dq = 0.0;
+          for (size_t i = 0; i < 6; ++i) {
+            if (!std::isfinite(pod.position[i]) || !std::isfinite(pod.velocity[i])) {
+              finite_ok = false;
+              break;
+            }
+            out_q[i] = pod.position[i];
+            max_dq = std::max(max_dq, std::abs(pod.velocity[i]));
           }
-          out_q[i] = pod.position[i];
-          max_dq = std::max(max_dq, std::abs(pod.velocity[i]));
-        }
-        if (finite_ok) {
-          out_max_dq = max_dq;
-          return true;
+          if (finite_ok) {
+            out_max_dq = max_dq;
+            return true;
+          }
         }
       }
     }
@@ -568,6 +591,11 @@ private:
         d.code = "ERR_NO_JOINT_STATE";
         d.message = "Cannot resolve current robot start pose: /joint_states unavailable or stale";
         if (req->auto_load) {
+          {
+            std::lock_guard<std::mutex> exec_lock(exec_mutex_);
+            loaded_program_.reset();
+            reset_exec_cursor_unlocked();
+          }
           supervisor_->on_compile_failed(req->request_id);
         }
         resp->success = false;
@@ -753,6 +781,10 @@ private:
         "Pause requested; it takes effect after the active gripper command completes";
       supervisor_->note_pause_deferred(
         note, gripper_active_timeout_sec_.load(std::memory_order_acquire));
+      const auto snap = supervisor_->snapshot();
+      resp->revision = snap.revision;
+      resp->state = snap.state;
+      resp->controller_epoch = snap.controller_epoch;
       resp->message = note;
     }
   }
@@ -2461,7 +2493,9 @@ private:
   rclcpp::CallbackGroup::SharedPtr client_group_;
   rclcpp::CallbackGroup::SharedPtr ctc_cmd_group_;
 
+  mutable std::mutex state_shm_mutex_;
   lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::StateShmSegment> state_shm_;
+  int64_t last_shm_reopen_ns_ = 0;
   uint64_t last_joint_seq_ = 0;
   int64_t last_joint_steady_ns_ = 0;
   rclcpp::TimerBase::SharedPtr joint_poll_timer_;

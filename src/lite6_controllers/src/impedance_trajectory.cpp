@@ -256,6 +256,14 @@ bool Lite6CTCController::valid_impedance_trajectory_goal(
   if (first_time != 0.0) {
     return false;
   }
+  const auto & first = goal.points.front();
+  for (size_t i = 0; i < joint_names_.size(); ++i) {
+    if (!std::isfinite(first.velocities[i]) ||
+        std::abs(first.velocities[i]) > imp_entry_max_speed_)
+    {
+      return false;
+    }
+  }
   double previous = -1.0;
   double max_grid_err = 0.0;
   for (size_t idx = 0; idx < goal.points.size(); ++idx) {
@@ -354,6 +362,7 @@ void Lite6CTCController::update_impedance_trajectory_reference(
     }
     if (!execution->cancel_applied) {
       if (system_state_ == SystemState::CARTESIAN_IMPEDANCE_TRAJECTORY) {
+        stopping_source_state_ = SystemState::CARTESIAN_IMPEDANCE_TRAJECTORY;
         begin_deceleration_tracker();
         compliance_stopping_elapsed_ = 0.0;
         integral_effort_.setZero();
@@ -407,6 +416,15 @@ void Lite6CTCController::update_impedance_trajectory_reference(
           ImpedanceTrajectoryResult::DEVIATION_LIMIT, static_cast<int>(i),
           pos_diff, imp_entry_position_tolerance_,
           "Initial impedance trajectory point deviates from measured joint pose [rad]");
+        return;
+      }
+      const double vel_init = std::abs(points.front().velocities[i]);
+      const double vel_diff = std::abs(points.front().velocities[i] - dq_[i]);
+      if (vel_init > imp_entry_max_speed_ || vel_diff > imp_entry_max_speed_) {
+        abort_prestart(
+          ImpedanceTrajectoryResult::VELOCITY_LIMIT, static_cast<int>(i),
+          std::max(vel_init, vel_diff), imp_entry_max_speed_,
+          "Initial impedance trajectory velocity exceeds entry speed limit [rad/s]");
         return;
       }
     }
@@ -667,7 +685,9 @@ void Lite6CTCController::finish_impedance_trajectory_cycle(double dt)
             "COMPLIANCE_STOPPING timed out during impedance trajectory cancellation";
           execution->result.store(ImpedanceTrajectoryResult::STOPPING_TIMEOUT);
         } else {
-          execution->result.store(ImpedanceTrajectoryResult::CANCELED);
+          execution->failure_detail =
+            "Impedance trajectory cancellation interrupted by E-STOP";
+          execution->result.store(ImpedanceTrajectoryResult::MODE_CHANGED);
         }
       }
     }

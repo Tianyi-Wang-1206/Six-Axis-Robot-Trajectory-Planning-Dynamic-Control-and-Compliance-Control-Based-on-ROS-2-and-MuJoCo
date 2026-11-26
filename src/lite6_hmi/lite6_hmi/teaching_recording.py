@@ -32,9 +32,11 @@ class TeachingRecording:
             self.note = "Stopped: invalid encoder sample"
             return
         if self.last_stamp is not None:
-            if stamp <= self.last_stamp:
+            if stamp < self.last_stamp:
                 self.stop()
                 self.note = "Stopped: encoder clock moved backwards"
+                return
+            if stamp == self.last_stamp:
                 return
             if stamp - self.last_stamp > 0.25:
                 self.stop()

@@ -265,7 +265,12 @@ trajectory_msgs::msg::JointTrajectory MotionPlanner::plan(const Goal& goal,
     stmt.loc = {1, 1, 0, "MoveC"};
     err_prefix = "MoveC: ";
     const Eigen::Matrix4d T_target = pose_matrix(goal.pose_target);
-    const Eigen::Matrix4d T_aux = pose_matrix(goal.pose_aux);
+    const auto & p_aux = goal.pose_aux.position;
+    if (!std::isfinite(p_aux.x) || !std::isfinite(p_aux.y) || !std::isfinite(p_aux.z)) {
+      fail(Action::Result::ERR_INVALID_INPUT, "Non-finite Cartesian via position");
+    }
+    Eigen::Matrix4d T_aux = Eigen::Matrix4d::Identity();
+    T_aux.topRightCorner<3, 1>() = Eigen::Vector3d(p_aux.x, p_aux.y, p_aux.z);
     stmt.type = lite6_studio_planner::MotionCommandType::MOVE_C_THREE_POINT;
     stmt.pose_target = T_target;
     stmt.pose_via = T_aux;

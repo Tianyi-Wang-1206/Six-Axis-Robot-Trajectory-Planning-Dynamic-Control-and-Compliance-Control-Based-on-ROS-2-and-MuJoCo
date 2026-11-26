@@ -55,6 +55,8 @@ class StudioRosWorker(QThread):
         self._direct_estop_sent = False
         self._last_studio_state_code = None
         self._supervisor_offline_notified = False
+        self._last_shm_seq = 0
+        self._last_shm_steady_ns = 0
 
     def _trigger_wake(self):
         gc = self._wake_gc
@@ -284,9 +286,21 @@ class StudioRosWorker(QThread):
                 )
 
     def _emit_telemetry(self, shm_reader, pin_model, pin_data, eef_frame_id):
-        pod, _ = shm_reader.read_joint_state()
+        pod, seq = shm_reader.read_joint_state()
         if pod is None or not is_stamp_fresh(pod.steady_stamp_ns, steady_now_ns(), 100_000_000):
             return
+        if seq == self._last_shm_seq:
+            return
+        if seq < self._last_shm_seq or pod.steady_stamp_ns <= self._last_shm_steady_ns:
+            if pod.steady_stamp_ns > self._last_shm_steady_ns:
+                # Hardware writer restarted with a fresh sequence counter.
+                self._last_shm_seq = seq
+                self._last_shm_steady_ns = pod.steady_stamp_ns
+            else:
+                return
+        else:
+            self._last_shm_seq = seq
+            self._last_shm_steady_ns = pod.steady_stamp_ns
         q_list = [float(pod.position[i]) for i in range(6)]
         dq_list = [float(pod.velocity[i]) for i in range(6)]
         if not all(math.isfinite(x) for x in q_list + dq_list):

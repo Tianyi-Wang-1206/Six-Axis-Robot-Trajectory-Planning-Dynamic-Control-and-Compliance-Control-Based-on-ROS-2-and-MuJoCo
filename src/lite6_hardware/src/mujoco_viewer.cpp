@@ -50,6 +50,8 @@ public:
       if (joint < 0) {throw std::runtime_error("Missing display joint");}
       qpos_[i] = model_->jnt_qposadr[joint];
       qvel_[i] = model_->jnt_dofadr[joint];
+      perturb_bodies_[i] = mj_name2id(model_.get(), mjOBJ_BODY,
+        ("link" + std::to_string(i + 1)).c_str());
     }
     for (size_t i = 0; i < 2; ++i) {
       const int id = mj_name2id(model_.get(), mjOBJ_JOINT,
@@ -367,7 +369,9 @@ private:
         const int body = mjv_select(model_.get(), data_.get(), &options_,
           static_cast<double>(width) / height, last_x_ / width, 1 - last_y_ / height,
           &scene_, point, &geom, &flex, &skin);
-        perturb_.select = body > 0 && model_->body_dofnum[body] > 0 ? body : 0;
+        const bool perturbable = body > 0 &&
+          std::find(perturb_bodies_.begin(), perturb_bodies_.end(), body) != perturb_bodies_.end();
+        perturb_.select = perturbable ? body : 0;
         if (perturb_.select) {
           mju_sub3(delta, point, data_->xpos + 3 * body);
           mju_mulMatTVec(perturb_.localpos, data_->xmat + 9 * body, delta, 3, 3);
@@ -418,7 +422,7 @@ private:
   mjvScene scene_{};
   mjrContext context_{};
   std::array<int, 2> object_qpos_{};
-  std::array<int, 6> qpos_{}, qvel_{};
+  std::array<int, 6> qpos_{}, qvel_{}, perturb_bodies_{};
   std::array<int, 2> gripper_qpos_{}, gripper_qvel_{};
   lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::StateShmSegment> state_shm_;
   lite6_interfaces::shm::ShmHandle<lite6_interfaces::shm::PerturbShmSegment> perturb_shm_;

@@ -77,6 +77,7 @@ private:
   std::vector<std::array<double, 2>> contact_forces_;
   int motor_ = -1;
   Snapshot state_;
+  double min_force_override_ = 0.0;
   double active_max_force_ = 0.0;
   double open_ = 0.0, closed_ = 0.0, target_ = 0.0, reference_ = 0.0, reference_velocity_ = 0.0;
   double elapsed_ = 0.0, settled_ = 0.0, grasp_time_ = 0.0, lost_time_ = 0.0;

@@ -469,6 +469,7 @@ private:
   std::atomic<bool> compliance_blocks_trajectory_{false};
   std::atomic<bool> emergency_pending_{false};
   SystemState system_state_ = SystemState::NORMAL;
+  SystemState stopping_source_state_ = SystemState::JOINT_IMPEDANCE;
   // Set by the first on_activate(); every later activation starts latched in ESTOP.
   bool activated_once_ = false;
 
@@ -502,6 +503,7 @@ private:
   static uint8_t controller_mode_for_state(SystemState state);
   uint8_t current_mode_code() const;
   void transition_system_state(SystemState next_state);
+  void publish_controller_status_rt(const rclcpp::Time & stamp);
   void process_controller_commands(double dt);
   uint8_t apply_controller_command(const PendingControllerCommand & cmd);
   void step_compliance_stopping(double dt);

@@ -446,6 +446,7 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   estop_rt_ack_generation_.store(
     estop_generation_.load(std::memory_order_acquire), std::memory_order_release);
   compliance_stopping_elapsed_ = 0.0;
+  stopping_source_state_ = SystemState::JOINT_IMPEDANCE;
   rigid_cancel_braking_ = false;
   rigid_cancel_elapsed_ = 0.0;
   transition_slew_active_ = false;
@@ -1022,43 +1023,49 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   ++status_publish_counter_;
   if (status_publish_pending_ || system_state_ != last_reported_state_ ||
       status_publish_counter_ >= status_publish_rate_divider_) {
-    if (rt_status_pub_->trylock()) {
-      auto & status = rt_status_pub_->msg_;
-      status.stamp = time;
-      const auto * execution = current_execution_;
-      const auto * imp_execution = current_impedance_execution_;
-      status.trajectory_start = builtin_interfaces::msg::Time{};
-      status.trajectory_id.fill(0);
-      if (execution && execution->started) {
-        status.trajectory_start = rclcpp::Time(execution->start_time_ns);
-        status.trajectory_id = execution->goal->get_goal_id();
-      } else if (imp_execution && imp_execution->started) {
-        status.trajectory_start = rclcpp::Time(imp_execution->start_time_ns);
-        status.trajectory_id = imp_execution->goal->get_goal_id();
-      }
-      status.mode = controller_mode_for_state(system_state_);
-      status.estop_reason = estop_reason_;
-      status.estop_joint = estop_joint_;
-      status.estop_value = estop_value_;
-      status.estop_limit = estop_limit_;
-      ++status_seq_;
-      status.status_seq = status_seq_;
-      status.controller_epoch = controller_epoch_;
-      status.mode_epoch = mode_epoch_;
-      status.last_cmd_seq = last_cmd_seq_;
-      status.last_cmd_code = last_cmd_code_;
-      status.last_cmd_result = last_cmd_result_;
-      status.rigid_trajectory_active = rigid_trajectory_active() || rigid_cancel_braking_;
-      status.payload_mass = payload_mass_;
-      status.payload_com_tcp = payload_com_tcp_;
-      rt_status_pub_->unlockAndPublish();
-      last_reported_state_ = system_state_;
-      status_publish_counter_ = 0;
-      status_publish_pending_ = false;
-    }
+    publish_controller_status_rt(time);
   }
 
   return controller_interface::return_type::OK;
+}
+
+void Lite6CTCController::publish_controller_status_rt(const rclcpp::Time & stamp)
+{
+  if (!rt_status_pub_ || !rt_status_pub_->trylock()) {
+    return;
+  }
+  auto & status = rt_status_pub_->msg_;
+  status.stamp = stamp;
+  const auto * execution = current_execution_;
+  const auto * imp_execution = current_impedance_execution_;
+  status.trajectory_start = builtin_interfaces::msg::Time{};
+  status.trajectory_id.fill(0);
+  if (execution && execution->started) {
+    status.trajectory_start = rclcpp::Time(execution->start_time_ns);
+    status.trajectory_id = execution->goal->get_goal_id();
+  } else if (imp_execution && imp_execution->started) {
+    status.trajectory_start = rclcpp::Time(imp_execution->start_time_ns);
+    status.trajectory_id = imp_execution->goal->get_goal_id();
+  }
+  status.mode = controller_mode_for_state(system_state_);
+  status.estop_reason = estop_reason_;
+  status.estop_joint = estop_joint_;
+  status.estop_value = estop_value_;
+  status.estop_limit = estop_limit_;
+  ++status_seq_;
+  status.status_seq = status_seq_;
+  status.controller_epoch = controller_epoch_;
+  status.mode_epoch = mode_epoch_;
+  status.last_cmd_seq = last_cmd_seq_;
+  status.last_cmd_code = last_cmd_code_;
+  status.last_cmd_result = last_cmd_result_;
+  status.rigid_trajectory_active = rigid_trajectory_active() || rigid_cancel_braking_;
+  status.payload_mass = payload_mass_;
+  status.payload_com_tcp = payload_com_tcp_;
+  rt_status_pub_->unlockAndPublish();
+  last_reported_state_ = system_state_;
+  status_publish_counter_ = 0;
+  status_publish_pending_ = false;
 }
 
 void Lite6CTCController::publish_shadow_shm(const Vec6d * target, bool valid)
@@ -1269,13 +1276,20 @@ void Lite6CTCController::configure_command_service()
         req->command == Cmd::CMD_ENTER_CARTESIAN_IMPEDANCE ||
         req->command == Cmd::CMD_ENTER_TEACH ||
         req->command == Cmd::CMD_UPDATE_COMPLIANCE_SETTINGS;
-      if (!lite6_interfaces::valid_controller_command(*req) ||
-          (uses_compliance && req->compliance.nullspace_stiffness != 0.0)) {
+      if (!lite6_interfaces::valid_controller_command(*req)) {
         resp->accepted = false;
         resp->ack_result = Resp::ACK_REJECTED_INVALID_ARG;
         resp->cmd_seq = 0;
         fill_snapshot();
-        resp->message = "Invalid ControllerCommand parameter (nullspace_stiffness must be zero)";
+        resp->message = "Invalid ControllerCommand code or parameter out of bounds";
+        return;
+      }
+      if (uses_compliance && req->compliance.nullspace_stiffness != 0.0) {
+        resp->accepted = false;
+        resp->ack_result = Resp::ACK_REJECTED_INVALID_ARG;
+        resp->cmd_seq = 0;
+        fill_snapshot();
+        resp->message = "Invalid ControllerCommand parameter: nullspace_stiffness must be zero";
         return;
       }
 
@@ -1664,6 +1678,14 @@ uint8_t Lite6CTCController::apply_controller_command(const PendingControllerComm
         return Resp::ACK_APPLIED;
       }
       if (compliance_active()) {
+        if (max_speed <= lite6_interfaces::contract::kPlannerSettleSpeedRadPerSec) {
+          bumpless_handover_to_normal(0.20);
+          clear_estop_reason();
+          compliance_stopping_elapsed_ = 0.0;
+          transition_system_state(SystemState::NORMAL);
+          return Resp::ACK_APPLIED;
+        }
+        stopping_source_state_ = system_state_;
         begin_deceleration_tracker();
         integral_effort_.setZero();
         compliance_stopping_elapsed_ = 0.0;

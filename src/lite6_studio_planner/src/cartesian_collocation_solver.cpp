@@ -2380,9 +2380,14 @@ void build_warm_start_mesh(
     mesh.T[s] = Ts;
     mesh.T_scale[s] = std::max(0.1, Ts);
 
-    // Choose sub-interval count responsive to segment duration (denser for long/fast segments).
+    // Choose sub-interval count responsive to segment duration while preserving headroom
+    // below the 640-node adaptive mesh refinement budget.
+    const size_t max_ns_per_seg = std::clamp<size_t>(440 / std::max<size_t>(1, M), 4, 22);
+    const size_t min_ns_per_seg = std::min<size_t>(8, max_ns_per_seg);
     const size_t ns = static_cast<size_t>(std::clamp(
-      static_cast<int>(std::ceil(Ts / 0.09)), 8, 22));
+      static_cast<int>(std::ceil(Ts / 0.09)),
+      static_cast<int>(min_ns_per_seg),
+      static_cast<int>(max_ns_per_seg)));
     seg_N[s] = ns;
     mesh.wp_node[s + 1] = mesh.wp_node[s] + ns;
     const double g = 1.0 / static_cast<double>(ns);
@@ -2998,6 +3003,16 @@ bool CartesianCollocationSolver::solve(
   const std::function<bool()> & is_cancelled)
 {
   if (waypoints.empty()) {
+    return false;
+  }
+  constexpr size_t kMaxExplicitCartesianPvaWaypoints = 64;
+  if (waypoints.size() > kMaxExplicitCartesianPvaWaypoints) {
+    add_diag(
+      out_diagnostics, D::STAGE_SEMANTIC, waypoints.front().loc,
+      "ERR_PVA_WAYPOINT_LIMIT",
+      "Explicit Cartesian MovePVA with velocity/acceleration/dt constraints supports at most " +
+        std::to_string(kMaxExplicitCartesianPvaWaypoints) +
+        " waypoints per block; split into multiple MovePVA blocks or use pure-position waypoints");
     return false;
   }
   auto check_cancelled = [&]() -> bool {

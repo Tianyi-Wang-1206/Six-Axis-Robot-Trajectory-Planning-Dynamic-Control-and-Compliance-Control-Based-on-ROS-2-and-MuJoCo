@@ -95,7 +95,7 @@
         <body name="link2" quat="-1 1 1 1">
           <inertial pos="0.179 0 0.0584" quat="0.417561 0.571619 0.569585 0.417693" mass="1.34" diaginertia="0.00560971 0.0052152 0.00122018"/>
 
-          <joint name="joint2" range="-2.61799 2.61799" damping="0" frictionloss="0"/>
+          <joint name="joint2" range="-2.617994 2.617994" damping="0" frictionloss="0"/>
 
           <geom class="visual" mesh="link2"/>
           <geom name="link2_c" class="collision" mesh="link2_c"/>

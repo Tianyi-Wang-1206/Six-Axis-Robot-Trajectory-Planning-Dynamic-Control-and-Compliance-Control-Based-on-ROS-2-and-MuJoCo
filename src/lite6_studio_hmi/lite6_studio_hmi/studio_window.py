@@ -821,6 +821,7 @@ class StudioMainWindow(QMainWindow):
         self.worker.command_finished.connect(self.on_command_finished)
         self.worker.gripper_finished.connect(self.on_gripper_finished)
         self.worker.supervisor_offline.connect(self.on_supervisor_offline)
+        self.worker.ros_log.connect(self.append_log)
 
     # ------------------------------------------------------------------ Helpers
 

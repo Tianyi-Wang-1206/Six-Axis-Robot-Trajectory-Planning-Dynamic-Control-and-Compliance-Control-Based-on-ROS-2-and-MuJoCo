@@ -49,10 +49,13 @@ bool Lite6CTCController::compliance_active() const
 const Lite6CTCController::ComplianceModeConfig &
 Lite6CTCController::active_compliance_config() const
 {
-  if (system_state_ == SystemState::CARTESIAN_IMPEDANCE) {
+  const SystemState effective =
+    (system_state_ == SystemState::COMPLIANCE_STOPPING) ? stopping_source_state_ : system_state_;
+  if (effective == SystemState::CARTESIAN_IMPEDANCE ||
+      effective == SystemState::CARTESIAN_IMPEDANCE_TRAJECTORY) {
     return cart_imp_cfg_;
   }
-  if (system_state_ == SystemState::TEACH) {
+  if (effective == SystemState::TEACH) {
     return teach_cfg_;
   }
   return joint_imp_cfg_;

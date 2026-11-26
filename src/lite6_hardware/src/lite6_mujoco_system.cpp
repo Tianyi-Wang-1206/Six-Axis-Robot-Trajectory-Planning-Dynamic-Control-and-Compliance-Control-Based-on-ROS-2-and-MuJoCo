@@ -654,7 +654,7 @@ void Lite6MujocoSystem::physics_loop()
           uint64_t shadow_seq = 0;
           if ((*state_shm_)->shadow_state.read(shadow, shadow_seq) &&
               shadow.valid != 0U &&
-              shadow.stamp_ns > 0 &&
+              shadow.stamp_ns >= activation_ns_ &&
               (steady_now_ns() - shadow.stamp_ns) <= 250000000LL) {
             controller_ready = true;
           }

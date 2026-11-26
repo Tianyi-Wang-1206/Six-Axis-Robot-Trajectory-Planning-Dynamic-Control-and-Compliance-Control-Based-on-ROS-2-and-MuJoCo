@@ -365,6 +365,20 @@ class SysIdEngine:
         self.fit_diagnostics = []
         (t_seq, cmd_seq, cmd_age, q_seq, dq_seq, tau_seq,
          gq_seq, gv_seq, ga_seq) = self._physical_samples()
+        # Trim to the excitation window so any telemetry gap before/after excitation
+        # does not reject a lossless identification window.
+        if len(t_seq) >= 5:
+            win = (t_seq >= -0.05) & (t_seq <= self.T_total + 0.05)
+            if np.count_nonzero(win) >= 5:
+                t_seq = t_seq[win]
+                cmd_seq = cmd_seq[win]
+                cmd_age = cmd_age[win]
+                q_seq = q_seq[win]
+                dq_seq = dq_seq[win]
+                tau_seq = tau_seq[win]
+                gq_seq = gq_seq[win]
+                gv_seq = gv_seq[win]
+                ga_seq = ga_seq[win]
         if len(t_seq) < 5:
             raise ValueError('Fewer than five distinct physical snapshots')
         if (not np.isfinite(t_seq).all() or np.any(np.diff(t_seq) <= 0) or

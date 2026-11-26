@@ -147,7 +147,11 @@ bool Lite6CTCController::valid_trajectory_goal(
     return false;
   }
 
-  auto valid_joint_tolerances = [this](const std::vector<control_msgs::msg::JointTolerance> & tols) {
+  auto valid_joint_tolerances = [this](
+    const std::vector<control_msgs::msg::JointTolerance> & tols,
+    const std::vector<double> & max_pos_tol,
+    const std::vector<double> & max_vel_tol)
+  {
     if (tols.size() > joint_names_.size()) return false;
     std::array<bool, 6> seen{};
     for (const auto & tol : tols) {
@@ -157,9 +161,9 @@ bool Lite6CTCController::valid_trajectory_goal(
       if (seen[idx]) return false;
       seen[idx] = true;
       if (!std::isfinite(tol.position) || tol.position < 0.0 ||
-          tol.position > path_position_tolerance_[idx] ||
+          tol.position > max_pos_tol[idx] ||
           !std::isfinite(tol.velocity) || tol.velocity < 0.0 ||
-          tol.velocity > path_velocity_tolerance_[idx] ||
+          tol.velocity > max_vel_tol[idx] ||
           !std::isfinite(tol.acceleration) || tol.acceleration < 0.0)
       {
         return false;
@@ -167,8 +171,10 @@ bool Lite6CTCController::valid_trajectory_goal(
     }
     return true;
   };
-  if (!valid_joint_tolerances(goal.path_tolerance) ||
-      !valid_joint_tolerances(goal.goal_tolerance))
+  if (!valid_joint_tolerances(
+        goal.path_tolerance, path_position_tolerance_, path_velocity_tolerance_) ||
+      !valid_joint_tolerances(
+        goal.goal_tolerance, goal_position_tolerance_, goal_velocity_tolerance_))
   {
     return false;
   }
@@ -493,6 +499,14 @@ uint8_t Lite6CTCController::valid_splice_request(
     if (out_message) *out_message = "Splice switch_time already passed";
     return Resp::RESULT_REJECTED_TIMING;
   }
+  constexpr double kMaxSpliceLookaheadSec = 5.0;
+  if (t_switch - est_elapsed > kMaxSpliceLookaheadSec) {
+    if (out_message) {
+      *out_message =
+        "Splice switch_time exceeds maximum 5.0 s lookahead window; submit closer to switch_time";
+    }
+    return Resp::RESULT_REJECTED_TIMING;
+  }
   if (out_uniform_1khz != nullptr) {
     *out_uniform_1khz = (max_grid_err <= 2e-4);
   }
@@ -616,7 +630,7 @@ void Lite6CTCController::configure_trajectory_action()
 
         const double est_elapsed = parent->elapsed_pub.load(std::memory_order_acquire);
         wait_sec = std::clamp(
-          std::max(0.0, splice->switch_time - est_elapsed) + 0.25, 0.20, 2.0);
+          std::max(0.0, splice->switch_time - est_elapsed) + 0.25, 0.20, 5.25);
 
         parent->splice_reserved = true;
         parent->splice_owner = splice;
@@ -806,6 +820,13 @@ void Lite6CTCController::update_trajectory_reference(
     execution->start_time_pub_ns.store(execution->start_time_ns, std::memory_order_release);
     execution->elapsed_pub.store(0.0, std::memory_order_release);
     execution->start_mode = static_cast<int>(system_state_);
+    // Clear residual mode-transition slew and recovery bias so rigid tracking starts unattenuated.
+    transition_slew_active_ = false;
+    transition_slew_elapsed_ = 0.0;
+    transition_slew_converged_cycles_ = 0;
+    recovery_bias_active_ = false;
+    recovery_bias_elapsed_ = 0.0;
+    recovery_bias_init_.setZero();
   }
 
   // Validate each splice once, then CAS-adopt at switch_time against withdrawal.
@@ -963,10 +984,15 @@ controller_interface::return_type Lite6CTCController::fail_controller(
   recovery_bias_elapsed_ = 0.0;
   recovery_bias_init_.setZero();
   // Best effort only: an inaccessible interface cannot be made writable here.
-  // ERROR asks controller_manager to deactivate this controller as well.
+  // Publish the latched ESTOP ControllerStatus immediately before returning ERROR so
+  // supervisors observe the fault reason without waiting for the stale-status timeout.
   for (auto & command : command_interfaces_) {
     try { (void)command.set_value(0.0); } catch (const std::exception &) {}
   }
+  status_publish_pending_ = true;
+  const rclcpp::Time fault_stamp =
+    node_clock_ ? node_clock_->now() : rclcpp::Time(0, 0, RCL_ROS_TIME);
+  publish_controller_status_rt(fault_stamp);
   return controller_interface::return_type::ERROR;
 }
 

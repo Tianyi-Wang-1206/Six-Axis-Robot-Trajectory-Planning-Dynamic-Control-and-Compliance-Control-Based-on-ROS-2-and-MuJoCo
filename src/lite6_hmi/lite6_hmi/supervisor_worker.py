@@ -1,5 +1,6 @@
 """Translate supervisor state into HMI labels and send guarded commands."""
 
+import collections
 import math
 import queue
 import threading
@@ -184,6 +185,7 @@ class ROS2Worker(QThread):
         self._manual_estop_active = False
 
         self.sysid_record_data = []
+        self._sysid_pre_exc_buffer = collections.deque(maxlen=4000)
         self.sysid_start_ros_time = None
         self.sysid_q0_locked = [0.0] * 6
 
@@ -510,10 +512,12 @@ class ROS2Worker(QThread):
             # Enable SysID ring capture during preparation/alignment so zero
             # excitation samples are dropped on entry.
             if msg.mode == SupervisorState.MODE_SYSID and not self._sysid_shm_enabled:
+                self._sysid_pre_exc_buffer.clear()
                 self._sysid_shm.discard_all()
                 self._sysid_shm.set_active(True)
                 self._sysid_shm_enabled = True
             elif msg.mode != SupervisorState.MODE_SYSID and self._sysid_shm_enabled:
+                self._sysid_pre_exc_buffer.clear()
                 self._sysid_shm.set_active(False)
                 self._sysid_shm_enabled = False
             if msg.mode == SupervisorState.MODE_SYSID and msg.session_id == self._sysid_session:
@@ -645,36 +649,44 @@ class ROS2Worker(QThread):
     def _drain_sysid_shm_unlocked(self, update_heartbeat: bool = True):
         if update_heartbeat:
             self._sysid_shm.set_active(True)
-        s = self.supervisor_state
-        if (s is not None and
-                s.mode == SupervisorState.MODE_SYSID and
-                s.sysid_phase == SupervisorState.SYSID_VALIDATING):
-            return
+        # Always drain the SPSC ring so long validation phases (>16.384 s) never overflow it.
         samples = self._sysid_shm.pop_all()
         if not samples:
             return
+        s = self.supervisor_state
         if (self.sysid_calc is None or s is None or
                 s.mode != SupervisorState.MODE_SYSID or
-                s.sysid_phase != SupervisorState.SYSID_EXCITING or
                 s.session_id != self._sysid_session):
             return
+        if s.sysid_phase == SupervisorState.SYSID_VALIDATING:
+            for pod in samples:
+                self._sysid_pre_exc_buffer.append(self._sysid_pod_to_dict(pod))
+            return
+        if s.sysid_phase != SupervisorState.SYSID_EXCITING:
+            return
+        if self._sysid_pre_exc_buffer:
+            self.sysid_record_data.extend(self._sysid_pre_exc_buffer)
+            self._sysid_pre_exc_buffer.clear()
         for pod in samples:
-            self.sysid_record_data.append({
-                't': self._ns_to_sec(pod.stamp_ns),
-                'read_time': self._ns_to_sec(pod.read_stamp_ns),
-                'simulation_time': float(pod.simulation_time),
-                'step': int(pod.step),
-                'command_sequence': int(pod.command_sequence),
-                'control_period': float(pod.control_period),
-                'physics_lag': float(pod.physics_lag),
-                'command_age': float(pod.command_age),
-                'q': np.array(pod.position, dtype=float),
-                'dq': np.array(pod.velocity, dtype=float),
-                'tau_cmd': np.array(pod.effort, dtype=float),
-                'gripper_q': np.array(pod.gripper_position, dtype=float),
-                'gripper_dq': np.array(pod.gripper_velocity, dtype=float),
-                'gripper_ddq': np.array(pod.gripper_acceleration, dtype=float),
-            })
+            self.sysid_record_data.append(self._sysid_pod_to_dict(pod))
+
+    def _sysid_pod_to_dict(self, pod):
+        return {
+            't': self._ns_to_sec(pod.stamp_ns),
+            'read_time': self._ns_to_sec(pod.read_stamp_ns),
+            'simulation_time': float(pod.simulation_time),
+            'step': int(pod.step),
+            'command_sequence': int(pod.command_sequence),
+            'control_period': float(pod.control_period),
+            'physics_lag': float(pod.physics_lag),
+            'command_age': float(pod.command_age),
+            'q': np.array(pod.position, dtype=float),
+            'dq': np.array(pod.velocity, dtype=float),
+            'tau_cmd': np.array(pod.effort, dtype=float),
+            'gripper_q': np.array(pod.gripper_position, dtype=float),
+            'gripper_dq': np.array(pod.gripper_velocity, dtype=float),
+            'gripper_ddq': np.array(pod.gripper_acceleration, dtype=float),
+        }
 
     def _poll_joint_shm(self):
         pod, seq = self._state_shm.read_joint_state()
@@ -988,10 +1000,12 @@ class ROS2Worker(QThread):
         now = time.monotonic()
         with self.state_lock:
             s = self.supervisor_state
-            age = now - self.last_supervisor_rx_time if self.last_supervisor_rx_time else float("inf")
+            if not self.last_supervisor_rx_time:
+                return False
+            age = now - self.last_supervisor_rx_time
             pending_stop = self._estop_requested_at
             already_fallback = self._direct_estop_sent
-            if self.last_supervisor_rx_time and age > 1.2:
+            if age > 1.2:
                 # Reset monotonic filters when supervisor feed goes stale so restarts reconnect.
                 self._planner_epoch = 0
                 self._revision = -1
@@ -999,7 +1013,7 @@ class ROS2Worker(QThread):
                     self._goal_epoch += 1
                     self._motion_pending = False
                     self.current_goal_handle = None
-        if age > 1.2 and now - self.boot_time > 2.0:
+        if age > 1.2:
             if not already_fallback:
                 self.trigger_estop("SUPERVISOR HEARTBEAT LOST", force_fallback=True)
             return True
@@ -1120,6 +1134,7 @@ class ROS2Worker(QThread):
                     self._sysid_session = 0
                     self._phase_actions.clear()
                     self.sysid_record_data.clear()
+                    self._sysid_pre_exc_buffer.clear()
                     self.sysid_start_ros_time = None
                     self.sysid_q0_locked = prep_pose
                     self._set_sysid_preparation_status("Waiting for Supervisor acceptance...")

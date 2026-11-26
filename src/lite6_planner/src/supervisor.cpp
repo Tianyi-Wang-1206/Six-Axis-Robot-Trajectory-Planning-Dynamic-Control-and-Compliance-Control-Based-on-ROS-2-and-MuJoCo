@@ -388,6 +388,16 @@ void Supervisor::on_controller_command_ack(uint8_t cmd,bool accepted,uint8_t ack
     }
     return;
   }
+  if(cmd==CTC::Request::CMD_UPDATE_COMPLIANCE_SETTINGS) {
+    if(accepted) {
+      changed_unlocked("Live compliance settings updated");
+    } else if(unknown) {
+      changed_unlocked("Live compliance update outcome unknown; verify controller state");
+    } else {
+      changed_unlocked("Compliance update rejected by CTC ("+std::to_string(ack_result)+"): "+msg);
+    }
+    return;
+  }
   if(accepted) return;
   if(unknown) {
     // Never assume rejection: the command may still have been applied. Compliance
