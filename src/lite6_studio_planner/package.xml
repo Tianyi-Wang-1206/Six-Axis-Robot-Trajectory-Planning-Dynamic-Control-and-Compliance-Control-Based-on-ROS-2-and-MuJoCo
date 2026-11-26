@@ -5,7 +5,7 @@
   <version>0.1.0</version>
   <description>Industrial trajectory programming DSL compiler, 3rd-order direct-transcription TOPP planner, and execution supervisor for Robot.</description>
   <maintainer email="developer@robot.local">developer</maintainer>
-  <license>Apache-2.0</license>
+  <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 

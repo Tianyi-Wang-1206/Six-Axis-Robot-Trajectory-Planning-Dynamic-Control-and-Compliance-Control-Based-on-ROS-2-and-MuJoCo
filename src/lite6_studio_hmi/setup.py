@@ -16,7 +16,7 @@ setup(
     maintainer='developer',
     maintainer_email='developer@robot.local',
     description='Industrial trajectory programming IDE and HMI for 6-DOF Robot',
-    license='BSD-3-Clause',
+    license='MIT',
     entry_points={
         'console_scripts': [
             'studio_gui = lite6_studio_hmi.studio_main:main',
