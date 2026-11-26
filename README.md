@@ -1,4 +1,4 @@
-# Six-Axis Robot Simulation Framework
+# Six-Axis Robot Simulation Framework 
 
 > **Education and research only.** This is a simulation project. The robot model originates from the publicly available [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie).
 >
