@@ -1025,12 +1025,7 @@ class PyQtHMI(QMainWindow):
         self.on_state_updated(state, detail)
 
     def check_connection_watchdog(self):
-        """Monitor *Supervisor* communications without a second state machine.
-
-        The planner Supervisor already monitors both CTC and joint states.
-        When the Supervisor itself disappears, only a direct CTC ESTOP
-        fallback remains available to the GUI. This is a view-side alarm.
-        """
+        """Monitor supervisor feedback and send direct CTC E-STOP if it disappears."""
         offline = self.worker.check_watchdog()
         if offline:
             if not self._supervisor_offline_displayed:

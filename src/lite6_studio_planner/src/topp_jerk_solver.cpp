@@ -339,10 +339,8 @@ bool run_topp_ra_2nd(
   return true;
 }
 
-// ---------------- Banded Symmetric Quasi-Definite LDL^T (Half-bandwidth B = 6) ----------------
-// Interleaving stage unknowns as [v_i, a_i, dt_i, y1_i, y2_i] gives half-bandwidth 6.
-// By Vanderbei's SQD theorem, a matrix with positive-definite primal block and negative-
-// definite dual block factors without pivoting in O(N * B^2) with certified inertia.
+// Banded SQD LDL^T: interleaved [v_i, a_i, dt_i, y1_i, y2_i] has half-bandwidth 6.
+// Definite primal/dual blocks permit pivot-free O(N * B^2) factorization.
 
 class BandedSQD
 {
@@ -824,16 +822,9 @@ void for_each_ineq(
       }
     }
 
-    // 3a. Interval velocity bounds:
-    // Lower bound: on interior intervals (1 <= i <= N - 2), enforce non-negativity of the
-    // quadratic Bernstein middle control point
-    //   b1 = 0.5 * (v_i + v_{i+1}) + 0.25 * (a_i - a_{i+1}) * dt_i >= 0.
-    // Together with v_i >= 0 and v_{i+1} >= 0, this strictly certifies v(tau) >= 0 on the
-    // entire interval [0, dt_i] (preventing interior speed reversals and Zeno bisection at
-    // near-stop corners) and algebraically implies vm = 0.25 * (v_i + v_{i+1}) + 0.5 * b1 >= 0
-    // even off the equality manifold. On endpoint intervals (i == 0 or i == N - 1), rest
-    // boundary conditions fix b1 == 0 on e1 == 0 while v_1 >= 0 / v_{N-1} >= 0 already
-    // guarantees non-negative v(tau), so keep the strictly interior bound vm >= 0 there.
+    // Require the interior Bernstein coefficient
+    // b1 = (v_i + v_{i+1})/2 + (a_i - a_{i+1})*dt_i/4 >= 0 to prevent reversals.
+    // At rest endpoints b1 is fixed to zero; use vm >= 0 for a strict barrier.
     {
       const bool use_b1 = (i > 0 && i + 1 < N);
       const double v_lo = use_b1 ?
@@ -2268,10 +2259,8 @@ Verify1kHzResult evaluate_1khz(
     }
   };
 
-  // Finite-sample Stage-4 verification at every collocation node (left/right one-sided limits),
-  // intra-interval sub-samples tau in {0, 0.25, 0.5, 0.75, 1}, and analytic interior cubic
-  // velocity peaks (tau* = -a_i / j_i when a_i > 0 > a_{i+1}). Note: this is dense finite-sample
-  // numerical validation rather than a continuous-time bound proof.
+  // Verify nodes, quarter-interval samples and interior velocity peaks.
+  // This finite sample set does not prove continuous-time bounds.
   if (out == nullptr) {
     constexpr double kSubTaus[5] = {0.0, 0.25, 0.5, 0.75, 1.0};
     for (size_t i = 0; i < timing.dt.size(); ++i) {

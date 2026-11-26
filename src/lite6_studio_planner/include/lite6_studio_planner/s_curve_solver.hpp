@@ -37,10 +37,8 @@ private:
   double total_time_ = 0.0;
 };
 
-// Phase-synchronized 6-axis S-curve: every joint follows q(t) = q0 + (q1 - q0) * s(t) with
-// one shared normalized jerk-limited profile s(t) in [0, 1], so the motion is a straight line
-// in joint space. s(t) uses the tightest per-joint (v, a, j) limit mapped to the normalized
-// stroke (with a small numerical safety margin) and rounds duration up to 1 ms.
+// Straight joint-space motion q = q0 + (q1-q0)*s(t), using shared jerk-limited
+// progress from the tightest joint bounds; duration rounds up to 1 ms.
 class MultiAxisSCurve
 {
 public:

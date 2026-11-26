@@ -63,10 +63,8 @@ private:
   alignas(64) std::array<T, Capacity> entries_{};
 };
 
-// Latest complete snapshot, with independent front/back ownership. Exchanging
-// the middle slot transfers ownership; neither side touches the other's slot.
-// Unlike a seqlock over plain doubles, this has no concurrent non-atomic access.
-// Exactly one producer and one consumer; use separate instances for readers.
+// Single-producer/single-consumer triple buffer with exclusive slot ownership.
+// Use separate instances for additional readers.
 template<typename T>
 class LatestSnapshot
 {

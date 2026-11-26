@@ -129,10 +129,8 @@ bool Lite6CTCController::valid_pva_sample_and_step(
   return true;
 }
 
-// Playback uses 1 kHz sampled PVA with zero-order hold (ZOH). Regular FollowJointTrajectory
-// goals must have a zero header.stamp, start at time_from_start == 0, maintain uniform 1 ms
-// sample spacing within kTrajectorySampleSpacingTolSec, respect per-joint PVA bounds and
-// inter-sample kinematic consistency, and end at rest.
+// Rigid playback requires 1 kHz ZOH PVA, zero header/start times, bounded
+// and consistent samples, and a resting endpoint.
 bool Lite6CTCController::valid_trajectory_goal(
   const FollowTrajectory::Goal & goal, bool * out_uniform_1khz) const
 {
@@ -810,10 +808,8 @@ void Lite6CTCController::update_trajectory_reference(
     execution->start_mode = static_cast<int>(system_state_);
   }
 
-  // Path-preserving splice: each candidate is validated once on first sight (rejected if
-  // epoch/mode changed, switch_time already passed, or endpoint already held), then adopted
-  // atomically at switch_time via CAS on splice->state (racing cleanly against withdrawal).
-  // Rejected/withdrawn candidates do not prevent a subsequent valid retry on this parent.
+  // Validate each splice once, then CAS-adopt at switch_time against withdrawal.
+  // Rejected candidates leave the parent available for another valid splice.
   if (execution->tail == nullptr) {
     auto * splice = execution->splice.load(std::memory_order_acquire);
     if (splice != nullptr && splice != execution->last_splice_resolved) {
@@ -1063,10 +1059,8 @@ void Lite6CTCController::finish_trajectory_cycle(double dt)
   }
   if (!execution->endpoint_applied) return;
 
-  // SYS_ID deliberately removes friction compensation and integral action, so
-  // static friction can leave a steady position error. Use its own bounded
-  // endpoint tolerance for excitation and post-alignment; NORMAL pre/return
-  // alignment keeps the precision tolerance. Mode changes still abort above.
+  // SYS_ID uses wider endpoint tolerances for uncompensated friction.
+  // NORMAL alignment keeps its precision tolerance; mode changes still abort.
   const bool is_sysid = (execution->start_mode == static_cast<int>(SystemState::SYS_ID));
   double worst_ratio = 0.0;
   int worst_joint = -1;

@@ -105,12 +105,8 @@ public:
 
   explicit ProgramCompiler(const lite6_kinematics::KinematicsEngine & engine);
 
-  // Executes the full 5-stage compilation & 1 kHz verification pipeline:
-  //   Stage 1: Lexical & Syntax check
-  //   Stage 2: Semantic & Parameter check
-  //   Stage 3: 3rd-Order Direct-Transcription TOPP Planning & 1 kHz Discretization
-  //   Stage 4: Full 1 kHz Kinematic Limits Verification (pos, vel, acc, jerk, singularity)
-  //   Stage 5: Full 1 kHz Coal Self & Environment Collision Verification
+  // Parse and validate the DSL, plan 1 kHz motion, then check kinematic limits
+  // and self/environment collisions.
   bool compile(
     const std::string & source_code,
     const std::array<double, 6> & start_joints,
@@ -165,13 +161,9 @@ public:
     FAILED        // no admissible splice (caller falls back to a controller cancel)
   };
 
-  // Builds a path-preserving stop for a running rigid block: from the 1 kHz sample at
-  // or after t_switch_sec (block time base), the remaining reference q(tau) is
-  // re-timed with tau_dot = sigma(t), where sigma falls from 1 to 0 along a septic
-  // (C^3) smoothstep, so the arm decelerates to rest ON the programmed path within
-  // joint velocity/acceleration/jerk limits. out_tail starts with the original sample
-  // verbatim (same time_from_start) for a seamless CTC splice; out_end_sample is the
-  // nearest original sample index to the stopping point.
+  // Build a path-preserving stop using septic time scaling within joint limits.
+  // The first tail sample matches the parent at t_switch_sec for a CTC splice;
+  // out_end_sample identifies the original sample nearest the stopping point.
   PauseSpliceStatus plan_pause_splice(
     const ExecutionBlock & block,
     double t_switch_sec,

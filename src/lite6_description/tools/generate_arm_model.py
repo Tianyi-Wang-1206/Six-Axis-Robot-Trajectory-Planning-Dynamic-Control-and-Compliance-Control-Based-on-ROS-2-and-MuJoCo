@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-"""Derive the six-axis planning model from the full, articulated URDF.
-
-Each split finger collision mesh is replaced by its bounding box swept over the
-entire jaw stroke. This conservatively covers every intermediate opening, so
-planning needs no asynchronous gripper state and cannot use obsolete geometry.
-The full URDF remains the source for dynamics and robot_state_publisher.
+"""Derive the planning URDF with finger collision boxes covering the full stroke.
+The articulated URDF remains the dynamics source.
 """
 from pathlib import Path
 import struct

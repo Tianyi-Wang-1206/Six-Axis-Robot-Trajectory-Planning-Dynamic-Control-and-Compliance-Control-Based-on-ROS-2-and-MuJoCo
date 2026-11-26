@@ -32,9 +32,10 @@ controller_interface::CallbackReturn Lite6CTCController::on_init()
   auto_declare<std::vector<double>>("max_effort", {50.0, 50.0, 32.0, 32.0, 32.0, 20.0});
   auto_declare<double>("tanh_slope", 300.0);
 
-  auto_declare<std::vector<double>>("estop_decel", {17.5, 12.5, 20.0, 40.0, 40.0, 50.0});
+  // Keep acceleration defaults in sync with both motion-limit YAML files.
+  auto_declare<std::vector<double>>("estop_decel", {16.0, 12.0, 20.0, 32.0, 36.0, 40.0});
   auto_declare<std::vector<double>>("execution.max_joint_velocity", {3.14, 3.14, 3.14, 3.14, 3.14, 3.14});
-  auto_declare<std::vector<double>>("execution.max_joint_acceleration", {3.5, 2.5, 4.0, 8.0, 8.0, 10.0});
+  auto_declare<std::vector<double>>("execution.max_joint_acceleration", {8.0, 6.0, 10.0, 16.0, 18.0, 20.0});
   auto_declare<double>("execution.position_limit_tolerance", 1e-4);
   auto_declare<std::vector<double>>("execution.path_position_tolerance", std::vector<double>(6, 0.1));
   auto_declare<std::vector<double>>("execution.path_velocity_tolerance", std::vector<double>(6, 0.5));
@@ -498,12 +499,8 @@ controller_interface::CallbackReturn Lite6CTCController::on_activate(const rclcp
   last_cmd_code_ = lite6_interfaces::srv::ControllerCommand::Request::CMD_NONE;
   last_cmd_result_ = lite6_interfaces::msg::ControllerStatus::ACK_NONE;
 
-  // CMD_CLEAR_ESTOP is the sole ESTOP -> NORMAL recovery path, so a deactivate /
-  // activate cycle (for example after an RT fault made controller_manager deactivate
-  // this controller) must not act as an implicit E-STOP clear. Only the very first
-  // activation of this controller instance starts in NORMAL; every re-activation
-  // starts latched in ESTOP, braking from the measured state, and needs an explicit
-  // supervised CMD_CLEAR_ESTOP.
+  // Only first activation starts in NORMAL; later activations brake in ESTOP.
+  // Recovery requires CMD_CLEAR_ESTOP.
   const bool reactivation = activated_once_;
   activated_once_ = true;
   system_state_ = reactivation ? SystemState::ESTOP : SystemState::NORMAL;
@@ -680,12 +677,8 @@ void Lite6CTCController::bumpless_handover_to_normal(double transition_duration_
   if (has_applied_tau_ && dynamics_q_.allFinite() && dynamics_dq_.allFinite() &&
       tau_applied_prev_.allFinite())
   {
-    // Reconcile the torque-domain integrator so the first NORMAL cycle (with
-    // e = 0, de = -dq, dq_target = 0, ddq_target = 0) reproduces tau_applied_prev_
-    // continuously without a step kick when snapping q_target from estop_q_ to q_.
-    // Any excess beyond integral_max_effort_ (or on ki == 0 joints) is carried by a
-    // C1 raised-cosine recovery bias that decays smoothly to zero while keeping the
-    // PD damping loop fully active.
+    // Match the previous torque when recapturing the NORMAL reference.
+    // Carry excess integral bias in a decaying cosine term while PD damping stays active.
     const Vec6d a_hold = -kv_.cwiseProduct(dq_);
     dynamics_ddq_.head(6) = a_hold;
     dynamics_ddq_.tail(2).setZero();
@@ -813,10 +806,8 @@ Lite6CTCController::Vec6d Lite6CTCController::compute_nullspace_damping_torque(
   if (!(nullspace_damping > 0.0) || !(lambda > 0.0)) {
     return Vec6d::Zero();
   }
-  // Passive M-weighted singularity damping using the Woodbury identity:
-  //   M - J^T (J M^-1 J^T + Sigma_lambda)^-1 J = M * (M + J^T Sigma_lambda^-1 J)^-1 * M
-  // This avoids subtraction cancellation and guarantees a symmetric positive-definite
-  // damping matrix at every pose (near zero at full rank, M-scaled near singularities).
+  // Use the Woodbury form M*(M + J^T Sigma^-1 J)^-1*M for passive damping,
+  // avoiding cancellation in M - J^T Lambda_reg J.
   Mat6d m_tot = pin_data_dynamics_.M.topLeftCorner<6, 6>();
   for (int i = 0; i < 6; ++i) {
     m_tot(i, i) += armature_[i];
@@ -1026,10 +1017,8 @@ controller_interface::return_type Lite6CTCController::update_and_write_commands(
   // 6. Write this cycle's actual reference directly to the shared-memory register.
   publish_shadow_shm(&q_target_, true);
 
-  // 7. Publish the actual internal CTC mode, observed by the Supervisor.
-  // The mode is mapped explicitly: SystemState is NOT the wire enum.
-  // Publish periodically even if unchanged (heartbeat), and retry every
-  // update cycle after a mode change until the nonblocking lock succeeds.
+  // Publish the explicit controller-mode mapping periodically; retry transitions
+  // each cycle until the nonblocking publish succeeds.
   ++status_publish_counter_;
   if (status_publish_pending_ || system_state_ != last_reported_state_ ||
       status_publish_counter_ >= status_publish_rate_divider_) {
@@ -1134,10 +1123,8 @@ void Lite6CTCController::add_trajectory_friction_ff(
     if (v_ref_abs <= 0.0) {
       continue;
     }
-    // Gate friction feedforward on measured joint motion aligned with the reference
-    // direction so stalled contact (dq ~= 0) or external pushback (sign(dq) != sign(dq_ref))
-    // never receives phantom moving-friction drive, while free-space tracking (dq ~= dq_ref)
-    // retains smooth compensation.
+    // Compensate friction only when measured and reference motion align;
+    // disable it during stalled contact or pushback.
     const double v_along = (v_ref >= 0.0) ? dq_[idx] : -dq_[idx];
     const double v_eff = std::clamp(v_along, 0.0, v_ref_abs);
     if (v_eff <= 0.0) {

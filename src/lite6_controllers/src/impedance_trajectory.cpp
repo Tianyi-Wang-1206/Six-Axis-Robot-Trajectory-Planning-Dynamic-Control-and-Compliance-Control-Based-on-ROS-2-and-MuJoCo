@@ -240,7 +240,8 @@ bool Lite6CTCController::configure_impedance_trajectory()
   return true;
 }
 
-// Playback uses 1 kHz sampled PVA + impedance targets with zero-order hold (ZOH).
+// Rigid playback requires 1 kHz ZOH PVA, zero header/start times, bounded
+// and consistent samples, and a resting endpoint.
 bool Lite6CTCController::valid_impedance_trajectory_goal(
   const FollowImpedance::Goal & goal, bool * out_uniform_1khz) const
 {
@@ -724,12 +725,9 @@ void Lite6CTCController::finish_impedance_trajectory_cycle(double dt)
   const double vel_ratio = dq_.cwiseAbs().maxCoeff() / imp_goal_velocity_tolerance_;
   double worst_ratio = vel_ratio;
   if (goal.end_behavior != FollowImpedance::Goal::END_HOLD_CARTESIAN_IMPEDANCE) {
-    // Per-axis endpoint pose settling for END_TRANSITION_NORMAL:
-    // - Pure force/torque axes (kt < 1.0 N/m or kr < 0.05 Nm/rad) have no spring
-    //   equilibrium target and rely on global deviation caps + velocity settling.
-    // - Soft or wrench_ff-biased axes widen their per-axis tolerance to cover
-    //   (|wrench_ff_k| + static LuGre friction deadband) / k_k, capped at max_*_deviation.
-    // - Stiff unbiased axes retain the exact nominal Euclidean tolerance.
+    // END_TRANSITION_NORMAL: pure-force axes use deviation and speed checks.
+    // Soft/biased axes allow (|wrench_ff| + friction deadband)/k within deviation caps;
+    // stiff unbiased axes keep nominal tolerances.
     constexpr double kMinPosControlledTransStiffness = 1.0;   // N/m
     constexpr double kMinPosControlledRotStiffness = 0.05;    // Nm/rad
     constexpr double kStaticFrictionMarginScale = 1.20;       // LuGre Fs = 1.15 * Fc + margin
@@ -844,10 +842,8 @@ void Lite6CTCController::finish_impedance_trajectory_cycle(double dt)
       compliance_pose_ = pinocchio::updateFramePlacement(
         pin_model_, pin_data_ref_, compliance_frame_);
       compliance_q_ = q_imp_ref_;
-      // Continuous handover: keep the trajectory's anisotropic per-axis gains and final
-      // feedforward wrench as the hold targets, starting from their current filtered
-      // values, instead of averaging axes or dropping the wrench. Joint-impedance and
-      // teach settings stay as last configured.
+      // Hold the final per-axis gains and wrench from their filtered values.
+      // Preserve joint-impedance and teach settings.
       for (int k = 0; k < 3; ++k) {
         cart_kt_target_[k] = last.translation_stiffness[k];
         cart_dt_target_[k] = last.translation_damping[k];

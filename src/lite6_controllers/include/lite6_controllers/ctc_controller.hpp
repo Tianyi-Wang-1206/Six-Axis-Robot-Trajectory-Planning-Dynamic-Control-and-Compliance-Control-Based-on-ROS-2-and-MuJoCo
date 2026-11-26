@@ -87,10 +87,8 @@ private:
     // Populated during non-RT validation before RT handoff.
     bool uniform_1khz = true;
     double t0_sec = 0.0;
-    // Path-preserving splice submitted via /ctc_controller/splice_joint_trajectory.
-    // splice_owner holds the active pending or adopted splice under trajectory_mutex_;
-    // rejected/withdrawn splices are moved to retired_splices so RT accesses splice
-    // lock-free without use-after-free or ABA pointer reuse while this execution exists.
+    // trajectory_mutex_ owns splice lifetimes; retired splices stay alive
+    // for lock-free RT access until the parent execution is released.
     std::shared_ptr<SpliceExecution> splice_owner;
     std::vector<std::shared_ptr<SpliceExecution>> retired_splices;
     std::atomic<SpliceExecution *> splice{nullptr};
@@ -278,10 +276,7 @@ private:
   Eigen::Vector3d payload_first_moment_link6_filtered_ = Eigen::Vector3d::Zero();
   bool payload_smoothing_active_ = false;
 
-  // Passive M-weighted singularity damping:
-  //   tau = -d0 * (M - J^T Lambda_reg J) * dq_err
-  //       = -d0 * M * (M + J^T Sigma_lambda^-1 J)^-1 * M * dq_err
-  // Symmetric positive definite everywhere and vanishing away from singularities,
+  // Passive damping: -d0*M*(M + J^T Sigma^-1 J)^-1*M*dq_err,
   // using cached M(q).
   Vec6d compute_nullspace_damping_torque(
     const Mat6d & j_arm, double lambda, double nullspace_damping,
@@ -289,10 +284,8 @@ private:
   // Transition-only torque slew-rate limiter.
   void begin_torque_transition(double duration_sec);
   void apply_transition_torque_slew(double dt, double slew_rate, Vec6d & tau);
-  // Recapture the current measured pose as a stationary NORMAL reference and
-  // reconcile integral_effort_ (plus a smooth cosine recovery bias for any load
-  // exceeding integral_max_effort_) so the mode switch preserves tau_applied_prev_
-  // continuously without an impulsive step kick.
+  // Capture a stationary NORMAL reference and reconcile integral/recovery bias
+  // to preserve the previous applied torque.
   void bumpless_handover_to_normal(double transition_duration_sec);
   bool transition_slew_active_ = false;
   double transition_slew_elapsed_ = 0.0;
@@ -456,10 +449,8 @@ private:
   bool has_applied_tau_ = false;
 
   lite6_interfaces::msg::ComplianceSettings compliance_settings_, compliance_filtered_;
-  // Per-axis gains [LOCAL_WORLD_ALIGNED] and feedforward wrench used by
-  // MODE_CARTESIAN_IMPEDANCE. Commands broadcast the scalar ComplianceSettings; an
-  // END_HOLD_CARTESIAN_IMPEDANCE handover keeps the trajectory's anisotropic gains and
-  // final wrench_ff, starting from its filtered values for a continuous torque.
+  // Cartesian gains/wrench in LOCAL_WORLD_ALIGNED. Settings broadcast scalars;
+  // END_HOLD keeps the trajectory targets and filtered values.
   void set_cartesian_targets_from_settings(bool reset_filtered);
   Eigen::Vector3d cart_kt_target_ = Eigen::Vector3d::Constant(200.0);
   Eigen::Vector3d cart_dt_target_ = Eigen::Vector3d::Constant(0.8);

@@ -478,14 +478,9 @@ void septic_smoothstep_derivs(double tau, double & a, double & da, double & dda)
   dda = t2 * (420.0 + t * (-1680.0 + t * (2100.0 - 840.0 * t)));
 }
 
-// C^3 corner blend between the end of one piece (s0) and the start of the next (s1),
-// trimmed symmetrically by trim_len on each side (blend length L = 2 * trim_len).
-// Position: degree-7 Bernstein/Bezier curve matching p, p_s, p_ss, p_sss at both ends.
-//   For linear-to-linear corners (p_ss = p_sss = 0), all 8 control points lie strictly on
-//   [a, W] and [W, b] inside the corner triangle [a, W, b] (convex-hull property) and
-//   collinear corners reproduce exact unit-speed straight lines.
-// Orientation: R(s) = R_in(s) * Exp(alpha(s) * Log(R_in(s)^T R_out(s))), with exact
-//   closed-form analytic SO(3) angular velocity w_s and angular acceleration w_ss.
+// Symmetrically trimmed C^3 corner: septic Bezier position and SO(3) rotation.
+// Straight-line control points stay inside the corner triangle.
+// Analytic rotation derivatives provide angular velocity and acceleration.
 class SepticBlendPiece final : public CartesianCurvePiece
 {
 public:
@@ -1128,11 +1123,8 @@ bool C3CartesianSpline::build(
       p[k], pm1[k], pm2[k], pm3[k],
       p[k + 1], pm1[k + 1], pm2[k + 1], pm3[k + 1], h);
 
-    // World angular derivatives on segment k (R(u) = R_k exp(theta(u))):
-    //   w_w = R_k (J_l dth)
-    //   a_w = R_k (dJ_l dth + J_l ddth)
-    //   j_w = R_k (ddJ_l dth + 2 dJ_l ddth + J_l dddth)
-    // Match (w_nodal, wa_nodal, wj_nodal) at both ends for global C^3 rotation continuity.
+    // Use SO(3) Jacobian derivatives to match nodal angular velocity,
+    // acceleration and jerk for global C^3 rotation continuity.
     const Eigen::Vector3d th0 = Eigen::Vector3d::Zero();
     const Eigen::Vector3d dth0 = R[k].transpose() * w_nodal[k];
     const Eigen::Vector3d ddth0 = R[k].transpose() * wa_nodal[k];

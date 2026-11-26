@@ -427,10 +427,8 @@ void fit_clamped_cubic_seed_1dof(
   if (M < 2) {
     return;
   }
-  // Solve tridiagonal system for nodal second derivatives c[0..M] with clamped v[0] = v[M] = 0:
-  //   (h[0]/3) c[0] + (h[0]/6) c[1] = (q[1] - q[0])/h[0]
-  //   (h[k-1]/6) c[k-1] + ((h[k-1]+h[k])/3) c[k] + (h[k]/6) c[k+1] = (q[k+1]-q[k])/h[k] - (q[k]-q[k-1])/h[k-1]
-  //   (h[M-1]/6) c[M-1] + (h[M-1]/3) c[M] = -(q[M] - q[M-1])/h[M-1]
+  // Solve the clamped cubic-spline tridiagonal system for nodal accelerations
+  // with zero endpoint velocities.
   const size_t n = M + 1;
   std::vector<double> dl(n, 0.0), dm(n, 0.0), du(n, 0.0), rhs(n, 0.0);
   dm[0] = h[0] / 3.0;
@@ -463,11 +461,8 @@ void fit_clamped_cubic_seed_1dof(
   }
 }
 
-// Computes the exact closed interval [out_a_lo, out_a_hi] of free accelerations `a` that make
-// (q, v_fixed, a) simultaneously forward- and reverse-time braking-feasible within hard limits
-// (optionally tightened by headroom <= 1.0 on v/a/j caps).
-// Exploits monotonicity: both U(a) = min_upper_excursion(q, |v|, a) and
-// L(a) = max_lower_excursion(q, -|v|, a) are monotonically non-decreasing in `a`.
+// Find the free-acceleration interval feasible for both braking directions.
+// Use monotone upper/lower excursions and optional v/a/j headroom.
 bool compute_feasible_acc_range_for_fixed_v(
   double q, double v, const DoFLimit & lim, double headroom,
   double & out_a_lo, double & out_a_hi,

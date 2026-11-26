@@ -43,20 +43,9 @@ struct CartesianCollocationResult
   bool kkt_optimal = false;
 };
 
-// Direct-transcription joint-space cubic collocation NLP solver for multi-waypoint
-// explicit Cartesian MovePVA trajectories:
-//   - Decision variables: nodal joint states (q_i, dq_i, ddq_i) on a per-segment
-//     adaptive collocation mesh plus free segment durations T_s (or fixed T_s when dt is pinned).
-//   - Dynamics: exact piecewise-constant-jerk cubic collocation equalities.
-//   - Constraints: joint position/velocity/acceleration/jerk bounds, smooth Euclidean
-//     Cartesian linear/angular velocity & classical acceleration norm bounds (using
-//     exact Pinocchio analytical forward-kinematics derivatives), and smooth
-//     singularity avoidance (using exact closed-form kinematic Hessians).
-//   - Linear algebra: Vanderbei banded SQD LDL^T (half-bandwidth 30) with exact
-//     Schur-complement elimination for coupled segment durations T_s.
-//   - Globalization: IPOPT-style primal-dual barrier filter line search with exact
-//     inertia correction, adaptive mesh refinement, 1 ms waypoint snapping, and
-//     collision-guided fallback when a minimum-time arc grazes obstacles/ground.
+// Adaptive cubic joint-space collocation for explicit Cartesian PVA.
+// Enforces joint/Cartesian bounds and singularity constraints via Pinocchio
+// derivatives, banded SQD IPM and 1 ms snapping, with collision-guided fallback.
 class CartesianCollocationSolver
 {
 public:

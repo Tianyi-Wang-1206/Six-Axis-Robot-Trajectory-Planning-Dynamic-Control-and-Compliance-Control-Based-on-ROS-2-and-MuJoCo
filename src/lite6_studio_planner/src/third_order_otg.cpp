@@ -538,10 +538,8 @@ void negate_profile(AxisProfile & prof)
   prof.finalize();
 }
 
-// Time-reversal + negation: r(s) = -q(T - s).
-// Maps (p0, v0, a0) -> (pf, vf, af) into (-pf, vf, -af) -> (-p0, v0, -a0),
-// keeping [v_min, v_max] unchanged, swapping [a_min, a_max] -> [-a_max, -a_min],
-// and preserving UDDU jerk signs (+j, 0, -j, 0, -j, 0, +j).
+// For r(s) = -q(T-s), reverse endpoints and negate q/a; keep v and jerk signs.
+// Swap acceleration bounds to [-a_max, -a_min].
 void time_reverse_negate_problem(
   const AxisState & s0, const AxisState & sf, const AxisLimits & lim,
   AxisState & o0, AxisState & of, AxisLimits & olim)
@@ -966,10 +964,8 @@ bool solve_max_disp_uddu(
   return found;
 }
 
-// Exact convex combination of two feasible AxisProfiles of identical duration T:
-// q(t) = (1 - alpha) * pA(t) + alpha * pB(t).
-// By convexity of box bounds on (v, a, j), guaranteed valid when durations and endpoints match;
-// validates endpoint state and kinematic bounds explicitly to guard against duration mismatch drift.
+// Blend equal-duration profiles as (1-alpha)*pA + alpha*pB.
+// Recheck endpoints and bounds to catch duration mismatch drift.
 bool blend_profiles_convex(
   const AxisProfile & pA, const AxisProfile & pB, double alpha,
   const AxisState & sf, const AxisLimits & lim,
@@ -2037,10 +2033,8 @@ bool solve_axis_velocity_at_duration(
   const double j = lim.j_max;
   const double a0 = s0.a;
   const double dv = vf - s0.v;
-  // Try UP-HOLD-DOWN with free plateau a1 in [max(a0, af), a_max]:
-  // t0 = (a1 - a0)/j, t2 = (a1 - af)/j, t1 = T - (2*a1 - a0 - af)/j
-  // dv = (2*a1^2 - a0^2 - af^2)/(2j) + a1*t1
-  //    => a1^2 - (j*T + a0 + af)*a1 + (j*dv + 0.5*(a0^2 + af^2)) = 0
+  // For an UP-HOLD-DOWN plateau a1, solve
+  // a1^2 - (j*T + a0 + af)*a1 + j*dv + (a0^2 + af^2)/2 = 0.
   auto try_dir = [&](double j_sgn) -> bool {
     const double jv = j_sgn * j;
     const double B = -(jv * T_target + a0 + af);
@@ -2434,10 +2428,7 @@ bool solve_axis_unconstrained_step2(
     return false;
   }
 
-  // Select best candidate:
-  //   1) Strictly within [q_min, q_max] preferred over overshooting;
-  //   2) Among in-bounds candidates, prefer lowest peak jerk (smoothest profile);
-  //   3) Among overshooting candidates, prefer smallest position overshoot.
+  // Prefer in-bounds profiles, then lower jerk; otherwise minimize overshoot.
   size_t best_idx = 0;
   bool best_in = !lim.has_pos_limits() || profile_within_pos(cands[0], lim);
   double best_over = lim.has_pos_limits() ? profile_pos_overshoot(cands[0], lim) : 0.0;

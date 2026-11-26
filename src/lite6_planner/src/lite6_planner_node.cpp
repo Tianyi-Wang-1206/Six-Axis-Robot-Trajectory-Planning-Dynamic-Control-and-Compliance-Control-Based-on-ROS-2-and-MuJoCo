@@ -312,10 +312,8 @@ private:
     uint8_t cmd=CtcCommand::Request::CMD_NONE;
     std::optional<rclcpp::Client<CtcCommand>::FutureAndRequestId> request;
   };
-  // Sends a CTC command without waiting for its response (called under
-  // transition_mutex_, which only orders command emission). With `pending`, the
-  // caller awaits the response after releasing the mutex; otherwise the response is
-  // acknowledged from cmd_client_group_.
+  // Emit CTC commands under transition_mutex_; await outside it via pending,
+  // or acknowledge asynchronously in cmd_client_group_.
   bool issue_ctc_command(const Supervisor::Effects& effects,PendingCtcCommand* pending) {
     if(!ctc_cmd_client_->service_is_ready()&&!ctc_cmd_client_->wait_for_service(20ms)) {
       // Never sent: definitively not applied.

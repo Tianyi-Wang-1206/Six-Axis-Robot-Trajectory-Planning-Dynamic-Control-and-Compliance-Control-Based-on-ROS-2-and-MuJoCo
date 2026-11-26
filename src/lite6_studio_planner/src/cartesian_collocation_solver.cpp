@@ -1865,15 +1865,11 @@ IpmSolveStats run_collocation_ipm(
 
         kkt.add_band(z_idx, z_idx, zL_n[n_idx] / sL + zU_n[n_idx] / sU);
         rhs_z[z_idx] += -stat_n[n_idx] + mu / sL - mu / sU;
-        // Wait: stat_n already included +lm * grad_g, while rhs_z already subtracted
-        // ((mu + lm*(gm+sm))/sm)*grad_g = (mu/sm + lm*gm/sm + lm)*grad_g!
-        // Thus rhs_z = -(grad_f + J_c^T y + sum lm*grad_g) + lm*grad_g - ... -> need to add back lm*grad_g!
+        // stat_n and the eliminated inequalities both include lm * grad_g;
+        // cancel the duplicate contribution below.
       }
     }
-    // Restore the +lm * grad_g cancellation in rhs_z and rhs_T cleanly:
-    // Currently rhs_z has -sum((mu + lm*(gm+sm))/sm * grad_g) - (grad_f + J_c^T y + sum lm*grad_g) + mu/sL - mu/sU.
-    // The exact condensed RHS is: -(grad_f + J_c^T y) + mu/sL - mu/sU - sum((mu + lm*(gm+sm))/sm * grad_g).
-    // So adding back +sum(lm * grad_g) eliminates the double-counted lm*grad_g!
+    // Cancel the duplicate lm * grad_g contribution in the condensed RHS.
     for (size_t m = 0; m < n_ineq; ++m) {
       const auto & gc = g_grads[m];
       const double lm = lam[m];

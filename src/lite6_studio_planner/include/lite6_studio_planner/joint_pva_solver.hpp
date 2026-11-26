@@ -14,27 +14,9 @@
 namespace lite6_studio_planner
 {
 
-// Native 6-DOF 3rd-order joint-space multi-waypoint PVA solver built on the standalone
-// 3rd-order OTG engine (third_order_otg.hpp):
-//
-// Layer A — Synchronized 3rd-order state-to-state segment solver with hard position
-//   limits [min_pos, max_pos], unconstrained blocked-interval synchronization, and exact dt:
-//   - Verifies forward-time and reverse-time minimum braking feasibility from both
-//     endpoints against [min_pos, max_pos] and scaled (v, a, j) limits.
-//   - Uses analytic unconstrained 3rd-order OTG where position bounds are inactive, and
-//     numerical boundary-contact search (finite grid + Brent refinement + bounded recursion)
-//     when position bounds are active, distinguishing mathematical infeasibility from
-//     numerical search failure.
-//   - Synchronizes all 6 joints and supports 1 ms segment durations (round_1ms(dt)) with
-//     piecewise-constant jerk throughout.
-//
-// Layer B — Deterministic coupled multi-waypoint (v_k, a_k) optimization:
-//   - Pins user-supplied intermediate velocities/accelerations (and rest at start/end),
-//     computing exact feasible intervals for partially constrained free components.
-//   - Evaluates natural C^2 cubic-spline, direction-preserving Catmull-Rom, and zero seeds.
-//   - Runs per-DoF chain pre-optimization, coupled 6-DOF smooth-max (LogSumExp) projected
-//     L-BFGS continuation over all free (v_k, a_k) simultaneously, and a deterministic
-//     6-DOF synchronized coordinate polish (no wall-clock timers, cooperatively cancellable).
+// Six-axis jerk-limited PVA planning with bounded-position OTG segments.
+// Synchronizes 1 ms durations and optimizes free waypoint derivatives with
+// deterministic, cancellable L-BFGS/coordinate searches; pinned PVA stays fixed.
 class JointPVASolver
 {
 public:
@@ -70,10 +52,8 @@ public:
     std::string & err_code,
     std::string & err_msg);
 
-  // Solves a multi-waypoint joint-space MovePVA starting from rest at start_q and
-  // ending at rest at waypoints.back().joint_pos. Unspecified intermediate velocities
-  // and accelerations are optimized deterministically to minimize synchronized duration.
-  // Optional is_cancelled predicate aborts with ERR_CANCELLED.
+  // Plan rest-to-rest joint MovePVA, optimizing unspecified interior derivatives.
+  // Cancellation returns ERR_CANCELLED.
   static bool solve_multi_waypoint(
     const std::array<double, 6> & start_q,
     const std::vector<PVAWaypoint> & waypoints,

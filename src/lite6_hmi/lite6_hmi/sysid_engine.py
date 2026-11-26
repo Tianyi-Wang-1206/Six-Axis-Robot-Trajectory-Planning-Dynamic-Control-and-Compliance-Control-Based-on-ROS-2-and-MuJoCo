@@ -140,11 +140,8 @@ class SysIdEngine:
         return mask
 
     def generate_fourier_coefficients(self, q0, max_pos_limits):
-        """Choose an informative, collision-free shape and adapt amplitude/time.
-
-        The UI amplitudes are upper bounds. All candidates satisfy the original
-        zero velocity/acceleration endpoint constraints. Sampled extrema are
-        padded with analytic derivative bounds before applying a 10% margin.
+        """Choose a collision-free Fourier shape within amplitude caps and rest endpoints.
+        Use analytic derivative bounds with a 10% margin.
         """
         q0 = np.asarray(q0, dtype=float)
         amplitudes = np.asarray(max_pos_limits, dtype=float)
@@ -337,12 +334,8 @@ class SysIdEngine:
 
     @classmethod
     def _integrate_zoh_torque(cls, dt_seq, cmd_seq, cmd_age, tau_seq):
-        """Integrate piecewise-constant actuator torque across exact physics intervals.
-
-        Between distinct snapshots k and k+1, actuator effort is held constant per
-        controller command_sequence. When exactly one command transition occurs in
-        (t_k, t_{k+1}], command_age[k+1] locates the sub-millisecond switch to the
-        exact 0.1 ms physics substep.
+        """Integrate ZOH torque over physics intervals using command_sequence and
+        command_age to locate a single intra-interval transition.
         """
         dseq = np.diff(cmd_seq)
         tau_int = 0.5 * (tau_seq[:-1] + tau_seq[1:]) * dt_seq[:, None]
@@ -366,12 +359,8 @@ class SysIdEngine:
         return tau_int
 
     def calculate_least_squares(self) -> str:
-        """Fit nonnegative Fv/Fc from measured Fourier data using generalized momentum integrals.
-
-        Using Euler-Lagrange momentum balance p = (M(Q)V)[:6] + J_a dq:
-          dp/dt = tau_act - tau_f - g(Q)[:6] + (C(Q, V)^T V)[:6]
-        integrating over contiguous post-reversal settled sliding windows removes
-        acceleration differentiation bias, reversal-kink smearing, and ZOH phase lag.
+        """Fit nonnegative Fv/Fc with momentum integrals over settled sliding windows:
+        dp/dt = tau_act - tau_f - g + C^T V, p = (M V)[:6] + J_a dq.
         """
         self.fit_diagnostics = []
         (t_seq, cmd_seq, cmd_age, q_seq, dq_seq, tau_seq,

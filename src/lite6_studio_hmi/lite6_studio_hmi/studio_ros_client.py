@@ -246,12 +246,7 @@ class StudioRosWorker(QThread):
         self.studio_state_updated.emit(msg)
 
     def _send_direct_controller_estop(self, ctc_cmd_cli, reason, force=False):
-        """Latch E-STOP directly on the CTC controller.
-
-        force=True bypasses the one-shot fallback latch; used for operator E-STOP
-        requests, which are always sent to the controller in parallel with the
-        StudioCommand so a busy or hung trajectory planner can never delay them.
-        """
+        """Latch CTC E-STOP; force=True bypasses the one-shot guard for operator requests."""
         if self._direct_estop_sent and not force:
             return
         if not ctc_cmd_cli.service_is_ready():

@@ -309,8 +309,8 @@ void Lite6CTCController::compute_compliance(double dt)
       wrench[k + 3] -= d_rot * velocity[k + 3];
     }
     tau_cmd_.noalias() += j_arm.transpose() * (wrench + cart_wrench_ff_filtered_);
-    // Passive M-weighted singularity damping: -d0 * (M - J^T Lambda_reg J) * dq.
-    // Symmetric positive definite everywhere and vanishing away from singularities.
+    // Passive damping: -d0*M*(M + J^T Sigma^-1 J)^-1*M*dq_err,
+    // using cached M(q).
     tau_cmd_ += compute_nullspace_damping_torque(
       j_arm, cfg.operational_damping_lambda, s.nullspace_damping, dq_);
   } else {

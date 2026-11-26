@@ -103,10 +103,8 @@ public:
   void observe_gripper(uint8_t gripper_state, bool ready);
   Effects watchdog();
 
-  // Compile coordination. begin_compile() atomically checks the state (auto_load only)
-  // and registers an in-flight load compile; RUN/RESUME/STEP/CLEAR_PROGRAM are rejected
-  // under the same mutex until the matching end_compile(true). Dry-run compiles
-  // (auto_load == false) do not block execution commands.
+  // Auto-load compilation blocks RUN/RESUME/STEP/CLEAR under the same mutex
+  // until end_compile(true); dry runs do not block execution.
   bool begin_compile(bool auto_load, std::string & out_reason);
   void end_compile(bool auto_load = true);
   void on_compile_dry_run(uint64_t request_id);

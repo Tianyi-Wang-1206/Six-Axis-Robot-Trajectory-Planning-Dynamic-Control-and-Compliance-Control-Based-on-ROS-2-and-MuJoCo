@@ -50,10 +50,8 @@ public:
     const double torque = p.sigma0 * z_ + p.sigma1 * z_dot + p.sigma2 * velocity;
 
     if (velocity != 0.0) {
-      // Exact solution for velocity held at v_n over this physics step:
-      // z_{n+1} = z_n + (z_ss - z_n) * (1 - exp(-rate * dt)).
-      // expm1 avoids cancellation near zero; no velocity deadband, state clamp,
-      // smoothed sign, or steady-state substitution is used.
+      // Exact constant-velocity update; expm1 preserves precision near zero.
+      // z_next = z + (z_ss - z) * (1 - exp(-rate * dt)).
       const double z_ss = std::copysign(g / p.sigma0, velocity);
       z_ = std::fma(z_ss - z_, -std::expm1(-rate * dt), z_);
     }

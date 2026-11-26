@@ -114,11 +114,8 @@ private:
   double total_length_ = 0.0;
 };
 
-// Smooth C^3 Cartesian spline through a sequence of SE(3) poses:
-//   - Position: globally C^3 piecewise septic Hermite spline parameterized by pseudo arc length.
-//   - Orientation: globally C^3 piecewise Lie-algebra septic Hermite spline matching continuous
-//     world angular velocity, angular acceleration, and angular jerk across all interior waypoints
-//     via exact first and second derivatives of the SO(3) left Jacobian.
+// C^3 septic position and Lie-algebra rotation splines through SE(3) poses.
+// SO(3) Jacobian derivatives match angular velocity, acceleration and jerk.
 class C3CartesianSpline : public CartesianPath
 {
 public:

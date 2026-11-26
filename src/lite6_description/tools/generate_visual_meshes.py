@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-"""Preserve the bundled STL facets and normals in MuJoCo's visual OBJ assets.
-
-MuJoCo regenerates normals when loading STL, smoothing the original facets.
-OBJ supports explicit per-face-corner normals, so no geometry changes are needed.
-Run this script after updating the source visual STL files. No third-party
-dependencies are required; collision meshes and source STL files are untouched.
+"""Preserve STL facets and normals in visual OBJ assets.
+Run after source STL changes; collision meshes are untouched.
 """
 
 from pathlib import Path

@@ -708,10 +708,8 @@ private:
     std::lock_guard<std::mutex> cmd_lock(command_mutex_);
     const uint8_t cmd = req->command;
 
-    // Hold exec_mutex_ and dispatch_mutex_ across the supervisor transition (lock order:
-    // command_mutex_ -> exec_mutex_ -> dispatch_mutex_ -> supervisor_->mutex_) so the worker
-    // can never wake on a stale cursor OR dispatch a goal/gripper/payload command after
-    // STOP/ESTOP/PAUSE has been accepted.
+    // Lock order: command -> exec -> dispatch -> supervisor. Keep the transition
+    // locked to prevent dispatch after STOP/ESTOP/PAUSE or with a stale cursor.
     StudioSupervisor::CommandResult result;
     {
       std::lock_guard<std::mutex> exec_lock(exec_mutex_);
@@ -1080,11 +1078,8 @@ private:
             &ack_mode);
           sent_clear_cmd = true;
           last_clear_cmd_tp = now_tp;
-          // Transient rejections are retried: SPEED (still moving), BUSY (trajectory
-          // or stopping ramp finishing), RT_TIMEOUT (withdrawn), OUTCOME_UNKNOWN (reconcile
-          // via observed controller mode before retrying).
-          // STATE while the controller already reports NORMAL means an earlier
-          // CLEAR_ESTOP took effect; the NORMAL observation advances the phase.
+          // Retry SPEED, BUSY and withdrawn RT_TIMEOUT; reconcile OUTCOME_UNKNOWN first.
+          // Observed NORMAL completes recovery even if CLEAR_ESTOP returned STATE.
           const bool transient =
             ack == ControllerCommand::Response::ACK_REJECTED_SPEED ||
             ack == ControllerCommand::Response::ACK_REJECTED_BUSY ||
@@ -1569,10 +1564,7 @@ private:
     TIMED_OUT
   };
 
-  // Waits until every joint speed stays at or below the planner settle bound
-  // (kPlannerSettleSpeedRadPerSec, strictly below the controller admission bound)
-  // for a short continuous window, so 100 Hz SHM sampling jitter never lets a
-  // command reach the 1 kHz controller while it would still be speed-rejected.
+  // Require continuous settling below the planner speed bound before dispatch.
   SettleOutcome wait_for_planner_settle(uint64_t session, double timeout_sec)
   {
     constexpr auto kContinuous = std::chrono::milliseconds(50);

@@ -1,8 +1,8 @@
 controller_manager:
   ros__parameters:
-    update_rate: 1000  # 1000Hz Hard Real-Time Control Loop
+    update_rate: 1000  # Hz
 
-    # 1. Declare the CTC controller, which is a custom controller that implements Computed Torque Control (CTC) for the 6-DOF robot arm
+    # Arm torque controller.
     ctc_controller:
       type: lite6_controllers/Lite6CTCController
 
@@ -34,13 +34,13 @@ ctc_controller:
     # Maximum torque of each joint (same as the xml file)
     max_effort : [50.0, 50.0, 32.0, 32.0, 32.0, 20.0]
 
-    # Deceleration (rad/s^2) of each joint when the emergency stop is triggered. This is used to compute the deceleration trajectory for each joint.
-    estop_decel: [17.5, 12.5, 20.0, 40.0, 40.0, 50.0]  # 5x of the joint acceleration limits.
+    # Braking limits [rad/s^2]: 2x normal acceleration to limit torque demand.
+    estop_decel: [16.0, 12.0, 20.0, 32.0, 36.0, 40.0]
 
     # Physical execution checks, in joint1..joint6 order; all values must be positive.
     # A path error aborts immediately, including while holding the endpoint.
     execution.max_joint_velocity: [3.14, 3.14, 3.14, 3.14, 3.14, 3.14]      # rad/s (matches URDF / kinematic_limits.yaml)
-    execution.max_joint_acceleration: [3.5, 2.5, 4.0, 8.0, 8.0, 10.0]       # rad/s^2 (matches kinematic_limits.yaml)
+    execution.max_joint_acceleration: [8.0, 6.0, 10.0, 16.0, 18.0, 20.0]     # rad/s^2 (matches kinematic_limits.yaml)
     execution.position_limit_tolerance: 0.0001                               # rad (allows tiny measured soft-limit penetration)
     execution.path_position_tolerance: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]  # rad
     execution.path_velocity_tolerance: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]  # rad/s

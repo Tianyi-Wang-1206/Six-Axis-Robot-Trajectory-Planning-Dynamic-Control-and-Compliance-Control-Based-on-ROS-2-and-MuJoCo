@@ -796,11 +796,8 @@ bool ProgramCompiler::build_cartesian_joint_path(
       }
     }
 
-    // d3q/du3 by central difference of the exact analytic d2q/du2 (only at new knots
-    // and their immediate neighbors whose spacing shrank). Exact on globally C^3 Cartesian
-    // paths (CompositeCartesianPath and C3CartesianSpline); acts as a local smoothing
-    // approximation across any interior knot of a custom C^2-only path with discontinuous
-    // angular jerk before constructing the C^3 septic Hermite joint spline.
+    // Differentiate analytic d2q/du2 at new or affected knots for the C^3 spline.
+    // This is a local smoothing approximation at discontinuous C^2 angular-jerk knots.
     auto q2_at = [&](size_t k, double uu, Vec6 & out) -> bool {
       const double du = uu - knots[k].u;
       const Vec6 guess = knots[k].q + du * (knots[k].m1 + 0.5 * du * knots[k].m2);
@@ -1410,10 +1407,8 @@ bool ProgramCompiler::compile_pva_statement(
       return true;
     }
 
-    // Explicit (P, V), (P, V, A), or dt Cartesian MovePVA: solve directly via
-    // Direct-Transcription Joint-Space Cubic Collocation NLP with exact Pinocchio
-    // kinematics/derivatives, banded SQD + Schur-complement IPM, smooth singularity
-    // avoidance, adaptive mesh refinement, and exact 1 kHz verification.
+    // Solve explicit Cartesian PVA/dt by adaptive joint-space cubic collocation
+    // with Pinocchio derivatives, singularity constraints and 1 kHz verification.
     std::vector<CartesianCollocationWaypoint> coll_wps;
     coll_wps.reserve(M);
     for (size_t k = 0; k < M; ++k) {
@@ -2338,10 +2333,8 @@ bool ProgramCompiler::replan_remaining_block(
       original_block.sample_locations[idx] : original_block.loc;
   };
 
-  // 1. Resume point: the reference sample closest to the actual configuration. The
-  //    reported pause sample lags (50 Hz feedback) and the arm brakes past it, so search
-  //    a local window first and extend forward adaptively if braking/lag exceeds 2.5 s
-  //    (stopping once a close valley is passed so self-intersecting loops are respected).
+  // Find the reference nearest the actual stopped pose, searching forward past
+  // the delayed pause sample. Stop at a close valley to preserve loop ordering.
   auto dist_sq_at = [&](size_t idx) -> double {
     const auto q = get_pt_q(idx);
     double d2 = 0.0;
@@ -2474,10 +2467,8 @@ bool ProgramCompiler::replan_remaining_block(
           break;
         }
         default: {
-          // Joint MovePVA or source-less blocks: follow the remaining reference geometry
-          // through a chord-length spline, re-timed with the programmed scales.
-          // Knots at uniform joint-space arc length: sample strides would crowd knots where
-          // the reference decelerates and create spurious kinks.
+          // Re-time the remaining joint geometry at the programmed scales.
+          // Space knots by arc length to avoid clustering during deceleration.
           std::vector<double> arc(total_pts, 0.0);
           for (size_t idx = resume_idx + 1; idx < total_pts; ++idx) {
             const auto qa = get_pt_q(idx - 1);

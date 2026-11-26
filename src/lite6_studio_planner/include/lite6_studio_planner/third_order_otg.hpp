@@ -40,12 +40,8 @@ enum class SolveStatus
   SEARCH_FAILED = 2   // Numerical bounded-position search did not find a solution within search/depth budget
 };
 
-// Kinematic and hard position bounds for a single degree of freedom.
-// Supports asymmetric velocity and acceleration limits:
-//   q_min <= q(t) <= q_max
-//   v_min <= v(t) <= v_max   (v_min < 0 < v_max)
-//   a_min <= a(t) <= a_max   (a_min < 0 < a_max)
-//   |j(t)| <= j_max          (j_max > 0)
+// Per-axis bounds: q_min <= q <= q_max, v_min <= v <= v_max,
+// a_min <= a <= a_max, |j| <= j_max; v/a bounds straddle zero.
 struct AxisLimits
 {
   double q_min = -std::numeric_limits<double>::infinity();
@@ -188,11 +184,8 @@ bool solve_axis_unconstrained_step2(
   double T_target,
   AxisProfile & out_profile);
 
-// Numerical 1-DOF state-constrained minimum-time search enforcing q(t) in [q_min, q_max].
-// Uses finite-grid sampling + Brent 1D refinement over inward boundary contact acceleration a_b
-// (covering touch-and-go bounces and zero-acceleration boundary arcs) with bounded recursion
-// for double-sided bounces. Because the boundary-contact search is numerical and depth-bounded,
-// failures distinguish SolveStatus::INFEASIBLE from SolveStatus::SEARCH_FAILED.
+// Bounded-position minimum-time search using refined boundary contacts.
+// Distinguishes proven infeasibility from a failed numerical search.
 bool solve_axis_bounded_min_time(
   const AxisState & s0,
   const AxisState & sf,
@@ -202,10 +195,8 @@ bool solve_axis_bounded_min_time(
   int depth = 0,
   SolveStatus * out_status = nullptr);
 
-// Numerical 1-DOF state-constrained fixed-duration search enforcing q(t) in [q_min, q_max]
-// at duration T_target. If no solution is found at T_target, sets out_next_feasible_T to a
-// strictly larger candidate duration (or +inf if none) and distinguishes
-// SolveStatus::INFEASIBLE (provably infeasible unconstrained) from SolveStatus::SEARCH_FAILED.
+// Search bounded-position profiles at T_target; on failure return a later
+// candidate (or infinity) and distinguish infeasibility from search failure.
 bool solve_axis_bounded_at_duration(
   const AxisState & s0,
   const AxisState & sf,

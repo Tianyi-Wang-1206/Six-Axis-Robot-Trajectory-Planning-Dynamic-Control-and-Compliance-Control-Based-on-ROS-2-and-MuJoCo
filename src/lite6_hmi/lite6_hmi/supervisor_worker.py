@@ -1,11 +1,4 @@
-"""ROS 2 transport adapter for the Robot GUI.
-
-The planner's Supervisor is the *only* owner of the global discrete state.
-This module never transitions the global machine: it translates state snapshots
-into the existing HMI labels and sends guarded commands to the Supervisor.
-
-GUI widgets, their layouts and the SysIdEngine numerical methods live elsewhere.
-"""
+"""Translate supervisor state into HMI labels and send guarded commands."""
 
 import math
 import queue
@@ -541,10 +534,8 @@ class ROS2Worker(QThread):
                 and (previous is None or previous.mode not in (
                     SupervisorState.MODE_ESTOP, SupervisorState.MODE_FAULT))
             )
-            # Suppress the fault popup for intentional manual E-STOP presses and
-            # for trajectory failures that already report through _goal_result.
-            # Direct CTC E-STOP can beat /supervisor/command CMD_ESTOP and arrive
-            # initially as ESTOP_CONTROLLER_FAULT (from CS::ESTOP_EXTERNAL).
+            # Suppress duplicate/manual E-STOP popups, including direct CTC requests
+            # that reach the controller before the supervisor.
             trajectory_reports_via_action = (
                 msg.estop_reason == SupervisorState.ESTOP_TRAJECTORY
                 and previous is not None
@@ -932,13 +923,7 @@ class ROS2Worker(QThread):
             self._scoped_dispatch_failed(context, session, "Action result unavailable")
 
     def trigger_estop(self, reason, force_fallback=False):
-        """Latch E-STOP directly on the CTC and request supervisor ESTOP in parallel.
-
-        The direct /ctc_controller/command request is sent first, so a busy or hung
-        supervisor (whose command service may wait on another CTC handshake) can
-        never delay the RT latch. The supervisor request keeps SupervisorState and
-        motion bookkeeping consistent.
-        """
+        """Send CTC E-STOP first, then update the supervisor bookkeeping in parallel."""
         with self.state_lock:
             self._estop_requested_at = time.monotonic()
             if reason == "SOFTWARE E-STOP PRESSED":
