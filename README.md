@@ -16,7 +16,7 @@
 
 ## Overview
 
-This README is quite long; if you would like a quick overview of the project, please watch the [video](demo/demo_main.mp4).
+This README is quite long; if you would like a quick overview of the project, please watch the [video](demo/demo_main.mp4). The demo video is also available on [YouTube](https://www.youtube.com/watch?v=bM5ZBoYWGcU) and [Bilibili](https://www.bilibili.com/video/BV1RZ1tzKEix/?vd_source=87d8b432e2f220e16a71413be4d9bcbf)
 
 This repository is a personal, end-to-end robotics simulation and control software stack for a six-axis robotic manipulator built on **ROS 2 Jazzy** and **MuJoCo 3.9.0**. The architecture splits cleanly into two specialized high-level applications that share a common real-time simulation backend, inter-process communication protocol, kinematics/collision library, and low-level dynamic controller: a **Debugging Version** tailored for single-move motion verification, interactive encoder-based compliance/drag teaching, payload testing, gripper operation, and automated friction identification; and a **Studio Version** featuring a custom robotic motion **Domain-Specific Language (DSL)**, a five-stage offline trajectory compiler, and a PyQt5 **Trajectory Programming IDE** with real-time execution monitoring, live pausing/resuming, and diagnostic reporting. The six-axis arm motion and compliance controller assumes no joint torque sensors and uses joint encoder measurements and rigid-body models without simulator contact-force feedback. The simulated gripper is separate: its grasp estimator reads MuJoCo contact forces, and its drive uses MuJoCo bias-force feedforward.
 
