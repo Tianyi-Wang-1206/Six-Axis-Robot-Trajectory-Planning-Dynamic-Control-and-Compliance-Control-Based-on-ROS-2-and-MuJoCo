@@ -1,0 +1,208 @@
+[Script Info]
+Title: Six-Axis Robot Trajectory Planning, Dynamic Control, and Compliance Control Demo
+ScriptType: v4.00+
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+YCbCr Matrix: TV.709
+PlayResX: 1920
+PlayResY: 1080
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: CardLabel,Noto Sans CJK SC,34,&H00F8BD38,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,4,0,1,0,0,5,60,60,30,1
+Style: CardNum,Noto Sans,96,&H00F8BD38,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,2,0,1,0,0,5,60,60,30,1
+Style: CardTitleZH,Noto Sans CJK SC,66,&H00FCFAF8,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,2,0,1,0,0,5,80,80,30,1
+Style: CardSubEN,Noto Sans,36,&H00E1D5CB,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0.5,0,1,0,0,5,80,80,30,1
+Style: CardDescZH,Noto Sans CJK SC,40,&H00FCFAF8,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,1.0,0,1,0,0,5,90,90,30,1
+Style: CardDescEN,Noto Sans,29,&H00B8A394,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0.3,0,1,0,0,5,90,90,30,1
+Style: CardNote,Noto Sans CJK SC,34,&H000B9EF5,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0.8,0,1,0,0,5,90,90,30,1
+Style: DiscZH,Noto Sans CJK SC,50,&H00FCFAF8,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,1.2,0,1,0,0,5,90,90,30,1
+Style: DiscEN,Noto Sans,32,&H00E1D5CB,&H000000FF,&H00000000,&H00000000,0,1,0,0,100,100,0.3,0,1,0,0,5,90,90,30,1
+Style: BarBg,Noto Sans,20,&H2A2A170F,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1
+Style: BarAccent,Noto Sans,20,&H00F8BD38,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1
+Style: SubZH,Noto Sans CJK SC,42,&H00FCFAF8,&H000000FF,&H80000000,&H00000000,0,0,0,0,100,100,0.8,0,1,0.8,0,5,30,30,20,1
+Style: SubZHBig,Noto Sans CJK SC,45,&H00FCFAF8,&H000000FF,&H80000000,&H00000000,0,0,0,0,100,100,0.9,0,1,0.8,0,5,30,30,20,1
+Style: SubEN,Noto Sans,28,&H00E1D5CB,&H000000FF,&H80000000,&H00000000,0,0,0,0,100,100,0.3,0,1,0.5,0,5,30,30,20,1
+Style: SubENBig,Noto Sans,30,&H00E1D5CB,&H000000FF,&H80000000,&H00000000,0,0,0,0,100,100,0.3,0,1,0.5,0,5,30,30,20,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+
+
+Comment: ==================== S00: OPENING DISCLAIMER (0:00:00.00 - 0:00:03.00) ====================
+Dialogue: 1,0:00:00.00,0:00:03.00,CardLabel,,0,0,0,,{\an5\pos(960,290)\fad(250,300)}声 明  ·  DISCLAIMER
+Dialogue: 1,0:00:00.00,0:00:03.00,BarAccent,,0,0,0,,{\an7\pos(860,342)\fad(250,300)\p1}m 0 0 l 200 0 l 200 4 l 0 4{\p0}
+Dialogue: 1,0:00:00.00,0:00:03.00,DiscZH,,0,0,0,,{\an5\pos(960,485)\fad(250,300)}本项目为纯个人开源作品，仅限教育与研究目的，\N与任何商业实体及商标无关联，不代表任何真实硬件或商业系统的控制算法。
+Dialogue: 1,0:00:00.00,0:00:03.00,DiscEN,,0,0,0,,{\an5\pos(960,680)\fad(250,300)}A personal open-source project for education and research only.\NNot affiliated with any commercial entity, nor representative of commercial or real-hardware algorithms.
+
+Comment: ==================== C01: CHAPTER 01 (0:00:03.00 - 0:00:07.00) ====================
+Dialogue: 1,0:00:03.00,0:00:07.00,CardNum,,0,0,0,,{\an5\pos(960,265)\fad(250,250)\c&HF8BD38&}01
+Dialogue: 1,0:00:03.00,0:00:07.00,BarAccent,,0,0,0,,{\an7\pos(890,335)\fad(250,250)\c&HF8BD38&\p1}m 0 0 l 140 0 l 140 4 l 0 4{\p0}
+Dialogue: 1,0:00:03.00,0:00:07.00,CardTitleZH,,0,0,0,,{\an5\pos(960,425)\fad(250,250)}轨迹编程界面（Studio）
+Dialogue: 1,0:00:03.00,0:00:07.00,CardSubEN,,0,0,0,,{\an5\pos(960,505)\fad(250,250)}Trajectory Programming Interface (Studio)
+Dialogue: 1,0:00:03.00,0:00:07.00,CardDescZH,,0,0,0,,{\an5\pos(960,655)\fad(250,250)}本项目引入了一个轨迹编程界面，可编写并编译自定义运动程序，\N支持 MoveJ、MoveP、MoveL、MoveC、MovePVA 及笛卡尔阻抗等模式。
+Dialogue: 1,0:00:03.00,0:00:07.00,CardDescEN,,0,0,0,,{\an5\pos(960,765)\fad(250,250)}A scriptable interface for authoring custom motion programs,\Nsupporting MoveJ, MoveP, MoveL, MoveC, MovePVA, and Cartesian impedance blocks.
+
+Comment: ==================== V01 ====================
+Dialogue: 0,0:00:07.30,0:00:32.30,BarBg,,0,0,0,,{\an7\pos(357,946)\fad(250,250)\p1}m 14 0 l 1192 0 b 1199 0 1206 7 1206 14 l 1206 100 b 1206 107 1199 114 1192 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:00:07.30,0:00:32.30,BarAccent,,0,0,0,,{\an7\pos(371,946)\fad(250,250)\c&HF8BD38&\p1}m 0 0 l 1178 0 l 1178 3 l 0 3{\p0}
+Dialogue: 1,0:00:07.30,0:00:32.30,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,250)}{\c&HF8BD38&\b1}笛卡尔空间 PVA 轨迹{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}基于直接配点法，按指定位姿、速度与加速度规划
+Dialogue: 1,0:00:07.30,0:00:32.30,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,250)}Cartesian PVA Trajectory  ·  Direct collocation for target poses, twists & accelerations
+
+Comment: ==================== V02 ====================
+Dialogue: 0,0:00:32.80,0:00:57.35,BarBg,,0,0,0,,{\an7\pos(403,946)\fad(250,250)\p1}m 14 0 l 1100 0 b 1107 0 1114 7 1114 14 l 1114 100 b 1114 107 1107 114 1100 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:00:32.80,0:00:57.35,BarAccent,,0,0,0,,{\an7\pos(417,946)\fad(250,250)\c&HF8BD38&\p1}m 0 0 l 1086 0 l 1086 3 l 0 3{\p0}
+Dialogue: 1,0:00:32.80,0:00:57.35,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,250)}{\c&HF8BD38&\b1}关节空间 PVA 轨迹{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}基于三阶有界位置 OTG 与多航点联合优化
+Dialogue: 1,0:00:32.80,0:00:57.35,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,250)}Joint-Space PVA Trajectory  ·  Third-order bounded-position OTG & multi-waypoint optimization
+
+Comment: ==================== V03: Demo_Trajectory_3 ====================
+Dialogue: 0,0:00:57.85,0:01:24.30,BarBg,,0,0,0,,{\an7\pos(323,946)\fad(250,140)\p1}m 14 0 l 1260 0 b 1267 0 1274 7 1274 14 l 1274 100 b 1274 107 1267 114 1260 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:00:57.85,0:01:24.30,BarAccent,,0,0,0,,{\an7\pos(337,946)\fad(250,140)\c&H0B9EF5&\p1}m 0 0 l 1246 0 l 1246 3 l 0 3{\p0}
+Dialogue: 1,0:00:57.85,0:01:24.30,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,140)}{\c&H0B9EF5&\b1}笛卡尔轨迹拼接 · 路径平滑对比（第一圈）{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}未启用拐角过渡，在各航点停顿
+Dialogue: 1,0:00:57.85,0:01:24.30,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,140)}Cartesian Trajectory Splicing · Blending Comparison (Loop 1)  ·  Full stop at each waypoint
+Dialogue: 0,0:01:24.30,0:01:33.18,BarBg,,0,0,0,,{\an7\pos(270,946)\fad(140,250)\p1}m 14 0 l 1366 0 b 1373 0 1380 7 1380 14 l 1380 100 b 1380 107 1373 114 1366 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:01:24.30,0:01:33.18,BarAccent,,0,0,0,,{\an7\pos(284,946)\fad(140,250)\c&H99D334&\p1}m 0 0 l 1352 0 l 1352 3 l 0 3{\p0}
+Dialogue: 1,0:01:24.30,0:01:33.18,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(140,250)}{\c&H99D334&\b1}笛卡尔轨迹拼接 · 路径平滑对比（第二圈）{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}基于 C³ 贝塞尔拐角过渡与三阶 TOPP
+Dialogue: 1,0:01:24.30,0:01:33.18,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(140,250)}Cartesian Trajectory Splicing · Blending Comparison (Loop 2)  ·  C³ Bezier blends & 3rd-order TOPP
+
+Comment: ==================== V04: Demo_Trajectory_4 ====================
+Dialogue: 0,0:01:33.68,0:02:03.02,BarBg,,0,0,0,,{\an7\pos(383,946)\fad(250,250)\p1}m 14 0 l 1140 0 b 1147 0 1154 7 1154 14 l 1154 100 b 1154 107 1147 114 1140 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:01:33.68,0:02:03.02,BarAccent,,0,0,0,,{\an7\pos(397,946)\fad(250,250)\c&HF8BD38&\p1}m 0 0 l 1126 0 l 1126 3 l 0 3{\p0}
+Dialogue: 1,0:01:33.68,0:02:03.02,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,250)}{\c&HF8BD38&\b1}综合抓取与堆叠演示{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}结合轨迹规划、在线负载更新与笛卡尔阻抗控制
+Dialogue: 1,0:01:33.68,0:02:03.02,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,250)}Pick, Stack & Transfer  ·  Trajectory planning, online payload updates & Cartesian impedance
+
+Comment: ==================== C02: CHAPTER 02 (0:02:03.22 - 0:02:07.22) ====================
+Dialogue: 1,0:02:03.22,0:02:07.22,CardNum,,0,0,0,,{\an5\pos(960,210)\fad(250,250)\c&H99D334&}02
+Dialogue: 1,0:02:03.22,0:02:07.22,BarAccent,,0,0,0,,{\an7\pos(890,278)\fad(250,250)\c&H99D334&\p1}m 0 0 l 140 0 l 140 4 l 0 4{\p0}
+Dialogue: 1,0:02:03.22,0:02:07.22,CardTitleZH,,0,0,0,,{\an5\pos(960,362)\fad(250,250)}调试版：柔顺控制与拖动示教
+Dialogue: 1,0:02:03.22,0:02:07.22,CardSubEN,,0,0,0,,{\an5\pos(960,438)\fad(250,250)}Debugging Version: Compliance Control & Drag Teaching
+Dialogue: 1,0:02:03.22,0:02:07.22,CardDescZH,,0,0,0,,{\an5\pos(960,565)\fad(250,250)}本部分演示无力矩传感器条件下的柔顺交互功能，\N仅基于关节编码器反馈与动力学模型，支持关节阻抗、笛卡尔阻抗与拖动示教。
+Dialogue: 1,0:02:03.22,0:02:07.22,CardDescEN,,0,0,0,,{\an5\pos(960,665)\fad(250,250)}Interactive compliance using joint encoders and dynamics models:\Njoint-space impedance, Cartesian-space impedance, and drag teaching.
+Dialogue: 1,0:02:03.22,0:02:07.22,CardNote,,0,0,0,,{\an5\pos(960,792)\fad(250,250)}注：尊重原机器人模型不带关节力矩传感器的现实，在本项目里也不读取仿真器的对应数值。
+Dialogue: 1,0:02:03.22,0:02:07.22,CardDescEN,,0,0,0,,{\an5\pos(960,852)\fad(250,250)}Note: Respecting that the real robot has no joint torque sensors, simulator torque values are never read.
+
+Comment: ==================== V05 ====================
+Dialogue: 0,0:02:07.52,0:02:23.58,BarBg,,0,0,0,,{\an7\pos(409,946)\fad(250,250)\p1}m 14 0 l 1088 0 b 1095 0 1102 7 1102 14 l 1102 100 b 1102 107 1095 114 1088 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:02:07.52,0:02:23.58,BarAccent,,0,0,0,,{\an7\pos(423,946)\fad(250,250)\c&H99D334&\p1}m 0 0 l 1074 0 l 1074 3 l 0 3{\p0}
+Dialogue: 1,0:02:07.52,0:02:23.58,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,250)}{\c&H99D334&\b1}笛卡尔空间阻抗控制{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}基于末端刚度、等效惯量阻尼与零空间阻尼
+Dialogue: 1,0:02:07.52,0:02:23.58,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,250)}Cartesian Impedance  ·  Operational-space stiffness, inertia-scaled damping & nullspace damping
+
+Comment: ==================== V06 ====================
+Dialogue: 0,0:02:24.08,0:02:43.10,BarBg,,0,0,0,,{\an7\pos(383,946)\fad(250,250)\p1}m 14 0 l 1140 0 b 1147 0 1154 7 1154 14 l 1154 100 b 1154 107 1147 114 1140 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:02:24.08,0:02:43.10,BarAccent,,0,0,0,,{\an7\pos(397,946)\fad(250,250)\c&H99D334&\p1}m 0 0 l 1126 0 l 1126 3 l 0 3{\p0}
+Dialogue: 1,0:02:24.08,0:02:43.10,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,250)}{\c&H99D334&\b1}拖动示教模式{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}基于重力补偿与惯量归一化阻尼，支持外力拖动与记录
+Dialogue: 1,0:02:24.08,0:02:43.10,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,250)}Drag Teaching Mode  ·  Gravity compensation with inertia-normalized damping & pose recording
+
+Comment: ==================== V07 ====================
+Dialogue: 0,0:02:43.60,0:02:54.50,BarBg,,0,0,0,,{\an7\pos(460,946)\fad(250,250)\p1}m 14 0 l 986 0 b 993 0 1000 7 1000 14 l 1000 100 b 1000 107 993 114 986 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:02:43.60,0:02:54.50,BarAccent,,0,0,0,,{\an7\pos(474,946)\fad(250,250)\c&H99D334&\p1}m 0 0 l 972 0 l 972 3 l 0 3{\p0}
+Dialogue: 1,0:02:43.60,0:02:54.50,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,250)}{\c&H99D334&\b1}关节空间阻抗控制{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}基于各关节虚拟弹簧阻尼与软限位保护
+Dialogue: 1,0:02:43.60,0:02:54.50,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,250)}Joint-Space Impedance  ·  Per-joint virtual spring-damper with soft joint-limit walls
+
+Comment: ==================== C03: CHAPTER 03 (0:02:54.70 - 0:02:58.20) ====================
+Dialogue: 1,0:02:54.70,0:02:58.20,CardNum,,0,0,0,,{\an5\pos(960,265)\fad(250,250)\c&H0B9EF5&}03
+Dialogue: 1,0:02:54.70,0:02:58.20,BarAccent,,0,0,0,,{\an7\pos(890,335)\fad(250,250)\c&H0B9EF5&\p1}m 0 0 l 140 0 l 140 4 l 0 4{\p0}
+Dialogue: 1,0:02:54.70,0:02:58.20,CardTitleZH,,0,0,0,,{\an5\pos(960,425)\fad(250,250)}运行中暂停与恢复
+Dialogue: 1,0:02:54.70,0:02:58.20,CardSubEN,,0,0,0,,{\an5\pos(960,505)\fad(250,250)}Mid-Motion Pause & Resume
+Dialogue: 1,0:02:54.70,0:02:58.20,CardDescZH,,0,0,0,,{\an5\pos(960,655)\fad(250,250)}本部分演示轨迹执行过程中的实时暂停与恢复，\N暂停时沿当前路径平滑减速，恢复时从当前位形重新规划剩余轨迹。
+Dialogue: 1,0:02:54.70,0:02:58.20,CardDescEN,,0,0,0,,{\an5\pos(960,765)\fad(250,250)}Mid-motion pause and resume: smooth deceleration along the active path,\Nfollowed by replanning the remaining trajectory from the paused configuration.
+
+Comment: ==================== V08: Demo_Pause_IDE ====================
+Dialogue: 0,0:02:58.50,0:03:04.70,BarBg,,0,0,0,,{\an7\pos(424,946)\fad(250,120)\p1}m 14 0 l 1058 0 b 1065 0 1072 7 1072 14 l 1072 100 b 1072 107 1065 114 1058 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:02:58.50,0:03:04.70,BarAccent,,0,0,0,,{\an7\pos(438,946)\fad(250,120)\c&HF8BD38&\p1}m 0 0 l 1044 0 l 1044 3 l 0 3{\p0}
+Dialogue: 1,0:02:58.50,0:03:04.70,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,120)}{\c&HF8BD38&\b1}轨迹暂停与恢复{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}正在执行笛卡尔 PVA 轨迹，准备触发中途暂停
+Dialogue: 1,0:02:58.50,0:03:04.70,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,120)}Pause & Resume  ·  Executing a Cartesian PVA trajectory prior to pausing
+Dialogue: 0,0:03:04.70,0:03:09.20,BarBg,,0,0,0,,{\an7\pos(401,946)\fad(120,120)\p1}m 14 0 l 1104 0 b 1111 0 1118 7 1118 14 l 1118 100 b 1118 107 1111 114 1104 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:03:04.70,0:03:09.20,BarAccent,,0,0,0,,{\an7\pos(415,946)\fad(120,120)\c&H0B9EF5&\p1}m 0 0 l 1090 0 l 1090 3 l 0 3{\p0}
+Dialogue: 1,0:03:04.70,0:03:09.20,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(120,120)}{\c&H0B9EF5&\b1}暂停（PAUSED）{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}基于七次时间缩放轨迹拼接，沿原路径减速停稳
+Dialogue: 1,0:03:04.70,0:03:09.20,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(120,120)}Paused  ·  Path-preserving septic time-scaling splice decelerating along the path
+Dialogue: 0,0:03:09.20,0:03:24.85,BarBg,,0,0,0,,{\an7\pos(374,946)\fad(120,250)\p1}m 14 0 l 1158 0 b 1165 0 1172 7 1172 14 l 1172 100 b 1172 107 1165 114 1158 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:03:09.20,0:03:24.85,BarAccent,,0,0,0,,{\an7\pos(388,946)\fad(120,250)\c&H99D334&\p1}m 0 0 l 1144 0 l 1144 3 l 0 3{\p0}
+Dialogue: 1,0:03:09.20,0:03:24.85,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(120,250)}{\c&H99D334&\b1}恢复运行（RESUMED）{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}从当前静止位形重新规划剩余路径并继续执行
+Dialogue: 1,0:03:09.20,0:03:24.85,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(120,250)}Resumed  ·  Replanning the remaining trajectory from the paused configuration
+
+Comment: ==================== C04: CHAPTER 04 (0:03:25.05 - 0:03:28.55) ====================
+Dialogue: 1,0:03:25.05,0:03:28.55,CardNum,,0,0,0,,{\an5\pos(960,210)\fad(250,250)\c&H7171F8&}04
+Dialogue: 1,0:03:25.05,0:03:28.55,BarAccent,,0,0,0,,{\an7\pos(890,278)\fad(250,250)\c&H7171F8&\p1}m 0 0 l 140 0 l 140 4 l 0 4{\p0}
+Dialogue: 1,0:03:25.05,0:03:28.55,CardTitleZH,,0,0,0,,{\an5\pos(960,362)\fad(250,250)}错误提示、故障保护与恢复
+Dialogue: 1,0:03:25.05,0:03:28.55,CardSubEN,,0,0,0,,{\an5\pos(960,438)\fad(250,250)}Diagnostics, Fault Protection & Recovery
+Dialogue: 1,0:03:25.05,0:03:28.55,CardDescZH,,0,0,0,,{\an5\pos(960,565)\fad(250,250)}本部分演示轨迹编程界面与调试界面的异常检测与安全保护，\N涵盖编译警告、逆解报错、执行前碰撞检查，以及碰撞急停后的恢复流程。
+Dialogue: 1,0:03:25.05,0:03:28.55,CardDescEN,,0,0,0,,{\an5\pos(960,665)\fad(250,250)}Fault handling across both interfaces: compile warnings, IK errors,\Npre-execution collision checks, runtime E-STOP protection, and recovery.
+Dialogue: 1,0:03:25.05,0:03:28.55,CardNote,,0,0,0,,{\an5\pos(960,792)\fad(250,250)}注：机器人运行过程中常见的异常情况与错误都会被报告出来，本视频仅展示几个典型例子。
+Dialogue: 1,0:03:25.05,0:03:28.55,CardDescEN,,0,0,0,,{\an5\pos(960,852)\fad(250,250)}Note: Common runtime anomalies and errors are reported automatically; only typical examples are shown here.
+
+Comment: ==================== V09 ====================
+Dialogue: 0,0:03:28.85,0:03:35.35,BarBg,,0,0,0,,{\an7\pos(400,946)\fad(250,250)\p1}m 14 0 l 1106 0 b 1113 0 1120 7 1120 14 l 1120 100 b 1120 107 1113 114 1106 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:03:28.85,0:03:35.35,BarAccent,,0,0,0,,{\an7\pos(414,946)\fad(250,250)\c&H0B9EF5&\p1}m 0 0 l 1092 0 l 1092 3 l 0 3{\p0}
+Dialogue: 1,0:03:28.85,0:03:35.35,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,250)}{\c&H0B9EF5&\b1}编译期警告提示{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}过渡半径超限时自动裁剪，并在编辑器标注对应行
+Dialogue: 1,0:03:28.85,0:03:35.35,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,250)}Compile Warning  ·  Oversized blend radius clamped automatically with line highlight
+
+Comment: ==================== V10 ====================
+Dialogue: 0,0:03:35.85,0:03:41.03,BarBg,,0,0,0,,{\an7\pos(416,946)\fad(250,250)\p1}m 14 0 l 1074 0 b 1081 0 1088 7 1088 14 l 1088 100 b 1088 107 1081 114 1074 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:03:35.85,0:03:41.03,BarAccent,,0,0,0,,{\an7\pos(430,946)\fad(250,250)\c&H7171F8&\p1}m 0 0 l 1060 0 l 1060 3 l 0 3{\p0}
+Dialogue: 1,0:03:35.85,0:03:41.03,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,250)}{\c&H7171F8&\b1}编译期错误拦截{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}基于解析逆解分支检查，在执行前捕获象限跳变
+Dialogue: 1,0:03:35.85,0:03:41.03,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,250)}Compile Error  ·  Analytical IK branch check catches a quadrant jump before execution
+
+Comment: ==================== V11 ====================
+Dialogue: 0,0:03:41.53,0:03:47.42,BarBg,,0,0,0,,{\an7\pos(404,946)\fad(250,250)\p1}m 14 0 l 1098 0 b 1105 0 1112 7 1112 14 l 1112 100 b 1112 107 1105 114 1098 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:03:41.53,0:03:47.42,BarAccent,,0,0,0,,{\an7\pos(418,946)\fad(250,250)\c&H0B9EF5&\p1}m 0 0 l 1084 0 l 1084 3 l 0 3{\p0}
+Dialogue: 1,0:03:41.53,0:03:47.42,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,250)}{\c&H0B9EF5&\b1}执行前碰撞检查{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}基于 Coal 碰撞检测，拦截发生自碰撞的目标位姿
+Dialogue: 1,0:03:41.53,0:03:47.42,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,250)}Collision Check  ·  Coal collision detection rejects a self-colliding target pose
+
+Comment: ==================== V12: Fault_and_Recovery ====================
+Dialogue: 0,0:03:47.92,0:03:54.62,BarBg,,0,0,0,,{\an7\pos(416,946)\fad(250,120)\p1}m 14 0 l 1074 0 b 1081 0 1088 7 1088 14 l 1088 100 b 1088 107 1081 114 1074 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:03:47.92,0:03:54.62,BarAccent,,0,0,0,,{\an7\pos(430,946)\fad(250,120)\c&H7171F8&\p1}m 0 0 l 1060 0 l 1060 3 l 0 3{\p0}
+Dialogue: 1,0:03:47.92,0:03:54.62,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,120)}{\c&H7171F8&\b1}运行时碰撞保护{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}速度跟踪误差超限后，底层控制器触发急停制动
+Dialogue: 1,0:03:47.92,0:03:54.62,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,120)}Runtime Fault Protection  ·  Velocity tracking error triggers closed-loop controller E-STOP
+Dialogue: 0,0:03:54.62,0:04:02.30,BarBg,,0,0,0,,{\an7\pos(416,946)\fad(120,250)\p1}m 14 0 l 1074 0 b 1081 0 1088 7 1088 14 l 1088 100 b 1088 107 1081 114 1074 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:03:54.62,0:04:02.30,BarAccent,,0,0,0,,{\an7\pos(430,946)\fad(120,250)\c&H99D334&\p1}m 0 0 l 1060 0 l 1060 3 l 0 3{\p0}
+Dialogue: 1,0:03:54.62,0:04:02.30,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(120,250)}{\c&H99D334&\b1}安全恢复流程{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}基于离散事件监督器，确认静止后复位并继续运行
+Dialogue: 1,0:03:54.62,0:04:02.30,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(120,250)}Supervised Recovery  ·  DES supervisor verifies rest state before resetting to NORMAL
+
+Comment: ==================== C05: CHAPTER 05 (0:04:02.50 - 0:04:07.00) ====================
+Dialogue: 1,0:04:02.50,0:04:07.00,CardNum,,0,0,0,,{\an5\pos(960,210)\fad(250,250)\c&HF8BD38&}05
+Dialogue: 1,0:04:02.50,0:04:07.00,BarAccent,,0,0,0,,{\an7\pos(890,278)\fad(250,250)\c&HF8BD38&\p1}m 0 0 l 140 0 l 140 4 l 0 4{\p0}
+Dialogue: 1,0:04:02.50,0:04:07.00,CardTitleZH,,0,0,0,,{\an5\pos(960,362)\fad(250,250)}调试版：基础运动、夹爪与摩擦系数辨识
+Dialogue: 1,0:04:02.50,0:04:07.00,CardSubEN,,0,0,0,,{\an5\pos(960,438)\fad(250,250)}Debugging Version: Motion, Gripper & Friction ID
+Dialogue: 1,0:04:02.50,0:04:07.00,CardDescZH,,0,0,0,,{\an5\pos(960,565)\fad(250,250)}本部分演示调试界面的基础功能，\N包括关节运动、直线运动、独立夹爪抓取、负载更新及自动化摩擦系数辨识。
+Dialogue: 1,0:04:02.50,0:04:07.00,CardDescEN,,0,0,0,,{\an5\pos(960,665)\fad(250,250)}Basic debugging interface features: joint and linear moves,\Ndecoupled gripper grasping, online payload updates, and automated friction ID.
+Dialogue: 1,0:04:02.50,0:04:07.00,CardNote,,0,0,0,,{\an5\pos(960,792)\fad(250,250)}注：调试版的 MoveP 与 MoveC 功能同样正常可用，本次未单独录进视频。
+Dialogue: 1,0:04:02.50,0:04:07.00,CardDescEN,,0,0,0,,{\an5\pos(960,852)\fad(250,250)}Note: MoveP and MoveC also work normally in the debugging version and were not recorded here.
+
+Comment: ==================== V13 ====================
+Dialogue: 0,0:04:07.30,0:04:16.85,BarBg,,0,0,0,,{\an7\pos(362,946)\fad(250,250)\p1}m 14 0 l 1182 0 b 1189 0 1196 7 1196 14 l 1196 100 b 1196 107 1189 114 1182 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:04:07.30,0:04:16.85,BarAccent,,0,0,0,,{\an7\pos(376,946)\fad(250,250)\c&HF8BD38&\p1}m 0 0 l 1168 0 l 1168 3 l 0 3{\p0}
+Dialogue: 1,0:04:07.30,0:04:16.85,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,250)}{\c&HF8BD38&\b1}关节空间运动（MoveJ）{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}基于三阶 S 曲线规划与计算力矩控制（CTC）
+Dialogue: 1,0:04:07.30,0:04:16.85,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,250)}Joint Motion (MoveJ)  ·  Third-order S-curve planning with computed torque control
+
+Comment: ==================== V14 ====================
+Dialogue: 0,0:04:17.35,0:04:22.18,BarBg,,0,0,0,,{\an7\pos(433,946)\fad(250,250)\p1}m 14 0 l 1040 0 b 1047 0 1054 7 1054 14 l 1054 100 b 1054 107 1047 114 1040 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:04:17.35,0:04:22.18,BarAccent,,0,0,0,,{\an7\pos(447,946)\fad(250,250)\c&HF8BD38&\p1}m 0 0 l 1026 0 l 1026 3 l 0 3{\p0}
+Dialogue: 1,0:04:17.35,0:04:22.18,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,250)}{\c&HF8BD38&\b1}笛卡尔直线运动（MoveL）{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}基于直线路径插补与连续解析逆解
+Dialogue: 1,0:04:17.35,0:04:22.18,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,250)}Linear Motion (MoveL)  ·  Straight-line TCP interpolation with continuous analytical IK
+
+Comment: ==================== V15 ====================
+Dialogue: 0,0:04:22.68,0:04:42.73,BarBg,,0,0,0,,{\an7\pos(360,946)\fad(250,250)\p1}m 14 0 l 1186 0 b 1193 0 1200 7 1200 14 l 1200 100 b 1200 107 1193 114 1186 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:04:22.68,0:04:42.73,BarAccent,,0,0,0,,{\an7\pos(374,946)\fad(250,250)\c&HF8BD38&\p1}m 0 0 l 1172 0 l 1172 3 l 0 3{\p0}
+Dialogue: 1,0:04:22.68,0:04:42.73,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,250)}{\c&HF8BD38&\b1}夹爪抓取与负载补偿{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}独立夹爪夹取物体，在线更新 Pinocchio 负载模型
+Dialogue: 1,0:04:22.68,0:04:42.73,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,250)}Grasping & Payload Update  ·  Decoupled gripper grasp with online Pinocchio payload update
+
+Comment: ==================== V16: FrictionID ====================
+Dialogue: 0,0:04:43.23,0:04:53.43,BarBg,,0,0,0,,{\an7\pos(349,946)\fad(250,140)\p1}m 14 0 l 1208 0 b 1215 0 1222 7 1222 14 l 1222 100 b 1222 107 1215 114 1208 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:04:43.23,0:04:53.43,BarAccent,,0,0,0,,{\an7\pos(363,946)\fad(250,140)\c&HF8BD38&\p1}m 0 0 l 1194 0 l 1194 3 l 0 3{\p0}
+Dialogue: 1,0:04:43.23,0:04:53.43,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(250,140)}{\c&HF8BD38&\b1}自动化摩擦系数辨识{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}基于傅里叶激励轨迹，关闭摩擦补偿后采集运动数据
+Dialogue: 1,0:04:43.23,0:04:53.43,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(250,140)}Automated Friction Coefficient ID  ·  Fourier excitation recorded without friction compensation
+Dialogue: 0,0:04:53.43,0:05:10.93,BarBg,,0,0,0,,{\an7\pos(260,872)\fad(140,140)\p1}m 16 0 l 1384 0 b 1392 0 1400 8 1400 16 l 1400 172 b 1400 180 1392 188 1384 188 l 16 188 b 8 188 0 180 0 172 l 0 16 b 0 8 8 0 16 0{\p0}
+Dialogue: 0,0:04:53.43,0:05:10.93,BarAccent,,0,0,0,,{\an7\pos(274,872)\fad(140,140)\c&H0B9EF5&\p1}m 0 0 l 1372 0 l 1372 3 l 0 3{\p0}
+Dialogue: 1,0:04:53.43,0:05:10.93,SubZHBig,,0,0,0,,{\an5\pos(960,930)\fad(140,140)}{\c&H0B9EF5&\b1}模型与补偿说明{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}采用 LuGre 模型模拟关节摩擦，但此处仅辨识简化模型\N用于控制器前馈补偿，低速非线性摩擦力由力矩积分器进行补偿（详见项目主页）。
+Dialogue: 1,0:04:53.43,0:05:10.93,SubENBig,,0,0,0,,{\an5\pos(960,1014)\fad(140,140)}Joint friction is simulated with the LuGre model; only a simplified model is identified for feedforward.\NLow-speed nonlinear friction is compensated by the torque integrator (see the project homepage).
+Dialogue: 0,0:05:10.93,0:05:20.33,BarBg,,0,0,0,,{\an7\pos(351,946)\fad(140,250)\p1}m 14 0 l 1204 0 b 1211 0 1218 7 1218 14 l 1218 100 b 1218 107 1211 114 1204 114 l 14 114 b 7 114 0 107 0 100 l 0 14 b 0 7 7 0 14 0{\p0}
+Dialogue: 0,0:05:10.93,0:05:20.33,BarAccent,,0,0,0,,{\an7\pos(365,946)\fad(140,250)\c&H99D334&\p1}m 0 0 l 1190 0 l 1190 3 l 0 3{\p0}
+Dialogue: 1,0:05:10.93,0:05:20.33,SubZH,,0,0,0,,{\an5\pos(960,984)\fad(140,250)}{\c&H99D334&\b1}摩擦系数辨识结果{\b0\c&HB8A394&}  |  {\c&HFCFAF8&}基于广义动量积分估计粘性与库仑摩擦（输出 YAML）
+Dialogue: 1,0:05:10.93,0:05:20.33,SubEN,,0,0,0,,{\an5\pos(960,1031)\fad(140,250)}Friction Estimation Result  ·  Viscous & Coulomb coefficients fitted via momentum integrals
+
+Comment: ==================== END: OUTRO (0:05:20.53 - 0:05:24.53) ====================
+Dialogue: 1,0:05:20.53,0:05:24.53,CardTitleZH,,0,0,0,,{\an5\pos(960,425)\fad(300,400)}完整代码已开源至 GitHub
+Dialogue: 1,0:05:20.53,0:05:24.53,CardSubEN,,0,0,0,,{\an5\pos(960,510)\fad(300,400)}Full Open-Source Code Available on GitHub
+Dialogue: 1,0:05:20.53,0:05:24.53,BarAccent,,0,0,0,,{\an7\pos(860,572)\fad(300,400)\p1}m 0 0 l 200 0 l 200 4 l 0 4{\p0}
+Dialogue: 1,0:05:20.53,0:05:24.53,CardDescEN,,0,0,0,,{\an5\pos(960,640)\fad(300,400)}ROS 2 Jazzy  ·  MuJoCo 3.9.0  ·  Pinocchio  ·  Coal  ·  PyQt5  ·  C++17
